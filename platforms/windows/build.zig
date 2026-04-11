@@ -11,6 +11,17 @@ pub fn build(b: *std.Build) void {
     const vulkan_sdk = b.graph.environ_map.get("VULKAN_SDK") orelse toolchain_vulkan;
 
     const glslc_path = b.fmt("{s}/Bin/glslc.exe", .{vulkan_sdk});
+    
+    // ── 0. Vulkan SDK Verification ──
+    const sdk_check = std.fs.accessAbsolute(glslc_path, .{}) catch {
+        std.debug.print("\n[FATAL] Vulkan SDK not found at: {s}\n", .{vulkan_sdk});
+        std.debug.print("[FIX] Please run '.\\sylor_forge.ps1' in the project root to install the hermetic toolchain.\n\n", .{});
+        std.process.exit(1);
+    };
+    _ = sdk_check;
+
+    const vulkan_include = b.fmt("{s}/Include", .{vulkan_sdk});
+    const vulkan_lib = b.fmt("{s}/Lib", .{vulkan_sdk});
 
     // Install directly into the architecture subfolder (e.g., windows/x86_64/bin)
     b.install_path = b.fmt("{s}", .{arch_name});
@@ -20,7 +31,7 @@ pub fn build(b: *std.Build) void {
     const ghost_core = b.createModule(.{
         .root_source_file = b.path(core_path),
     });
-    ghost_core.addIncludePath(.{ .cwd_relative = b.fmt("{s}/Include", .{vulkan_sdk}) });
+    ghost_core.addIncludePath(.{ .cwd_relative = vulkan_include });
 
     // ── 2. Shader Compilation (Per-CPU) ──
     const shaders = [_][]const u8{ "resonance_query", "genesis_etch", "thermal_prune", "recursive_lookahead", "lattice_etch" };
@@ -45,9 +56,9 @@ pub fn build(b: *std.Build) void {
 
     ghost_exe.root_module.addImport("ghost_core", ghost_core);
     ghost_exe.root_module.linkSystemLibrary("c", .{});
+    ghost_exe.root_module.addIncludePath(.{ .cwd_relative = vulkan_include });
+    ghost_exe.root_module.addLibraryPath(.{ .cwd_relative = vulkan_lib });
     ghost_exe.root_module.linkSystemLibrary("vulkan-1", .{});
-    ghost_exe.root_module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/Include", .{vulkan_sdk}) });
-    ghost_exe.root_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/Lib", .{vulkan_sdk}) });
     
     for (&shader_steps) |step| ghost_exe.step.dependOn(step);
     b.installArtifact(ghost_exe);
@@ -65,9 +76,9 @@ pub fn build(b: *std.Build) void {
 
     trainer_exe.root_module.addImport("ghost_core", ghost_core);
     trainer_exe.root_module.linkSystemLibrary("c", .{});
+    trainer_exe.root_module.addIncludePath(.{ .cwd_relative = vulkan_include });
+    trainer_exe.root_module.addLibraryPath(.{ .cwd_relative = vulkan_lib });
     trainer_exe.root_module.linkSystemLibrary("vulkan-1", .{});
-    trainer_exe.root_module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/Include", .{vulkan_sdk}) });
-    trainer_exe.root_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/Lib", .{vulkan_sdk}) });
 
     for (&shader_steps) |step| trainer_exe.step.dependOn(step);
     b.installArtifact(trainer_exe);
