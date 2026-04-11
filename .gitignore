@@ -1,0 +1,31 @@
+# Ghost Engine .gitignore
+
+# Zig build artifacts
+.zig-cache/
+zig-out/
+cimport.zig
+
+# Platform-specific build outputs
+**/bin/*.exe
+**/bin/*.dll
+**/bin/*.pdb
+**/bin/*.so
+**/bin/*.dylib
+**/plugins/*.dll
+**/plugins/*.pdb
+**/plugins/*.sigil
+**/plugins/*.lib
+**/plugins/*.exp
+
+# General compiled artifacts
+*.obj
+*.spv
+*.pdb
+*.exe
+*.dll
+
+# Model state / weights (regeneratable via ohl_trainer)
+*.bin
+
+# Large training datasets (too large for GitHub LFS free tier)
+**/corpus/wikitext_train.txt
