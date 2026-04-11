@@ -1,0 +1,110 @@
+#version 450
+#extension GL_ARB_gpu_shader_int64 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ── 1. The 2GB Meaning Matrix (u16) ──
+layout(std430, binding = 0) buffer Matrix {
+    uint16_t data[]; 
+} meaning_matrix;
+
+// ── 2. Input Batch ──
+layout(std430, binding = 1) readonly buffer BatchRotors {
+    uint64_t rotors[];
+} batch_rotors;
+
+layout(std430, binding = 2) readonly buffer BatchChars {
+    uint target_chars[];
+} batch_chars;
+
+// ── 3. Output Buffer ──
+layout(std430, binding = 3) buffer BatchOutput {
+    uint energies[];
+} energy_output;
+
+// ── 4. Parameter Block ──
+layout(push_constant) uniform Constants {
+    uint batch_size;
+    uint mode; // 0 = Training, 1 = Inference
+} params;
+
+// ── 5. Tag Buffer ──
+layout(std430, binding = 4) buffer Tags {
+    uint64_t entries[];
+} matrix_tags;
+
+uint getRealityBit(uint char_id, uint bit_idx) {
+    uint word_idx = bit_idx / 64u;
+    uint64_t s = uint64_t(char_id) ^ 0x60bee2bee120fc15ul;
+    const uint64_t c1 = 0xa3b195354a39b70dul;
+    const uint64_t c2 = 0x123456789abcdef0ul;
+    for (uint i = 0; i <= word_idx; i++) {
+        s = (s ^ (s >> 33)) * c1;
+        s = (s ^ (s >> 33)) * c2;
+        s = s ^ (s >> 33);
+    }
+    return uint((s >> (bit_idx % 64u)) & 1ul);
+}
+
+uint collapseChunk(uint base_idx, uint chunk_idx) {
+    uint result = 0u;
+    for (uint b = 0; b < 32; b++) {
+        uint counter_idx = chunk_idx * 32u + b;
+        // 16-bit Threshold: 32768
+        if (uint(meaning_matrix.data[base_idx + counter_idx]) > 32767u) {
+            result |= (1u << b);
+        }
+    }
+    return result;
+}
+
+uint findSlot(uint64_t rotor) {
+    uint base_slot = uint(rotor % 1048576ul);
+    for (uint p = 0; p < 8; p++) {
+        uint slot = (base_slot + p) % 1048576u;
+        if (matrix_tags.entries[slot] == rotor) return slot;
+        if (matrix_tags.entries[slot] == 0ul) return slot;
+    }
+    return base_slot;
+}
+
+uint computeEnergy(uint64_t rotor, uint target_char) {
+    uint slot_idx = findSlot(rotor);
+    uint base_idx = slot_idx * 1024u;
+    uint total_hamming = 0u;
+    
+    for (uint chunk = 0; chunk < 32u; chunk++) {
+        uint expectation = collapseChunk(base_idx, chunk);
+        uint reality = 0u;
+        for (uint b = 0; b < 32u; b++) {
+            if (getRealityBit(target_char, chunk * 32u + b) == 1u) {
+                reality |= (1u << b);
+            }
+        }
+        total_hamming += bitCount(expectation ^ reality);
+    }
+    return 1024u - total_hamming;
+}
+
+void main() {
+    uint g_id = gl_GlobalInvocationID.x;
+    if (params.mode == 0u) {
+        if (g_id >= params.batch_size) return;
+        uint64_t lex = batch_rotors.rotors[g_id * 2];
+        uint64_t sem = batch_rotors.rotors[g_id * 2 + 1];
+        energy_output.energies[g_id] = (computeEnergy(lex, batch_chars.target_chars[g_id]) + computeEnergy(sem, batch_chars.target_chars[g_id])) / 2;
+    } else {
+        if (g_id >= 256u) return;
+        uint64_t lex = batch_rotors.rotors[0];
+        uint64_t sem = batch_rotors.rotors[1];
+        
+        uint e_lex = computeEnergy(lex, g_id);
+        uint e_sem = computeEnergy(sem, g_id);
+        
+        // MesoLattice Bundling
+        energy_output.energies[g_id] = (e_lex * 2 + e_sem) / 3;
+        if (energy_output.energies[g_id] < 512) energy_output.energies[g_id] = 512;
+    }
+}

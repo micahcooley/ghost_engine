@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ghost V22 | Symmetric Bitwise Intelligence</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&family=JetBrains+Mono&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #050505;
+            --accent: #00ffaa;
+            --text: #e0e0e0;
+            --card: #111;
+            --ghost-blur: blur(20px);
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: 'Outfit', sans-serif;
+            overflow: hidden;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        #glass-panopticon {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: radial-gradient(circle at 50% 50%, #111 0%, #050505 100%);
+            z-index: -1;
+        }
+
+        .ambient-orb {
+            position: absolute;
+            width: 400px; height: 400px;
+            background: radial-gradient(circle, rgba(0, 255, 170, 0.05) 0%, transparent 70%);
+            border-radius: 50%;
+            filter: blur(50px);
+            animation: drift 20s infinite alternate;
+        }
+
+        @keyframes drift {
+            from { transform: translate(-10%, -10%); }
+            to { transform: translate(10%, 10%); }
+        }
+
+        header {
+            padding: 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            background: rgba(0, 0, 0, 0.8);
+            backdrop-filter: var(--ghost-blur);
+        }
+
+        .logo {
+            font-size: 1.5rem;
+            font-weight: 600;
+            letter-spacing: 2px;
+            color: var(--accent);
+            text-transform: uppercase;
+        }
+
+        .status {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+            color: rgba(255, 255, 255, 0.4);
+        }
+
+        #chat-stream {
+            flex: 1;
+            padding: 2rem;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+            scroll-behavior: smooth;
+        }
+
+        .message {
+            max-width: 80%;
+            padding: 1.5rem;
+            border-radius: 1rem;
+            line-height: 1.6;
+            position: relative;
+            animation: fadeIn 0.5s ease-out;
+        }
+
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+        .user-msg {
+            align-self: flex-end;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            color: var(--text);
+        }
+
+        .ghost-msg {
+            align-self: flex-start;
+            background: rgba(0, 255, 170, 0.02);
+            border: 1px solid rgba(0, 255, 170, 0.1);
+            color: var(--accent);
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .input-chamber {
+            padding: 2rem;
+            background: rgba(0, 0, 0, 0.8);
+            backdrop-filter: var(--ghost-blur);
+            border-top: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .input-wrapper {
+            max-width: 900px;
+            margin: 0 auto;
+            position: relative;
+        }
+
+        input {
+            width: 100%;
+            background: #111;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            padding: 1.2rem 2rem;
+            border-radius: 100px;
+            color: white;
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.1rem;
+            outline: none;
+            transition: border 0.3s ease;
+        }
+
+        input:focus {
+            border: 1px solid var(--accent);
+        }
+
+        .orb-indicator {
+            position: absolute;
+            right: 1.5rem;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 12px;
+            height: 12px;
+            background: var(--accent);
+            border-radius: 50%;
+            box-shadow: 0 0 15px var(--accent);
+            opacity: 0.3;
+        }
+
+        .typing .orb-indicator {
+            animation: pulse 1s infinite;
+            opacity: 1;
+        }
+
+        @keyframes pulse { 0% { opacity: 0.3; } 50% { opacity: 1; } 100% { opacity: 0.3; } }
+    </style>
+</head>
+<body>
+    <div id="glass-panopticon"></div>
+    <div class="ambient-orb"></div>
+    
+    <header>
+        <div class="logo">Ghost V22</div>
+        <div class="status">TRP RESONANCE: <span id="res-val">STABLE</span></div>
+    </header>
+
+    <div id="chat-stream">
+        <div class="message ghost-msg">The silicon panopticon is open. How shall we warp the lattice today?</div>
+    </div>
+
+    <div class="input-chamber">
+        <div class="input-wrapper">
+            <input type="text" id="prompt-in" placeholder="Etch a concept into the matrix..." autocomplete="off">
+            <div class="orb-indicator"></div>
+        </div>
+    </div>
+
+    <script>
+        const chat = document.getElementById('chat-stream');
+        const input = document.getElementById('prompt-in');
+        const orb = document.querySelector('.input-wrapper');
+
+        async function postPrompt(prompt) {
+            orb.classList.add('typing');
+            
+            const userBox = document.createElement('div');
+            userBox.className = 'message user-msg';
+            userBox.innerText = prompt;
+            chat.appendChild(userBox);
+            chat.scrollTop = chat.scrollHeight;
+
+            try {
+                const res = await fetch('/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ prompt })
+                });
+                const data = await res.json();
+                
+                const ghostBox = document.createElement('div');
+                ghostBox.className = 'message ghost-msg';
+                ghostBox.innerText = data.reply;
+                chat.appendChild(ghostBox);
+            } catch (e) {
+                console.error(e);
+            } finally {
+                orb.classList.remove('typing');
+                chat.scrollTop = chat.scrollHeight;
+            }
+        }
+
+        input.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter' && input.value.trim()) {
+                postPrompt(input.value.trim());
+                input.value = '';
+            }
+        });
+    </script>
+</body>
+</html>
