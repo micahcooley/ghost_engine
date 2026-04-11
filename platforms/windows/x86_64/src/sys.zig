@@ -32,6 +32,9 @@ pub const getArgs = os_layer.getArgs;
 pub const isTrainerActive = os_layer.isTrainerActive;
 pub const findPluginFiles = os_layer.findPluginFiles;
 pub const findNativePlugins = os_layer.findNativePlugins;
+pub const getSiloRoot = os_layer.getSiloRoot;
+pub const getAnchorPath = os_layer.getAnchorPath;
+
 
 
 // Common utilities

@@ -25,6 +25,8 @@ extern "kernel32" fn GetCurrentProcess() callconv(.c) *anyopaque;
 extern "kernel32" fn LoadLibraryW(lpLibFileName: [*:0]const u16) callconv(.c) ?*anyopaque;
 extern "kernel32" fn GetProcAddress(hModule: *anyopaque, lpProcName: [*:0]const u8) callconv(.c) ?*anyopaque;
 extern "kernel32" fn FreeLibrary(hLibModule: *anyopaque) callconv(.c) i32;
+extern "kernel32" fn GetModuleFileNameW(hModule: ?*anyopaque, lpFilename: [*:0]u16, nSize: u32) callconv(.c) u32;
+
 
 
 pub const WIN32_MEMORY_RANGE_ENTRY = extern struct {
@@ -61,10 +63,58 @@ extern "kernel32" fn FindNextFileW(hFindFile: *anyopaque, lpFindFileData: *WIN32
 extern "kernel32" fn FindClose(hFindFile: *anyopaque) callconv(.c) i32;
 pub extern "kernel32" fn DeleteFileW(lpFileName: [*:0]const u16) callconv(.c) i32;
 
+var global_silo_root: ?[]const u8 = null;
+
+pub fn getExePath(allocator: std.mem.Allocator) ![]const u8 {
+    var buf: [1024]u16 = undefined;
+    const len = GetModuleFileNameW(null, &buf, 1024);
+    if (len == 0) return error.GetModuleFileNameFailed;
+    
+    // Convert UTF-16 to UTF-8
+    var out_list = std.ArrayList(u8).init(allocator);
+    errdefer out_list.deinit();
+    
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        const c = buf[i];
+        if (c < 0x80) { try out_list.append(@intCast(c)); }
+        else if (c < 0x800) { 
+            try out_list.append(@intCast(0xC0 | (c >> 6))); 
+            try out_list.append(@intCast(0x80 | (c & 0x3F))); 
+        } else {
+            try out_list.append(@intCast(0xE0 | (c >> 12)));
+            try out_list.append(@intCast(0x80 | ((c >> 6) & 0x3F)));
+            try out_list.append(@intCast(0x80 | (c & 0x3F)));
+        }
+    }
+    return out_list.toOwnedSlice();
+}
+
+pub fn getSiloRoot(allocator: std.mem.Allocator) ![]const u8 {
+    if (global_silo_root) |r| return r;
+    
+    const exe_path = try getExePath(allocator);
+    defer allocator.free(exe_path);
+    
+    const bin_dir = std.fs.path.dirname(exe_path) orelse return error.NoDirName;
+    const silo_root = std.fs.path.dirname(bin_dir) orelse bin_dir; // Step back from bin/
+    
+    global_silo_root = try allocator.dupe(u8, silo_root);
+    return global_silo_root.?;
+}
+
+pub fn getAnchorPath(allocator: std.mem.Allocator, sub_path: []const u8) ![]const u8 {
+    const root = try getSiloRoot(allocator);
+    return std.fs.path.join(allocator, &[_][]const u8{ root, sub_path });
+}
+
+
 pub fn findPluginFiles(allocator: std.mem.Allocator) ![][]const u8 {
     var results = std.ArrayListUnmanaged([]const u8).empty;
     var wbuf: [1024]u16 = undefined;
-    const search_path = utf8ToW("plugins\\*", &wbuf);
+    const anchored_plugins = try getAnchorPath(allocator, "plugins\\*");
+    defer allocator.free(anchored_plugins);
+    const search_path = utf8ToW(anchored_plugins, &wbuf);
     
     var find_data: WIN32_FIND_DATAW = undefined;
     const hFind = FindFirstFileW(search_path, &find_data);
@@ -86,7 +136,9 @@ pub fn findPluginFiles(allocator: std.mem.Allocator) ![][]const u8 {
 
         const name = out_buf[0..out_idx];
         if (std.mem.endsWith(u8, name, ".sigil")) {
-            const full_path = try std.fmt.allocPrint(allocator, "plugins\\{s}", .{name});
+            const joined = try std.fs.path.join(allocator, &[_][]const u8{ "plugins", name });
+            defer allocator.free(joined);
+            const full_path = try getAnchorPath(allocator, joined);
             try results.append(allocator, full_path);
         }
 
@@ -99,7 +151,9 @@ pub fn findPluginFiles(allocator: std.mem.Allocator) ![][]const u8 {
 pub fn findNativePlugins(allocator: std.mem.Allocator) ![][]const u8 {
     var results = std.ArrayListUnmanaged([]const u8).empty;
     var wbuf: [1024]u16 = undefined;
-    const search_path = utf8ToW("plugins\\*", &wbuf);
+    const anchored_plugins = try getAnchorPath(allocator, "plugins\\*");
+    defer allocator.free(anchored_plugins);
+    const search_path = utf8ToW(anchored_plugins, &wbuf);
     
     var find_data: WIN32_FIND_DATAW = undefined;
     const hFind = FindFirstFileW(search_path, &find_data);
@@ -123,7 +177,9 @@ pub fn findNativePlugins(allocator: std.mem.Allocator) ![][]const u8 {
         const is_dll = std.mem.endsWith(u8, name, ".dll");
         const is_so = std.mem.endsWith(u8, name, ".so");
         if (is_dll or is_so) {
-            const full_path = try std.fmt.allocPrint(allocator, "plugins\\{s}", .{name});
+            const joined = try std.fs.path.join(allocator, &[_][]const u8{ "plugins", name });
+            defer allocator.free(joined);
+            const full_path = try getAnchorPath(allocator, joined);
             try results.append(allocator, full_path);
         }
 

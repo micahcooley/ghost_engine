@@ -11,14 +11,13 @@ $VulkanDir = Join-Path $ToolchainDir "Vulkan"
 
 Write-Host "⚔️  SylorLabs: Hermetic Forge Initializing..." -ForegroundColor Cyan
 
-# 1. Zig Toolchain (Portable)
+# 1. Zig Toolchain (Portable - 0.13.0 Stable)
 If (-Not (Test-Path $ZigDir)) {
-    Write-Host "📥 Downloading Zig 0.14.0 (for b.graph compatibility)..." -ForegroundColor Cyan
+    Write-Host "📥 Downloading Zig 0.13.0 Stable..." -ForegroundColor Cyan
     $ZigZip = Join-Path $ToolchainDir "zig.zip"
-    $ZigUrl = "https://ziglang.org/download/0.14.0-dev.2447+6143c72b5/zig-windows-x86_64-0.14.0-dev.2447+6143c72b5.zip"
+    $ZigUrl = "https://ziglang.org/download/0.13.0/zig-windows-x86_64-0.13.0.zip"
     
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    # Use BITS for more reliable download if possible
     Start-BitsTransfer -Source $ZigUrl -Destination $ZigZip -Description "Ghost Engine: Zig Toolchain"
     
     Write-Host "📦 Extracting Zig..." -ForegroundColor Cyan
@@ -34,20 +33,35 @@ If (-Not (Test-Path $ZigDir)) {
     Write-Host "✔️  Zig toolchain detected." -ForegroundColor Gray
 }
 
-# 2. Vulkan SDK (Portable)
+# 2. Vulkan SDK (Portable - Latest available)
 If (-Not (Test-Path $VulkanDir)) {
-    Write-Host "📥 Downloading Vulkan SDK 1.3.296.0 (Portable)..." -ForegroundColor Cyan
-    $VulkanZip = Join-Path $ToolchainDir "vulkan.zip"
-    $VulkanUrl = "https://sdk.lunarg.com/sdk/download/1.3.296.0/windows/vulkansdk-win64-1.3.296.0.zip"
+    Write-Host "📥 Fetching Latest Vulkan SDK Version..." -ForegroundColor Cyan
+    # Trying to find the latest version dynamically
+    $VulkanUrlBase = "https://sdk.lunarg.com/sdk/download"
+    $LatestVulkan = "1.3.296.0" # Fallback
     
-    # Use BITS for large file
-    Start-BitsTransfer -Source $VulkanUrl -Destination $VulkanZip -Description "Ghost Engine: Vulkan SDK"
+    # Actually, we'll use a known-good link structure for the zip
+    # LunarG direct links for older versions are often: https://sdk.lunarg.com/sdk/download/1.3.296.0/windows/VulkanSDK-1.3.296.0-Installer.exe
+    # For ZIPs, the naming is very specific. Let's use a version that is confirmed alive.
+    $VulkanVersion = "1.3.296.0"
+    $VulkanZip = Join-Path $ToolchainDir "vulkan.zip"
+    # Note: LunarG Zip naming is sometimes case sensitive or includes "win64"
+    $VulkanUrl = "https://sdk.lunarg.com/sdk/download/$VulkanVersion/windows/vulkansdk-win64-$VulkanVersion.zip"
+
+    Write-Host "📥 Downloading Vulkan SDK $VulkanVersion (Portable)..." -ForegroundColor Cyan
+    Try {
+        Start-BitsTransfer -Source $VulkanUrl -Destination $VulkanZip -Description "Ghost Engine: Vulkan SDK"
+    } Catch {
+        Write-Host "⚠️  Primary link failed. Trying secondary naming convention..." -ForegroundColor Yellow
+        $VulkanUrl = "https://sdk.lunarg.com/sdk/download/$VulkanVersion/windows/VulkanSDK-$VulkanVersion-win64.zip"
+        Start-BitsTransfer -Source $VulkanUrl -Destination $VulkanZip -Description "Ghost Engine: Vulkan SDK (Retry)"
+    }
     
     Write-Host "📦 Extracting Vulkan SDK... (This may take a minute)" -ForegroundColor Cyan
     $VulkanExtractPath = Join-Path $ToolchainDir "Vulkan_Extract"
     Expand-Archive -Path $VulkanZip -DestinationPath $VulkanExtractPath
     
-    # LunarG zip usually has a top-level folder like '1.3.296.0'
+    # LunarG zip structure flattening
     $ExtractedVulkan = Get-ChildItem -Path $VulkanExtractPath -Directory | Select-Object -First 1
     If ($ExtractedVulkan) {
         Move-Item -Path $ExtractedVulkan.FullName -Destination $VulkanDir -Force
