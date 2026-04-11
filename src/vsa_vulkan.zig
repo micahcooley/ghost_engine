@@ -37,6 +37,10 @@ pub const SparsityMask = struct {
 pub const BATCH_SIZE = 1024;
 
 pub const OperationalTier = enum(u32) {
+    god = 19192,
+    hyper = 16384,
+    ultra = 12288,
+    extreme = 8192,
     max = 4096,
     high = 2048,
     standard = 1024,
@@ -129,6 +133,8 @@ pub const VulkanEngine = struct {
     mapped_lattice: ?[*]u32 = null,
 
     matrix_slots: u32 = 0,
+    gpu_matrix_size: usize = 0, // actual GPU allocation for meaning matrix
+    gpu_lattice_size: usize = 0, // actual GPU allocation for lattice
 
     command_pool: vk.VkCommandPool = null,
     descriptor_pool: vk.VkDescriptorPool = null,
@@ -323,45 +329,60 @@ pub const VulkanEngine = struct {
         }
 
         // 4. Buffers: Adaptive Saturation Logic
+        // Scale GPU allocations to fit available VRAM.
+        // Budget: 60% meaning matrix, 30% lattice, 10% batch/overhead
+        // Minimum: 128MB meaning matrix (64K slots), 64MB lattice
+        const vram = engine.vram_size;
+        const ideal_matrix_size = @as(usize, 1024) * 1024 * 1024 * 2; // 2GB (1M full slots)
+        const ideal_lattice_size = @as(usize, 1024) * 1024 * 1024; // 1GB
+
+        // Reserve 10% for batch buffers, driver overhead
+        const usable = if (vram > 4 * 1024 * 1024 * 1024) vram * 85 / 100 else vram * 70 / 100;
+        const max_matrix = @min(ideal_matrix_size, usable * 60 / 100);
+        const max_lattice = @min(ideal_lattice_size, usable * 30 / 100);
+
+        const matrix_size = @max(max_matrix, 128 * 1024 * 1024); // floor: 128MB
+        const lattice_size = @max(max_lattice, 64 * 1024 * 1024); // floor: 64MB
+
+        engine.gpu_matrix_size = matrix_size;
+        engine.gpu_lattice_size = lattice_size;
+        engine.matrix_slots = @intCast(@min(@as(usize, 1_048_576), matrix_size / (1024 * 2))); // slots = size / 1024 u16 per slot
+
+        std.debug.print("[VULKAN] Adaptive Budget: matrix={d}MB lattice={d}MB slots={d}\n", .{
+            matrix_size / 1024 / 1024,
+            lattice_size / 1024 / 1024,
+            engine.matrix_slots,
+        });
+
         // iGPU (UMA): Use Host Visible + Coherent for zero-copy
         // dGPU (>4GB): Use Device Local for core lattice structures
         var matrix_flags: vk.VkMemoryPropertyFlags = vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         if (engine.is_discrete and engine.vram_size > 4 * 1024 * 1024 * 1024) {
             std.debug.print("[VULKAN] High-Tier Detected: Enabling DEVICE_LOCAL Lattice Pinning.\n", .{});
             matrix_flags = vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-            // Note: If we use DEVICE_LOCAL without HOST_VISIBLE, we'd need staging buffers for getMatrixData().
-            // For V27, we prioritize ReBAR (DEVICE_LOCAL | HOST_VISIBLE).
-            // findMemoryType will fallback to HOST_VISIBLE if DEVICE_LOCAL is not mappable.
             matrix_flags |= vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
         }
 
         const batch_flags = vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
-        // 2GB Meaning Matrix (1M slots × 1024 u16)
-        engine.matrix_slots = 1_048_576;
-        const init_matrix_size = @as(usize, 1024) * 1024 * 1024 * 2; // 2GB
         const init_tag_size = @as(usize, engine.matrix_slots) * 8;
 
-        engine.mapped_matrix = @ptrCast(engine.createBuffer(init_matrix_size, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, matrix_flags, &engine.matrix_buffer, &engine.matrix_memory) catch |err| {
+        const matrix_usage = vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT | vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+        engine.mapped_matrix = @ptrCast(engine.createBuffer(matrix_size, matrix_usage, matrix_flags, &engine.matrix_buffer, &engine.matrix_memory) catch |err| {
             return err;
         });
 
-        engine.mapped_tags = @ptrCast(@alignCast(try engine.createBuffer(init_tag_size, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, matrix_flags, &engine.tag_buffer, &engine.tag_memory)));
-        
+        engine.mapped_tags = @ptrCast(@alignCast(try engine.createBuffer(init_tag_size, matrix_usage, matrix_flags, &engine.tag_buffer, &engine.tag_memory)));
+
         for (0..FRAME_COUNT) |i| {
-            // Rotors: MAX_STREAMS * 2 u64s (lex + sem per stream)
             engine.mapped_rotors[i] = @ptrCast(@alignCast(try engine.createBuffer(64 * 2 * 8, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, batch_flags, &engine.rotor_buffers[i], &engine.rotor_memories[i])));
-            // Chars: 4096 slots * 4 bytes (greedy-packed unified buffer)
             engine.mapped_chars[i] = @ptrCast(@alignCast(try engine.createBuffer(4096 * 4, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, batch_flags, &engine.char_buffers[i], &engine.char_memories[i])));
-            // V28: Rotor demux index — 4096 u32 stream IDs parallel to char buffer
             engine.mapped_index[i] = @ptrCast(@alignCast(try engine.createBuffer(4096 * 4, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, batch_flags, &engine.index_buffers[i], &engine.index_memories[i])));
-            // Energy output: 4096 u32 slots
             engine.mapped_energy[i] = @ptrCast(@alignCast(try engine.createBuffer(4096 * 4, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, batch_flags, &engine.energy_buffers[i], &engine.energy_memories[i])));
         }
 
-        // 1GB Unified Lattice (536M u16 = 268M u32 packed)
-        const lattice_size = @as(usize, 1024) * 1024 * 1024;
-        engine.mapped_lattice = @ptrCast(@alignCast(try engine.createBuffer(lattice_size, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, matrix_flags, &engine.lattice_buffer, &engine.lattice_memory) orelse return error.VulkanError));
+        engine.mapped_lattice = @ptrCast(@alignCast(try engine.createBuffer(lattice_size, matrix_usage, matrix_flags, &engine.lattice_buffer, &engine.lattice_memory) orelse return error.VulkanError));
 
         // 5. Descriptor Layout
         // V28: push constants now carry batch_size + num_streams (8 bytes total)
@@ -719,33 +740,64 @@ pub const VulkanEngine = struct {
     pub fn growMatrix(self: *VulkanEngine, extra_elements: u32) !void {
         const old_elements: u32 = self.matrix_slots;
         const new_elements = old_elements + extra_elements;
-        const new_data_size = @as(usize, new_elements) * 1024;
-        const new_tag_size = @as(usize, new_elements) * 8;
+        const new_data_size = @as(usize, new_elements) * 1024 * 2; // 2 bytes per u16
         
-        std.debug.print("[VSA] Growing Matrix: {d} slots -> {d} slots\n", .{ old_elements, new_elements });
+        std.debug.print("[VSA] Growing Matrix (GPU-Accelerated): {d} slots -> {d} slots\n", .{ old_elements, new_elements });
+
+        // 1. Drain the pipeline: Wait for all outstanding frames
+        for (0..FRAME_COUNT) |i| {
+            try check(vk.vkWaitForFences(self.dev, 1, &self.fences[i], vk.VK_TRUE, std.math.maxInt(u64)));
+        }
 
         const batch_flags = vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        const matrix_usage = vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT | vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
+        // 2. Allocate New Buffers
         var next_matrix_buffer: vk.VkBuffer = null;
         var next_matrix_memory: vk.VkDeviceMemory = null;
-        const next_matrix_ptr = @as([*]u8, @ptrCast(self.createBuffer(new_data_size, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, batch_flags, &next_matrix_buffer, &next_matrix_memory) catch |err| blk: {
+        const next_matrix_ptr = @as([*]u8, @ptrCast(self.createBuffer(new_data_size, matrix_usage, batch_flags, &next_matrix_buffer, &next_matrix_memory) catch |err| blk: {
             if (err == error.MemoryTypeNotFound) {
-                break :blk try self.createBuffer(new_data_size, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, batch_flags, &next_matrix_buffer, &next_matrix_memory);
+                break :blk try self.createBuffer(new_data_size, matrix_usage, batch_flags, &next_matrix_buffer, &next_matrix_memory);
             }
             return err;
         } orelse return error.VulkanError));
 
-        // 2. Allocate New Tag Buffer
         var next_tag_buffer: vk.VkBuffer = null;
         var next_tag_memory: vk.VkDeviceMemory = null;
-        const next_tag_ptr = @as([*]u64, @ptrCast(@alignCast(try self.createBuffer(new_tag_size, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, batch_flags, &next_tag_buffer, &next_tag_memory) orelse return error.VulkanError)));
+        const next_tag_size = @as(usize, new_elements) * 8;
+        const next_tag_ptr = @as([*]u64, @ptrCast(@alignCast(try self.createBuffer(next_tag_size, matrix_usage, batch_flags, &next_tag_buffer, &next_tag_memory) orelse return error.VulkanError)));
 
-        // 3. Migrate Data
-        @memcpy(next_matrix_ptr[0 .. @as(usize, old_elements) * 1024], self.mapped_matrix.?[0 .. @as(usize, old_elements) * 1024]);
-        @memset(next_matrix_ptr[@as(usize, old_elements) * 1024 .. new_data_size], 128); // Neutral anchor
-        
-        @memcpy(next_tag_ptr[0 .. old_elements], self.mapped_tags.?[0 .. old_elements]);
-        @memset(std.mem.sliceAsBytes(next_tag_ptr[old_elements .. new_elements]), 0); // Empty slots
+        // 3. GPU-Side Migration
+        const f = self.frame_idx;
+        try check(vk.vkResetFences(self.dev, 1, &self.fences[f]));
+        var beginInfo = std.mem.zeroes(vk.VkCommandBufferBeginInfo);
+        beginInfo.sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        try check(vk.vkBeginCommandBuffer(self.command_buffers[f], &beginInfo));
+
+        // Copy Meaning Matrix
+        const matrix_copy = vk.VkBufferCopy{
+            .srcOffset = 0,
+            .dstOffset = 0,
+            .size = @as(usize, old_elements) * 1024 * 2,
+        };
+        vk.vkCmdCopyBuffer(self.command_buffers[f], self.matrix_buffer, next_matrix_buffer, 1, &matrix_copy);
+
+        // Copy Tags
+        const tag_copy = vk.VkBufferCopy{
+            .srcOffset = 0,
+            .dstOffset = 0,
+            .size = @as(usize, old_elements) * 8,
+        };
+        vk.vkCmdCopyBuffer(self.command_buffers[f], self.tag_buffer, next_tag_buffer, 1, &tag_copy);
+
+        try check(vk.vkEndCommandBuffer(self.command_buffers[f]));
+
+        var submitInfo = std.mem.zeroes(vk.VkSubmitInfo);
+        submitInfo.sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &self.command_buffers[f];
+        try check(vk.vkQueueSubmit(self.queue, 1, &submitInfo, self.fences[f]));
+        try check(vk.vkWaitForFences(self.dev, 1, &self.fences[f], vk.VK_TRUE, std.math.maxInt(u64)));
 
         // 4. Cleanup Legacy Silicon
         vk.vkUnmapMemory(self.dev, self.matrix_memory);
@@ -768,9 +820,8 @@ pub const VulkanEngine = struct {
         self.matrix_slots = new_elements;
 
         // 6. Refresh Descriptor Bindings
-        for (0..8) |i| {
-            const chunk_size: vk.VkDeviceSize = 1024;
-            self.updateDescriptorSets(@intCast(i), i * chunk_size * 8, i * chunk_size * 4);
+        for (0..FRAME_COUNT) |i| {
+            self.updateDescriptorSets(@intCast(i));
         }
     }
 
@@ -830,8 +881,8 @@ pub const VulkanEngine = struct {
     /// correctly bound-check rotor_index lookups and prefix-scan safely.
     pub fn dispatchMergedEtch(self: *VulkanEngine, batch_size: u32, num_streams: u32) !void {
         const f = self.frame_idx;
-        // Safe fence wait — triple buffering means frame N-3 is guaranteed done
-        try check(vk.vkWaitForFences(self.dev, 1, &self.fences[f], vk.VK_TRUE, std.math.maxInt(u64)));
+        // The caller (e.g. VulkanComputeProvider.etch) is expected to have waited for this fence
+        // before writing to the host-mapped buffers. We just reset it here for submission.
         try check(vk.vkResetFences(self.dev, 1, &self.fences[f]));
 
         var beginInfo = std.mem.zeroes(vk.VkCommandBufferBeginInfo);
@@ -941,7 +992,7 @@ const VulkanComputeProvider = struct {
 
     pub fn getLatticeData() []u16 {
         const engine = &global_instance.?;
-        return @as([*]u16, @ptrCast(@alignCast(engine.mapped_lattice.?)))[0 .. (1024 * 1024 * 1024) / 2];
+        return @as([*]u16, @ptrCast(@alignCast(engine.mapped_lattice.?)))[0 .. engine.gpu_lattice_size / 2];
     }
 
     /// V28: etch() now accepts rotor_indices — the per-rune stream ID sidecar.

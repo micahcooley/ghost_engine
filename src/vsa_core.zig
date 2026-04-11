@@ -94,23 +94,22 @@ pub const MeaningMatrix = struct {
     /// Converts 1024 16-bit accumulators into 1024 bits via thresholding.
     pub fn collapseToBinaryAtSlot(self: *const MeaningMatrix, slot: u32) HyperVector {
         const acc = self.data[slot * 1024 .. slot * 1024 + 1024];
-        var res_bytes = [_]u8{0} ** 128;
+        var res_bytes: [128]u8 = undefined;
 
-        // Use @Vector for architecture-level parallelism if possible
-        // Here we do a standard threshold pass, but unrolled for performance.
+        const threshold: @Vector(16, u16) = @splat(@as(u16, 32767));
+        const powers: @Vector(16, u16) = .{ 1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128 };
+
         var i: usize = 0;
-        while (i < 128) : (i += 1) {
-            var byte: u8 = 0;
-            const base = i * 8;
-            if (acc[base + 0] > 32767) byte |= 1;
-            if (acc[base + 1] > 32767) byte |= 2;
-            if (acc[base + 2] > 32767) byte |= 4;
-            if (acc[base + 3] > 32767) byte |= 8;
-            if (acc[base + 4] > 32767) byte |= 16;
-            if (acc[base + 5] > 32767) byte |= 32;
-            if (acc[base + 6] > 32767) byte |= 64;
-            if (acc[base + 7] > 32767) byte |= 128;
-            res_bytes[i] = byte;
+        while (i < 64) : (i += 1) {
+            const chunk: @Vector(16, u16) = acc[i * 16 ..][0..16].*;
+            const mask = @as(@Vector(16, u16), @select(u16, chunk > threshold, powers, @as(@Vector(16, u16), @splat(0))));
+            
+            // Sum the bits into two bytes
+            const mask_arr: [16]u16 = mask;
+            const low = @reduce(.Add, @as(@Vector(8, u16), mask_arr[0..8].*));
+            const high = @reduce(.Add, @as(@Vector(8, u16), mask_arr[8..16].*));
+            res_bytes[i * 2] = @as(u8, @intCast(low));
+            res_bytes[i * 2 + 1] = @as(u8, @intCast(high));
         }
         return @bitCast(res_bytes);
     }

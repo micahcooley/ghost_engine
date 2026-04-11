@@ -1,3 +1,5 @@
+
+
 const std = @import("std");
 const builtin = @import("builtin");
 const sys = @import("sys.zig");
@@ -32,6 +34,7 @@ fn ctrlHandler(ctrl_type: u32) void {
 const StreamState = struct {
     lexical_rotor: u64,
     semantic_rotor: u64,
+    claimed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     concept: vsa.HyperVector,
     syntax: vsa.HyperVector,
     phrase: vsa.HyperVector,
@@ -41,6 +44,7 @@ const StreamState = struct {
     cursor: usize,
     name: []const u8,
     done: bool,
+    last_rune_byte: u8 = 0,
 
     pub fn init(data: []const u8, name: []const u8) StreamState {
         return .{
@@ -55,6 +59,7 @@ const StreamState = struct {
             .cursor = 0,
             .name = name,
             .done = false,
+            .last_rune_byte = 0,
         };
     }
 
@@ -109,6 +114,7 @@ const StreamState = struct {
             self.semantic_rotor = (self.semantic_rotor ^ rune_hash) *% ghost_state.FNV_PRIME;
         }
 
+        self.last_rune_byte = @as(u8, @truncate(rune));
         return rune;
     }
 
@@ -119,34 +125,75 @@ const StreamState = struct {
 };
 
 // ── Multi-Stream Greedy Pool Batcher (V28: Unified Stream Pool) ──
-// Replaces the old static-partition MultiStreamBatcher.
-//
-// Architecture:
-//   - No more chunk_size = max_batch / streams.len
-//   - fillBatch() is greedy: pulls runes from ANY active stream until the
-//     unified buffer is full or all streams are exhausted.
-//   - A parallel rotor_index[] slice records the stream origin of each rune.
-//   - The final batch_len is clamped to a multiple of 64 for wavefront alignment.
-//
-// GPU Saturation effect:
-//   - If 3 of 4 streams finish early, Stream 4 immediately fills 100% of the
-//     buffer on the next dispatch, using all available GPU cores.
 const MAX_STREAMS = 64;
-// Wavefront size: AMD Wave64=64, Nvidia Wave32=32. We align to 64 to cover both.
 const WAVEFRONT_ALIGN = 64;
+
+/// V28.1: Sovereign Worker Pool eliminates per-batch thread spawning.
+const WorkerPool = struct {
+    threads: []std.Thread,
+    work_queue: [MAX_STREAMS]?*StreamState,
+    active_count: std.atomic.Value(usize),
+    pending_count: std.atomic.Value(usize),
+    stop: std.atomic.Value(bool),
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator, num_threads: usize) !*WorkerPool {
+        const self = try allocator.create(WorkerPool);
+        self.* = .{
+            .threads = try allocator.alloc(std.Thread, num_threads),
+            .work_queue = [_]?*StreamState{null} ** MAX_STREAMS,
+            .active_count = std.atomic.Value(usize).init(0),
+            .pending_count = std.atomic.Value(usize).init(0),
+            .stop = std.atomic.Value(bool).init(false),
+            .allocator = allocator,
+        };
+
+        for (0..num_threads) |i| {
+            self.threads[i] = try std.Thread.spawn(.{ .allocator = allocator }, workerMain, .{self});
+        }
+        return self;
+    }
+
+    fn workerMain(self: *WorkerPool) void {
+        while (!self.stop.load(.acquire)) {
+            // Spin-wait for work (Parallel Preprocessing Wavefront)
+            while (self.pending_count.load(.acquire) == 0) {
+                if (self.stop.load(.acquire)) return;
+                std.atomic.spinLoopHint();
+            }
+
+            const total = self.active_count.load(.acquire);
+            for (0..total) |i| {
+                const stream = self.work_queue[i] orelse continue;
+                // Atomic claim to ensure only one worker processes this stream per wavefront
+                if (stream.claimed.swap(true, .acquire) == false) {
+                    _ = stream.nextRune();
+                    _ = self.pending_count.fetchSub(1, .release);
+                }
+            }
+        }
+    }
+
+    pub fn deinit(self: *WorkerPool) void {
+        self.stop.store(true, .release);
+        for (self.threads) |t| t.join();
+        self.allocator.free(self.threads);
+        self.allocator.destroy(self);
+    }
+};
 
 const GreedyBatcher = struct {
     streams: []StreamState,
+    pool: ?*WorkerPool = null,
     active_count: usize,
-    /// Greedy-packed rune bytes. May contain bytes from any stream, contiguous.
     batch_bytes: [20480]u8,
-    /// Parallel stream-ID per slot. batch_index[i] == which stream produced batch_bytes[i].
     batch_index: [20480]u32,
     batch_len: usize,
 
-    pub fn init(streams: []StreamState) GreedyBatcher {
+    pub fn init(streams: []StreamState, pool: ?*WorkerPool) GreedyBatcher {
         return .{
             .streams = streams,
+            .pool = pool,
             .active_count = streams.len,
             .batch_bytes = [_]u8{0} ** 20480,
             .batch_index = [_]u32{0} ** 20480,
@@ -154,50 +201,66 @@ const GreedyBatcher = struct {
         };
     }
 
-    /// Greedy fill: iterates streams round-robin pulling one rune per stream
-    /// per round, filling the unified buffer until max_batch is reached or all
-    /// streams are exhausted. Wavefront-aligns the final count to WAVEFRONT_ALIGN.
     pub fn fillBatch(self: *GreedyBatcher, max_batch: u32) usize {
-        // Clamp max_batch to our buffer size
         const cap: usize = @min(max_batch, self.batch_bytes.len);
         var pos: usize = 0;
-        var any_active = true;
+        
+        // Greedy fill with Parallel Preprocessing
+        // V28.1: Instead of serial pull, we pull in wavefronts to keep GPU saturated.
+        while (pos < cap and self.active_count > 0) {
+            if (self.pool) |p| {
+                // Prepare work for the pool: All active streams pull their NEXT rune.
+                var streams_this_pass: usize = 0;
+                for (self.streams, 0..) |*s, si| {
+                    if (s.done) continue;
+                    p.work_queue[streams_this_pass] = s;
+                    // Pre-store index for demux
+                    self.batch_index[pos + streams_this_pass] = @as(u32, @intCast(si));
+                    streams_this_pass += 1;
+                }
+                
+                if (streams_this_pass == 0) break;
+                
+                p.active_count.store(streams_this_pass, .release);
+                p.pending_count.store(streams_this_pass, .release);
+                // Wait for pool to finish processing this wavefront
+                while (p.pending_count.load(.acquire) > 0) {
+                    std.atomic.spinLoopHint();
+                }
 
-        // Round-robin pull: one rune per stream per pass.
-        // This distributes load evenly when multiple streams are alive, and
-        // automatically saturates to one stream when others are exhausted.
-        while (pos < cap and any_active) {
-            any_active = false;
-            for (self.streams, 0..) |*s, si| {
-                if (pos >= cap) break;
-                if (s.done) continue;
-                // Pull one rune from this stream
-                const rune = s.nextRune() orelse continue;
-                self.batch_bytes[pos] = @as(u8, @truncate(rune));
-                self.batch_index[pos] = @as(u32, @intCast(si));
-                pos += 1;
-                any_active = true;
+                // Now collect the results into the batch
+                for (0..streams_this_pass) |i| {
+                    const s = p.work_queue[i].?;
+                    // Stream.cursor was already advanced, but we need the rune that WAS pulled.
+                    // To avoid another loop, we change nextRune to store the result in the stream state.
+                    self.batch_bytes[pos + i] = s.last_rune_byte;
+                }
+                pos += streams_this_pass;
+            } else {
+                // Serial Fallback
+                var any_active = false;
+                for (self.streams, 0..) |*s, si| {
+                    if (pos >= cap) break;
+                    if (s.done) continue;
+                    const rune = s.nextRune() orelse continue;
+                    self.batch_bytes[pos] = @as(u8, @truncate(rune));
+                    self.batch_index[pos] = @as(u32, @intCast(si));
+                    pos += 1;
+                    any_active = true;
+                }
+                if (!any_active) break;
             }
         }
 
-        // ── Wavefront Alignment ──
-        // Truncate to the largest multiple of WAVEFRONT_ALIGN ≤ pos.
-        // This eliminates masked-out threads on the silicon level (Wave64/Wave32).
         if (pos > 0) {
             pos = (pos / WAVEFRONT_ALIGN) * WAVEFRONT_ALIGN;
-            // If we got fewer than one wavefront of data, keep it as-is
-            // (final tail of training — we don't want to discard it).
             if (pos == 0) pos = @min(WAVEFRONT_ALIGN, self.batch_len);
         }
-
         self.batch_len = pos;
-
-        // Update active_count so callers can track stream death
         self.active_count = 0;
-        for (self.streams) |s| {
+        for (self.streams) |*s| {
             if (!s.done) self.active_count += 1;
         }
-
         return self.batch_len;
     }
 
@@ -250,6 +313,9 @@ fn main_wrapped() !void {
     var plugins_on: bool = false;
     for (args[2..]) |arg| {
         if (std.mem.eql(u8, arg, "--god")) tier = .god
+        else if (std.mem.eql(u8, arg, "--hyper")) tier = .hyper
+        else if (std.mem.eql(u8, arg, "--ultra")) tier = .ultra
+        else if (std.mem.eql(u8, arg, "--extreme")) tier = .extreme
         else if (std.mem.eql(u8, arg, "--max")) tier = .max
         else if (std.mem.eql(u8, arg, "--high")) tier = .high
         else if (std.mem.eql(u8, arg, "--standard")) tier = .standard
@@ -281,14 +347,14 @@ fn main_wrapped() !void {
     // Constrain batch to 20480 (our buffer cap) and wavefront-align it
     const aligned_batch_size: u32 = @min(batch_size, 20480);
     const num_streams: usize = switch (tier) {
-        .god      => MAX_STREAMS,
+        .god, .hyper, .ultra, .extreme => MAX_STREAMS,
         .max      => @min(MAX_STREAMS, cpu_cores * 2),
         .high     => cpu_cores,
         .standard => @min(cpu_cores, 4),
         .background => 1,
     };
     const sleep_ms: u32 = switch (tier) {
-        .god, .max, .high, .standard => 0,
+        .god, .hyper, .ultra, .extreme, .max, .high, .standard => 0,
         .background => 15,
     };
 
@@ -397,9 +463,12 @@ fn main_wrapped() !void {
     sys.printOut("[SIGIL] Done.\n");
 
     // ── 7. Initialize Greedy Stream Pool ──
+    const pool = try WorkerPool.init(allocator, cpu_cores);
+    defer pool.deinit();
+
     var streams: [MAX_STREAMS]StreamState = undefined;
     for (0..num_streams) |si| streams[si] = StreamState.init(stream_data[si], stream_names[si]);
-    var batcher = GreedyBatcher.init(streams[0..num_streams]);
+    var batcher = GreedyBatcher.init(streams[0..num_streams], pool);
     // Pre-allocated rotor snapshot buffer: 2 u64s per stream (lex + sem)
     var rotor_snapshot: [MAX_STREAMS * 2]u64 = [_]u64{0} ** (MAX_STREAMS * 2);
 
