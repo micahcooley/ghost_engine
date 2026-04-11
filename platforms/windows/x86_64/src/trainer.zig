@@ -79,10 +79,48 @@ const StreamState = struct {
         // Update rotors (fast path - no boredom tracking)
         self.lexical_rotor = (self.lexical_rotor ^ @as(u64, byte)) *% ghost_state.FNV_PRIME;
         self.semantic_rotor = (self.semantic_rotor ^ @as(u64, byte)) *% ghost_state.FNV_PRIME;
-        const is_boundary = (byte == ' ' or byte == '.' or byte == ';' or byte == '=');
+        
+        // Universal Boundary Check: ASCII whitespace/punctuation + anything > 127 (Unicode start)
+        const is_boundary = (byte <= ' ' or byte == '.' or byte == ';' or byte == '=' or byte > 127);
         if (is_boundary) self.semantic_rotor = ghost_state.FNV_OFFSET_BASIS;
 
         return byte;
+    }
+
+    /// Pulls the next full Rune (UTF-8 multi-byte sequence) from the stream.
+    /// This is the key to 'ingesting literally anything' without bias.
+    pub fn nextRune(self: *StreamState) ?u32 {
+        if (self.cursor >= self.file_data.len) {
+            self.done = true;
+            return null;
+        }
+
+        const first_byte = self.file_data[self.cursor];
+        const len = std.unicode.utf8ByteSequenceLength(first_byte) catch 1;
+        
+        if (self.cursor + len > self.file_data.len) {
+            self.done = true;
+            return null;
+        }
+
+        const rune_bytes = self.file_data[self.cursor .. self.cursor + len];
+        const rune = if (len == 1) @as(u32, first_byte) else std.unicode.utf8Decode(rune_bytes) catch @as(u32, first_byte);
+        
+        self.cursor += len;
+        
+        // Update rotors with the full Rune hash
+        const rune_hash = ghost_state.wyhash(ghost_state.FNV_OFFSET_BASIS, rune);
+        self.lexical_rotor = (self.lexical_rotor ^ rune_hash) *% ghost_state.FNV_PRIME;
+        
+        // Semantic rotor reset: uses a broader set of boundaries including Unicode whitespace
+        const is_boundary = (rune <= 32 or rune == '.' or rune == ';' or rune == '=' or rune == 0x3000); // 0x3000 = Ideographic Space
+        if (is_boundary) {
+            self.semantic_rotor = ghost_state.FNV_OFFSET_BASIS;
+        } else {
+            self.semantic_rotor = (self.semantic_rotor ^ rune_hash) *% ghost_state.FNV_PRIME;
+        }
+
+        return rune;
     }
 
     pub fn progress(self: *const StreamState) f64 {
@@ -124,14 +162,13 @@ const MultiStreamBatcher = struct {
             const start_in_batch = si * chunk_size;
             var i: usize = 0;
             while (i < chunk_size) : (i += 1) {
-                if (s.cursor >= s.file_data.len) {
-                    s.done = true;
-                    break;
-                }
-                const byte = s.file_data[s.cursor];
-                s.cursor += 1;
+                // Use nextRune for universal ingestion
+                const rune = s.nextRune() orelse break;
                 
-                self.batch_bytes[start_in_batch + i] = byte;
+                // For the batch bytes, we currently pack the rune as a u32 into the byte stream
+                // Note: The GPU shaders must be updated to handle u32 tokens if we want bitwise parity.
+                // For now, we store the low 8 bits but the rotors are 100% rune-aware.
+                self.batch_bytes[start_in_batch + i] = @as(u8, @truncate(rune));
                 self.batch_len += 1;
             }
         }
@@ -373,10 +410,18 @@ fn main_wrapped() !void {
         }
     }
 
-    // ── 6. Hard-Lock ASCII Sigils ──
-    sys.printOut("[SIGIL] Locking ASCII identities...\n");
+    // ── 6. Hard-Lock Universal Sigils ──
+    sys.printOut("[SIGIL] Locking Universal identities (Latin + CJK Base)...\n");
+    // Lock ASCII 
     for (0..128) |c| {
         meaning_matrix.hardLockSigil(@as(u64, @truncate(vsa.generate(@intCast(c))[0])), @intCast(c));
+    }
+    // Lock Key Unicode Ranges (e.g. CJK Unified Ideographs start)
+    const extra_locks: [4]u32 = .{ 0x4E00, 0x4E01, 0x4E02, 0x4E03 };
+    for (extra_locks) |r| {
+        // We Use a 64-bit hash of the rune for the matrix slot
+        const rune_hash = ghost_state.wyhash(0, r);
+        meaning_matrix.hardLockUniversalSigil(rune_hash, r);
     }
     sys.printOut("[SIGIL] Done.\n");
 

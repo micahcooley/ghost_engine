@@ -10,11 +10,23 @@ pub const REASON_TOP_K: u32 = 3;
 pub const KORYPHAIOS_MANAGER_THRESHOLD: u64 = 256;
 pub const KORYPHAIOS_CRITIC_THRESHOLD: u64 = 5;
 
-pub fn isAllowed(c: u8) bool {
-    if (c >= 'a' and c <= 'z') return true;
-    if (c >= 'A' and c <= 'Z') return true;
-    if (c >= '0' and c <= '9') return true;
-    if (c == ' ' or c == '.' or c == ',' or c == '!' or c == '?' or c == '\'' or c == '"' or c == '-') return true;
+pub fn isAllowed(cp: u32) bool {
+    if (cp > 0x10FFFF) return false;
+    // ASCII Range
+    if (cp < 128) {
+        if (cp >= 'a' and cp <= 'z') return true;
+        if (cp >= 'A' and cp <= 'Z') return true;
+        if (cp >= '0' and cp <= '9') return true;
+        if (cp == ' ' or cp == '.' or cp == ',' or cp == '!' or cp == '?' or cp == '\'' or cp == '"' or cp == '-') return true;
+        if (cp == '\n' or cp == '\r' or cp == '\t') return true;
+        return false;
+    }
+    // Basic Multilingual Plane (BMP) support
+    // We allow any valid printable character in the BMP (0x0080 to 0xFFFF)
+    // Excluding surrogates (0xD800-0xDFFF) as they aren't valid codepoints
+    if (cp >= 0x0080 and cp <= 0xD7FF) return true;
+    if (cp >= 0xE000 and cp <= 0xFFFF) return true;
+    
     return false;
 }
 
@@ -89,20 +101,22 @@ pub const SingularityEngine = struct {
 
     pub fn resolveText1D(self: *SingularityEngine) ?u8 {
         const position = self.canvas.cursor;
-        var top_chars: [REASON_TOP_K]u8 = [_]u8{' '} ** REASON_TOP_K;
+        var top_chars: [REASON_TOP_K]u32 = [_]u32{' '} ** REASON_TOP_K;
         var top_energies: [REASON_TOP_K]u32 = [_]u32{0} ** REASON_TOP_K;
         const prev1 = self.inventory[(self.inv_cursor + 127) % 128];
         const prev2 = self.inventory[(self.inv_cursor + 126) % 128];
         const prev3 = self.inventory[(self.inv_cursor + 125) % 128];
 
-        var gpu_success = false;
+        var gpu_success: bool = false;
         if (self.compute) |compute| {
             if (compute.queryResonance(self.soul.lexical_rotor, self.soul.semantic_rotor, self.allocator)) |energies| {
                 defer self.allocator.free(energies);
                 gpu_success = true;
                 const boredom = self.soul.getBoredomPenalty(self.soul.lexical_rotor);
+                // Note: The GPU currently only queries 256 results. 
+                // We'll process them as ASCII and fallback to CPU for higher codepoints if resonance is low.
                 for (energies, 0..) |raw_e, i| {
-                    const cb: u8 = @intCast(i);
+                    const cb: u32 = @intCast(i);
                     if (!isAllowed(cb)) continue;
                     var energy = raw_e;
                     if (cb == prev1 and cb == prev2 and cb == prev3) energy = energy -| 50;
@@ -114,22 +128,24 @@ pub const SingularityEngine = struct {
 
         if (!gpu_success) {
             const boredom = self.soul.getBoredomPenalty(self.soul.lexical_rotor);
-            var i: u16 = 0;
-            while (i < 256) : (i += 1) {
-                const cb: u8 = @intCast(i);
-                if (!isAllowed(cb)) continue;
-                const e_lex = vsa.calculateResonance(self.meaning.collapseToBinary(self.soul.lexical_rotor), vsa.generate(cb));
-                const e_sem = vsa.calculateResonance(self.meaning.collapseToBinary(self.soul.semantic_rotor), vsa.generate(cb));
+            var cp: u32 = 0;
+            // Iterate over BMP to find high-resonance characters
+            while (cp < 0xFFFF) : (cp += 1) {
+                if (!isAllowed(cp)) continue;
+                const e_lex = vsa.calculateResonance(self.meaning.collapseToBinary(self.soul.lexical_rotor), vsa.generate(cp));
+                const e_sem = vsa.calculateResonance(self.meaning.collapseToBinary(self.soul.semantic_rotor), vsa.generate(cp));
                 var energy: u32 = if (e_lex > 0) (e_lex * 2 + e_sem) / 3 else e_sem;
                 if (energy == 0) energy = 512;
-                if (cb == prev1 and cb == prev2 and cb == prev3) energy = energy -| 50;
+                if (cp < 256) {
+                    if (cp == prev1 and cp == prev2 and cp == prev3) energy = energy -| 50;
+                }
                 energy = energy -| boredom;
-                insertTopK(&top_chars, &top_energies, cb, energy);
+                insertTopK(&top_chars, &top_energies, cp, energy);
             }
         }
 
         const primary_concept = self.soul.concept;
-        var reason_best_char: u8 = top_chars[0];
+        var reason_best_char: u32 = top_chars[0];
         var reason_best_score: u32 = 0;
         var frustration: u64 = 0;
 
@@ -137,11 +153,23 @@ pub const SingularityEngine = struct {
             for (top_chars, 0..) |candidate, ki| {
                 if (top_energies[ki] == 0) continue;
                 const snapshot = saveSoul(self.soul);
-                const cand_vec = vsa.generate(candidate);
-                self.soul.simulateAbsorb(cand_vec, candidate, null);
+                
+                // --- Task 3: UTF-8 BMP Character Preservation ---
+                // We must process all bytes of the codepoint to maintain state resonance.
+                var utf8_buf: [4]u8 = undefined;
+                const len = std.unicode.utf8Encode(@intCast(candidate), &utf8_buf) catch {
+                    restoreSoul(self.soul, snapshot);
+                    continue;
+                };
+
+                for (utf8_buf[0..len]) |b| {
+                    self.soul.simulateAbsorb(vsa.generate(b), b, null);
+                }
+
                 const sigmoid_leniency = (200 * (frustration * frustration)) / ((frustration * frustration) + 25);
                 const verdict = vsa.koryphaiosBrickwall(self.soul.concept, primary_concept, KORYPHAIOS_MANAGER_THRESHOLD, KORYPHAIOS_CRITIC_THRESHOLD + sigmoid_leniency);
                 if (!verdict.passed) { restoreSoul(self.soul, snapshot); continue; }
+                
                 var future_energy: u32 = top_energies[ki] + @as(u32, @intCast(@min(verdict.manager_drift / 4, 64)));
                 if (self.compute) |compute| {
                     if (compute.lookahead(REASON_TOP_K, REASON_DEPTH, self.allocator)) |fut_energies| {
@@ -156,12 +184,21 @@ pub const SingularityEngine = struct {
             frustration += 1;
         }
 
-        const chosen: u8 = if (reason_best_score > 0) reason_best_char else top_chars[0];
+        const chosen: u32 = if (reason_best_score > 0) reason_best_char else top_chars[0];
         const chosen_vec = vsa.generate(chosen);
         self.canvas.setCell(position, 0, chosen_vec);
         self.canvas.noise[position] = self.measureNoise(chosen_vec, position);
         self.canvas.advance();
-        return chosen;
+
+        // Encode and push to inventory
+        var utf8_fin: [4]u8 = undefined;
+        const len_fin = std.unicode.utf8Encode(@intCast(chosen), &utf8_fin) catch 1;
+        for (utf8_fin[0..len_fin]) |b| {
+            self.inventory[self.inv_cursor % 128] = b;
+            self.inv_cursor += 1;
+        }
+
+        return if (chosen < 256) @intCast(@as(u8, @truncate(chosen))) else '?';
     }
 
     pub fn resolveImage2D(self: *SingularityEngine) void {
@@ -203,7 +240,7 @@ pub const SingularityEngine = struct {
     }
 };
 
-pub fn insertTopK(chars: *[REASON_TOP_K]u8, energies: *[REASON_TOP_K]u32, candidate: u8, energy: u32) void {
+pub fn insertTopK(chars: *[REASON_TOP_K]u32, energies: *[REASON_TOP_K]u32, candidate: u32, energy: u32) void {
     var i: usize = 0; while (i < REASON_TOP_K) : (i += 1) {
         if (energy > energies[i]) {
             var j: usize = REASON_TOP_K - 1; while (j > i) : (j -= 1) { chars[j] = chars[j - 1]; energies[j] = energies[j - 1]; }

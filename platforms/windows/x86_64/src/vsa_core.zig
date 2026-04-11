@@ -159,6 +159,11 @@ pub const MeaningMatrix = struct {
 
     /// Absolute Sigil Locking: Hardcoding a symbol into the matrix.
     pub fn hardLockSigil(self: *MeaningMatrix, hash: u64, char: u8) void {
+        self.hardLockUniversalSigil(hash, @as(u32, char));
+    }
+
+    /// Universal Sigil Locking: Handles any 32-bit rune.
+    pub fn hardLockUniversalSigil(self: *MeaningMatrix, hash: u64, rune: u32) void {
         const base_idx = @as(u32, @intCast(hash % 1_048_576));
         var slot_idx: ?u32 = null;
         if (self.tags) |tags| {
@@ -170,7 +175,7 @@ pub const MeaningMatrix = struct {
             }
         }
         const sid = slot_idx orelse return;
-        const reality_bytes: [128]u8 = @bitCast(generate(char));
+        const reality_bytes: [128]u8 = @bitCast(generate(@as(u64, rune)));
         var word_acc = self.data[sid * 1024 .. sid * 1024 + 1024];
         for (0..1024) |i| {
             const bit = (reality_bytes[i / 8] >> @as(u3, @intCast(i % 8))) & 1;

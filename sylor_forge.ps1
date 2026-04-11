@@ -77,12 +77,26 @@ If (-Not (Test-Path $VulkanDir)) {
     
     Remove-Item -Path $VulkanExtractPath -Recurse -Force
     Remove-Item -Path $VulkanZip -Force
-    Write-Host "✅ Vulkan SDK installed to .toolchain/Vulkan" -ForegroundColor Green
-} Else {
-    Write-Host "✔️  Vulkan SDK detected." -ForegroundColor Gray
-}
+    
+    # ── VERIFICATION ──
+    Write-Host "`n🔍 Verifying Hermetic Toolchain..." -ForegroundColor Cyan
+    $ZigExe = Join-Path $ZigDir "zig.exe"
+    $GlslcExe = Join-Path $VulkanDir "Bin/glslc.exe"
+    
+    If (Test-Path $ZigExe) {
+        $ZigVer = & $ZigExe version
+        Write-Host "✔️  Zig $ZigVer verified." -ForegroundColor Green
+    } Else {
+        Write-Error "❌ Zig verification FAILED. Binaries missing."
+    }
+    
+    If (Test-Path $GlslcExe) {
+        Write-Host "✔️  Vulkan SDK (glslc) verified." -ForegroundColor Green
+    } Else {
+        Write-Error "❌ Vulkan SDK verification FAILED. Binaries missing or nested incorrectly."
+    }
 
-Write-Host "`n🚀 Hermetic Forge Ready." -ForegroundColor Green
+    Write-Host "`n🚀 Hermetic Forge Ready." -ForegroundColor Green
 Write-Host "------------------------------------------------"
 Write-Host "To build the engine without global installs:" -ForegroundColor Gray
 Write-Host "1. `$env:PATH = '$ZigDir;' + `$env:PATH" -ForegroundColor White

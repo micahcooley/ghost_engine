@@ -89,22 +89,30 @@ pub const GhostSoul = struct {
     /// compressed into a 64-bit fingerprint of the current sequence.
     /// Infinite context depth: the rotor carries the state of every previous
     /// character in the session. O(1) cost. 
-    pub fn pushRotor(self: *GhostSoul, raw_char: u8) void {
-        self.lexical_rotor = (self.lexical_rotor ^ @as(u64, raw_char)) *% FNV_PRIME;
+    /// Avalanche Rotor: wyhash + FNV-1a rolling hash. 
+    /// Updated to use Rune hashes for language-agnostic threading.
+    pub fn pushRotor(self: *GhostSoul, rune: u32) void {
+        const rune_hash = wyhash(FNV_OFFSET_BASIS, rune);
+        self.lexical_rotor = (self.lexical_rotor ^ rune_hash) *% FNV_PRIME;
         
-        self.semantic_rotor = (self.semantic_rotor ^ @as(u64, raw_char)) *% FNV_PRIME;
-        const is_boundary = (raw_char == ' ' or raw_char == '.' or raw_char == ';' or raw_char == '=');
-        if (is_boundary) self.semantic_rotor = FNV_OFFSET_BASIS;
+        // Universal Boundary Check: Statistical Snap priority
+        const is_boundary = (rune <= 32 or rune == '.' or rune == ';' or rune == '=' or rune == 0x3000);
+        if (is_boundary) {
+            self.semantic_rotor = FNV_OFFSET_BASIS;
+        } else {
+            self.semantic_rotor = (self.semantic_rotor ^ rune_hash) *% FNV_PRIME;
+        }
 
         // Update history for satiation
         self.rotor_history[self.history_ptr] = self.lexical_rotor;
         self.history_ptr = (self.history_ptr + 1) % 16;
     }
 
-    pub fn pushRotorFast(self: *GhostSoul, raw_char: u8) void {
-        self.lexical_rotor = (self.lexical_rotor ^ @as(u64, raw_char)) *% FNV_PRIME;
-        self.semantic_rotor = (self.semantic_rotor ^ @as(u64, raw_char)) *% FNV_PRIME;
-        const is_boundary = (raw_char == ' ' or raw_char == '.' or raw_char == ';' or raw_char == '=');
+    pub fn pushRotorFast(self: *GhostSoul, rune: u32) void {
+        const rune_hash = wyhash(FNV_OFFSET_BASIS, rune);
+        self.lexical_rotor = (self.lexical_rotor ^ rune_hash) *% FNV_PRIME;
+        
+        const is_boundary = (rune <= 32 or rune == '.' or rune == ';' or rune == '=' or rune == 0x3000);
         if (is_boundary) self.semantic_rotor = FNV_OFFSET_BASIS;
     }
 
@@ -122,10 +130,9 @@ pub const GhostSoul = struct {
     }
 
     /// Fractal State Update: MAP operation (Multiply-Add-Permute).
-    /// Rotates the 1024-bit vector and XORs with the character's permanent
-    /// random signature. O(1) cost, infinite context depth.
-    pub fn fractalPush(self: *GhostSoul, raw_char: u8) void {
-        self.fractal_state = vsa.rotate(self.fractal_state, 1) ^ vsa.generate(raw_char);
+    /// Now rune-aware: each character gets exactly one Permute cycle.
+    pub fn fractalPush(self: *GhostSoul, rune: u32) void {
+        self.fractal_state = vsa.rotate(self.fractal_state, 1) ^ vsa.generate(rune);
     }
 
     /// Fractal Resonance: hamming distance between two fractal states.
@@ -136,10 +143,9 @@ pub const GhostSoul = struct {
     }
 
     /// Spell Vector Push: rotate + XOR binding for word-level VSA encoding.
-    /// Accumulates characters into a 1024-bit "micro spell" that represents
-    /// the current word. Handles words of any length (infinite capacity).
-    pub fn spellPush(self: *GhostSoul, raw_char: u8) void {
-        self.spell_vector = vsa.rotate(self.spell_vector, 1) ^ vsa.generate(raw_char);
+    /// Rune-aware word representation.
+    pub fn spellPush(self: *GhostSoul, rune: u32) void {
+        self.spell_vector = vsa.rotate(self.spell_vector, 1) ^ vsa.generate(rune);
     }
 
     /// Detect boundary type from Resonance Energy.
@@ -152,40 +158,36 @@ pub const GhostSoul = struct {
     /// The core evolution: absorb a new token into the state.
     /// Boundaries are detected dynamically via Prediction Error (Resonance Drop).
     /// Returns the semantic drift occurred (if any).
-    pub fn absorb(self: *GhostSoul, token_vec: vsa.HyperVector, raw_char: u8, energy: ?u16) !u64 {
-        self.rolling_buffer[self.rolling_idx % 65536] = raw_char;
+    /// The core evolution: absorb a new token into the state.
+    /// Rune-aware: processes any Unicode character as a semantic atom.
+    pub fn absorb(self: *GhostSoul, token_vec: vsa.HyperVector, rune: u32, energy: ?u16) !u64 {
+        const raw_byte = @as(u8, @truncate(rune)); // For rolling buffer heartbeat
+        self.rolling_buffer[self.rolling_idx % 65536] = raw_byte;
         self.rolling_idx +%= 1;
-        // Phase-Change Detector (Entropy Heartbeat) - Recalibrate every 64KB window
+        // Phase-Change Detector (Entropy Heartbeat)
         if (self.rolling_idx % 65536 == 0) {
             var hamming_variance: u32 = 0;
-            // Sample a stride to measure thermodynamic texture quickly
             for (1..8192) |i| {
                 hamming_variance += @popCount(self.rolling_buffer[i*8] ^ self.rolling_buffer[(i-1)*8]);
             }
             
             if (hamming_variance == 0) {
-                // --- Task 4: Baseline Structural Fallback (The Blindness Fix) ---
-                // Data is perfectly flat. Fall back to ASCII delimiters.
+                // Structural Fallback: rely on ASCII/Universal delimiters
                 self.entropy_flatline = true;
             } else if (hamming_variance > 20000) {
-                // High entropy (Code, Base64, Tables)
+                // High entropy (Code, Compressed Data)
                 self.entropy_flatline = false;
                 self.energy_word_threshold = 600;
                 self.energy_sentence_threshold = 400;
-            } else if (hamming_variance < 10000) {
-                // Low entropy (Predictable formatting / Whitespace heavy)
-                self.entropy_flatline = false;
-                self.energy_word_threshold = 800;
-                self.energy_sentence_threshold = 600;
             } else {
-                // Normal English text
+                // Universal Text (Multi-lingual)
                 self.entropy_flatline = false;
-                self.energy_word_threshold = 700;
-                self.energy_sentence_threshold = 500;
+                self.energy_word_threshold = 750;
+                self.energy_sentence_threshold = 550;
             }
         }
 
-        // 1. Calculate Resonance (Prediction Error) BEFORE updating state
+        // 1. Calculate Resonance
         if (energy) |e| {
             self.last_energy = e;
         } else if (self.meaning_matrix) |mm| {
@@ -196,27 +198,27 @@ pub const GhostSoul = struct {
         }
 
         const boundary = if (self.entropy_flatline) blk: {
-            // Task 4: Hardcoded ASCII Fallback
-            if (raw_char == '\n' or raw_char == '\r' or raw_char == 0) break :blk Boundary.sentence;
-            if (raw_char == ' ' or raw_char == '\t' or raw_char == ',' or raw_char == ';') break :blk Boundary.word;
+            // Task 4: Universal Hardcoded Fallback
+            if (rune == '\n' or rune == '\r' or rune == 0) break :blk Boundary.sentence;
+            if (rune <= 32 or rune == ',' or rune == ';' or rune == 0x3000) break :blk Boundary.word;
             break :blk Boundary.none;
         } else self.detectSnap(self.last_energy);
 
         self.last_boundary = boundary;
 
         // 2. Update state based on boundary detection
-        self.pushRotor(raw_char);
-        self.fractalPush(raw_char);
+        self.pushRotor(rune);
+        self.fractalPush(rune);
 
-        // Continuous Concept Update (every byte)
+        // Continuous Concept Update (every rune)
         self.concept = vsa.bundle(vsa.permute(self.concept), token_vec, vsa.generate(0xD00));
 
         // Accumulate spell_vector only for non-boundary characters
         if (boundary == .none) {
-            self.spellPush(raw_char);
+            self.spellPush(rune);
         }
 
-        try self.panopticon.pushByte(raw_char);
+        try self.panopticon.pushByte(@as(u8, @truncate(rune)));
         self.sentence_pool = vsa.bundle(self.sentence_pool, token_vec, vsa.generate(0x1337));
         self.syntax = vsa.bundle(vsa.permute(self.syntax), token_vec, vsa.generate(0xB00));
         self.phrase = vsa.bundle(vsa.permute(self.phrase), token_vec, vsa.generate(0xC00));
@@ -244,7 +246,7 @@ pub const GhostSoul = struct {
     }
 
     /// Simulation absorb for lookahead -- mirrors absorb() physics.
-    pub fn simulateAbsorb(self: *GhostSoul, token_vec: vsa.HyperVector, raw_char: u8, energy: ?u16) void {
+    pub fn simulateAbsorb(self: *GhostSoul, token_vec: vsa.HyperVector, rune: u32, energy: ?u16) void {
         // 1. Calculate Resonance
         if (energy) |e| {
             self.last_energy = e;
@@ -259,13 +261,13 @@ pub const GhostSoul = struct {
         self.last_boundary = boundary;
 
         // 2. Update state
-        self.pushRotor(raw_char);
-        self.fractalPush(raw_char);
+        self.pushRotor(rune);
+        self.fractalPush(rune);
 
         self.concept = vsa.bundle(vsa.permute(self.concept), token_vec, vsa.generate(0xD00));
 
         if (boundary == .none) {
-            self.spellPush(raw_char);
+            self.spellPush(rune);
         }
 
         self.sentence_pool = vsa.bundle(self.sentence_pool, token_vec, vsa.generate(0x1337));

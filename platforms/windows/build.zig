@@ -1,6 +1,14 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
+    // ── 0. Version Verification ──
+    const zig_ver = @import("builtin").zig_version;
+    if (zig_ver.minor != 13 or zig_ver.major != 0) {
+        std.debug.print("\n[WARNING] Zig Version Mismatch: Detected {d}.{d}.{d}\n", .{ zig_ver.major, zig_ver.minor, zig_ver.patch });
+        std.debug.print("[INFO] Ghost Engine V23 is optimized for Zig 0.13.0 Stable.\n", .{});
+        std.debug.print("[FIX] Run '.\\sylor_forge.ps1' and follow instructions to use the hermetic toolchain.\n\n", .{});
+    }
+
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 

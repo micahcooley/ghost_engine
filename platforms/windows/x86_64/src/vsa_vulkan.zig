@@ -4,6 +4,16 @@ const vk = @cImport({
     @cInclude("vulkan/vulkan.h");
 });
 
+const builtin = @import("builtin");
+
+fn ghostCopy(comptime T: type, dest: []T, source: []const T) void {
+    if (comptime builtin.zig_version.minor >= 14 or builtin.zig_version.major > 0) {
+        @call(.always_inline, std.mem.copyForwards, .{ T, dest, source });
+    } else {
+        @call(.always_inline, std.mem.copy, .{ T, dest, source });
+    }
+}
+
 pub const SparsityMask = struct {
     data: [131072]u8, // 1 bit per MeaningMatrix slot (1,048,576 slots)
 
@@ -82,13 +92,24 @@ pub const VulkanEngine = struct {
     command_pool: vk.VkCommandPool = null,
     command_buffer: vk.VkCommandBuffer = null,
     descriptor_pool: vk.VkDescriptorPool = null,
-    descriptor_set: vk.VkDescriptorSet = null,
+    descriptor_sets: [8]vk.VkDescriptorSet = [_]vk.VkDescriptorSet{null} ** 8,
+    descriptor_set: vk.VkDescriptorSet = null, // Alias for descriptor_sets[0]
     fence: vk.VkFence = null,
 
     // ── V23: Operational Tier & Hardware Detection ──
     tier: OperationalTier = .standard,
     max_workgroup_invocations: u32 = 1024,
+    max_alloc_count: u32 = 4096,
+    vram_size: u64 = 0,
+    is_discrete: bool = false,
     supports_int16: bool = false,
+
+    // ── Multi-Queue Saturation ──
+    queues: [8]vk.VkQueue = [_]vk.VkQueue{null} ** 8,
+    command_pools: [8]vk.VkCommandPool = [_]vk.VkCommandPool{null} ** 8,
+    command_buffers: [8]vk.VkCommandBuffer = [_]vk.VkCommandBuffer{null} ** 8,
+    fences: [8]vk.VkFence = [_]vk.VkFence{null} ** 8,
+    num_queues: u32 = 1,
 
     allocator: std.mem.Allocator,
 
@@ -103,11 +124,25 @@ pub const VulkanEngine = struct {
         var memProperties: vk.VkPhysicalDeviceMemoryProperties = undefined;
         vk.vkGetPhysicalDeviceMemoryProperties(pdev, &memProperties);
         var i: u32 = 0;
+        
+        // Strategy: First try to find exact match
         while (i < memProperties.memoryTypeCount) : (i += 1) {
             if ((typeFilter & (@as(u32, 1) << @intCast(i))) != 0 and (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
                 return i;
             }
         }
+
+        // Fallback: If DEVICE_LOCAL requested but not found with HOST_VISIBLE, try just HOST_VISIBLE
+        if ((properties & vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
+            const fallback_props = properties & ~@as(vk.VkMemoryPropertyFlags, vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            i = 0;
+            while (i < memProperties.memoryTypeCount) : (i += 1) {
+                if ((typeFilter & (@as(u32, 1) << @intCast(i))) != 0 and (memProperties.memoryTypes[i].propertyFlags & fallback_props) == fallback_props) {
+                    return i;
+                }
+            }
+        }
+
         return error.MemoryTypeNotFound;
     }
 
@@ -131,24 +166,30 @@ pub const VulkanEngine = struct {
         try check(vk.vkAllocateMemory(self.dev, &allocInfo, null, memory));
         try check(vk.vkBindBufferMemory(self.dev, buffer.*, memory.*, 0));
 
-        var pData: ?*anyopaque = null;
-        try check(vk.vkMapMemory(self.dev, memory.*, 0, size, 0, &pData));
-        return pData;
+        // Only map if it's host visible
+        var memProperties: vk.VkPhysicalDeviceMemoryProperties = undefined;
+        vk.vkGetPhysicalDeviceMemoryProperties(self.pdev, &memProperties);
+        if ((memProperties.memoryTypes[allocInfo.memoryTypeIndex].propertyFlags & vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
+            var pData: ?*anyopaque = null;
+            try check(vk.vkMapMemory(self.dev, memory.*, 0, size, 0, &pData));
+            return pData;
+        }
+        return null;
     }
 
-    fn updateDescriptorSets(self: *VulkanEngine) void {
+    fn updateDescriptorSets(self: *VulkanEngine, set_idx: u32, rotor_offset: vk.VkDeviceSize, char_offset: vk.VkDeviceSize) void {
         var bInfos = [_]vk.VkDescriptorBufferInfo{
             .{ .buffer = self.matrix_buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE },
-            .{ .buffer = self.rotor_buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE },
-            .{ .buffer = self.char_buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE },
-            .{ .buffer = self.energy_buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = self.rotor_buffer, .offset = rotor_offset, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = self.char_buffer, .offset = char_offset, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = self.energy_buffer, .offset = char_offset, .range = vk.VK_WHOLE_SIZE },
             .{ .buffer = self.tag_buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE },
             .{ .buffer = self.lattice_buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         };
         var wds = [_]vk.VkWriteDescriptorSet{ std.mem.zeroes(vk.VkWriteDescriptorSet) } ** 6;
         for (&wds, 0..) |*w, i| {
             w.sType = vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w.dstSet = self.descriptor_set;
+            w.dstSet = self.descriptor_sets[set_idx];
             w.dstBinding = @intCast(i);
             w.descriptorType = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             w.descriptorCount = 1;
@@ -206,6 +247,7 @@ pub const VulkanEngine = struct {
                         best_score = score;
                         engine.pdev = pd;
                         engine.queue_family = @intCast(i);
+                        engine.num_queues = @min(4, qf.queueCount);
                         found_compute = true;
                     }
                     break;
@@ -223,18 +265,31 @@ pub const VulkanEngine = struct {
         var devProps: vk.VkPhysicalDeviceProperties = undefined;
         vk.vkGetPhysicalDeviceProperties(engine.pdev, &devProps);
         engine.max_workgroup_invocations = devProps.limits.maxComputeWorkGroupInvocations;
+        engine.max_alloc_count = devProps.limits.maxMemoryAllocationCount;
+        engine.is_discrete = devProps.deviceType == vk.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+
+        var memProps: vk.VkPhysicalDeviceMemoryProperties = undefined;
+        vk.vkGetPhysicalDeviceMemoryProperties(engine.pdev, &memProps);
+        engine.vram_size = 0;
+        for (memProps.memoryHeaps[0..memProps.memoryHeapCount]) |heap| {
+            if ((heap.flags & vk.VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
+                engine.vram_size += heap.size;
+            }
+        }
 
         std.debug.print("[VULKAN] Selected Device: {s}\n", .{devProps.deviceName});
-        std.debug.print("[VULKAN] shaderInt16: {any}\n", .{engine.supports_int16});
+        std.debug.print("[VULKAN] VRAM Detect: {d} MB | Discrete: {any}\n", .{ engine.vram_size / 1048576, engine.is_discrete });
+        std.debug.print("[VULKAN] Parallel Streams: {d}\n", .{engine.num_queues});
         std.debug.print("[VULKAN] maxComputeWorkGroupInvocations: {d}\n", .{engine.max_workgroup_invocations});
+        std.debug.print("[VULKAN] shaderInt16: {any}\n", .{engine.supports_int16});
 
         // 3. Logical Device
-        const qPriority: f32 = 1.0;
+        const qPriorities = [_]f32{1.0} ** 8;
         var qCreateInfo = std.mem.zeroes(vk.VkDeviceQueueCreateInfo);
         qCreateInfo.sType = vk.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
         qCreateInfo.queueFamilyIndex = engine.queue_family;
-        qCreateInfo.queueCount = 1;
-        qCreateInfo.pQueuePriorities = &qPriority;
+        qCreateInfo.queueCount = engine.num_queues;
+        qCreateInfo.pQueuePriorities = &qPriorities;
 
         var features = std.mem.zeroes(vk.VkPhysicalDeviceFeatures);
         features.shaderInt64 = vk.VK_TRUE;
@@ -246,9 +301,24 @@ pub const VulkanEngine = struct {
         dCreateInfo.pQueueCreateInfos = &qCreateInfo;
         dCreateInfo.pEnabledFeatures = &features;
         try check(vk.vkCreateDevice(engine.pdev, &dCreateInfo, null, &engine.dev));
-        vk.vkGetDeviceQueue(engine.dev, engine.queue_family, 0, &engine.queue);
+        
+        for (0..engine.num_queues) |i| {
+            vk.vkGetDeviceQueue(engine.dev, engine.queue_family, @intCast(i), &engine.queues[i]);
+        }
 
-        // 4. Buffers
+        // 4. Buffers: Adaptive Saturation Logic
+        // iGPU (UMA): Use Host Visible + Coherent for zero-copy
+        // dGPU (>4GB): Use Device Local for core lattice structures
+        var matrix_flags: vk.VkMemoryPropertyFlags = vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        if (engine.is_discrete and engine.vram_size > 4 * 1024 * 1024 * 1024) {
+            std.debug.print("[VULKAN] High-Tier Detected: Enabling DEVICE_LOCAL Lattice Pinning.\n", .{});
+            matrix_flags = vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+            // Note: If we use DEVICE_LOCAL without HOST_VISIBLE, we'd need staging buffers for getMatrixData().
+            // For V23, we prioritize ReBAR (DEVICE_LOCAL | HOST_VISIBLE).
+            // findMemoryType will fallback to HOST_VISIBLE if DEVICE_LOCAL is not mappable.
+            matrix_flags |= vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+        }
+
         const batch_flags = vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
         // 2GB Meaning Matrix (1M slots × 1024 u16)
@@ -256,18 +326,18 @@ pub const VulkanEngine = struct {
         const init_matrix_size = @as(usize, 1024) * 1024 * 1024 * 2; // 2GB
         const init_tag_size = @as(usize, engine.matrix_slots) * 8;
 
-        engine.mapped_matrix = @ptrCast(engine.createBuffer(init_matrix_size, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, batch_flags, &engine.matrix_buffer, &engine.matrix_memory) catch |err| {
+        engine.mapped_matrix = @ptrCast(engine.createBuffer(init_matrix_size, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, matrix_flags, &engine.matrix_buffer, &engine.matrix_memory) catch |err| {
             return err;
         });
 
-        engine.mapped_tags = @ptrCast(@alignCast(try engine.createBuffer(init_tag_size, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, batch_flags, &engine.tag_buffer, &engine.tag_memory)));
+        engine.mapped_tags = @ptrCast(@alignCast(try engine.createBuffer(init_tag_size, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, matrix_flags, &engine.tag_buffer, &engine.tag_memory)));
         engine.mapped_rotors = @ptrCast(@alignCast(try engine.createBuffer(4096 * 8 * 2, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, batch_flags, &engine.rotor_buffer, &engine.rotor_memory)));
         engine.mapped_chars = @ptrCast(@alignCast(try engine.createBuffer(4096 * 4, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, batch_flags, &engine.char_buffer, &engine.char_memory)));
         engine.mapped_energy = @ptrCast(@alignCast(try engine.createBuffer(4096 * 4, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, batch_flags, &engine.energy_buffer, &engine.energy_memory)));
 
         // 1GB Unified Lattice (536M u16 = 268M u32 packed)
         const lattice_size = @as(usize, 1024) * 1024 * 1024;
-        engine.mapped_lattice = @ptrCast(@alignCast(try engine.createBuffer(lattice_size, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, batch_flags, &engine.lattice_buffer, &engine.lattice_memory) orelse return error.VulkanError));
+        engine.mapped_lattice = @ptrCast(@alignCast(try engine.createBuffer(lattice_size, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, matrix_flags, &engine.lattice_buffer, &engine.lattice_memory) orelse return error.VulkanError));
 
         // 5. Descriptor Layout
         var pcRange = std.mem.zeroes(vk.VkPushConstantRange);
@@ -430,39 +500,54 @@ pub const VulkanEngine = struct {
         // 8. Descriptors
         var poolSize = std.mem.zeroes(vk.VkDescriptorPoolSize);
         poolSize.type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        poolSize.descriptorCount = 6;
+        poolSize.descriptorCount = 6 * 8;
         var dpCreateInfo = std.mem.zeroes(vk.VkDescriptorPoolCreateInfo);
         dpCreateInfo.sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         dpCreateInfo.poolSizeCount = 1;
         dpCreateInfo.pPoolSizes = &poolSize;
-        dpCreateInfo.maxSets = 1;
+        dpCreateInfo.maxSets = 8;
         try check(vk.vkCreateDescriptorPool(engine.dev, &dpCreateInfo, null, &engine.descriptor_pool));
 
+        var dsls = [_]vk.VkDescriptorSetLayout{dsl} ** 8;
         var dsAllocInfo = std.mem.zeroes(vk.VkDescriptorSetAllocateInfo);
         dsAllocInfo.sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         dsAllocInfo.descriptorPool = engine.descriptor_pool;
-        dsAllocInfo.descriptorSetCount = 1;
-        dsAllocInfo.pSetLayouts = &dsl;
-        try check(vk.vkAllocateDescriptorSets(engine.dev, &dsAllocInfo, &engine.descriptor_set));
+        dsAllocInfo.descriptorSetCount = 8;
+        dsAllocInfo.pSetLayouts = &dsls[0];
+        try check(vk.vkAllocateDescriptorSets(engine.dev, &dsAllocInfo, &engine.descriptor_sets[0]));
         
-        engine.updateDescriptorSets();
+        engine.descriptor_set = engine.descriptor_sets[0];
 
-        // 9. Commands
-        var cpCreateInfo = std.mem.zeroes(vk.VkCommandPoolCreateInfo);
-        cpCreateInfo.sType = vk.VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-        cpCreateInfo.queueFamilyIndex = engine.queue_family;
-        cpCreateInfo.flags = vk.VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-        try check(vk.vkCreateCommandPool(engine.dev, &cpCreateInfo, null, &engine.command_pool));
-        var cbAllocInfo = std.mem.zeroes(vk.VkCommandBufferAllocateInfo);
-        cbAllocInfo.sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        cbAllocInfo.commandPool = engine.command_pool;
-        cbAllocInfo.level = vk.VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cbAllocInfo.commandBufferCount = 1;
-        try check(vk.vkAllocateCommandBuffers(engine.dev, &cbAllocInfo, &engine.command_buffer));
+        // Initial update for all sets
+        for (0..8) |i| {
+            const chunk_size: vk.VkDeviceSize = 1024;
+            engine.updateDescriptorSets(@intCast(i), i * chunk_size * 8, i * chunk_size * 4);
+        }
 
-        var fCreateInfo = std.mem.zeroes(vk.VkFenceCreateInfo);
-        fCreateInfo.sType = vk.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        try check(vk.vkCreateFence(engine.dev, &fCreateInfo, null, &engine.fence));
+        // 9. Commands (Multi-Pool for Parallel Dispatch)
+        for (0..engine.num_queues) |i| {
+            var cpCreateInfo = std.mem.zeroes(vk.VkCommandPoolCreateInfo);
+            cpCreateInfo.sType = vk.VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+            cpCreateInfo.queueFamilyIndex = engine.queue_family;
+            cpCreateInfo.flags = vk.VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+            try check(vk.vkCreateCommandPool(engine.dev, &cpCreateInfo, null, &engine.command_pools[i]));
+            
+            var cbAllocInfo = std.mem.zeroes(vk.VkCommandBufferAllocateInfo);
+            cbAllocInfo.sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            cbAllocInfo.commandPool = engine.command_pools[i];
+            cbAllocInfo.level = vk.VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cbAllocInfo.commandBufferCount = 1;
+            try check(vk.vkAllocateCommandBuffers(engine.dev, &cbAllocInfo, &engine.command_buffers[i]));
+
+            var fCreateInfo = std.mem.zeroes(vk.VkFenceCreateInfo);
+            fCreateInfo.sType = vk.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            try check(vk.vkCreateFence(engine.dev, &fCreateInfo, null, &engine.fences[i]));
+        }
+
+        // Default command buffer for single-stream dispatches
+        engine.command_buffer = engine.command_buffers[0];
+        engine.fence = engine.fences[0];
+        engine.queue = engine.queues[0];
 
         return engine;
     }
@@ -535,7 +620,7 @@ pub const VulkanEngine = struct {
         try check(vk.vkWaitForFences(self.dev, 1, &self.fence, vk.VK_TRUE, std.math.maxInt(u64)));
 
         const result = try allocator.alloc(u32, num_rotors);
-        std.mem.copy(u32, result, self.mapped_energy.?[0..num_rotors]);
+        ghostCopy(u32, result, self.mapped_energy.?[0..num_rotors]);
         return result;
     }
 
@@ -563,7 +648,7 @@ pub const VulkanEngine = struct {
         try check(vk.vkWaitForFences(self.dev, 1, &self.fence, vk.VK_TRUE, std.math.maxInt(u64)));
 
         const result = try self.allocator.alloc(u32, batch_size);
-        std.mem.copy(u32, result, self.mapped_energy.?[0..batch_size]);
+        ghostCopy(u32, result, self.mapped_energy.?[0..batch_size]);
         return result;
     }
 
@@ -649,7 +734,10 @@ pub const VulkanEngine = struct {
         self.matrix_slots = new_elements;
 
         // 6. Refresh Descriptor Bindings
-        self.updateDescriptorSets();
+        for (0..8) |i| {
+            const chunk_size: vk.VkDeviceSize = 1024;
+            self.updateDescriptorSets(@intCast(i), i * chunk_size * 8, i * chunk_size * 4);
+        }
     }
 
     pub fn setTier(self: *VulkanEngine, tier: OperationalTier) void {
@@ -705,50 +793,66 @@ pub const VulkanEngine = struct {
     /// a single command buffer, one fence wait for both operations.
     /// Utilizes Prefix Scan on GPU to calculate rotors internally.
     pub fn dispatchMergedEtch(self: *VulkanEngine, batch_size: u32) !void {
-        var beginInfo = std.mem.zeroes(vk.VkCommandBufferBeginInfo);
-        beginInfo.sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        try check(vk.vkBeginCommandBuffer(self.command_buffer, &beginInfo));
+        const num_streams = self.num_queues;
+        const chunk_size = batch_size / num_streams;
+        const remainder = batch_size % num_streams;
 
-        const num_workgroups = (batch_size + 1023) / 1024;
+        for (0..num_streams) |i| {
+            const current_chunk = chunk_size + (if (i == num_streams - 1) remainder else 0);
+            if (current_chunk == 0) continue;
 
-        // Pass 1: Lattice etch (3-domain CMS)
-        vk.vkCmdBindPipeline(self.command_buffer, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.lattice_pipeline);
-        vk.vkCmdBindDescriptorSets(self.command_buffer, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &self.descriptor_set, 0, null);
-        const params = [_]u32{ batch_size, 0 };
-        vk.vkCmdPushConstants(self.command_buffer, self.pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &params[0]);
-        vk.vkCmdDispatch(self.command_buffer, num_workgroups, 1, 1);
+            var beginInfo = std.mem.zeroes(vk.VkCommandBufferBeginInfo);
+            beginInfo.sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            try check(vk.vkBeginCommandBuffer(self.command_buffers[i], &beginInfo));
 
-        // Memory barrier between the two dispatches
-        var barrier = std.mem.zeroes(vk.VkMemoryBarrier);
-        barrier.sType = vk.VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        barrier.srcAccessMask = vk.VK_ACCESS_SHADER_WRITE_BIT;
-        barrier.dstAccessMask = vk.VK_ACCESS_SHADER_READ_BIT | vk.VK_ACCESS_SHADER_WRITE_BIT;
-        vk.vkCmdPipelineBarrier(
-            self.command_buffer,
-            vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 1, &barrier, 0, null, 0, null,
-        );
+            const num_workgroups = (current_chunk + 1023) / 1024;
 
-        // Pass 2: Meaning matrix etch
-        vk.vkCmdBindPipeline(self.command_buffer, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.etch_pipeline);
-        vk.vkCmdPushConstants(self.command_buffer, self.pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &params[0]);
-        vk.vkCmdDispatch(self.command_buffer, num_workgroups, 1, 1);
+            // Pass 1: Lattice etch (3-domain CMS)
+            vk.vkCmdBindPipeline(self.command_buffers[i], vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.lattice_pipeline);
+            vk.vkCmdBindDescriptorSets(self.command_buffers[i], vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &self.descriptor_sets[i], 0, null);
+            
+            const params = [_]u32{ current_chunk, 0 };
+            vk.vkCmdPushConstants(self.command_buffers[i], self.pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &params[0]);
+            vk.vkCmdDispatch(self.command_buffers[i], num_workgroups, 1, 1);
 
-        try check(vk.vkEndCommandBuffer(self.command_buffer));
+            // Memory barrier between the two dispatches
+            var barrier = std.mem.zeroes(vk.VkMemoryBarrier);
+            barrier.sType = vk.VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            barrier.srcAccessMask = vk.VK_ACCESS_SHADER_WRITE_BIT;
+            barrier.dstAccessMask = vk.VK_ACCESS_SHADER_READ_BIT | vk.VK_ACCESS_SHADER_WRITE_BIT;
+            vk.vkCmdPipelineBarrier(
+                self.command_buffers[i],
+                vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, &barrier, 0, null, 0, null,
+            );
 
-        var submitInfo = std.mem.zeroes(vk.VkSubmitInfo);
-        submitInfo.sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &self.command_buffer;
-        try check(vk.vkResetFences(self.dev, 1, &self.fence));
-        try check(vk.vkQueueSubmit(self.queue, 1, &submitInfo, self.fence));
-        try check(vk.vkWaitForFences(self.dev, 1, &self.fence, vk.VK_TRUE, std.math.maxInt(u64)));
+            // Pass 2: Meaning matrix etch
+            vk.vkCmdBindPipeline(self.command_buffers[i], vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.etch_pipeline);
+            vk.vkCmdPushConstants(self.command_buffers[i], self.pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &params[0]);
+            vk.vkCmdDispatch(self.command_buffers[i], num_workgroups, 1, 1);
+
+            try check(vk.vkEndCommandBuffer(self.command_buffers[i]));
+
+            var submitInfo = std.mem.zeroes(vk.VkSubmitInfo);
+            submitInfo.sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submitInfo.commandBufferCount = 1;
+            submitInfo.pCommandBuffers = &self.command_buffers[i];
+            try check(vk.vkResetFences(self.dev, 1, &self.fences[i]));
+            try check(vk.vkQueueSubmit(self.queues[i], 1, &submitInfo, self.fences[i]));
+        }
+
+        // Wait for all active queues to complete
+        for (0..num_streams) |i| {
+            try check(vk.vkWaitForFences(self.dev, 1, &self.fences[i], vk.VK_TRUE, std.math.maxInt(u64)));
+        }
     }
 
     pub fn deinit(self: *VulkanEngine) void {
-        vk.vkDestroyFence(self.dev, self.fence, null);
-        vk.vkDestroyCommandPool(self.dev, self.command_pool, null);
+        for (0..self.num_queues) |i| {
+            vk.vkDestroyFence(self.dev, self.fences[i], null);
+            vk.vkDestroyCommandPool(self.dev, self.command_pools[i], null);
+        }
         vk.vkDestroyDescriptorPool(self.dev, self.descriptor_pool, null);
         vk.vkDestroyPipeline(self.dev, self.etch_pipeline, null);
         vk.vkDestroyPipeline(self.dev, self.prune_pipeline, null);
@@ -809,7 +913,7 @@ const VulkanComputeProvider = struct {
     pub fn etch(total_batch: u32, starting_rotors: []const u64, chars: []const u8) anyerror!void {
         const engine = &global_instance.?;
         // Transfer data to GPU buffers
-        std.mem.copy(u64, engine.mapped_rotors.?[0..starting_rotors.len], starting_rotors);
+        ghostCopy(u64, engine.mapped_rotors.?[0..starting_rotors.len], starting_rotors);
         for (chars, 0..) |c, i| {
             engine.mapped_chars.?[i] = @as(u32, c);
         }

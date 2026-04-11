@@ -11,6 +11,13 @@ pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
     sys.printOut("[MONOLITH] Mapping Cortex...\n");
+    // Task 2: Bulletproof Silicon - Comptime alignment check
+    comptime {
+        const lattice_align = @alignOf(ghost_state.UnifiedLattice);
+        if (lattice_align > 65536) {
+            @compileError("UnifiedLattice alignment exceeds expected OS page alignment (64KB)");
+        }
+    }
     const mapped_lattice = try sys.createMappedFile("state/unified_lattice.bin", ghost_state.UNIFIED_SIZE_BYTES);
     const lattice: *ghost_state.UnifiedLattice = @as(*ghost_state.UnifiedLattice, @ptrCast(@alignCast(mapped_lattice.data.ptr)));
 
@@ -58,7 +65,11 @@ pub fn main() !void {
             .vk_engine = if (vk_engine_opt) |*ve| ve else null 
         };
 
-        while (true) {
+        // Task 3: Safety Valve Generation
+        var tokens_generated: u32 = 0;
+        const MAX_TOKENS = 2048;
+
+        while (tokens_generated < MAX_TOKENS) : (tokens_generated += 1) {
             const chosen = engine.resolveTopology() orelse break; 
             sys.printOut(&[_]u8{chosen});
             engine.inventory[engine.inv_cursor] = chosen; 
@@ -67,6 +78,9 @@ pub fn main() !void {
             
             // Paragraph break or Concept Drift limit
             if (soul.last_boundary == .paragraph or vsa.hammingDistance(soul.concept, generation_start_concept) > 450) break;
+        }
+        if (tokens_generated == MAX_TOKENS) {
+            sys.printOut("\n[SAFETY] Concept Drift Limit: Forced Break.\n");
         }
         sys.printOut("\n\n");
     }

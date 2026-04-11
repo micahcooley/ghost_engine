@@ -133,11 +133,12 @@ const Lexer = struct {
             else => {},
         }
 
-        if (std.ascii.isAlphabetic(c) or c == '_') {
-            while (self.pos < self.buffer.len and
-                   (std.ascii.isAlphanumeric(self.buffer[self.pos]) or self.buffer[self.pos] == '_'))
-            {
-                self.advance();
+        if (c > 127 or std.ascii.isAlphabetic(c) or c == '_') {
+            while (self.pos < self.buffer.len) {
+                const peek_c = self.buffer[self.pos];
+                if (peek_c > 127 or std.ascii.isAlphanumeric(peek_c) or peek_c == '_') {
+                    self.advance();
+                } else break;
             }
             const text = self.buffer[sl..self.pos];
             if (std.mem.eql(u8, text, "LET"))  return .{ .tag = .keyword_let,  .text = text, .line = ll, .col = cl };

@@ -8,7 +8,19 @@ pub fn build(b: *std.Build) void {
     const arch_name = if (arch_tag == .x86_64) "x86_64" else "arm64";
 
     // Use system glslc on Linux
-    const glslc_path = "glslc";
+    const glslc_path = b.findProgram(&.{"glslc"}, &.{}) catch {
+        std.debug.print(
+            \\
+            \\ [BUILD ERROR] 'glslc' (Vulkan Shader Compiler) not found in PATH.
+            \\ 
+            \\ To maintain 'Zero-Friction' development:
+            \\ 1. Ensure the Vulkan SDK is installed.
+            \\ 2. Or run '.\sylor_forge.ps1' to auto-bundle dependencies.
+            \\
+            \\
+        , .{});
+        std.process.exit(1);
+    };
 
     // Install directly into the architecture subfolder (e.g., linux/x86_64/bin)
     b.install_path = b.fmt("{s}", .{arch_name});

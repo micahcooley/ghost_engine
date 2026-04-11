@@ -305,10 +305,35 @@ pub fn createMappedFile(allocator: std.mem.Allocator, path: []const u8, size: us
             _ = SetFilePointerEx(fh, 0, null, 0);
         }
     }
+
+    // Task 2: Bulletproof Silicon - Aligned Memory Mapping
+    // We use VirtualAlloc to reserve a specific, page-aligned range first if needed,
+    // but MapViewOfFile naturally aligns to the "allocation granularity" (usually 64KB).
+    // To be 100% sure, we explicitly check alignment after mapping.
     const size_high: u32 = @intCast((size >> 32) & 0xFFFFFFFF);
     const size_low: u32 = @intCast(size & 0xFFFFFFFF);
-    const mh = CreateFileMappingW(fh, null, 0x04, size_high, size_low, null) orelse return error.MapCreateFailed;
-    const ptr = MapViewOfFile(mh, 0x0002, 0, 0, size) orelse return error.MapViewFailed;
+    const mh = CreateFileMappingW(fh, null, 0x04, size_high, size_low, null) orelse {
+        _ = CloseHandle(fh);
+        return error.MapCreateFailed;
+    };
+    
+    const ptr = MapViewOfFile(mh, 0x0002, 0, 0, size) orelse {
+        _ = CloseHandle(mh);
+        _ = CloseHandle(fh);
+        return error.MapViewFailed;
+    };
+
+    // Verify alignment
+    const addr = @intFromPtr(ptr);
+    if (addr & (64 * 1024 - 1) != 0) {
+        // This is extremely rare on Windows but we must handle it for "Bulletproof" status
+        std.debug.print("[SYS FATAL] Memory mapping not 64KB aligned: 0x{X}\n", .{addr});
+        _ = UnmapViewOfFile(ptr);
+        _ = CloseHandle(mh);
+        _ = CloseHandle(fh);
+        return error.AlignmentFailure;
+    }
+
     return MappedFile{ .file_handle = fh, .map_handle = mh, .data = @as([*]u8, @ptrCast(ptr))[0..size] };
 }
 

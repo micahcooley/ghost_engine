@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const vk = @cImport({
     @cInclude("vulkan/vulkan.h");
@@ -74,9 +75,41 @@ pub const VulkanEngine = struct {
 
     allocator: std.mem.Allocator,
 
+    fn vkErrorString(result: vk.VkResult) []const u8 {
+        return switch (result) {
+            vk.VK_SUCCESS => "VK_SUCCESS",
+            vk.VK_NOT_READY => "VK_NOT_READY",
+            vk.VK_TIMEOUT => "VK_TIMEOUT",
+            vk.VK_EVENT_SET => "VK_EVENT_SET",
+            vk.VK_EVENT_RESET => "VK_EVENT_RESET",
+            vk.VK_INCOMPLETE => "VK_INCOMPLETE",
+            vk.VK_ERROR_OUT_OF_HOST_MEMORY => "VK_ERROR_OUT_OF_HOST_MEMORY",
+            vk.VK_ERROR_OUT_OF_DEVICE_MEMORY => "VK_ERROR_OUT_OF_DEVICE_MEMORY",
+            vk.VK_ERROR_INITIALIZATION_FAILED => "VK_ERROR_INITIALIZATION_FAILED",
+            vk.VK_ERROR_DEVICE_LOST => "VK_ERROR_DEVICE_LOST",
+            vk.VK_ERROR_MEMORY_MAP_FAILED => "VK_ERROR_MEMORY_MAP_FAILED",
+            vk.VK_ERROR_LAYER_NOT_PRESENT => "VK_ERROR_LAYER_NOT_PRESENT",
+            vk.VK_ERROR_EXTENSION_NOT_PRESENT => "VK_ERROR_EXTENSION_NOT_PRESENT",
+            vk.VK_ERROR_FEATURE_NOT_PRESENT => "VK_ERROR_FEATURE_NOT_PRESENT",
+            vk.VK_ERROR_INCOMPATIBLE_DRIVER => "VK_ERROR_INCOMPATIBLE_DRIVER",
+            vk.VK_ERROR_TOO_MANY_OBJECTS => "VK_ERROR_TOO_MANY_OBJECTS",
+            vk.VK_ERROR_FORMAT_NOT_SUPPORTED => "VK_ERROR_FORMAT_NOT_SUPPORTED",
+            vk.VK_ERROR_FRAGMENTED_POOL => "VK_ERROR_FRAGMENTED_POOL",
+            vk.VK_ERROR_UNKNOWN => "VK_ERROR_UNKNOWN",
+            else => "UNKNOWN_VULKAN_ERROR",
+        };
+    }
+
+    fn assertSuccess(result: vk.VkResult, context: []const u8) void {
+        if (result != vk.VK_SUCCESS) {
+            std.debug.print("\n[VULKAN FATAL] {s} failed with {s} ({d})\n", .{ context, vkErrorString(result), result });
+            @panic("Vulkan Assertion Failed");
+        }
+    }
+
     fn check(result: vk.VkResult) !void {
         if (result != vk.VK_SUCCESS) {
-            std.debug.print("Vulkan Error: {d}\n", .{result});
+            std.debug.print("Vulkan Error: {s} ({d})\n", .{vkErrorString(result), result});
             return error.VulkanError;
         }
     }
@@ -145,9 +178,18 @@ pub const VulkanEngine = struct {
         var appInfo = std.mem.zeroes(vk.VkApplicationInfo);
         appInfo.sType = vk.VK_STRUCTURE_TYPE_APPLICATION_INFO;
         appInfo.apiVersion = vk.VK_API_VERSION_1_0;
+        
         var createInfo = std.mem.zeroes(vk.VkInstanceCreateInfo);
         createInfo.sType = vk.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
         createInfo.pApplicationInfo = &appInfo;
+
+        const validation_layers = [_][*:0]const u8{ "VK_LAYER_KHRONOS_validation" };
+        if (builtin.mode == .Debug) {
+            std.debug.print("[VULKAN] Debug Mode: Enabling Validation Layers...\n", .{});
+            createInfo.enabledLayerCount = 1;
+            createInfo.ppEnabledLayerNames = &validation_layers[0];
+        }
+
         try check(vk.vkCreateInstance(&createInfo, null, &engine.instance));
 
         // 2. Physical Device
