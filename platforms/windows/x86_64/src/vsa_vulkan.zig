@@ -535,7 +535,7 @@ pub const VulkanEngine = struct {
         try check(vk.vkWaitForFences(self.dev, 1, &self.fence, vk.VK_TRUE, std.math.maxInt(u64)));
 
         const result = try allocator.alloc(u32, num_rotors);
-        std.mem.copyForwards(u32, result, self.mapped_energy.?[0..num_rotors]);
+        std.mem.copy(u32, result, self.mapped_energy.?[0..num_rotors]);
         return result;
     }
 
@@ -563,7 +563,7 @@ pub const VulkanEngine = struct {
         try check(vk.vkWaitForFences(self.dev, 1, &self.fence, vk.VK_TRUE, std.math.maxInt(u64)));
 
         const result = try self.allocator.alloc(u32, batch_size);
-        std.mem.copyForwards(u32, result, self.mapped_energy.?[0..batch_size]);
+        std.mem.copy(u32, result, self.mapped_energy.?[0..batch_size]);
         return result;
     }
 
@@ -667,7 +667,7 @@ pub const VulkanEngine = struct {
     /// into GPU-sized workgroups, carrying rotors across streams.
     pub fn dispatchEtchChunked(self: *VulkanEngine, total_batch: u32, starting_rotors: []const u64) !void {
         // Upload the starting rotors for this batch
-        std.mem.copyForwards(u64, self.mapped_rotors.?[0..starting_rotors.len], starting_rotors);
+        std.mem.copy(u64, self.mapped_rotors.?[0..starting_rotors.len], starting_rotors);
 
         // We assume the batch is blocked: [Chunk S0][Chunk S1][Chunk S2][Chunk S3]
         // Each chunk is handled by a dedicated workgroup (1024 threads).
@@ -809,7 +809,7 @@ const VulkanComputeProvider = struct {
     pub fn etch(total_batch: u32, starting_rotors: []const u64, chars: []const u8) anyerror!void {
         const engine = &global_instance.?;
         // Transfer data to GPU buffers
-        std.mem.copyForwards(u64, engine.mapped_rotors.?[0..starting_rotors.len], starting_rotors);
+        std.mem.copy(u64, engine.mapped_rotors.?[0..starting_rotors.len], starting_rotors);
         for (chars, 0..) |c, i| {
             engine.mapped_chars.?[i] = @as(u32, c);
         }
