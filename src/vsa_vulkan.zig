@@ -891,6 +891,12 @@ const compute_api = @import("compute_api.zig");
 
 var global_instance: ?VulkanEngine = null;
 
+/// Get a pointer to the live VulkanEngine (null if not initialized).
+pub fn getEngine() ?*VulkanEngine {
+    if (global_instance == null) return null;
+    return &global_instance.?;
+}
+
 const VulkanComputeProvider = struct {
     pub fn getMatrixData() []u16 {
         const engine = &global_instance.?;

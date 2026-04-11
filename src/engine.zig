@@ -4,6 +4,7 @@ const vsa = @import("vsa_core.zig");
 const ghost_state = @import("ghost_state.zig");
 const vsa_vulkan = @import("vsa_vulkan.zig");
 const compute_api = @import("compute_api.zig");
+const mc = @import("inference.zig");
 
 pub const VERSION = "V27";
 
@@ -85,6 +86,7 @@ pub const SingularityEngine = struct {
     inventory: [128]u8,
     inv_cursor: usize,
     compute: ?*const compute_api.ComputeApi,
+    vulkan: ?*vsa_vulkan.VulkanEngine,
     allocator: std.mem.Allocator,
 
     pub fn measureNoise(self: *SingularityEngine, candidate_vec: vsa.HyperVector, position: u32) u16 {
@@ -144,45 +146,46 @@ pub const SingularityEngine = struct {
 
         const primary_concept = self.soul.concept;
         var reason_best_char: u32 = top_chars[0];
-        var reason_best_score: u32 = 0;
-        var frustration: u64 = 0;
 
-        while (true) {
-            for (top_chars, 0..) |candidate, ki| {
-                if (top_energies[ki] == 0) continue;
-                const snapshot = saveSoul(self.soul);
-                
-                // --- Task 3: UTF-8 BMP Character Preservation ---
-                // We must process all bytes of the codepoint to maintain state resonance.
-                var utf8_buf: [4]u8 = undefined;
-                const len = std.unicode.utf8Encode(@intCast(candidate), &utf8_buf) catch {
+        // System 2: Monte Carlo rollout (when Vulkan is available)
+        if (self.vulkan) |vk_engine| {
+            const mc_engine = mc.MonteCarloEngine.init(self.allocator, vk_engine, self.meaning);
+            const winner_idx = mc_engine.resolve(self.soul, &top_chars, &top_energies);
+            reason_best_char = top_chars[winner_idx];
+        } else {
+            // Fallback: shallow koryphaios reasoning (no GPU)
+            var reason_best_score: u32 = 0;
+            var frustration: u64 = 0;
+
+            while (true) {
+                for (top_chars, 0..) |candidate, ki| {
+                    if (top_energies[ki] == 0) continue;
+                    const snapshot = saveSoul(self.soul);
+
+                    var utf8_buf: [4]u8 = undefined;
+                    const len = std.unicode.utf8Encode(@intCast(candidate), &utf8_buf) catch {
+                        restoreSoul(self.soul, snapshot);
+                        continue;
+                    };
+
+                    for (utf8_buf[0..len]) |b| {
+                        self.soul.simulateAbsorb(vsa.generate(b), b, null);
+                    }
+
+                    const sigmoid_leniency = (200 * (frustration * frustration)) / ((frustration * frustration) + 25);
+                    const verdict = vsa.koryphaiosBrickwall(self.soul.concept, primary_concept, KORYPHAIOS_MANAGER_THRESHOLD, KORYPHAIOS_CRITIC_THRESHOLD + sigmoid_leniency);
+                    if (!verdict.passed) { restoreSoul(self.soul, snapshot); continue; }
+
+                    const future_energy: u32 = top_energies[ki] + @as(u32, @intCast(@min(verdict.manager_drift / 4, 64)));
                     restoreSoul(self.soul, snapshot);
-                    continue;
-                };
-
-                for (utf8_buf[0..len]) |b| {
-                    self.soul.simulateAbsorb(vsa.generate(b), b, null);
+                    if (future_energy > reason_best_score) { reason_best_score = future_energy; reason_best_char = candidate; }
                 }
-
-                const sigmoid_leniency = (200 * (frustration * frustration)) / ((frustration * frustration) + 25);
-                const verdict = vsa.koryphaiosBrickwall(self.soul.concept, primary_concept, KORYPHAIOS_MANAGER_THRESHOLD, KORYPHAIOS_CRITIC_THRESHOLD + sigmoid_leniency);
-                if (!verdict.passed) { restoreSoul(self.soul, snapshot); continue; }
-                
-                var future_energy: u32 = top_energies[ki] + @as(u32, @intCast(@min(verdict.manager_drift / 4, 64)));
-                if (self.compute) |compute| {
-                    if (compute.lookahead(REASON_TOP_K, REASON_DEPTH, self.allocator)) |fut_energies| {
-                        defer self.allocator.free(fut_energies);
-                        future_energy += fut_energies[ki];
-                    } else |_| {}
-                }
-                restoreSoul(self.soul, snapshot);
-                if (future_energy > reason_best_score) { reason_best_score = future_energy; reason_best_char = candidate; }
+                if (reason_best_score > 0 or frustration >= 15) break;
+                frustration += 1;
             }
-            if (reason_best_score > 0 or frustration >= 15) break;
-            frustration += 1;
         }
 
-        const chosen: u32 = if (reason_best_score > 0) reason_best_char else top_chars[0];
+        const chosen: u32 = reason_best_char;
         const chosen_vec = vsa.generate(chosen);
         self.canvas.setCell(position, 0, chosen_vec);
         self.canvas.noise[position] = self.measureNoise(chosen_vec, position);

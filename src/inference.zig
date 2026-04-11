@@ -1,112 +1,102 @@
 const std = @import("std");
 const vsa = @import("vsa_core.zig");
-const compute_api = @import("compute_api.zig");
+const ghost_state = @import("ghost_state.zig");
+const vsa_vulkan = @import("vsa_vulkan.zig");
 
-/// [ASPIRATIONAL] Heuristic Inference Engine with Monte Carlo Rollout
-/// Not yet wired into the production pipeline. engine.zig uses SingularityEngine
-/// for inference. This module implements a System-2 rollout approach that will
-/// eventually complement or replace the fast path.
-pub const InferenceEngine = struct {
+/// Monte Carlo Inference Engine (System 2 Reasoning)
+/// Takes top-K candidates from fast-path resonance, then simulates each one
+/// forward N steps to measure terminal coherence. The lane with the highest
+/// terminal resonance wins. This replaces greedy next-token prediction with
+/// consequential reasoning.
+
+pub const MC_NUM_LANES: u32 = 5;
+pub const MC_ROLLOUT_DEPTH: u32 = 10;
+pub const MSB_BONUS: u32 = 64; // Weight bonus for terminal states with MSB-locked runes
+
+pub const MonteCarloEngine = struct {
     allocator: std.mem.Allocator,
-    compute: *const compute_api.ComputeApi,
-    
-    // Candidate Set: 256 common runes for fast-path resonance
-    candidates: [256]u32,
-    num_candidates: u32,
+    vulkan: *vsa_vulkan.VulkanEngine,
+    meaning: *vsa.MeaningMatrix,
 
-    pub fn init(allocator: std.mem.Allocator, compute: *const compute_api.ComputeApi) InferenceEngine {
-        var self = InferenceEngine{
+    pub fn init(allocator: std.mem.Allocator, vulkan: *vsa_vulkan.VulkanEngine, meaning: *vsa.MeaningMatrix) MonteCarloEngine {
+        return .{
             .allocator = allocator,
-            .compute = compute,
-            .candidates = [_]u32{0} ** 256,
-            .num_candidates = 0,
+            .vulkan = vulkan,
+            .meaning = meaning,
         };
-
-        // Populate with ASCII + common punctuation (The Fast Path)
-        var i: u32 = 0;
-        // Space to ~
-        var c: u32 = 32;
-        while (c <= 126) : (c += 1) {
-            self.candidates[i] = c;
-            i += 1;
-        }
-        // Newline, Tab, CR
-        self.candidates[i] = '\n'; i += 1;
-        self.candidates[i] = '\r'; i += 1;
-        self.candidates[i] = '\t'; i += 1;
-        
-        self.num_candidates = i;
-        return self;
     }
 
-    /// Resolves the most resonant character using a Monte Carlo Rollout (System 2).
-    /// Spawns 5 parallel lanes, steps forward 10 cycles, and picks the path
-    /// with the highest terminal similarity to the source context.
-    pub fn resolveCharacter(self: *const InferenceEngine, soul: *const @import("ghost_state.zig").GhostSoul) !u32 {
-        const energies = try self.compute.queryResonance(soul.lexical_rotor, soul.semantic_rotor, self.allocator);
-        defer self.allocator.free(energies);
+    /// Run Monte Carlo rollout over the given top-K candidates.
+    /// Returns the index into top_chars that wins.
+    pub fn resolve(self: *const MonteCarloEngine, soul: *const ghost_state.GhostSoul, top_chars: []const u32, top_energies: []const u32) u32 {
+        var best_terminal: u32 = 0;
+        var best_idx: u32 = 0;
 
-        // 1. Identify Top 5 Candidates
-        var top_candidates: [5]u32 = [_]u32{0} ** 5;
-        var top_energies: [5]u32 = [_]u32{0} ** 5;
+        for (top_chars, 0..) |prime_char, idx| {
+            if (top_energies[idx] == 0) continue;
 
-        for (0..self.num_candidates) |idx| {
-            const char_val = self.candidates[idx];
-            const energy = energies[char_val % 256];
-            
-            var j: usize = 0;
-            while (j < 5) : (j += 1) {
-                if (energy > top_energies[j]) {
-                    // Shift down
-                    var k: usize = 4;
-                    while (k > j) : (k -= 1) {
-                        top_energies[k] = top_energies[k-1];
-                        top_candidates[k] = top_candidates[k-1];
-                    }
-                    top_energies[j] = energy;
-                    top_candidates[j] = char_val;
-                    break;
-                }
-            }
-        }
-
-        // 2. Brute-force Parallel Rollout (5 Lanes, 10 Steps)
-        var best_terminal_resonance: u32 = 0;
-        var best_primary_char: u32 = top_candidates[0];
-
-        for (top_candidates) |prime_char| {
-            if (prime_char == 0) continue;
-            
-            var sim_soul = soul.*; // Lightweight state clone
+            // Clone soul state for this lane
+            var sim_soul = soul.*;
             sim_soul.simulateAbsorb(vsa.generate(prime_char), prime_char, null);
 
-            var steps: usize = 0;
-            while (steps < 10) : (steps += 1) {
-                // Greedy step within the rollout
-                const s_energies = try self.compute.queryResonance(sim_soul.lexical_rotor, sim_soul.semantic_rotor, self.allocator);
-                defer self.allocator.free(s_energies);
-                
-                var max_s_energy: u32 = 0;
-                var next_char: u32 = ' ';
-                for (0..self.num_candidates) |idx| {
-                    const c = self.candidates[idx];
-                    if (s_energies[c % 256] > max_s_energy) {
-                        max_s_energy = s_energies[c % 256];
-                        next_char = c;
-                    }
-                }
-                sim_soul.simulateAbsorb(vsa.generate(next_char), next_char, @as(u16, @truncate(max_s_energy)));
-                if (next_char == '\n') break; // Early exit on logical boundary
+            // Roll forward
+            var steps: u32 = 0;
+            while (steps < MC_ROLLOUT_DEPTH) : (steps += 1) {
+                const next = self.greedyStep(&sim_soul) orelse break;
+                sim_soul.simulateAbsorb(vsa.generate(next), next, null);
+                if (next == '\n') break;
             }
 
-            // Calculate terminal similarity to original context
-            const terminal_res = vsa.calculateResonance(sim_soul.fractal_state, soul.fractal_state);
-            if (terminal_res > best_terminal_resonance) {
-                best_terminal_resonance = terminal_res;
-                best_primary_char = prime_char;
+            // Score: terminal resonance + MSB bonus
+            var terminal_res: u32 = @intCast(vsa.calculateResonance(sim_soul.concept, soul.concept));
+            terminal_res += self.msbBonus(&sim_soul);
+
+            if (terminal_res > best_terminal) {
+                best_terminal = terminal_res;
+                best_idx = @intCast(idx);
             }
         }
 
-        return best_primary_char;
+        return best_idx;
+    }
+
+    /// Single greedy step: query resonance and pick the best character
+    fn greedyStep(self: *const MonteCarloEngine, soul: *ghost_state.GhostSoul) ?u8 {
+        const energies = self.vulkan.dispatchResonance(soul.lexical_rotor, soul.semantic_rotor, self.allocator) catch return null;
+        defer self.allocator.free(energies);
+
+        var best_energy: u32 = 0;
+        var best_char: u8 = ' ';
+
+        for (energies, 0..) |raw_e, i| {
+            const cb: u8 = @intCast(i);
+            if (!isAsciiPrintable(cb)) continue;
+            if (raw_e > best_energy) {
+                best_energy = raw_e;
+                best_char = cb;
+            }
+        }
+        return best_char;
+    }
+
+    /// Bonus for terminal states that land on MSB-locked (myelinated) lattice positions.
+    /// Checks if the meaning matrix slot for the current rotor has locked counters.
+    fn msbBonus(self: *const MonteCarloEngine, soul: *const ghost_state.GhostSoul) u32 {
+        const slot = soul.lexical_rotor % (self.meaning.data.len / 1024);
+        const base = slot * 1024;
+        var locked: u32 = 0;
+        for (0..@min(64, self.meaning.data.len - base)) |i| {
+            if (self.meaning.data[base + i] >= 0x8000) locked += 1;
+        }
+        // If more than half the sampled counters are locked, give the bonus
+        return if (locked > 32) MSB_BONUS else 0;
     }
 };
+
+fn isAsciiPrintable(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or
+        (c >= 'A' and c <= 'Z') or
+        (c >= '0' and c <= '9') or
+        c == ' ' or c == '.' or c == ',' or c == '!' or c == '?' or
+        c == '\'' or c == '"' or c == '-';
+}

@@ -74,17 +74,18 @@ pub fn main() !void {
 
         for (prompt) |byte| _ = try soul.absorb(vsa.generate(byte), byte, null);
 
-        sys.printOut("Ghost > "); 
+        sys.printOut("Ghost > ");
         const generation_start_concept = soul.concept;
-        var engine = engine_logic.SingularityEngine{ 
-            .lattice = lattice, 
-            .meaning = &meaning_matrix, 
-            .soul = &soul, 
-            .canvas = ghost_state.MesoLattice.initText(), 
-            .is_live = sys.isTrainerActive(allocator), 
-            .inventory = [_]u8{0} ** 128, 
-            .inv_cursor = 0, 
+        var engine = engine_logic.SingularityEngine{
+            .lattice = lattice,
+            .meaning = &meaning_matrix,
+            .soul = &soul,
+            .canvas = ghost_state.MesoLattice.initText(),
+            .is_live = sys.isTrainerActive(allocator),
+            .inventory = [_]u8{0} ** 128,
+            .inv_cursor = 0,
             .compute = active_compute,
+            .vulkan = vsa_vulkan.getEngine(),
             .allocator = allocator,
         };
 
