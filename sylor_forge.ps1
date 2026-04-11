@@ -3,7 +3,7 @@
 $ErrorActionPreference = "Stop"
 $ToolchainDir = Join-Path $PSScriptRoot ".toolchain"
 If (-Not (Test-Path $ToolchainDir)) {
-    New-Item -ItemType Directory -Path $ToolchainDir | Out-Null
+    New-Item -ItemType Directory -Path $ToolchainDir -Force | Out-Null
 }
 
 $ZigDir = Join-Path $ToolchainDir "zig"
@@ -13,19 +13,22 @@ Write-Host "⚔️  SylorLabs: Hermetic Forge Initializing..." -ForegroundColor 
 
 # 1. Zig Toolchain (Portable)
 If (-Not (Test-Path $ZigDir)) {
-    Write-Host "📥 Downloading Zig 0.13.0..." -ForegroundColor Cyan
+    Write-Host "📥 Downloading Zig 0.14.0 (for b.graph compatibility)..." -ForegroundColor Cyan
     $ZigZip = Join-Path $ToolchainDir "zig.zip"
-    $ZigUrl = "https://ziglang.org/download/0.13.0/zig-windows-x86_64-0.13.0.zip"
+    $ZigUrl = "https://ziglang.org/download/0.14.0-dev.2447+6143c72b5/zig-windows-x86_64-0.14.0-dev.2447+6143c72b5.zip"
     
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    Invoke-WebRequest -Uri $ZigUrl -OutFile $ZigZip
+    # Use BITS for more reliable download if possible
+    Start-BitsTransfer -Source $ZigUrl -Destination $ZigZip -Description "Ghost Engine: Zig Toolchain"
     
     Write-Host "📦 Extracting Zig..." -ForegroundColor Cyan
     Expand-Archive -Path $ZigZip -DestinationPath $ToolchainDir
     
-    $ExtractedZig = Join-Path $ToolchainDir "zig-windows-x86_64-0.13.0"
-    Move-Item -Path $ExtractedZig -Destination $ZigDir
-    Remove-Item -Path $ZigZip
+    $ExtractedZig = Get-ChildItem -Path $ToolchainDir -Directory | Where-Object { $_.Name -like "zig-windows*" } | Select-Object -First 1
+    If ($ExtractedZig) {
+        Move-Item -Path $ExtractedZig.FullName -Destination $ZigDir -Force
+    }
+    Remove-Item -Path $ZigZip -Force
     Write-Host "✅ Zig installed to .toolchain/zig" -ForegroundColor Green
 } Else {
     Write-Host "✔️  Zig toolchain detected." -ForegroundColor Gray
@@ -37,21 +40,21 @@ If (-Not (Test-Path $VulkanDir)) {
     $VulkanZip = Join-Path $ToolchainDir "vulkan.zip"
     $VulkanUrl = "https://sdk.lunarg.com/sdk/download/1.3.296.0/windows/vulkansdk-win64-1.3.296.0.zip"
     
-    Invoke-WebRequest -Uri $VulkanUrl -OutFile $VulkanZip
+    # Use BITS for large file
+    Start-BitsTransfer -Source $VulkanUrl -Destination $VulkanZip -Description "Ghost Engine: Vulkan SDK"
     
     Write-Host "📦 Extracting Vulkan SDK... (This may take a minute)" -ForegroundColor Cyan
-    Expand-Archive -Path $VulkanZip -DestinationPath $VulkanDir
+    $VulkanExtractPath = Join-Path $ToolchainDir "Vulkan_Extract"
+    Expand-Archive -Path $VulkanZip -DestinationPath $VulkanExtractPath
     
     # LunarG zip usually has a top-level folder like '1.3.296.0'
-    $ExtractedVulkan = Get-ChildItem -Path $VulkanDir -Directory | Select-Object -First 1
+    $ExtractedVulkan = Get-ChildItem -Path $VulkanExtractPath -Directory | Select-Object -First 1
     If ($ExtractedVulkan) {
-        $TempPath = Join-Path $ToolchainDir "Vulkan_Temp"
-        Move-Item -Path $ExtractedVulkan.FullName -Destination $TempPath
-        Remove-Item -Path $VulkanDir -Recurse -Force
-        Rename-Item -Path $TempPath -NewName "Vulkan"
+        Move-Item -Path $ExtractedVulkan.FullName -Destination $VulkanDir -Force
     }
     
-    Remove-Item -Path $VulkanZip
+    Remove-Item -Path $VulkanExtractPath -Recurse -Force
+    Remove-Item -Path $VulkanZip -Force
     Write-Host "✅ Vulkan SDK installed to .toolchain/Vulkan" -ForegroundColor Green
 } Else {
     Write-Host "✔️  Vulkan SDK detected." -ForegroundColor Gray

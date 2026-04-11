@@ -35,7 +35,7 @@ pub fn build(b: *std.Build) void {
     // ── 3. Ghost Pulse (Inference Engine) ──
     const entry_path = b.fmt("{s}/src/main.zig", .{arch_name});
     const ghost_exe = b.addExecutable(.{
-        .name = "ghost_pulse",
+        .name = "ghost_sovereign",
         .root_module = b.createModule(.{
             .root_source_file = b.path(entry_path),
             .target = target,
@@ -103,7 +103,7 @@ pub fn build(b: *std.Build) void {
     const release_step = b.step("release", "Build a distributable release package (Ghost_V23_Release)");
     const release_dir = "Ghost_V23_Release";
 
-    const release_ghost_pulse = b.addInstallArtifact(ghost_exe, .{
+    const release_ghost_sovereign = b.addInstallArtifact(ghost_exe, .{
         .dest_dir = .{ .override = .{ .custom = release_dir } },
     });
     const release_ohl_trainer = b.addInstallArtifact(trainer_exe, .{
@@ -125,7 +125,7 @@ pub fn build(b: *std.Build) void {
         b.fmt("New-Item -ItemType Directory -Path {s}/zig-out/{s}/state -Force", .{ b.install_path, release_dir }),
     });
 
-    release_step.dependOn(&release_ghost_pulse.step);
+    release_step.dependOn(&release_ghost_sovereign.step);
     release_step.dependOn(&release_ohl_trainer.step);
     release_step.dependOn(&release_beast_dll.step);
     release_step.dependOn(&release_guide.step);

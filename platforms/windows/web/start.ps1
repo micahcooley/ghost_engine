@@ -13,10 +13,10 @@ if (!(Get-Command node -ErrorAction SilentlyContinue)) {
 $Arch = if ([IntPtr]::Size -eq 8) { "x86_64" } else { "x86" }
 if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { $Arch = "arm64" }
 
-$BinaryPath = Join-Path $PSScriptRoot "..\$Arch\bin\ghost_pulse.exe"
+$BinaryPath = Join-Path $PSScriptRoot "..\$Arch\bin\ghost_sovereign.exe"
 
 if (!(Test-Path $BinaryPath)) {
-    Write-Host "[WARNING] Ghost Engine binary (ghost_pulse.exe) not found for $Arch at: $BinaryPath" -ForegroundColor Yellow
+    Write-Host "[WARNING] Ghost Engine binary (ghost_sovereign.exe) not found for $Arch at: $BinaryPath" -ForegroundColor Yellow
     Write-Host "[INFO] Attempting to build engine via zig build..." -ForegroundColor Gray
     
     # Build from the Local Platform Silo
