@@ -7,10 +7,8 @@ pub fn build(b: *std.Build) void {
     const arch_tag = target.result.cpu.arch;
     const arch_name = if (arch_tag == .x86_64) "x86_64" else "arm64";
 
-    const vulkan_sdk = b.graph.environ_map.get("VULKAN_SDK") orelse {
-        std.debug.print("VULKAN_SDK environment variable not set.\n", .{});
-        std.process.exit(1);
-    };
+    const toolchain_vulkan = b.pathFromRoot("../../.toolchain/Vulkan");
+    const vulkan_sdk = b.graph.environ_map.get("VULKAN_SDK") orelse toolchain_vulkan;
 
     const glslc_path = b.fmt("{s}/Bin/glslc.exe", .{vulkan_sdk});
 
@@ -90,12 +88,9 @@ pub fn build(b: *std.Build) void {
     });
     optimizer_plugin.root_module.addImport("plugin_api", plugin_api_module);
 
-
-
     optimizer_plugin.root_module.linkSystemLibrary("winmm", .{});
     optimizer_plugin.root_module.linkSystemLibrary("powrprof", .{});
     optimizer_plugin.root_module.linkSystemLibrary("c", .{});
-
 
     // Install to platforms/windows/<arch>/plugins/
     const install_plugin = b.addInstallArtifact(optimizer_plugin, .{
@@ -103,5 +98,37 @@ pub fn build(b: *std.Build) void {
     });
 
     b.getInstallStep().dependOn(&install_plugin.step);
+
+    // ── 6. Release Step (Zero-Friction Distribution) ──
+    const release_step = b.step("release", "Build a distributable release package (Ghost_V23_Release)");
+    const release_dir = "Ghost_V23_Release";
+
+    const release_ghost_pulse = b.addInstallArtifact(ghost_exe, .{
+        .dest_dir = .{ .override = .{ .custom = release_dir } },
+    });
+    const release_ohl_trainer = b.addInstallArtifact(trainer_exe, .{
+        .dest_dir = .{ .override = .{ .custom = release_dir } },
+    });
+    const release_beast_dll = b.addInstallArtifact(optimizer_plugin, .{
+        .dest_dir = .{ .override = .{ .custom = b.fmt("{s}/plugins", .{release_dir}) } },
+    });
+
+    // Copy guide.md into the release plugins folder
+    const release_guide = b.addInstallFile(
+        b.path(b.fmt("{s}/plugins/guide.md", .{arch_name})),
+        b.fmt("{s}/plugins/guide.md", .{release_dir}),
+    );
+
+    // Create an empty 'state' directory in the release folder
+    const mkdir_state = b.addSystemCommand(&[_][]const u8{
+        "powershell", "-Command",
+        b.fmt("New-Item -ItemType Directory -Path {s}/zig-out/{s}/state -Force", .{ b.install_path, release_dir }),
+    });
+
+    release_step.dependOn(&release_ghost_pulse.step);
+    release_step.dependOn(&release_ohl_trainer.step);
+    release_step.dependOn(&release_beast_dll.step);
+    release_step.dependOn(&release_guide.step);
+    release_step.dependOn(&mkdir_state.step);
 }
 
