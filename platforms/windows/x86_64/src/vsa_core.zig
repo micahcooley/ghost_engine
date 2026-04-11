@@ -189,7 +189,7 @@ pub const Panopticon = struct {
     ledger: std.ArrayListUnmanaged(u8),
     concepts: std.ArrayListUnmanaged(HyperVector),
     allocator: std.mem.Allocator,
-    pub fn init(allocator: std.mem.Allocator) Panopticon { return .{ .ledger = .empty, .concepts = .empty, .allocator = allocator }; }
+    pub fn init(allocator: std.mem.Allocator) Panopticon { return .{ .ledger = .{}, .concepts = .{}, .allocator = allocator }; }
     pub fn deinit(self: *Panopticon) void { self.ledger.deinit(self.allocator); self.concepts.deinit(self.allocator); }
     pub fn pushByte(self: *Panopticon, byte: u8) !void { try self.ledger.append(self.allocator, byte); }
     pub fn markSentence(self: *Panopticon, concept: HyperVector) !void { try self.concepts.append(self.allocator, concept); }

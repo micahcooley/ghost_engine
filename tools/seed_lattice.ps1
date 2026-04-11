@@ -1,64 +1,30 @@
 # seed_lattice.ps1 - Ghost Engine State Initializer
-# Part of the Collaborator-Zero onboarding suite.
-
 $ErrorActionPreference = "Stop"
-
-$LatticeSize = 1024 * 1024 * 1024 # 1GB
-$MonolithSize = 1024 * 1024 * 1024 # 1GB
 $LatticeFile = "platforms/windows/x86_64/state/unified_lattice.bin"
 $MonolithFile = "platforms/windows/x86_64/state/semantic_monolith.bin"
+$LatticeSize = 1073741824
+$MonolithSize = 1073741824
 
-Write-Host "🧠 Ghost Engine: State Seeding..." -ForegroundColor Cyan
+Write-Host "🧠 Ghost Engine: State Seeding..."
 
-# Ensure state directory exists
-$StateDir = [System.IO.Path]::GetDirectoryName($LatticeFile)
+$StateDir = "platforms/windows/x86_64/state"
 If (-Not (Test-Path $StateDir)) {
     New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
-    Write-Host "📁 Created state directory: $StateDir" -ForegroundColor Gray
 }
 
-Function Initialize-Lattice($Path, $Size) {
+Function Init-File($Path, $Size) {
     If (Test-Path $Path) {
-        Write-Host "✔️  $Path already exists." -ForegroundColor Gray
+        Write-Host "Already exists: $Path"
         Return
     }
-
-    Write-Host "🔨 Initializing 1GB Genesis Monolith: $Path" -ForegroundColor Yellow
-    
-    # We use a fast .NET method to create a zero-filled file. 
-    # This is much faster than writing bytes in a loop.
-    $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    Write-Host "Creating 1GB file: $Path"
+    $fs = [System.IO.File]::Create($Path)
     $fs.SetLength($Size)
-    
-    # Optional: Write Genesis Header (0x5A5A5A5A...)
-    # In the current architecture, the engine handles zero-filled files as 'tabula rasa'.
-    # But we can etch a 'Genesis Pulse' if needed.
-    
     $fs.Close()
-    Write-Host "✅ Created $Path" -ForegroundColor Green
+    Write-Host "Created $Path"
 }
 
-# Check for 'Genesis' Download Option
-$DownloadSeed = $false
-# Placeholder URL for pre-trained weights
-$SeedUrl = "https://sylorlabs.io/ghost/seeds/genesis_v22_x64.bin" 
+Init-File $LatticeFile $LatticeSize
+Init-File $MonolithFile $MonolithSize
 
-If (-Not (Test-Path $LatticeFile)) {
-    $Choice = Read-Host "Lattice not found. [I]nitialize tabula rasa (1GB) or [D]ownload Genesis Seed? (I/D)"
-    If ($Choice -eq 'D' -or $Choice -eq 'd') {
-        $DownloadSeed = $true
-    }
-}
-
-If ($DownloadSeed) {
-    Write-Host "📥 Downloading Genesis Seed (Placeholder)..." -ForegroundColor Cyan
-    Write-Host "⚠️  Note: sylorlabs.io placeholder active. Falling back to local init." -ForegroundColor Yellow
-    Initialize-Lattice $LatticeFile $LatticeSize
-} Else {
-    Initialize-Lattice $LatticeFile $LatticeSize
-}
-
-Initialize-Lattice $MonolithFile $MonolithSize
-
-Write-Host "`n🚀 State Seeding Complete." -ForegroundColor Green
-Write-Host "The Ghost is ready to begin ingestion." -ForegroundColor Cyan
+Write-Host "State Seeding Complete."

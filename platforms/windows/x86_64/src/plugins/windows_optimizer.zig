@@ -5,7 +5,7 @@ const api = @import("plugin_api");
 // --- WINDOWS BEAST OPTIMIZER ---
 // Native hardware seizure for maximum throughput.
 
-const WINAPI = std.builtin.CallingConvention.winapi;
+const WINAPI = std.os.windows.WINAPI;
 
 // Kernel32/Winmm exports
 extern "kernel32" fn GetCurrentProcess() callconv(WINAPI) *anyopaque;

@@ -3,7 +3,7 @@ const sys = @import("sys.zig");
 const vsa = @import("vsa_core.zig");
 const ghost_state = @import("ghost_state.zig");
 const vsa_vulkan = @import("vsa_vulkan.zig");
-const compute_api = @import("compute_api.zig");
+const compute_api = @import("compute_api");
 
 pub const REASON_DEPTH: u32 = 8;
 pub const REASON_TOP_K: u32 = 3;

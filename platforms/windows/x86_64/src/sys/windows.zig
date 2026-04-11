@@ -3,29 +3,29 @@ const std = @import("std");
 // --- GHOST ENGINE: DIRECT WINAPI CORE ---
 // Zero-overhead Windows Kernel32 I/O and memory-mapping layer.
 
-extern "kernel32" fn CreateFileW(n: [*:0]const u16, a: u32, s: u32, p: ?*anyopaque, d: u32, f: u32, t: ?*anyopaque) callconv(.winapi) *anyopaque;
-extern "kernel32" fn WriteFile(h: *anyopaque, b: [*]const u8, n: u32, w: ?*u32, o: ?*anyopaque) callconv(.winapi) i32;
-extern "kernel32" fn ReadFile(h: *anyopaque, b: [*]u8, n: u32, r: ?*u32, o: ?*anyopaque) callconv(.winapi) i32;
-extern "kernel32" fn CloseHandle(h: *anyopaque) callconv(.winapi) i32;
-extern "kernel32" fn GetFileSizeEx(h: *anyopaque, lp: *i64) callconv(.winapi) i32;
-extern "kernel32" fn CreateFileMappingW(h: *anyopaque, a: ?*anyopaque, p: u32, sh: u32, sl: u32, n: ?[*:0]const u16) callconv(.winapi) ?*anyopaque;
-extern "kernel32" fn MapViewOfFile(m: *anyopaque, a: u32, oh: u32, ol: u32, s: usize) callconv(.winapi) ?*anyopaque;
-extern "kernel32" fn UnmapViewOfFile(lpBaseAddress: *const anyopaque) callconv(.winapi) i32;
-extern "kernel32" fn FlushViewOfFile(lpBaseAddress: *const anyopaque, dwNumberOfBytesToFlush: usize) callconv(.winapi) i32;
-extern "kernel32" fn GetStdHandle(n: u32) callconv(.winapi) *anyopaque;
-extern "kernel32" fn GetCommandLineW() callconv(.winapi) [*:0]const u16;
-extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
-extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
-extern "kernel32" fn ExitProcess(uExitCode: u32) callconv(.winapi) noreturn;
-extern "kernel32" fn SetFilePointerEx(h: *anyopaque, dist: i64, new_pos: ?*i64, method: u32) callconv(.winapi) i32;
-extern "kernel32" fn SetEndOfFile(h: *anyopaque) callconv(.winapi) i32;
-extern "kernel32" fn VirtualAlloc(lpAddress: ?*anyopaque, dwSize: usize, flAllocationType: u32, flProtect: u32) callconv(.winapi) ?*anyopaque;
-extern "kernel32" fn VirtualFree(lpAddress: *anyopaque, dwSize: usize, dwFreeType: u32) callconv(.winapi) i32;
-extern "kernel32" fn GetCurrentProcess() callconv(.winapi) *anyopaque;
-extern "kernel32" fn LoadLibraryW(lpLibFileName: [*:0]const u16) callconv(.winapi) ?*anyopaque;
-extern "kernel32" fn GetProcAddress(hModule: *anyopaque, lpProcName: [*:0]const u8) callconv(.winapi) ?*anyopaque;
-extern "kernel32" fn FreeLibrary(hLibModule: *anyopaque) callconv(.winapi) i32;
-extern "kernel32" fn GetModuleFileNameW(hModule: ?*anyopaque, lpFilename: [*:0]u16, nSize: u32) callconv(.winapi) u32;
+extern "kernel32" fn CreateFileW(n: [*:0]const u16, a: u32, s: u32, p: ?*anyopaque, d: u32, f: u32, t: ?*anyopaque) callconv(.C) *anyopaque;
+extern "kernel32" fn WriteFile(h: *anyopaque, b: [*]const u8, n: u32, w: ?*u32, o: ?*anyopaque) callconv(.C) i32;
+extern "kernel32" fn ReadFile(h: *anyopaque, b: [*]u8, n: u32, r: ?*u32, o: ?*anyopaque) callconv(.C) i32;
+extern "kernel32" fn CloseHandle(h: *anyopaque) callconv(.C) i32;
+extern "kernel32" fn GetFileSizeEx(h: *anyopaque, lp: *i64) callconv(.C) i32;
+extern "kernel32" fn CreateFileMappingW(h: *anyopaque, a: ?*anyopaque, p: u32, sh: u32, sl: u32, n: ?[*:0]const u16) callconv(.C) ?*anyopaque;
+extern "kernel32" fn MapViewOfFile(m: *anyopaque, a: u32, oh: u32, ol: u32, s: usize) callconv(.C) ?*anyopaque;
+extern "kernel32" fn UnmapViewOfFile(lpBaseAddress: *const anyopaque) callconv(.C) i32;
+extern "kernel32" fn FlushViewOfFile(lpBaseAddress: *const anyopaque, dwNumberOfBytesToFlush: usize) callconv(.C) i32;
+extern "kernel32" fn GetStdHandle(n: u32) callconv(.C) *anyopaque;
+extern "kernel32" fn GetCommandLineW() callconv(.C) [*:0]const u16;
+extern "kernel32" fn GetTickCount64() callconv(.C) u64;
+extern "kernel32" fn Sleep(ms: u32) callconv(.C) void;
+extern "kernel32" fn ExitProcess(uExitCode: u32) callconv(.C) noreturn;
+extern "kernel32" fn SetFilePointerEx(h: *anyopaque, dist: i64, new_pos: ?*i64, method: u32) callconv(.C) i32;
+extern "kernel32" fn SetEndOfFile(h: *anyopaque) callconv(.C) i32;
+extern "kernel32" fn VirtualAlloc(lpAddress: ?*anyopaque, dwSize: usize, flAllocationType: u32, flProtect: u32) callconv(.C) ?*anyopaque;
+extern "kernel32" fn VirtualFree(lpAddress: *anyopaque, dwSize: usize, dwFreeType: u32) callconv(.C) i32;
+extern "kernel32" fn GetCurrentProcess() callconv(.C) *anyopaque;
+extern "kernel32" fn LoadLibraryW(lpLibFileName: [*:0]const u16) callconv(.C) ?*anyopaque;
+extern "kernel32" fn GetProcAddress(hModule: *anyopaque, lpProcName: [*:0]const u8) callconv(.C) ?*anyopaque;
+extern "kernel32" fn FreeLibrary(hLibModule: *anyopaque) callconv(.C) i32;
+extern "kernel32" fn GetModuleFileNameW(hModule: ?*anyopaque, lpFilename: [*:0]u16, nSize: u32) callconv(.C) u32;
 
 
 
@@ -34,7 +34,7 @@ pub const WIN32_MEMORY_RANGE_ENTRY = extern struct {
     NumberOfBytes: usize,
 };
 
-extern "kernel32" fn PrefetchVirtualMemory(hProcess: *anyopaque, NumberOfOffsets: usize, VirtualAddresses: [*]const WIN32_MEMORY_RANGE_ENTRY, Flags: u32) callconv(.winapi) i32;
+extern "kernel32" fn PrefetchVirtualMemory(hProcess: *anyopaque, NumberOfOffsets: usize, VirtualAddresses: [*]const WIN32_MEMORY_RANGE_ENTRY, Flags: u32) callconv(.C) i32;
 
 pub fn prefetchMemory(addr: ?*anyopaque, size: usize) void {
     if (addr == null) return;
@@ -58,10 +58,10 @@ pub const WIN32_FIND_DATAW = extern struct {
     cAlternateFileName: [14]u16,
 };
 
-extern "kernel32" fn FindFirstFileW(lpFileName: [*:0]const u16, lpFindFileData: *WIN32_FIND_DATAW) callconv(.c) *anyopaque;
-extern "kernel32" fn FindNextFileW(hFindFile: *anyopaque, lpFindFileData: *WIN32_FIND_DATAW) callconv(.c) i32;
-extern "kernel32" fn FindClose(hFindFile: *anyopaque) callconv(.c) i32;
-pub extern "kernel32" fn DeleteFileW(lpFileName: [*:0]const u16) callconv(.c) i32;
+extern "kernel32" fn FindFirstFileW(lpFileName: [*:0]const u16, lpFindFileData: *WIN32_FIND_DATAW) callconv(.C) *anyopaque;
+extern "kernel32" fn FindNextFileW(hFindFile: *anyopaque, lpFindFileData: *WIN32_FIND_DATAW) callconv(.C) i32;
+extern "kernel32" fn FindClose(hFindFile: *anyopaque) callconv(.C) i32;
+pub extern "kernel32" fn DeleteFileW(lpFileName: [*:0]const u16) callconv(.C) i32;
 
 var global_silo_root: ?[]const u8 = null;
 
@@ -116,7 +116,7 @@ pub fn getAnchorPath(allocator: std.mem.Allocator, sub_path: []const u8) ![]cons
 
 
 pub fn findPluginFiles(allocator: std.mem.Allocator) ![][]const u8 {
-    var results = std.ArrayListUnmanaged([]const u8).empty;
+    var results = std.ArrayListUnmanaged([]const u8){};
     var wbuf: [1024]u16 = undefined;
     const anchored_plugins = try getAnchorPath(allocator, "plugins\\*");
     defer allocator.free(anchored_plugins);
@@ -155,7 +155,7 @@ pub fn findPluginFiles(allocator: std.mem.Allocator) ![][]const u8 {
 }
 
 pub fn findNativePlugins(allocator: std.mem.Allocator) ![][]const u8 {
-    var results = std.ArrayListUnmanaged([]const u8).empty;
+    var results = std.ArrayListUnmanaged([]const u8){};
     var wbuf: [1024]u16 = undefined;
     const anchored_plugins = try getAnchorPath(allocator, "plugins\\*");
     defer allocator.free(anchored_plugins);
@@ -398,17 +398,17 @@ pub const NativeLibrary = struct {
 pub fn getArgs(allocator: std.mem.Allocator) ![][]const u8 {
 
     const cmd_w = GetCommandLineW();
-    var utf8_list: std.ArrayList(u8) = .empty;
-    defer utf8_list.deinit(allocator);
+    var utf8_list = std.ArrayList(u8).init(allocator);
+    defer utf8_list.deinit();
     var idx: usize = 0;
     while (cmd_w[idx] != 0) : (idx += 1) {
         const c = cmd_w[idx];
-        if (c < 0x80) { try utf8_list.append(allocator, @intCast(c)); }
-        else if (c < 0x800) { try utf8_list.append(allocator, @intCast(0xc0 | (c >> 6))); try utf8_list.append(allocator, @intCast(0x80 | (c & 0x3f))); }
-        else { try utf8_list.append(allocator, @intCast(0xe0 | (c >> 12))); try utf8_list.append(allocator, @intCast(0x80 | ((c >> 6) & 0x3f))); try utf8_list.append(allocator, @intCast(0x80 | (c & 0x3f))); }
+        if (c < 0x80) { try utf8_list.append(@intCast(c)); }
+        else if (c < 0x800) { try utf8_list.append(@intCast(0xc0 | (c >> 6))); try utf8_list.append(@intCast(0x80 | (c & 0x3f))); }
+        else { try utf8_list.append(@intCast(0xe0 | (c >> 12))); try utf8_list.append(@intCast(0x80 | ((c >> 6) & 0x3f))); try utf8_list.append(@intCast(0x80 | (c & 0x3f))); }
     }
     const utf8 = utf8_list.items;
-    var args_list: std.ArrayList([]const u8) = .empty;
+    var args_list = std.ArrayList([]const u8).init(allocator);
     var i: usize = 0;
     while (i < utf8.len) {
         while (i < utf8.len and utf8[i] == ' ') : (i += 1) {}
@@ -417,12 +417,12 @@ pub fn getArgs(allocator: std.mem.Allocator) ![][]const u8 {
         if (utf8[i] == '"') {
             i += 1; const s2 = i;
             while (i < utf8.len and utf8[i] != '"') : (i += 1) {}
-            try args_list.append(allocator, try allocator.dupe(u8, utf8[s2..i]));
+            try args_list.append(try allocator.dupe(u8, utf8[s2..i]));
             if (i < utf8.len) i += 1;
         } else {
             while (i < utf8.len and utf8[i] != ' ') : (i += 1) {}
-            try args_list.append(allocator, try allocator.dupe(u8, utf8[start..i]));
+            try args_list.append(try allocator.dupe(u8, utf8[start..i]));
         }
     }
-    return args_list.toOwnedSlice(allocator);
+    return try args_list.toOwnedSlice();
 }

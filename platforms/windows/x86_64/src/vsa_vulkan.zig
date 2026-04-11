@@ -7,11 +7,7 @@ const vk = @cImport({
 const builtin = @import("builtin");
 
 fn ghostCopy(comptime T: type, dest: []T, source: []const T) void {
-    if (comptime builtin.zig_version.minor >= 14 or builtin.zig_version.major > 0) {
-        @call(.always_inline, std.mem.copyForwards, .{ T, dest, source });
-    } else {
-        @call(.always_inline, std.mem.copy, .{ T, dest, source });
-    }
+    @call(.always_inline, std.mem.copyForwards, .{ T, dest, source });
 }
 
 pub const SparsityMask = struct {
@@ -890,7 +886,8 @@ pub const VulkanEngine = struct {
     }
 };
 
-const compute_api = @import("compute_api.zig");
+const compute_api = @import("compute_api");
+
 
 var global_instance: ?VulkanEngine = null;
 

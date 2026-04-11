@@ -8,14 +8,16 @@ const compute_api = core.compute_api;
 const builtin = @import("builtin");
 
 
-const WINAPI = if (builtin.os.tag == .windows) std.builtin.CallingConvention.winapi else .C;
+const WINAPI = if (builtin.os.tag == .windows) std.os.windows.WINAPI else .C;
 extern "kernel32" fn SetConsoleCtrlHandler(handler: ?*const fn(u32) callconv(WINAPI) i32, add: i32) callconv(WINAPI) i32;
+
+// const compute_api = @import("compute_api");
 
 var active_compute: ?*const compute_api.ComputeApi = null;
 var global_lattice: ?*ghost_state.UnifiedLattice = null;
 var global_mapped: ?sys.MappedFile = null;
 var using_cpu_fallback: bool = false;
-var loaded_plugins = std.ArrayListUnmanaged(sys.NativeLibrary).empty;
+var loaded_plugins = std.ArrayListUnmanaged(sys.NativeLibrary){};
 
 
 
@@ -304,7 +306,7 @@ fn main_wrapped() !void {
     var mapped = try sys.createMappedFile(allocator, "state/unified_lattice.bin", ghost_state.UNIFIED_SIZE_BYTES);
 
     global_mapped = mapped;
-    var lattice = @as(*ghost_state.UnifiedLattice, @ptrCast(@alignCast(mapped.data.ptr)));
+    var lattice = std.mem.bytesAsValue(ghost_state.UnifiedLattice, @as(*align(2) [ghost_state.UNIFIED_SIZE_BYTES]u8, @ptrCast(@alignCast(mapped.data[0..@sizeOf(ghost_state.UnifiedLattice)]))));
 
     // ── 3. Initialize Compute Provider (Vulkan/iGPU) with CPU Fallback ──
     sys.printOut("[COMPUTE] Initializing Sovereign Compute Provider...\n");
@@ -320,8 +322,8 @@ fn main_wrapped() !void {
         const tags_data = compute.getTagsData();
         
         meaning_matrix = vsa.MeaningMatrix{
-            .data = matrix_data.ptr[0..matrix_data.len],
-            .tags = tags_data.ptr[0..tags_data.len]
+            .data = matrix_data,
+            .tags = tags_data,
         };
         sys.printOut("[COMPUTE] ");
         sys.printOut(compute.name);
@@ -330,7 +332,7 @@ fn main_wrapped() !void {
         // Copy lattice from mapped file into compute buffer
         sys.printOut("[CORTEX] Transferring lattice to Silicon...\n");
         const compute_lattice = compute.getLatticeData();
-        const mapped_u16 = @as([*]const u16, @ptrCast(@alignCast(mapped.data.ptr)));
+        const mapped_u16 = std.mem.bytesAsSlice(u16, mapped.data);
         const total_u16 = ghost_state.UNIFIED_SIZE_BYTES / 2;
         @memcpy(compute_lattice[0..total_u16], mapped_u16[0..total_u16]);
         sys.printOut("[CORTEX] Lattice transferred to Silicon.\n");
@@ -339,7 +341,7 @@ fn main_wrapped() !void {
         sys.printOut("[COMPUTE] *** GPU init FAILED. Falling back to CPU-only VSA. ***\n");
         const cpu_buf = sys.allocSectorAligned(1024 * 1024 * 2) orelse return error.OutOfMemory;
         meaning_matrix = vsa.MeaningMatrix{
-            .data = @as([*]u16, @ptrCast(@alignCast(cpu_buf.ptr)))[0..(1024 * 1024)],
+            .data = std.mem.bytesAsSlice(u16, @as([]align(2) u8, @alignCast(cpu_buf))),
             .tags = null,
         };
     }
@@ -348,7 +350,7 @@ fn main_wrapped() !void {
     const hMM = sys.openForRead(allocator, "state/semantic_monolith.bin") catch null;
 
     if (hMM) |h| {
-        _ = try sys.readAll(h, @as([]u8, @ptrCast(meaning_matrix.data)));
+        _ = try sys.readAll(h, std.mem.sliceAsBytes(meaning_matrix.data));
         sys.closeFile(h);
     }
 
@@ -582,7 +584,7 @@ fn main_wrapped() !void {
     // Copy lattice from Silicon back to mapped file
     if (active_compute) |compute| {
         const compute_lattice = compute.getLatticeData();
-        const mapped_u16 = @as([*]u16, @ptrCast(@alignCast(mapped.data.ptr)));
+        const mapped_u16 = std.mem.bytesAsSlice(u16, mapped.data);
         const total_u16 = ghost_state.UNIFIED_SIZE_BYTES / 2;
         @memcpy(mapped_u16[0..total_u16], compute_lattice[0..total_u16]);
     }
@@ -595,7 +597,7 @@ fn main_wrapped() !void {
 
     if (hOut) |h| {
         const mm_bytes = std.mem.sliceAsBytes(meaning_matrix.data);
-        _ = sys.writeAll(h, mm_bytes) catch 0;
+        _ = try sys.writeAll(h, mm_bytes);
         sys.closeFile(h);
     }
 
@@ -603,7 +605,7 @@ fn main_wrapped() !void {
 
     if (hTags) |h| {
         if (meaning_matrix.tags) |tags| {
-            _ = sys.writeAll(h, std.mem.sliceAsBytes(tags)) catch 0;
+            _ = try sys.writeAll(h, std.mem.sliceAsBytes(tags));
         }
         sys.closeFile(h);
     }
@@ -614,7 +616,7 @@ fn main_wrapped() !void {
         active_compute = null;
     }
     if (using_cpu_fallback) {
-        sys.freeSectorAligned(@as([]u8, @ptrCast(meaning_matrix.data)));
+        sys.freeSectorAligned(std.mem.sliceAsBytes(meaning_matrix.data));
     }
 
     // Cleanup plugins

@@ -7,8 +7,10 @@ const vsa_vulkan = core.vsa_vulkan;
 const engine_logic = core.engine;
 
 const builtin = @import("builtin");
-const WINAPI = if (builtin.os.tag == .windows) std.builtin.CallingConvention.winapi else .C;
+const WINAPI = if (builtin.os.tag == .windows) std.os.windows.WINAPI else .C;
 extern "kernel32" fn SetConsoleCtrlHandler(handler: ?*const fn(u32) callconv(WINAPI) i32, add: i32) callconv(WINAPI) i32;
+
+const compute_api = @import("compute_api");
 
 var global_vk_engine: ?*vsa_vulkan.VulkanEngine = null;
 
@@ -40,19 +42,19 @@ pub fn main() !void {
     const mapped_lattice = try sys.createMappedFile(allocator, "state/unified_lattice.bin", ghost_state.UNIFIED_SIZE_BYTES);
     if (mapped_lattice.data.len < ghost_state.UNIFIED_SIZE_BYTES) return error.LatticeMapFailed;
 
-    const lattice: *ghost_state.UnifiedLattice = @as(*ghost_state.UnifiedLattice, @ptrCast(@alignCast(mapped_lattice.data.ptr)));
+    const lattice = std.mem.bytesAsValue(ghost_state.UnifiedLattice, @as(*align(2) [ghost_state.UNIFIED_SIZE_BYTES]u8, @ptrCast(@alignCast(mapped_lattice.data[0..@sizeOf(ghost_state.UnifiedLattice)]))));
 
     sys.printOut("[MEANING] Mapping Hippocampus...\n");
-    const mapped_meaning = try sys.createMappedFile(allocator, "state/semantic_monolith.bin", 1024*1024*1024);
+    const mapped_meaning = try sys.createMappedFile(allocator, "state/semantic_monolith.bin", 1024*1024*512 * 2);
     const mapped_tags = try sys.createMappedFile(allocator, "state/semantic_tags.bin", 1048576 * 8);
 
     var meaning_matrix = vsa.MeaningMatrix{ 
-        .data = @as([*]u16, @ptrCast(@alignCast(mapped_meaning.data.ptr)))[0..(1024*1024*512)], 
-        .tags = @as([*]u64, @ptrCast(@alignCast(mapped_tags.data.ptr)))[0..1048576] 
+        .data = std.mem.bytesAsSlice(u16, @as([]align(2) u8, @alignCast(mapped_meaning.data))),
+        .tags = std.mem.bytesAsSlice(u64, @as([]align(8) u8, @alignCast(mapped_tags.data))),
     };
 
     sys.printOut("[VULKAN] Initializing Sovereign Compute...\n");
-    var active_compute: ?*const core.compute_api.ComputeApi = null;
+    var active_compute: ?*const compute_api.ComputeApi = null;
     if (vsa_vulkan.GHOST_COMPUTE_PLUGIN.init(allocator)) |compute| {
         active_compute = compute;
         sys.printOut("[COMPUTE] ");

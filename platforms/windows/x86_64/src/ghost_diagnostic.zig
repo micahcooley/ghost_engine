@@ -48,7 +48,7 @@ pub fn main() !void {
             var top_energies = [_]u32{0} ** 3;
             const boredom = soul.getBoredomPenalty(soul.lexical_rotor);
 
-            if (vk_engine.dispatchResonance(soul.lexical_rotor, soul.semantic_rotor)) |energies| {
+            if (vk_engine.dispatchResonance(soul.lexical_rotor, soul.semantic_rotor, allocator)) |energies| {
                 defer allocator.free(energies);
                 for (energies, 0..) |e, i| {
                     const cb: u8 = @intCast(i);
