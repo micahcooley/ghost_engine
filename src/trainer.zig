@@ -139,17 +139,17 @@ const GreedyBatcher = struct {
     streams: []StreamState,
     active_count: usize,
     /// Greedy-packed rune bytes. May contain bytes from any stream, contiguous.
-    batch_bytes: [4096]u8,
+    batch_bytes: [20480]u8,
     /// Parallel stream-ID per slot. batch_index[i] == which stream produced batch_bytes[i].
-    batch_index: [4096]u32,
+    batch_index: [20480]u32,
     batch_len: usize,
 
     pub fn init(streams: []StreamState) GreedyBatcher {
         return .{
             .streams = streams,
             .active_count = streams.len,
-            .batch_bytes = [_]u8{0} ** 4096,
-            .batch_index = [_]u32{0} ** 4096,
+            .batch_bytes = [_]u8{0} ** 20480,
+            .batch_index = [_]u32{0} ** 20480,
             .batch_len = 0,
         };
     }
@@ -249,7 +249,8 @@ fn main_wrapped() !void {
     var tier: vsa_vulkan.OperationalTier = .standard;
     var plugins_on: bool = false;
     for (args[2..]) |arg| {
-        if (std.mem.eql(u8, arg, "--max")) tier = .max
+        if (std.mem.eql(u8, arg, "--god")) tier = .god
+        else if (std.mem.eql(u8, arg, "--max")) tier = .max
         else if (std.mem.eql(u8, arg, "--high")) tier = .high
         else if (std.mem.eql(u8, arg, "--standard")) tier = .standard
         else if (std.mem.eql(u8, arg, "--background")) tier = .background
@@ -277,17 +278,18 @@ fn main_wrapped() !void {
     }
 
     const batch_size = @intFromEnum(tier);
-    // Constrain batch to 4096 (our buffer cap) and wavefront-align it
-    const aligned_batch_size: u32 = @min(batch_size, 4096);
+    // Constrain batch to 20480 (our buffer cap) and wavefront-align it
+    const aligned_batch_size: u32 = @min(batch_size, 20480);
     const num_streams: usize = switch (tier) {
+        .god      => MAX_STREAMS,
         .max      => @min(MAX_STREAMS, cpu_cores * 2),
         .high     => cpu_cores,
         .standard => @min(cpu_cores, 4),
         .background => 1,
     };
     const sleep_ms: u32 = switch (tier) {
+        .god, .max, .high, .standard => 0,
         .background => 15,
-        else => 0,
     };
 
     sys.print("\nGhost Trainer {s}: Sovereign Trinity Engine (V28 Greedy Saturation)\n", .{VERSION});

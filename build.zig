@@ -115,7 +115,29 @@ pub fn build(b: *std.Build) void {
     }
     b.installArtifact(probe_exe);
 
-    // ── 6. Run Step ──
+    // ── 7. Ghost Shell (REPL + Background Trainer) ──
+    const shell_exe = b.addExecutable(.{
+        .name = "ghost_shell",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/shell.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    shell_exe.root_module.addImport("ghost_core", ghost_core);
+    shell_exe.root_module.linkSystemLibrary("c", .{});
+    if (target.result.os.tag == .windows) {
+        if (vulkan_sdk) |sdk| {
+            shell_exe.root_module.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "Include" }) });
+            shell_exe.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "Lib" }) });
+        }
+        shell_exe.root_module.linkSystemLibrary("vulkan-1", .{});
+    } else {
+        shell_exe.root_module.linkSystemLibrary("vulkan", .{});
+    }
+    b.installArtifact(shell_exe);
+
+    // ── 8. Run Step ──
     const run_cmd = b.addRunArtifact(ghost_exe);
     run_cmd.step.dependOn(b.getInstallStep());
     const run_step = b.step("run", "Run the app");
