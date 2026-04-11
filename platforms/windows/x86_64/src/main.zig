@@ -77,8 +77,10 @@ pub fn main() !void {
             .is_live = sys.isTrainerActive(allocator), 
             .inventory = [_]u8{0} ** 128, 
             .inv_cursor = 0, 
-            .compute = active_compute 
+            .compute = active_compute,
+            .allocator = allocator,
         };
+
 
 
 
