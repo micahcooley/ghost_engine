@@ -3,29 +3,29 @@ const std = @import("std");
 // --- GHOST ENGINE: DIRECT WINAPI CORE ---
 // Zero-overhead Windows Kernel32 I/O and memory-mapping layer.
 
-extern "kernel32" fn CreateFileW(n: [*:0]const u16, a: u32, s: u32, p: ?*anyopaque, d: u32, f: u32, t: ?*anyopaque) callconv(.c) *anyopaque;
-extern "kernel32" fn WriteFile(h: *anyopaque, b: [*]const u8, n: u32, w: ?*u32, o: ?*anyopaque) callconv(.c) i32;
-extern "kernel32" fn ReadFile(h: *anyopaque, b: [*]u8, n: u32, r: ?*u32, o: ?*anyopaque) callconv(.c) i32;
-extern "kernel32" fn CloseHandle(h: *anyopaque) callconv(.c) i32;
-extern "kernel32" fn GetFileSizeEx(h: *anyopaque, lp: *i64) callconv(.c) i32;
-extern "kernel32" fn CreateFileMappingW(h: *anyopaque, a: ?*anyopaque, p: u32, sh: u32, sl: u32, n: ?[*:0]const u16) callconv(.c) ?*anyopaque;
-extern "kernel32" fn MapViewOfFile(m: *anyopaque, a: u32, oh: u32, ol: u32, s: usize) callconv(.c) ?*anyopaque;
-extern "kernel32" fn UnmapViewOfFile(lpBaseAddress: *const anyopaque) callconv(.c) i32;
-extern "kernel32" fn FlushViewOfFile(lpBaseAddress: *const anyopaque, dwNumberOfBytesToFlush: usize) callconv(.c) i32;
-extern "kernel32" fn GetStdHandle(n: u32) callconv(.c) *anyopaque;
-extern "kernel32" fn GetCommandLineW() callconv(.c) [*:0]const u16;
-extern "kernel32" fn GetTickCount64() callconv(.c) u64;
-extern "kernel32" fn Sleep(ms: u32) callconv(.c) void;
-extern "kernel32" fn ExitProcess(uExitCode: u32) callconv(.c) noreturn;
-extern "kernel32" fn SetFilePointerEx(h: *anyopaque, dist: i64, new_pos: ?*i64, method: u32) callconv(.c) i32;
-extern "kernel32" fn SetEndOfFile(h: *anyopaque) callconv(.c) i32;
-extern "kernel32" fn VirtualAlloc(lpAddress: ?*anyopaque, dwSize: usize, flAllocationType: u32, flProtect: u32) callconv(.c) ?*anyopaque;
-extern "kernel32" fn VirtualFree(lpAddress: *anyopaque, dwSize: usize, dwFreeType: u32) callconv(.c) i32;
-extern "kernel32" fn GetCurrentProcess() callconv(.c) *anyopaque;
-extern "kernel32" fn LoadLibraryW(lpLibFileName: [*:0]const u16) callconv(.c) ?*anyopaque;
-extern "kernel32" fn GetProcAddress(hModule: *anyopaque, lpProcName: [*:0]const u8) callconv(.c) ?*anyopaque;
-extern "kernel32" fn FreeLibrary(hLibModule: *anyopaque) callconv(.c) i32;
-extern "kernel32" fn GetModuleFileNameW(hModule: ?*anyopaque, lpFilename: [*:0]u16, nSize: u32) callconv(.c) u32;
+extern "kernel32" fn CreateFileW(n: [*:0]const u16, a: u32, s: u32, p: ?*anyopaque, d: u32, f: u32, t: ?*anyopaque) callconv(.winapi) *anyopaque;
+extern "kernel32" fn WriteFile(h: *anyopaque, b: [*]const u8, n: u32, w: ?*u32, o: ?*anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn ReadFile(h: *anyopaque, b: [*]u8, n: u32, r: ?*u32, o: ?*anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn CloseHandle(h: *anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn GetFileSizeEx(h: *anyopaque, lp: *i64) callconv(.winapi) i32;
+extern "kernel32" fn CreateFileMappingW(h: *anyopaque, a: ?*anyopaque, p: u32, sh: u32, sl: u32, n: ?[*:0]const u16) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn MapViewOfFile(m: *anyopaque, a: u32, oh: u32, ol: u32, s: usize) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn UnmapViewOfFile(lpBaseAddress: *const anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn FlushViewOfFile(lpBaseAddress: *const anyopaque, dwNumberOfBytesToFlush: usize) callconv(.winapi) i32;
+extern "kernel32" fn GetStdHandle(n: u32) callconv(.winapi) *anyopaque;
+extern "kernel32" fn GetCommandLineW() callconv(.winapi) [*:0]const u16;
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
+extern "kernel32" fn ExitProcess(uExitCode: u32) callconv(.winapi) noreturn;
+extern "kernel32" fn SetFilePointerEx(h: *anyopaque, dist: i64, new_pos: ?*i64, method: u32) callconv(.winapi) i32;
+extern "kernel32" fn SetEndOfFile(h: *anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn VirtualAlloc(lpAddress: ?*anyopaque, dwSize: usize, flAllocationType: u32, flProtect: u32) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn VirtualFree(lpAddress: *anyopaque, dwSize: usize, dwFreeType: u32) callconv(.winapi) i32;
+extern "kernel32" fn GetCurrentProcess() callconv(.winapi) *anyopaque;
+extern "kernel32" fn LoadLibraryW(lpLibFileName: [*:0]const u16) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GetProcAddress(hModule: *anyopaque, lpProcName: [*:0]const u8) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn FreeLibrary(hLibModule: *anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn GetModuleFileNameW(hModule: ?*anyopaque, lpFilename: [*:0]u16, nSize: u32) callconv(.winapi) u32;
 
 
 
@@ -34,7 +34,7 @@ pub const WIN32_MEMORY_RANGE_ENTRY = extern struct {
     NumberOfBytes: usize,
 };
 
-extern "kernel32" fn PrefetchVirtualMemory(hProcess: *anyopaque, NumberOfOffsets: usize, VirtualAddresses: [*]const WIN32_MEMORY_RANGE_ENTRY, Flags: u32) callconv(.c) i32;
+extern "kernel32" fn PrefetchVirtualMemory(hProcess: *anyopaque, NumberOfOffsets: usize, VirtualAddresses: [*]const WIN32_MEMORY_RANGE_ENTRY, Flags: u32) callconv(.winapi) i32;
 
 pub fn prefetchMemory(addr: ?*anyopaque, size: usize) void {
     if (addr == null) return;
@@ -67,28 +67,32 @@ var global_silo_root: ?[]const u8 = null;
 
 pub fn getExePath(allocator: std.mem.Allocator) ![]const u8 {
     var buf: [1024]u16 = undefined;
-    const len = GetModuleFileNameW(null, &buf, 1024);
+    const len = GetModuleFileNameW(null, @as([*:0]u16, @ptrCast(&buf)), 1024);
     if (len == 0) return error.GetModuleFileNameFailed;
+
     
     // Convert UTF-16 to UTF-8
-    var out_list = std.ArrayList(u8).init(allocator);
-    errdefer out_list.deinit();
+    const out_buf = try allocator.alloc(u8, len * 3);
+    errdefer allocator.free(out_buf);
     
+    var out_idx: usize = 0;
     var i: usize = 0;
     while (i < len) : (i += 1) {
         const c = buf[i];
-        if (c < 0x80) { try out_list.append(@intCast(c)); }
-        else if (c < 0x800) { 
-            try out_list.append(@intCast(0xC0 | (c >> 6))); 
-            try out_list.append(@intCast(0x80 | (c & 0x3F))); 
+        if (c < 0x80) { 
+            out_buf[out_idx] = @intCast(c); out_idx += 1; 
+        } else if (c < 0x800) { 
+            out_buf[out_idx] = @intCast(0xC0 | (c >> 6)); out_idx += 1;
+            out_buf[out_idx] = @intCast(0x80 | (c & 0x3F)); out_idx += 1; 
         } else {
-            try out_list.append(@intCast(0xE0 | (c >> 12)));
-            try out_list.append(@intCast(0x80 | ((c >> 6) & 0x3F)));
-            try out_list.append(@intCast(0x80 | (c & 0x3F)));
+            out_buf[out_idx] = @intCast(0xE0 | (c >> 12)); out_idx += 1;
+            out_buf[out_idx] = @intCast(0x80 | ((c >> 6) & 0x3F)); out_idx += 1;
+            out_buf[out_idx] = @intCast(0x80 | (c & 0x3F)); out_idx += 1;
         }
     }
-    return out_list.toOwnedSlice();
+    return out_buf[0..out_idx];
 }
+
 
 pub fn getSiloRoot(allocator: std.mem.Allocator) ![]const u8 {
     if (global_silo_root) |r| return r;
@@ -104,9 +108,11 @@ pub fn getSiloRoot(allocator: std.mem.Allocator) ![]const u8 {
 }
 
 pub fn getAnchorPath(allocator: std.mem.Allocator, sub_path: []const u8) ![]const u8 {
+    if (std.fs.path.isAbsolute(sub_path)) return try allocator.dupe(u8, sub_path);
     const root = try getSiloRoot(allocator);
     return std.fs.path.join(allocator, &[_][]const u8{ root, sub_path });
 }
+
 
 
 pub fn findPluginFiles(allocator: std.mem.Allocator) ![][]const u8 {
@@ -189,15 +195,18 @@ pub fn findNativePlugins(allocator: std.mem.Allocator) ![][]const u8 {
     return results.toOwnedSlice(allocator);
 }
 
-pub fn isTrainerActive() bool {
+pub fn isTrainerActive(allocator: std.mem.Allocator) bool {
     var wbuf: [1024]u16 = undefined;
-    const h = CreateFileW(utf8ToW("plugins\\trainer.lock", &wbuf), 0x80000000, FILE_SHARE_READ | FILE_SHARE_WRITE, null, 3, 0x80, null);
+    const anchored = getAnchorPath(allocator, "plugins\\trainer.lock") catch return false;
+    defer allocator.free(anchored);
+    const h = CreateFileW(utf8ToW(anchored, &wbuf), 0x80000000, FILE_SHARE_READ | FILE_SHARE_WRITE, null, 3, 0x80, null);
     if (h != INVALID_HANDLE) {
         _ = CloseHandle(h);
         return true;
     }
     return false;
 }
+
 
 pub const FileHandle = *anyopaque;
 pub const INVALID_HANDLE = @as(*anyopaque, @ptrFromInt(0xFFFFFFFFFFFFFFFF));
@@ -250,32 +259,41 @@ pub fn utf8ToW(path: []const u8, buf: []u16) [*:0]const u16 {
 const FILE_SHARE_READ: u32 = 0x00000001;
 const FILE_SHARE_WRITE: u32 = 0x00000002;
 
-pub fn openForWrite(path: []const u8) !FileHandle {
+pub fn openForWrite(allocator: std.mem.Allocator, path: []const u8) !FileHandle {
     var wbuf: [1024]u16 = undefined;
-    const h = CreateFileW(utf8ToW(path, &wbuf), 0x40000000, FILE_SHARE_READ | FILE_SHARE_WRITE, null, 4, 128, null);
+    const anchored = try getAnchorPath(allocator, path);
+    defer allocator.free(anchored);
+    const h = CreateFileW(utf8ToW(anchored, &wbuf), 0x40000000, FILE_SHARE_READ | FILE_SHARE_WRITE, null, 4, 128, null);
     if (h == INVALID_HANDLE) return error.OpenFailed;
     return h;
 }
 
-pub fn openForWriteAppend(path: []const u8) !FileHandle {
+pub fn openForWriteAppend(allocator: std.mem.Allocator, path: []const u8) !FileHandle {
     var wbuf: [1024]u16 = undefined;
-    const h = CreateFileW(utf8ToW(path, &wbuf), 0x40000000, FILE_SHARE_READ | FILE_SHARE_WRITE, null, 4, 128, null);
+    const anchored = try getAnchorPath(allocator, path);
+    defer allocator.free(anchored);
+    const h = CreateFileW(utf8ToW(anchored, &wbuf), 0x40000000, FILE_SHARE_READ | FILE_SHARE_WRITE, null, 4, 128, null);
     if (h == INVALID_HANDLE) return error.OpenFailed;
     _ = SetFilePointerEx(h, 0, null, 2);
     return h;
 }
 
-pub fn openForRead(path: []const u8) !FileHandle {
+pub fn openForRead(allocator: std.mem.Allocator, path: []const u8) !FileHandle {
     var wbuf: [1024]u16 = undefined;
-    const h = CreateFileW(utf8ToW(path, &wbuf), 0x80000000, FILE_SHARE_READ | FILE_SHARE_WRITE, null, 3, 0x80, null);
+    const anchored = try getAnchorPath(allocator, path);
+    defer allocator.free(anchored);
+    const h = CreateFileW(utf8ToW(anchored, &wbuf), 0x80000000, FILE_SHARE_READ | FILE_SHARE_WRITE, null, 3, 0x80, null);
     if (h == INVALID_HANDLE) return error.FileNotFound;
     return h;
 }
 
-pub fn createMappedFile(path: []const u8, size: usize) !MappedFile {
+pub fn createMappedFile(allocator: std.mem.Allocator, path: []const u8, size: usize) !MappedFile {
     var wbuf: [1024]u16 = undefined;
-    const wpath = utf8ToW(path, &wbuf);
+    const anchored = try getAnchorPath(allocator, path);
+    defer allocator.free(anchored);
+    const wpath = utf8ToW(anchored, &wbuf);
     const fh = CreateFileW(wpath, 0xC0000000, FILE_SHARE_READ | FILE_SHARE_WRITE, null, 4, 0x80, null);
+
     if (fh == INVALID_HANDLE) return error.CreateFailed;
     var current_size: i64 = 0;
     if (GetFileSizeEx(fh, &current_size) != 0) {

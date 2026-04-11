@@ -7,9 +7,14 @@ const vsa_vulkan = @import("vsa_vulkan.zig");
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
     sys.printOut("=== Ghost Absolute Sigil Audit ===\n");
+    const state_monolith = try sys.getAnchorPath(allocator, "state/semantic_monolith.bin"); // Ensure we use 'state/' as per engine norm
+    defer allocator.free(state_monolith);
+    const state_tags = try sys.getAnchorPath(allocator, "state/semantic_tags.bin");
+    defer allocator.free(state_tags);
 
-    const mapped_meaning = try sys.createMappedFile("semantic_monolith.bin", 1024 * 1024 * 1024);
-    const mapped_tags = try sys.createMappedFile("semantic_tags.bin", 1048576 * 8);
+    const mapped_meaning = try sys.createMappedFile(allocator, state_monolith, 1024 * 1024 * 1024);
+    const mapped_tags = try sys.createMappedFile(allocator, state_tags, 1048576 * 8);
+
     var meaning_matrix = vsa.MeaningMatrix{ 
         .data = @as([*]u16, @ptrCast(@alignCast(mapped_meaning.data.ptr)))[0..(1048576 * 1024)],
         .tags = @as([*]u64, @ptrCast(@alignCast(mapped_tags.data.ptr)))[0..1048576],

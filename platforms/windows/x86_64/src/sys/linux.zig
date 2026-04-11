@@ -28,13 +28,23 @@ pub fn readStdin(buffer: []u8) ![]u8 {
     return buffer[0..bytes_read];
 }
 
-pub fn openForRead(path: []const u8) !FileHandle {
+pub fn openForRead(allocator: std.mem.Allocator, path: []const u8) !FileHandle {
+    _ = allocator;
     return std.os.open(path, std.os.O.RDONLY, 0) catch error.FileNotFound;
 }
 
-pub fn openForWrite(path: []const u8) !FileHandle {
+pub fn openForWrite(allocator: std.mem.Allocator, path: []const u8) !FileHandle {
+    _ = allocator;
     return std.os.open(path, std.os.O.WRONLY | std.os.O.CREAT | std.os.O.TRUNC, 0o644) catch error.OpenFailed;
 }
+
+pub fn openForWriteAppend(allocator: std.mem.Allocator, path: []const u8) !FileHandle {
+    _ = allocator;
+    const fd = try std.os.open(path, std.os.O.WRONLY | std.os.O.CREAT, 0o644);
+    _ = try std.os.lseek(fd, 0, std.os.SEEK.END);
+    return fd;
+}
+
 
 pub fn closeFile(handle: FileHandle) void {
     std.os.close(handle);
@@ -64,7 +74,8 @@ pub fn writeAll(handle: FileHandle, data: []const u8) !void {
     }
 }
 
-pub fn createMappedFile(path: []const u8, size: usize) !MappedFile {
+pub fn createMappedFile(allocator: std.mem.Allocator, path: []const u8, size: usize) !MappedFile {
+    _ = allocator;
     const fd = try std.os.open(path, std.os.O.RDWR | std.os.O.CREAT, 0o644);
     try std.os.ftruncate(fd, size);
     const ptr = try std.os.mmap(null, size, std.os.PROT.READ | std.os.PROT.WRITE, std.os.MAP.SHARED, fd, 0);
@@ -73,6 +84,7 @@ pub fn createMappedFile(path: []const u8, size: usize) !MappedFile {
         .data = ptr,
     };
 }
+
 
 pub fn allocSectorAligned(size: usize) ?[]u8 {
     const aligned_size = (size + SECTOR_SIZE - 1) & ~(SECTOR_SIZE - 1);
@@ -103,21 +115,47 @@ pub fn getArgs(allocator: std.mem.Allocator) ![][]const u8 {
     return std.process.argsAlloc(allocator);
 }
 
-pub fn isTrainerActive() bool {
-    const fd = std.os.open("plugins/trainer.lock", std.os.O.RDONLY, 0) catch return false;
+pub fn isTrainerActive(allocator: std.mem.Allocator) bool {
+    const anchored = getAnchorPath(allocator, "plugins/trainer.lock") catch return false;
+    defer allocator.free(anchored);
+    const fd = std.os.open(anchored, std.os.O.RDONLY, 0) catch return false;
     std.os.close(fd);
     return true;
 }
 
+
+pub fn getSiloRoot(allocator: std.mem.Allocator) ![]const u8 {
+    var buf: [1024]u8 = undefined;
+    const len = try std.os.readlink("/proc/self/exe", &buf);
+    const exe_path = buf[0..len];
+    const bin_dir = std.fs.path.dirname(exe_path) orelse return error.NoDirName;
+    const silo_root = std.fs.path.dirname(bin_dir) orelse bin_dir;
+    return try allocator.dupe(u8, silo_root);
+}
+
+pub fn getAnchorPath(allocator: std.mem.Allocator, sub_path: []const u8) ![]const u8 {
+    if (std.fs.path.isAbsolute(sub_path)) return try allocator.dupe(u8, sub_path);
+    const root = try getSiloRoot(allocator);
+    defer allocator.free(root);
+    return try std.fs.path.join(allocator, &[_][]const u8{ root, sub_path });
+}
+
+
 pub fn findPluginFiles(allocator: std.mem.Allocator) ![][]const u8 {
     var results = std.ArrayList([]const u8).init(allocator);
-    var dir = std.fs.cwd().openIterableDir("plugins", .{}) catch return results.toOwnedSlice();
+    const anchored_plugins = try getAnchorPath(allocator, "plugins");
+    defer allocator.free(anchored_plugins);
+    
+    var dir = std.fs.openIterableDirAbsolute(anchored_plugins, .{}) catch return results.toOwnedSlice();
     var iter = dir.iterate();
     while (try iter.next()) |entry| {
         if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".sigil")) {
-            const path = try std.fmt.allocPrint(allocator, "plugins/{s}", .{entry.name});
-            try results.append(path);
+            const joined = try std.fs.path.join(allocator, &[_][]const u8{ "plugins", entry.name });
+            defer allocator.free(joined);
+            const full_path = try getAnchorPath(allocator, joined);
+            try results.append(full_path);
         }
     }
     return results.toOwnedSlice();
 }
+

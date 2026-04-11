@@ -301,11 +301,12 @@ fn getLobeIndices(h: u64) [4]u32 {
     };
 }
 
-fn finalizeSigil() !void {
+fn finalizeSigil(allocator: std.mem.Allocator) !void {
     const path = current_sigil_path orelse return;
     const cms = dense_cms orelse return;
-    const h = try sys.openForWrite(path);
+    const h = try sys.openForWrite(allocator, path);
     defer sys.closeFile(h);
+
 
     // 1. Write VSA Identity Header (128 bytes)
     const id_bytes: [128]u8 = @bitCast(current_id_vector);
@@ -362,8 +363,9 @@ pub fn main() !void {
     }
 
     const script_path = args[1];
-    const fh = try sys.openForRead(script_path);
+    const fh = try sys.openForRead(arena_alloc.allocator(), script_path);
     defer sys.closeFile(fh);
+
 
     const size = try sys.getFileSize(fh);
     const buffer = try arena_alloc.allocator().alloc(u8, size);
@@ -387,6 +389,7 @@ pub fn main() !void {
         }
     }
 
-    try finalizeSigil();
+    try finalizeSigil(arena_alloc.allocator());
+
     sys.printOut("\nSigil compilation complete (128 MiB dense cartridge format).\n");
 }

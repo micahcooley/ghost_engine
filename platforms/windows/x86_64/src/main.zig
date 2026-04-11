@@ -30,26 +30,29 @@ pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
     sys.printOut("[MONOLITH] Mapping Cortex...\n");
-    const mapped_lattice = try sys.createMappedFile("state/unified_lattice.bin", ghost_state.UNIFIED_SIZE_BYTES);
+    const mapped_lattice = try sys.createMappedFile(allocator, "state/unified_lattice.bin", ghost_state.UNIFIED_SIZE_BYTES);
+    if (mapped_lattice.data.len < ghost_state.UNIFIED_SIZE_BYTES) return error.LatticeMapFailed;
+
     const lattice: *ghost_state.UnifiedLattice = @as(*ghost_state.UnifiedLattice, @ptrCast(@alignCast(mapped_lattice.data.ptr)));
 
     sys.printOut("[MEANING] Mapping Hippocampus...\n");
-    const mapped_meaning = try sys.createMappedFile("state/semantic_monolith.bin", 1024*1024*1024);
-    const mapped_tags = try sys.createMappedFile("state/semantic_tags.bin", 1048576 * 8);
+    const mapped_meaning = try sys.createMappedFile(allocator, "state/semantic_monolith.bin", 1024*1024*1024);
+    const mapped_tags = try sys.createMappedFile(allocator, "state/semantic_tags.bin", 1048576 * 8);
+
     var meaning_matrix = vsa.MeaningMatrix{ 
         .data = @as([*]u16, @ptrCast(@alignCast(mapped_meaning.data.ptr)))[0..(1024*1024*512)], 
         .tags = @as([*]u64, @ptrCast(@alignCast(mapped_tags.data.ptr)))[0..1048576] 
     };
 
-    sys.printOut("[VULKAN] Initializing...\n");
-    var vk_engine_opt: ?vsa_vulkan.VulkanEngine = null;
-    if (vsa_vulkan.VulkanEngine.init(allocator)) |init_engine| {
-        vk_engine_opt = init_engine;
-        global_vk_engine = &vk_engine_opt.?;
-        if (vk_engine_opt.?.mapped_matrix) |mm| {
-            std.mem.copyForwards(u16, @as([*]u16, @ptrCast(@alignCast(mm)))[0..(1024*1024*512)], meaning_matrix.data);
-        }
+    sys.printOut("[VULKAN] Initializing Sovereign Compute...\n");
+    var active_compute: ?*const core.compute_api.ComputeApi = null;
+    if (vsa_vulkan.GHOST_COMPUTE_PLUGIN.init(allocator)) |compute| {
+        active_compute = compute;
+        sys.printOut("[COMPUTE] ");
+        sys.printOut(compute.name);
+        sys.printOut(" active.\n");
     } else |_| sys.printOut("[VULKAN] Failed.\n");
+
 
     var soul = ghost_state.GhostSoul.init(allocator); 
     soul.meaning_matrix = &meaning_matrix;
@@ -71,11 +74,13 @@ pub fn main() !void {
             .meaning = &meaning_matrix, 
             .soul = &soul, 
             .canvas = ghost_state.MesoLattice.initText(), 
-            .is_live = sys.isTrainerActive(), 
+            .is_live = sys.isTrainerActive(allocator), 
             .inventory = [_]u8{0} ** 128, 
             .inv_cursor = 0, 
-            .vk_engine = if (vk_engine_opt) |*ve| ve else null 
+            .compute = active_compute 
         };
+
+
 
         while (true) {
             const chosen = engine.resolveTopology() orelse break; 

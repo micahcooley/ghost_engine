@@ -1,0 +1,23 @@
+install
++- install ghost_sovereign
+   +- compile exe ghost_sovereign ReleaseSafe native 1 errors
+x86_64\src\main.zig:71:52: error: missing struct field: allocator
+        var engine = engine_logic.SingularityEngine{ 
+                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+x86_64\src\engine.zig:65:31: note: struct declared here
+pub const SingularityEngine = struct {
+                              ^~~~~~
+referenced by:
+    callMain [inlined]: C:\zig\lib\std\start.zig:685:59
+    main: C:\zig\lib\std\start.zig:657:28
+    2 reference(s) hidden; use '-freference-trace=4' to see all references
+error: 1 compilation errors
+failed command: "C:\\zig\\zig.exe" build-exe -lvulkan-1 -OReleaseSafe -I "C:\\VulkanSDK\\1.4.341.1\\Include" -L "C:\\VulkanSDK\\1.4.341.1\\Lib" --dep ghost_core "-Mroot=C:\\ghost_engine\\platforms\\windows\\x86_64\\src\\main.zig" -I "C:\\VulkanSDK\\1.4.341.1\\Include" "-Mghost_core=C:\\ghost_engine\\platforms\\windows\\x86_64\\src\\ghost.zig" -lc --cache-dir .zig-cache --global-cache-dir "C:\\Users\\micah\\AppData\\Local\\zig" --name ghost_sovereign --zig-lib-dir "C:\\zig\\lib\\" --listen=-
+
+Build Summary: 9/12 steps succeeded (1 failed)
+install transitive failure
++- install ghost_sovereign transitive failure
+   +- compile exe ghost_sovereign ReleaseSafe native 1 errors
+
+error: the following build command failed with exit code 1:
+.zig-cache\o\c2315cb543ed5a82db8b7643185232f4\build.exe C:\zig\zig.exe C:\zig\lib C:\ghost_engine\platforms\windows .zig-cache C:\Users\micah\AppData\Local\zig --seed 0x50b8084e -Z6a8949a7116515da -Doptimize=ReleaseSafe

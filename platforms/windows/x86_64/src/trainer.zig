@@ -4,8 +4,9 @@ const sys = core.sys;
 const ghost_state = core.ghost_state;
 const vsa = core.vsa;
 const vsa_vulkan = core.vsa_vulkan;
-const compute_api = @import("compute_api.zig");
+const compute_api = core.compute_api;
 const builtin = @import("builtin");
+
 
 const WINAPI = if (builtin.os.tag == .windows) std.builtin.CallingConvention.winapi else .C;
 extern "kernel32" fn SetConsoleCtrlHandler(handler: ?*const fn(u32) callconv(WINAPI) i32, add: i32) callconv(WINAPI) i32;
@@ -263,14 +264,16 @@ fn main_wrapped() !void {
 
     // ── 2. Map the 1GB Unified Lattice into GPU buffer ──
     sys.printOut("[CORTEX] Mapping 1GB Unified Lattice...\n");
-    var mapped = try sys.createMappedFile("state/unified_lattice.bin", ghost_state.UNIFIED_SIZE_BYTES);
+    var mapped = try sys.createMappedFile(allocator, "state/unified_lattice.bin", ghost_state.UNIFIED_SIZE_BYTES);
+
     global_mapped = mapped;
     var lattice = @as(*ghost_state.UnifiedLattice, @ptrCast(@alignCast(mapped.data.ptr)));
 
     // ── 3. Initialize Compute Provider (Vulkan/iGPU) with CPU Fallback ──
     sys.printOut("[COMPUTE] Initializing Sovereign Compute Provider...\n");
-    var compute_or_err = vsa_vulkan.GHOST_COMPUTE_PLUGIN.init(allocator) catch null;
+    const compute_or_err = vsa_vulkan.GHOST_COMPUTE_PLUGIN.init(allocator) catch null;
     var meaning_matrix: vsa.MeaningMatrix = undefined;
+
 
     if (compute_or_err) |compute| {
         active_compute = compute;
@@ -305,7 +308,8 @@ fn main_wrapped() !void {
     }
 
     // ── 4. Load Existing Meaning Matrix ──
-    const hMM = sys.openForRead("state/semantic_monolith.bin") catch null;
+    const hMM = sys.openForRead(allocator, "state/semantic_monolith.bin") catch null;
+
     if (hMM) |h| {
         _ = try sys.readAll(h, @as([]u8, @ptrCast(meaning_matrix.data)));
         sys.closeFile(h);
@@ -317,7 +321,8 @@ fn main_wrapped() !void {
     _ = corpus_files; // We load from the primary path for now
 
     // Load primary corpus
-    const corpus_handle = try sys.openForRead(corpus_path);
+    const corpus_handle = try sys.openForRead(allocator, corpus_path);
+
     const corpus_size = try sys.getFileSize(corpus_handle);
     var corpus_buf = try allocator.alloc(u8, corpus_size);
     const bytes_read = try sys.readAll(corpus_handle, corpus_buf);
@@ -343,7 +348,8 @@ fn main_wrapped() !void {
         var loaded: usize = 1;
         for (extra_files) |fpath| {
             if (loaded >= num_streams) break;
-            if (sys.openForRead(fpath)) |h| {
+            if (sys.openForRead(allocator, fpath)) |h| {
+
                 const sz = sys.getFileSize(h) catch 0;
                 if (sz > 0) {
                     var buf = try allocator.alloc(u8, sz);
@@ -540,14 +546,16 @@ fn main_wrapped() !void {
     mapped.unmap();
     global_mapped = null;
 
-    const hOut = sys.openForWrite("state/semantic_monolith.bin") catch null;
+    const hOut = sys.openForWrite(allocator, "state/semantic_monolith.bin") catch null;
+
     if (hOut) |h| {
         const mm_bytes = std.mem.sliceAsBytes(meaning_matrix.data);
         _ = sys.writeAll(h, mm_bytes) catch 0;
         sys.closeFile(h);
     }
 
-    const hTags = sys.openForWrite("state/semantic_tags.bin") catch null;
+    const hTags = sys.openForWrite(allocator, "state/semantic_tags.bin") catch null;
+
     if (hTags) |h| {
         if (meaning_matrix.tags) |tags| {
             _ = sys.writeAll(h, std.mem.sliceAsBytes(tags)) catch 0;

@@ -169,27 +169,51 @@ pub const VulkanEngine = struct {
         createInfo.pApplicationInfo = &appInfo;
         try check(vk.vkCreateInstance(&createInfo, null, &engine.instance));
 
-        // 2. Physical Device
+        // 2. Physical Device Selection (Scoring)
         var deviceCount: u32 = 0;
         try check(vk.vkEnumeratePhysicalDevices(engine.instance, &deviceCount, null));
+        if (deviceCount == 0) return error.NoVulkanDevicesFound;
+
         const pdevs = try allocator.alloc(vk.VkPhysicalDevice, deviceCount);
         defer allocator.free(pdevs);
         try check(vk.vkEnumeratePhysicalDevices(engine.instance, &deviceCount, pdevs.ptr));
+
+        var best_score: u32 = 0;
         for (pdevs) |pd| {
+            var props: vk.VkPhysicalDeviceProperties = undefined;
+            vk.vkGetPhysicalDeviceProperties(pd, &props);
+            
+            var features: vk.VkPhysicalDeviceFeatures = undefined;
+            vk.vkGetPhysicalDeviceFeatures(pd, &features);
+
+            // Required features for Ghost Engine V23
+            if (features.shaderInt64 != vk.VK_TRUE) continue;
+            
+            var score: u32 = 0;
+            if (props.deviceType == vk.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) score += 10000;
+            score += props.limits.maxComputeWorkGroupInvocations;
+
             var qfCount: u32 = 0;
             vk.vkGetPhysicalDeviceQueueFamilyProperties(pd, &qfCount, null);
             const qfs = try allocator.alloc(vk.VkQueueFamilyProperties, qfCount);
             defer allocator.free(qfs);
             vk.vkGetPhysicalDeviceQueueFamilyProperties(pd, &qfCount, qfs.ptr);
+
+            var found_compute = false;
             for (qfs, 0..) |qf, i| {
                 if ((qf.queueFlags & vk.VK_QUEUE_COMPUTE_BIT) != 0) {
-                    engine.pdev = pd;
-                    engine.queue_family = @intCast(i);
+                    if (score > best_score) {
+                        best_score = score;
+                        engine.pdev = pd;
+                        engine.queue_family = @intCast(i);
+                        found_compute = true;
+                    }
                     break;
                 }
             }
-            if (engine.pdev != null) break;
         }
+
+        if (engine.pdev == null) return error.NoSuitableGPUFound;
 
         // ── V23 Hardware Feature Detection ──
         var deviceFeatures: vk.VkPhysicalDeviceFeatures = undefined;
@@ -200,6 +224,7 @@ pub const VulkanEngine = struct {
         vk.vkGetPhysicalDeviceProperties(engine.pdev, &devProps);
         engine.max_workgroup_invocations = devProps.limits.maxComputeWorkGroupInvocations;
 
+        std.debug.print("[VULKAN] Selected Device: {s}\n", .{devProps.deviceName});
         std.debug.print("[VULKAN] shaderInt16: {any}\n", .{engine.supports_int16});
         std.debug.print("[VULKAN] maxComputeWorkGroupInvocations: {d}\n", .{engine.max_workgroup_invocations});
 
