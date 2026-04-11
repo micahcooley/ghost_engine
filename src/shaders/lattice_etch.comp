@@ -24,7 +24,7 @@ layout(push_constant) uniform Constants {
     uint _pad;
 } params;
 
-// ── V23 Parallel Prefix Scan: Shared Temporal Cache ──
+// ── V27 Parallel Prefix Scan: Shared Temporal Cache ──
 shared uint temporal_cache[1024];
 
 const uint64_t FNV_OFFSET = 14695981039346656037ul;

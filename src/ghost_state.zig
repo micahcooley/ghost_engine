@@ -42,6 +42,10 @@ pub const GhostSoul = struct {
     fractal_state: vsa.HyperVector,
     spell_vector: vsa.HyperVector,
 
+    // ── L2 Semantic Cache (Phantom Lobe) ──
+    l2_cache: [256]vsa.HyperVector,
+    l2_ptr: usize,
+
     // Vectorial Gravity: Semantic Pool
     sentence_pool: vsa.HyperVector,
     meaning_matrix: ?*vsa.MeaningMatrix,
@@ -77,6 +81,8 @@ pub const GhostSoul = struct {
             .allocator = allocator,
             .rotor_history = [_]u64{0} ** 16,
             .history_ptr = 0,
+            .l2_cache = [_]vsa.HyperVector{@as(vsa.HyperVector, @splat(0))} ** 256,
+            .l2_ptr = 0,
             .rolling_buffer = [_]u8{0} ** 65536,
             .rolling_idx = 0,
             .energy_word_threshold = 700,
@@ -208,6 +214,29 @@ pub const GhostSoul = struct {
         } else self.detectSnap(self.last_energy);
 
         self.last_boundary = boundary;
+
+        // 1b. L2 Ring Buffer Management (Phantom Lobe)
+        if (boundary == .sentence or boundary == .paragraph) {
+            self.l2_cache[self.l2_ptr] = self.fractal_state;
+            self.l2_ptr = (self.l2_ptr + 1) % 256;
+        }
+
+        // 1c. L2 Retrieval (Semantic Page Fault)
+        // If resonance is garbage (< 15%), attempt recovery from L2 cache
+        if (self.last_energy < 150) {
+            var best_res: u16 = 0;
+            var best_idx: ?usize = null;
+            for (self.l2_cache, 0..) |past_state, i| {
+                const r = vsa.calculateResonance(past_state, token_vec);
+                if (r > best_res) {
+                    best_res = r;
+                    best_idx = i;
+                }
+            }
+            if (best_res > 700) { // Found a resonant past context
+                self.fractal_state = self.l2_cache[best_idx.?];
+            }
+        }
 
         // 2. Update state based on boundary detection
         self.pushRotor(rune);
@@ -635,12 +664,15 @@ pub const UnifiedLattice = struct {
     /// Solstice Decay: global >> 1 across the entire 1GB Monolith.
     /// Halves all counters to free headroom, preserving relative rankings.
     /// Called when sampled occupancy exceeds SOLSTICE_THRESHOLD.
-    /// Global shift and check for Scaling Realignment (V23).
+    /// Global shift and check for Scaling Realignment (V27).
     /// Returns true if expansion is required (saturation exceeds 85.00%).
     pub fn solsticeDecay(self: *UnifiedLattice) bool {
         const occ = self.sampleOccupancy(0x1337);
         for (&self.data) |*entry| {
-            entry.* >>= 1;
+            // Masked Bit-Shifting (Myelination): Skip if MSB is locked (0x8000)
+            if (entry.* < 0x8000) {
+                entry.* >>= 1;
+            }
         }
         return occ > 8500;
     }
@@ -651,7 +683,9 @@ pub const UnifiedLattice = struct {
     pub fn chunkedSolsticeDecay(self: *UnifiedLattice, position: *usize) bool {
         const end = @min(position.* + SOLSTICE_CHUNK, UNIFIED_ENTRIES);
         for (position.*..end) |i| {
-            self.data[i] >>= 1;
+            if (self.data[i] < 0x8000) {
+                self.data[i] >>= 1;
+            }
         }
         position.* = end;
         if (position.* >= UNIFIED_ENTRIES) {

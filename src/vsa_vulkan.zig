@@ -129,7 +129,7 @@ pub const VulkanEngine = struct {
     descriptor_pool: vk.VkDescriptorPool = null,
     descriptor_sets: [FRAME_COUNT]vk.VkDescriptorSet = [_]vk.VkDescriptorSet{null} ** FRAME_COUNT,
 
-    // ── V23: Operational Tier & Hardware Detection ──
+    // ── V27: Operational Tier & Hardware Detection ──
     tier: OperationalTier = .standard,
     max_workgroup_invocations: u32 = 1024,
     max_alloc_count: u32 = 4096,
@@ -228,7 +228,7 @@ pub const VulkanEngine = struct {
             var features: vk.VkPhysicalDeviceFeatures = undefined;
             vk.vkGetPhysicalDeviceFeatures(pd, &features);
 
-            // Required features for Ghost Engine V23
+            // Required features for Ghost Engine V27
             if (features.shaderInt64 != vk.VK_TRUE) continue;
             
             var score: u32 = 0;
@@ -258,7 +258,7 @@ pub const VulkanEngine = struct {
 
         if (engine.pdev == null) return error.NoSuitableGPUFound;
 
-        // ── V23 Hardware Feature Detection ──
+        // ── V27 Hardware Feature Detection ──
         var deviceFeatures: vk.VkPhysicalDeviceFeatures = undefined;
         vk.vkGetPhysicalDeviceFeatures(engine.pdev, &deviceFeatures);
         engine.supports_int16 = deviceFeatures.shaderInt16 == vk.VK_TRUE;
@@ -315,7 +315,7 @@ pub const VulkanEngine = struct {
             std.debug.print("[VULKAN] High-Tier Detected: Enabling DEVICE_LOCAL Lattice Pinning.\n", .{});
             matrix_flags = vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
             // Note: If we use DEVICE_LOCAL without HOST_VISIBLE, we'd need staging buffers for getMatrixData().
-            // For V23, we prioritize ReBAR (DEVICE_LOCAL | HOST_VISIBLE).
+            // For V27, we prioritize ReBAR (DEVICE_LOCAL | HOST_VISIBLE).
             // findMemoryType will fallback to HOST_VISIBLE if DEVICE_LOCAL is not mappable.
             matrix_flags |= vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
         }
@@ -688,7 +688,7 @@ pub const VulkanEngine = struct {
         try check(vk.vkWaitForFences(self.dev, 1, &self.fences[f], vk.VK_TRUE, std.math.maxInt(u64)));
 
         const result = try allocator.alloc(u32, 256);
-        std.mem.copyForwards(u32, result, self.mapped_energy[f].?[0..256]);
+        ghostCopy(u32, result, self.mapped_energy[f].?[0..256]);
         self.frame_idx = (self.frame_idx + 1) % FRAME_COUNT;
         return result;
     }
@@ -960,7 +960,7 @@ const VULKAN_API = compute_api.ComputeApi{
 
 pub const GHOST_COMPUTE_PLUGIN = compute_api.ComputePlugin{
     .name = "Ghost-Vulkan-Native",
-    .version = 0x17, // V23
+    .version = 0x1B, // V27
     .init = pluginInit,
     .deinit = pluginDeinit,
 };

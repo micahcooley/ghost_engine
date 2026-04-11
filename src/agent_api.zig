@@ -2,9 +2,8 @@ const std = @import("std");
 const vsa = @import("vsa_core.zig");
 const ghost_state = @import("ghost_state.zig");
 
-/// Ghost Engine Sovereign Agent Interface
-/// Agents are autonomous resonance threads that manifest when specific
-/// matrix patterns reach a critical resonance threshold (> 0.85).
+/// [ASPIRATIONAL] This interface is not yet used by any production code.
+/// See AGENTS_SPEC.md for the intended architecture.
 pub const AgentApi = struct {
     name: []const u8,
     

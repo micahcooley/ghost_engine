@@ -1,7 +1,7 @@
 const std = @import("std");
 
-/// Ghost Engine Native Plugin Interface (Sovereign Contract)
-/// Every plugin must export a symbol named 'plugin_info' of this type.
+/// [ASPIRATIONAL] This interface is not yet used by any production code.
+/// Plugin hot-loading is a planned feature.
 pub const PluginApi = struct {
     name: []const u8,
     version: u32,

@@ -1,9 +1,10 @@
 const std = @import("std");
 
-/// Ghost Engine Compute API Interface (Sovereign Threading Contract)
-/// This allows the engine to swap between Vulkan, CUDA, and CPU backends.
+/// [ASPIRATIONAL] This interface is not yet used by any production code.
+/// Currently vsa_vulkan.zig implements compute directly. This abstraction
+/// will enable CUDA and CPU backends in future releases.
 pub const ComputeApi = struct {
-    /// Human-readable name of the provider (e.g., "Vulkan-V23", "CUDA-X")
+    /// Human-readable name of the provider (e.g., "Vulkan-V27", "CUDA-X")
     name: []const u8,
 
     /// Returns the raw pointer to the Meaning Matrix memory managed by the provider.
@@ -33,7 +34,7 @@ pub const ComputeApi = struct {
     /// Update the operational tier (power/performance targets).
     setTier: *const fn (tier: u32) void,
 
-    /// Transfer the lattice from host to device memory (V23 Async Bridge).
+    /// Transfer the lattice from host to device memory.
     transferLattice: *const fn () anyerror!void,
 };
 

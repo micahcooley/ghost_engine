@@ -26,7 +26,7 @@ pub fn main() !void {
         _ = SetConsoleCtrlHandler(ctrlHandler, 1);
     }
 
-    sys.printOut("\nGhost V22: Symmetric Bitwise Intelligence Engine (Windows x64)\n");
+    sys.printOut("\nGhost V27: Symmetric Bitwise Intelligence Engine\n");
     const allocator = std.heap.page_allocator;
 
     sys.printOut("[MONOLITH] Mapping Cortex...\n");

@@ -144,7 +144,7 @@ void main() {
             uint best_char = shared_chars[0];
             uint best_energy = shared_energies[0];
 
-            // --- Task 2: Bitwise Beam Culling (V23) ---
+            // --- Task 2: Bitwise Beam Culling (V27) ---
             // If the path is already dying by step 2 or 3, prune it.
             if ((step == 2u || step == 3u) && best_energy < 400u) {
                 path_killed = true;

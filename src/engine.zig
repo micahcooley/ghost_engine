@@ -4,7 +4,6 @@ const vsa = @import("vsa_core.zig");
 const ghost_state = @import("ghost_state.zig");
 const vsa_vulkan = @import("vsa_vulkan.zig");
 const compute_api = @import("compute_api.zig");
-const inference = @import("inference.zig");
 
 pub const VERSION = "V27";
 
