@@ -101,6 +101,5 @@ Write-Host "------------------------------------------------"
 Write-Host "To build the engine without global installs:" -ForegroundColor Gray
 Write-Host "1. `$env:PATH = '$ZigDir;' + `$env:PATH" -ForegroundColor White
 Write-Host "2. `$env:VULKAN_SDK = '$VulkanDir'" -ForegroundColor White
-Write-Host "3. cd platforms/windows" -ForegroundColor White
-Write-Host "4. zig build release -Doptimize=ReleaseFast" -ForegroundColor Yellow
+Write-Host "3. (from project root) zig build -Doptimize=ReleaseFast" -ForegroundColor Yellow
 Write-Host "------------------------------------------------"

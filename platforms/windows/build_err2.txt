@@ -1,5 +1,0 @@
-
-[WARNING] Zig Version Mismatch: Detected 0.16.0
-[INFO] Ghost Engine V23 is optimized for Zig 0.13.0 Stable.
-[FIX] Run '.\sylor_forge.ps1' and follow instructions to use the hermetic toolchain.
-
