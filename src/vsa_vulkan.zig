@@ -113,6 +113,11 @@ pub const VulkanEngine = struct {
     char_memories: [FRAME_COUNT]vk.VkDeviceMemory = [_]vk.VkDeviceMemory{null} ** FRAME_COUNT,
     mapped_chars: [FRAME_COUNT]?[*]u32 = [_]?[*]u32{null} ** FRAME_COUNT,
 
+    // ── 3.5. Rotor Demux Index (V28: 4096 * 4 bytes, u32 stream ID per slot) ──
+    index_buffers: [FRAME_COUNT]vk.VkBuffer = [_]vk.VkBuffer{null} ** FRAME_COUNT,
+    index_memories: [FRAME_COUNT]vk.VkDeviceMemory = [_]vk.VkDeviceMemory{null} ** FRAME_COUNT,
+    mapped_index: [FRAME_COUNT]?[*]u32 = [_]?[*]u32{null} ** FRAME_COUNT,
+
     // ── 4. Batch Output Energies (4096 * 4 bytes) ──
     energy_buffers: [FRAME_COUNT]vk.VkBuffer = [_]vk.VkBuffer{null} ** FRAME_COUNT,
     energy_memories: [FRAME_COUNT]vk.VkDeviceMemory = [_]vk.VkDeviceMemory{null} ** FRAME_COUNT,
@@ -179,15 +184,25 @@ pub const VulkanEngine = struct {
     }
 
     fn updateDescriptorSets(self: *VulkanEngine, f_idx: u32) void {
+        // V28: 7 bindings — added rotor_index at binding 3
+        // Binding layout:
+        //   0: meaning_matrix
+        //   1: rotor_buffers  (per-stream rotor pairs)
+        //   2: char_buffers   (greedy-packed rune data)
+        //   3: index_buffers  (per-rune stream ID — V28 new)
+        //   4: tag_buffer
+        //   5: lattice_buffer
+        //   6: energy_buffers (output)
         var bInfos = [_]vk.VkDescriptorBufferInfo{
-            .{ .buffer = self.matrix_buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = self.matrix_buffer,        .offset = 0, .range = vk.VK_WHOLE_SIZE },
             .{ .buffer = self.rotor_buffers[f_idx], .offset = 0, .range = vk.VK_WHOLE_SIZE },
-            .{ .buffer = self.char_buffers[f_idx], .offset = 0, .range = vk.VK_WHOLE_SIZE },
-            .{ .buffer = self.energy_buffers[f_idx], .offset = 0, .range = vk.VK_WHOLE_SIZE },
-            .{ .buffer = self.tag_buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE },
-            .{ .buffer = self.lattice_buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = self.char_buffers[f_idx],  .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = self.index_buffers[f_idx], .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = self.tag_buffer,            .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = self.lattice_buffer,        .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = self.energy_buffers[f_idx],.offset = 0, .range = vk.VK_WHOLE_SIZE },
         };
-        var wds = [_]vk.VkWriteDescriptorSet{ std.mem.zeroes(vk.VkWriteDescriptorSet) } ** 6;
+        var wds = [_]vk.VkWriteDescriptorSet{ std.mem.zeroes(vk.VkWriteDescriptorSet) } ** 7;
         for (&wds, 0..) |*w, i| {
             w.sType = vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             w.dstSet = self.descriptor_sets[f_idx];
@@ -196,7 +211,7 @@ pub const VulkanEngine = struct {
             w.descriptorCount = 1;
             w.pBufferInfo = &bInfos[i];
         }
-        vk.vkUpdateDescriptorSets(self.dev, 6, &wds[0], 0, null);
+        vk.vkUpdateDescriptorSets(self.dev, 7, &wds[0], 0, null);
     }
 
     pub fn init(allocator: std.mem.Allocator) !VulkanEngine {
@@ -334,8 +349,13 @@ pub const VulkanEngine = struct {
         engine.mapped_tags = @ptrCast(@alignCast(try engine.createBuffer(init_tag_size, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, matrix_flags, &engine.tag_buffer, &engine.tag_memory)));
         
         for (0..FRAME_COUNT) |i| {
-            engine.mapped_rotors[i] = @ptrCast(@alignCast(try engine.createBuffer(4096 * 8 * 2, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, batch_flags, &engine.rotor_buffers[i], &engine.rotor_memories[i])));
+            // Rotors: MAX_STREAMS * 2 u64s (lex + sem per stream)
+            engine.mapped_rotors[i] = @ptrCast(@alignCast(try engine.createBuffer(64 * 2 * 8, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, batch_flags, &engine.rotor_buffers[i], &engine.rotor_memories[i])));
+            // Chars: 4096 slots * 4 bytes (greedy-packed unified buffer)
             engine.mapped_chars[i] = @ptrCast(@alignCast(try engine.createBuffer(4096 * 4, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, batch_flags, &engine.char_buffers[i], &engine.char_memories[i])));
+            // V28: Rotor demux index — 4096 u32 stream IDs parallel to char buffer
+            engine.mapped_index[i] = @ptrCast(@alignCast(try engine.createBuffer(4096 * 4, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, batch_flags, &engine.index_buffers[i], &engine.index_memories[i])));
+            // Energy output: 4096 u32 slots
             engine.mapped_energy[i] = @ptrCast(@alignCast(try engine.createBuffer(4096 * 4, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, batch_flags, &engine.energy_buffers[i], &engine.energy_memories[i])));
         }
 
@@ -344,12 +364,15 @@ pub const VulkanEngine = struct {
         engine.mapped_lattice = @ptrCast(@alignCast(try engine.createBuffer(lattice_size, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, matrix_flags, &engine.lattice_buffer, &engine.lattice_memory) orelse return error.VulkanError));
 
         // 5. Descriptor Layout
+        // V28: push constants now carry batch_size + num_streams (8 bytes total)
         var pcRange = std.mem.zeroes(vk.VkPushConstantRange);
         pcRange.stageFlags = vk.VK_SHADER_STAGE_COMPUTE_BIT;
         pcRange.offset = 0;
-        pcRange.size = 8; // uint batch_size, uint mode
+        pcRange.size = 8; // uint batch_size, uint num_streams
 
+        // V28: 7 bindings (added rotor_index at slot 3)
         var bindings = [_]vk.VkDescriptorSetLayoutBinding{
+            std.mem.zeroes(vk.VkDescriptorSetLayoutBinding),
             std.mem.zeroes(vk.VkDescriptorSetLayoutBinding),
             std.mem.zeroes(vk.VkDescriptorSetLayoutBinding),
             std.mem.zeroes(vk.VkDescriptorSetLayoutBinding),
@@ -366,7 +389,7 @@ pub const VulkanEngine = struct {
 
         var dslCreateInfo = std.mem.zeroes(vk.VkDescriptorSetLayoutCreateInfo);
         dslCreateInfo.sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        dslCreateInfo.bindingCount = 6;
+        dslCreateInfo.bindingCount = 7;
         dslCreateInfo.pBindings = &bindings[0];
         var dsl: vk.VkDescriptorSetLayout = null;
         try check(vk.vkCreateDescriptorSetLayout(engine.dev, &dslCreateInfo, null, &dsl));
@@ -504,7 +527,7 @@ pub const VulkanEngine = struct {
         // 8. Descriptors
         var poolSize = std.mem.zeroes(vk.VkDescriptorPoolSize);
         poolSize.type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        poolSize.descriptorCount = 6 * FRAME_COUNT;
+        poolSize.descriptorCount = 7 * FRAME_COUNT; // V28: 7 bindings
         var dpCreateInfo = std.mem.zeroes(vk.VkDescriptorPoolCreateInfo);
         dpCreateInfo.sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         dpCreateInfo.poolSizeCount = 1;
@@ -803,9 +826,11 @@ pub const VulkanEngine = struct {
     /// Merged Dispatch: records both lattice etch AND meaning matrix etch into
     /// a single command buffer, one fence wait for both operations.
     /// Utilizes Prefix Scan on GPU to calculate rotors internally.
-    pub fn dispatchMergedEtch(self: *VulkanEngine, batch_size: u32) !void {
+    /// V28: dispatchMergedEtch now takes num_streams so the shader can
+    /// correctly bound-check rotor_index lookups and prefix-scan safely.
+    pub fn dispatchMergedEtch(self: *VulkanEngine, batch_size: u32, num_streams: u32) !void {
         const f = self.frame_idx;
-        // Wait and Reset handled in bridge, but let's be safe
+        // Safe fence wait — triple buffering means frame N-3 is guaranteed done
         try check(vk.vkWaitForFences(self.dev, 1, &self.fences[f], vk.VK_TRUE, std.math.maxInt(u64)));
         try check(vk.vkResetFences(self.dev, 1, &self.fences[f]));
 
@@ -813,24 +838,25 @@ pub const VulkanEngine = struct {
         beginInfo.sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         try check(vk.vkBeginCommandBuffer(self.command_buffers[f], &beginInfo));
 
+        // V28: workgroup count derived from wavefront-aligned batch size (always multiple of 64)
         const num_workgroups = (batch_size + 1023) / 1024;
+        // Push constants: [batch_size, num_streams]
+        const params = [_]u32{ batch_size, num_streams };
 
-        // Pass 1: Lattice etch (3-domain CMS)
+        // ── Pass 1: Lattice etch (3-domain CMS, Sovereign demux via rotor_index) ──
         vk.vkCmdBindPipeline(self.command_buffers[f], vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.lattice_pipeline);
         vk.vkCmdBindDescriptorSets(self.command_buffers[f], vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &self.descriptor_sets[f], 0, null);
-        
-        const params = [_]u32{ batch_size, 0 };
         vk.vkCmdPushConstants(self.command_buffers[f], self.pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &params[0]);
         vk.vkCmdDispatch(self.command_buffers[f], num_workgroups, 1, 1);
 
-        // Memory barrier
+        // ── Memory barrier between passes ──
         var barrier = std.mem.zeroes(vk.VkMemoryBarrier);
         barrier.sType = vk.VK_STRUCTURE_TYPE_MEMORY_BARRIER;
         barrier.srcAccessMask = vk.VK_ACCESS_SHADER_WRITE_BIT;
         barrier.dstAccessMask = vk.VK_ACCESS_SHADER_READ_BIT | vk.VK_ACCESS_SHADER_WRITE_BIT;
         vk.vkCmdPipelineBarrier(self.command_buffers[f], vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
 
-        // Pass 2: Meaning matrix etch
+        // ── Pass 2: Meaning matrix etch ──
         vk.vkCmdBindPipeline(self.command_buffers[f], vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.etch_pipeline);
         vk.vkCmdPushConstants(self.command_buffers[f], self.pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &params[0]);
         vk.vkCmdDispatch(self.command_buffers[f], num_workgroups, 1, 1);
@@ -849,7 +875,7 @@ pub const VulkanEngine = struct {
         for (0..FRAME_COUNT) |i| {
             vk.vkDestroyFence(self.dev, self.fences[i], null);
             vk.vkDestroyCommandPool(self.dev, self.command_pools[i], null);
-            
+
             vk.vkUnmapMemory(self.dev, self.rotor_memories[i]);
             vk.vkDestroyBuffer(self.dev, self.rotor_buffers[i], null);
             vk.vkFreeMemory(self.dev, self.rotor_memories[i], null);
@@ -857,6 +883,11 @@ pub const VulkanEngine = struct {
             vk.vkUnmapMemory(self.dev, self.char_memories[i]);
             vk.vkDestroyBuffer(self.dev, self.char_buffers[i], null);
             vk.vkFreeMemory(self.dev, self.char_memories[i], null);
+
+            // V28: cleanup rotor demux index buffer
+            vk.vkUnmapMemory(self.dev, self.index_memories[i]);
+            vk.vkDestroyBuffer(self.dev, self.index_buffers[i], null);
+            vk.vkFreeMemory(self.dev, self.index_memories[i], null);
 
             vk.vkUnmapMemory(self.dev, self.energy_memories[i]);
             vk.vkDestroyBuffer(self.dev, self.energy_buffers[i], null);
@@ -913,20 +944,29 @@ const VulkanComputeProvider = struct {
         return @as([*]u16, @ptrCast(@alignCast(engine.mapped_lattice.?)))[0 .. (1024 * 1024 * 1024) / 2];
     }
 
-    pub fn etch(total_batch: u32, starting_rotors: []const u64, chars: []const u8) anyerror!void {
+    /// V28: etch() now accepts rotor_indices — the per-rune stream ID sidecar.
+    /// This enables Greedy Pool filling: chars from any stream packed contiguously,
+    /// with each slot annotated with its originating stream for GPU demux.
+    pub fn etch(total_batch: u32, num_streams: u32, starting_rotors: []const u64, chars: []const u8, rotor_indices: []const u32) anyerror!void {
         const engine = &global_instance.?;
         const f = engine.frame_idx;
-        
-        // Wait for frame (handled in dispatchMergedEtch, but we need to write to the correct buffer)
-        // Actually, dispatchMergedEtch does the wait. But we need to write to the buffer of the frame we ARE ABOUT TO USE.
+
+        // Wait for this frame's fence before overwriting its host-mapped buffers.
+        // dispatchMergedEtch will reset this fence before resubmitting.
         try check(vk.vkWaitForFences(engine.dev, 1, &engine.fences[f], vk.VK_TRUE, std.math.maxInt(u64)));
-        
-        // Transfer data to the specific frame's GPU buffers
+
+        // Upload rotating context: all stream rotors (lex+sem pairs)
         ghostCopy(u64, engine.mapped_rotors[f].?[0..starting_rotors.len], starting_rotors);
+
+        // Upload greedy-packed chars
         for (chars, 0..) |c, i| {
             engine.mapped_chars[f].?[i] = @as(u32, c);
         }
-        try engine.dispatchMergedEtch(total_batch);
+
+        // Upload rotor demux index (V28 key addition)
+        ghostCopy(u32, engine.mapped_index[f].?[0..rotor_indices.len], rotor_indices);
+
+        try engine.dispatchMergedEtch(total_batch, num_streams);
     }
 
     pub fn queryResonance(lexical_rotor: u64, semantic_rotor: u64, allocator: std.mem.Allocator) anyerror![]u32 {

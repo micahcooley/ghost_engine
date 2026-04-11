@@ -1,4 +1,4 @@
-# Ghost Engine: Sovereign Agents [ASPIRATIONAL]
+# Ghost Engine: Agents [ASPIRATIONAL]
 
 > **Status: SPEC — NOT YET IMPLEMENTED**
 > This document describes the intended agent architecture. The current binary
@@ -6,7 +6,7 @@
 > typed agents, or autonomous resonance threads. `src/agent_api.zig` is a stub.
 > This spec exists to anchor future development.
 
-Sovereign Agents are autonomous resonance threads that will operate within the Meaning Matrix.
+Agents are autonomous resonance threads that will operate within the Meaning Matrix.
 
 ## 1. The Agent Lifecycle
 1.  **Ignition**: An agent is spawned when a specific Sigil trigger resonates > 0.85.

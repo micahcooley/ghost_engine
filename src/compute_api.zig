@@ -17,10 +17,12 @@ pub const ComputeApi = struct {
     /// Returns the raw pointer to the Unified Lattice memory.
     getLatticeData: *const fn () []u16,
 
-    /// Perform a batch etch operation. 
-    /// 'starting_rotors' contains (lexical, semantic) pairs for each stream.
-    /// 'chars' contains the raw byte stream to etch.
-    etch: *const fn (total_batch: u32, starting_rotors: []const u64, chars: []const u8) anyerror!void,
+    /// Perform a batch etch operation. V28: Greedy Saturation.
+    /// 'starting_rotors' contains (lexical, semantic) pairs for each stream — one pair per stream.
+    /// 'chars' contains the greedy-packed rune buffer (runes from any stream, contiguous).
+    /// 'rotor_indices' is a parallel array of u32 stream IDs, one per slot in 'chars'.
+    /// 'num_streams' is the active stream count (for shader bounds-checking).
+    etch: *const fn (total_batch: u32, num_streams: u32, starting_rotors: []const u64, chars: []const u8, rotor_indices: []const u32) anyerror!void,
 
     /// Query resonance for a specific context. Returns top-K energy scores.
     queryResonance: *const fn (lexical_rotor: u64, semantic_rotor: u64, allocator: std.mem.Allocator) anyerror![]u32,

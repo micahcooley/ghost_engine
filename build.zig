@@ -93,7 +93,29 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(trainer_exe);
 
-    // ── 5. Run Step ──
+    // ── 5. Inference Probe ──
+    const probe_exe = b.addExecutable(.{
+        .name = "probe_inference",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/probe_inference.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    probe_exe.root_module.addImport("ghost_core", ghost_core);
+    probe_exe.root_module.linkSystemLibrary("c", .{});
+    if (target.result.os.tag == .windows) {
+        if (vulkan_sdk) |sdk| {
+            probe_exe.root_module.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "Include" }) });
+            probe_exe.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "Lib" }) });
+        }
+        probe_exe.root_module.linkSystemLibrary("vulkan-1", .{});
+    } else {
+        probe_exe.root_module.linkSystemLibrary("vulkan", .{});
+    }
+    b.installArtifact(probe_exe);
+
+    // ── 6. Run Step ──
     const run_cmd = b.addRunArtifact(ghost_exe);
     run_cmd.step.dependOn(b.getInstallStep());
     const run_step = b.step("run", "Run the app");

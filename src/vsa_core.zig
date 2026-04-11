@@ -12,6 +12,10 @@ pub const ROLE_SUBJECT   = generate(0x1234_5678_9ABC_DEF0);
 pub const ROLE_OBJECT    = generate(0x0FED_CBA9_8765_4321);
 pub const ROLE_PREDICATE = generate(0x5555_5555_AAAA_AAAA);
 
+// ── Orthogonal Namespace Masks ──
+pub const MASK_SCRIBE = generate(0x55AA_55AA_55AA_55AA);
+pub const MASK_CRITIC = generate(0xAA55_AA55_AA55_AA55);
+
 /// Hardware-accelerated concept generator.
 pub fn generate(seed: u64) HyperVector {
     var v: HyperVector = undefined;
@@ -152,7 +156,7 @@ pub const MeaningMatrix = struct {
             
             // Vectorize 8-lane chunk
             const chunk: @Vector(8, u16) = acc_ptr[base..][0..8].*;
-            const mask: @Vector(8, u16) = .{
+            const mask_bits: @Vector(8, u16) = .{
                 @as(u16, (byte >> 0) & 1), @as(u16, (byte >> 1) & 1),
                 @as(u16, (byte >> 2) & 1), @as(u16, (byte >> 3) & 1),
                 @as(u16, (byte >> 4) & 1), @as(u16, (byte >> 5) & 1),
@@ -166,15 +170,25 @@ pub const MeaningMatrix = struct {
             const dec = chunk -| ones;
             
             // Branchless selection: res = (mask == 1) ? inc : dec
-            const res = @select(u16, mask == ones, inc, dec);
+            var res = @select(u16, mask_bits == ones, inc, dec);
+
+            // Myelination: If counter hits 1000, lock by flipping MSB
+            // Vectorized comparison and conditional OR
+            const threshold: @Vector(8, u16) = @splat(1000);
+            const lock_bit: @Vector(8, u16) = @splat(0x8000);
+            res = @select(u16, res == threshold, res | lock_bit, res);
             
-            // Store back and count drift (drift is harder to vectorize without popcount)
-            // But the store is now a single aligned vector write.
+            // Store back and count drift
             acc_ptr[base..][0..8].* = res;
             total_drift += 8; // Approximation for simplicity in this pass
         }
 
         return total_drift;
+    }
+
+    /// Bound gravity: XOR binds data to an agent mask before etching.
+    pub fn applyBoundGravity(self: *MeaningMatrix, word_hash: u64, data: HyperVector, mask: HyperVector) u64 {
+        return self.applyGravity(word_hash, data ^ mask);
     }
 
     /// Absolute Sigil Locking: Hardcoding a symbol into the matrix.

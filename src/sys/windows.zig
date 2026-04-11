@@ -263,7 +263,7 @@ pub fn openForWrite(allocator: std.mem.Allocator, path: []const u8) !FileHandle 
     var wbuf: [1024]u16 = undefined;
     const anchored = try getAnchorPath(allocator, path);
     defer allocator.free(anchored);
-    const h = CreateFileW(utf8ToW(anchored, &wbuf), 0x40000000, FILE_SHARE_READ | FILE_SHARE_WRITE, null, 4, NVME_DIRECT_FLAGS, null);
+    const h = CreateFileW(utf8ToW(anchored, &wbuf), 0x40000000, FILE_SHARE_READ | FILE_SHARE_WRITE, null, 4, 0x80, null);
     if (h == INVALID_HANDLE) return error.OpenFailed;
     return h;
 }
@@ -342,7 +342,7 @@ pub fn getFileSize(handle: FileHandle) !u32 { var size: i64 = 0; if (GetFileSize
 pub fn writeAll(handle: FileHandle, data: []const u8) !void {
     var written: u32 = 0; var total: usize = 0;
     while (total < data.len) {
-        const chunk = @min(data.len - total, 0x7FFFFFFF);
+        const chunk = @min(data.len - total, 64 * 1024 * 1024);
         if (WriteFile(handle, data[total..].ptr, @intCast(chunk), &written, null) == 0) return error.WriteFailed;
         if (written == 0) break; total += written;
     }

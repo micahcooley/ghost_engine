@@ -1,45 +1,50 @@
 #version 450
 #extension GL_ARB_gpu_shader_int64 : enable
 
-layout(local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
+// ── V28: Greedy Saturation - Lattice Etch Shader ──
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 // ── 1. Unified Lattice (1GB, 536M u16 entries) ──
 layout(std430, binding = 5) buffer Lattice {
     uint data[];  // Packed u32 (2 x u16 per uint)
 } lattice;
 
-// ── 2. Batch Starting Rotors (1 per stream) ──
+// ── 2. Batch Starting Rotors (1 pair PER STREAM, not per workgroup) ──
 layout(std430, binding = 1) readonly buffer StartingRotors {
-    uint64_t rotors[];
+    uint64_t rotors[]; // [stream0_lex, stream0_sem, stream1_lex, stream1_sem, ...]
 } batch_rotors;
 
-// ── 3. Batch Chars ──
+// ── 3. Batch Chars (greedy-packed unified buffer) ──
 layout(std430, binding = 2) readonly buffer BatchChars {
     uint target_chars[];
 } batch_chars;
 
-// ── 4. Push Constants ──
+// ── 4. Rotor Demux Index (V28: per-rune stream ID) ──
+layout(std430, binding = 3) readonly buffer RotorIndex {
+    uint stream_ids[]; // u32 (logically u16, max 64 streams)
+} rotor_index;
+
+// ── 5. Tag Buffer (unused in lattice path but keep binding slot consistent) ──
+layout(std430, binding = 4) buffer Tags {
+    uint64_t entries[];
+} matrix_tags;
+
+// ── Push Constants ──
 layout(push_constant) uniform Constants {
     uint batch_size;
-    uint _pad;
+    uint num_streams;
 } params;
 
-// ── V27 Parallel Prefix Scan: Shared Temporal Cache ──
 shared uint temporal_cache[1024];
 
-const uint64_t FNV_OFFSET = 14695981039346656037ul;
 const uint64_t FNV_PRIME  = 1099511628211ul;
-
-// ── Constants ──
 const uint UNIFIED_QUARTER = 134217728u;  // 536870912 / 4
 const uint64_t LEAKY_MASK = 0xEFEFEFEFEFEFEFEFul;
 
-// Domain seeds (must match ghost_state.zig)
 const uint64_t DOMAIN_SYNTAX    = 0x9E3779B97F4A7C15ul;
 const uint64_t DOMAIN_CONCEPT   = 0xC7115792D0E47B43ul;
 const uint64_t DOMAIN_INTUITION = 0x6C62272E07BB0142ul;
 
-// ── Portable 64x64 -> 128 multiply (high 64 bits) ──
 uint64_t mul64hi(uint64_t a, uint64_t b) {
     uint a_lo = uint(a & 0xFFFFFFFFul);
     uint a_hi = uint(a >> 32u);
@@ -55,7 +60,6 @@ uint64_t mul64hi(uint64_t a, uint64_t b) {
     return p3 + (mid >> 32u) + p2 + uint64_t(uint(mid) < uint(p1));
 }
 
-// ── wyhash: same as ghost_state.zig ──
 uint64_t wyhash(uint64_t state, uint64_t in_val) {
     uint64_t x = state ^ 0x60bee2bee120fc15ul;
     uint64_t y = in_val ^ 0xa3b195354a39b70dul;
@@ -64,7 +68,6 @@ uint64_t wyhash(uint64_t state, uint64_t in_val) {
     return lo ^ hi;
 }
 
-// ── Get 4 CMS probes from hash ──
 void getProbes(uint64_t h, out uint probes[4]) {
     uint s = UNIFIED_QUARTER;
     probes[0] = uint(h & 0xFFFFFFFFul) % s;
@@ -75,9 +78,7 @@ void getProbes(uint64_t h, out uint probes[4]) {
     probes[3] = uint(h3 & 0xFFFFFFFFul) % s + s * 3u;
 }
 
-// ── Etch into lattice for one (rotor, char, domain) triple ──
 void etchProbe(uint packed_idx, uint is_high, uint64_t h) {
-    // Atomic update for shared RAM space (using atomicExchange loop for packed u16)
     bool success = false;
     while (!success) {
         uint original = lattice.data[packed_idx];
@@ -130,25 +131,31 @@ void etchDomain(uint64_t rotor, uint char_byte, uint64_t domain) {
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
-    uint global_idx = gl_WorkGroupID.x * 1024u + tid;
+    uint wg_size = gl_WorkGroupSize.x;
+    uint global_idx = gl_WorkGroupID.x * wg_size + tid;
 
-    temporal_cache[tid] = 0u;
+    uint my_stream = 0u;
+    uint my_char   = 0u;
+
     if (global_idx < params.batch_size) {
-        temporal_cache[tid] = batch_chars.target_chars[global_idx];
+        my_stream = rotor_index.stream_ids[global_idx];
+        my_char   = batch_chars.target_chars[global_idx];
     }
+
+    temporal_cache[tid] = (global_idx < params.batch_size) ? my_char : 0u;
     barrier();
 
-    // Blelloch XOR Scan
-    for (uint d = 1u; d < 1024u; d *= 2u) {
+    // Blelloch XOR prefix scan
+    for (uint d = 1u; d < wg_size; d *= 2u) {
         uint partner = tid + d;
-        if ((tid & (d * 2u - 1u)) == (d * 2u - 1u) && partner < 1024u) {
+        if ((tid & (d * 2u - 1u)) == (d * 2u - 1u) && partner < wg_size) {
             temporal_cache[partner] ^= temporal_cache[tid];
         }
         barrier();
     }
-    if (tid == 1023u) temporal_cache[tid] = 0u;
+    if (tid == wg_size - 1u) temporal_cache[tid] = 0u;
     barrier();
-    for (uint d = 512u; d >= 1u; d /= 2u) {
+    for (uint d = wg_size / 2u; d >= 1u; d /= 2u) {
         if ((tid & (d * 2u - 1u)) == (d * 2u - 1u)) {
             uint left = temporal_cache[tid - d];
             temporal_cache[tid - d] = temporal_cache[tid];
@@ -158,18 +165,18 @@ void main() {
     }
 
     if (global_idx < params.batch_size) {
-        uint target_char = batch_chars.target_chars[global_idx];
         uint aggregated_xor = temporal_cache[tid];
-        
-        // Use workgroup-associated stream rotor
-        uint64_t base_lex = batch_rotors.rotors[gl_WorkGroupID.x * 2u];
-        uint64_t current_lex = (base_lex ^ uint64_t(aggregated_xor)) * FNV_PRIME;
-        
-        etchDomain(current_lex, target_char, DOMAIN_SYNTAX);
-        etchDomain(current_lex, target_char, DOMAIN_CONCEPT);
 
-        uint64_t base_sem = batch_rotors.rotors[gl_WorkGroupID.x * 2u + 1u];
+        // ── V28: Sovereign per-rune rotor lookup ──
+        uint stream_rotor_base = my_stream * 2u;
+        uint64_t base_lex = batch_rotors.rotors[stream_rotor_base];
+        uint64_t current_lex = (base_lex ^ uint64_t(aggregated_xor)) * FNV_PRIME;
+
+        etchDomain(current_lex, my_char, DOMAIN_SYNTAX);
+        etchDomain(current_lex, my_char, DOMAIN_CONCEPT);
+
+        uint64_t base_sem = batch_rotors.rotors[stream_rotor_base + 1u];
         uint64_t current_sem = (base_sem ^ uint64_t(aggregated_xor)) * FNV_PRIME;
-        etchDomain(current_sem, target_char, DOMAIN_INTUITION);
+        etchDomain(current_sem, my_char, DOMAIN_INTUITION);
     }
 }

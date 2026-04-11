@@ -12,15 +12,22 @@ pub fn main() !void {
     const silo_root = try sys.getSiloRoot(allocator);
     sys.print("Silo Root: {s}\n", .{silo_root});
 
-    const mapped_meaning = try sys.createMappedFile(allocator, "state/semantic_monolith.bin", 1024*1024*1024);
-    var meaning_matrix = vsa.MeaningMatrix{
-        .data = @as([*]u16, @ptrCast(@alignCast(mapped_meaning.data.ptr)))[0..(1024*1024*512)],
-        .tags = null
-    };
-
-    _ = try vsa_vulkan.GHOST_COMPUTE_PLUGIN.init(allocator);
+    const compute = try vsa_vulkan.GHOST_COMPUTE_PLUGIN.init(allocator);
     defer vsa_vulkan.GHOST_COMPUTE_PLUGIN.deinit();
     const vk_engine = vsa_vulkan.getEngine() orelse return error.NoVulkan;
+
+    // Upload CPU-trained data to GPU buffers
+    const mapped_meaning = try sys.createMappedFile(allocator, "state/semantic_monolith.bin", 1024*1024*1024);
+    const gpu_matrix = compute.getMatrixData();
+    const src_ptr: [*]const u16 = @ptrCast(@alignCast(mapped_meaning.data.ptr));
+    const src_len = mapped_meaning.data.len / 2;
+    const copy_len = @min(gpu_matrix.len, src_len);
+    @memcpy(gpu_matrix[0..copy_len], src_ptr[0..copy_len]);
+
+    var meaning_matrix = vsa.MeaningMatrix{
+        .data = gpu_matrix,
+        .tags = null
+    };
 
     var soul = ghost_state.GhostSoul.init(allocator);
     soul.meaning_matrix = &meaning_matrix;
@@ -33,12 +40,12 @@ pub fn main() !void {
 
     sys.print("Response: ", .{});
     var i: usize = 0;
-    while (i < 20) : (i += 1) {
+    while (i < 40) : (i += 1) {
         // Fast-path: get top-5 from GPU resonance
         const energies = vk_engine.dispatchResonance(soul.lexical_rotor, soul.semantic_rotor, allocator) catch break;
         defer allocator.free(energies);
 
-        var top_chars: [5]u32 = [_]u32{' '} ** 5;
+        var top_chars: [5]u32 = [_]u32{0} ** 5;
         var top_energies: [5]u32 = [_]u32{0} ** 5;
         for (energies, 0..) |raw_e, idx| {
             const cb: u32 = @intCast(idx);
@@ -46,12 +53,21 @@ pub fn main() !void {
             insertTop5(&top_chars, &top_energies, cb, raw_e);
         }
 
+        // Debug: show top-3 candidates
+        if (i < 5) {
+            sys.print("\n  [MC-{d}] top3: '{c}'({d}) '{c}'({d}) '{c}'({d})", .{
+                i, @as(u8, @intCast(top_chars[0])), top_energies[0],
+                @as(u8, @intCast(top_chars[1])), top_energies[1],
+                @as(u8, @intCast(top_chars[2])), top_energies[2],
+            });
+        }
+
         // System 2: Monte Carlo picks the winner
         const winner_idx = mc_engine.resolve(&soul, &top_chars, &top_energies);
         const chosen = top_chars[winner_idx];
-        sys.print("{c}", .{@as(u8, @intCast(chosen))});
+        sys.print("\n  -> chosen: '{c}' (lane {d})\n", .{@as(u8, @intCast(chosen)), winner_idx});
         _ = try soul.absorb(vsa.generate(@intCast(chosen)), @intCast(chosen), null);
-        if (chosen == ' ' and i > 5) break;
+        if (chosen == '.' or chosen == '\n') break;
     }
     sys.print("\n", .{});
 }

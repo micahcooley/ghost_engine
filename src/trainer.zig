@@ -6,7 +6,7 @@ const vsa = @import("vsa_core.zig");
 const vsa_vulkan = @import("vsa_vulkan.zig");
 const compute_api = @import("compute_api.zig");
 
-const VERSION = "V27";
+const VERSION = "V28";
 
 var active_compute: ?*const compute_api.ComputeApi = null;
 var global_lattice: ?*ghost_state.UnifiedLattice = null;
@@ -41,7 +41,6 @@ const StreamState = struct {
     cursor: usize,
     name: []const u8,
     done: bool,
-    last_filled: usize = 0,
 
     pub fn init(data: []const u8, name: []const u8) StreamState {
         return .{
@@ -119,70 +118,112 @@ const StreamState = struct {
     }
 };
 
-// ── Multi-Stream Batcher: Interleaves bytes from N streams into one batch ──
+// ── Multi-Stream Greedy Pool Batcher (V28: Unified Stream Pool) ──
+// Replaces the old static-partition MultiStreamBatcher.
+//
+// Architecture:
+//   - No more chunk_size = max_batch / streams.len
+//   - fillBatch() is greedy: pulls runes from ANY active stream until the
+//     unified buffer is full or all streams are exhausted.
+//   - A parallel rotor_index[] slice records the stream origin of each rune.
+//   - The final batch_len is clamped to a multiple of 64 for wavefront alignment.
+//
+// GPU Saturation effect:
+//   - If 3 of 4 streams finish early, Stream 4 immediately fills 100% of the
+//     buffer on the next dispatch, using all available GPU cores.
 const MAX_STREAMS = 64;
+// Wavefront size: AMD Wave64=64, Nvidia Wave32=32. We align to 64 to cover both.
+const WAVEFRONT_ALIGN = 64;
 
-const MultiStreamBatcher = struct {
+const GreedyBatcher = struct {
     streams: []StreamState,
     active_count: usize,
-    batch_bytes: [16384]u8, // Increased for larger batches
+    /// Greedy-packed rune bytes. May contain bytes from any stream, contiguous.
+    batch_bytes: [4096]u8,
+    /// Parallel stream-ID per slot. batch_index[i] == which stream produced batch_bytes[i].
+    batch_index: [4096]u32,
     batch_len: usize,
 
-    pub fn init(streams: []StreamState) MultiStreamBatcher {
+    pub fn init(streams: []StreamState) GreedyBatcher {
         return .{
             .streams = streams,
             .active_count = streams.len,
-            .batch_bytes = [_]u8{0} ** 16384,
+            .batch_bytes = [_]u8{0} ** 4096,
+            .batch_index = [_]u32{0} ** 4096,
             .batch_len = 0,
         };
     }
 
-    pub fn fillBatch(self: *MultiStreamBatcher, max_batch: u32) !usize {
-        const chunk_size = max_batch / @as(u32, @intCast(self.streams.len));
-        var wg: std.Thread.WaitGroup = .{};
+    /// Greedy fill: iterates streams round-robin pulling one rune per stream
+    /// per round, filling the unified buffer until max_batch is reached or all
+    /// streams are exhausted. Wavefront-aligns the final count to WAVEFRONT_ALIGN.
+    pub fn fillBatch(self: *GreedyBatcher, max_batch: u32) usize {
+        // Clamp max_batch to our buffer size
+        const cap: usize = @min(max_batch, self.batch_bytes.len);
+        var pos: usize = 0;
+        var any_active = true;
 
-        for (self.streams, 0..) |*s, si| {
-            if (s.done) {
-                s.last_filled = 0;
-                continue;
+        // Round-robin pull: one rune per stream per pass.
+        // This distributes load evenly when multiple streams are alive, and
+        // automatically saturates to one stream when others are exhausted.
+        while (pos < cap and any_active) {
+            any_active = false;
+            for (self.streams, 0..) |*s, si| {
+                if (pos >= cap) break;
+                if (s.done) continue;
+                // Pull one rune from this stream
+                const rune = s.nextRune() orelse continue;
+                self.batch_bytes[pos] = @as(u8, @truncate(rune));
+                self.batch_index[pos] = @as(u32, @intCast(si));
+                pos += 1;
+                any_active = true;
             }
-            const start_idx = si * chunk_size;
-            const slice = self.batch_bytes[start_idx .. start_idx + chunk_size];
-            
-            wg.add(1);
-            const thread = try std.Thread.spawn(.{}, struct {
-                fn run(stream: *StreamState, sl: []u8, w: *std.Thread.WaitGroup) void {
-                    defer w.finish();
-                    stream.last_filled = 0;
-                    for (0..sl.len) |i| {
-                        const rune = stream.nextRune() orelse break;
-                        sl[i] = @as(u8, @truncate(rune));
-                        stream.last_filled += 1;
-                    }
-                }
-            }.run, .{ s, slice, &wg });
-            thread.detach();
         }
-        wg.wait();
 
-        self.batch_len = 0;
-        for (self.streams) |s| {
-            self.batch_len += s.last_filled;
+        // ── Wavefront Alignment ──
+        // Truncate to the largest multiple of WAVEFRONT_ALIGN ≤ pos.
+        // This eliminates masked-out threads on the silicon level (Wave64/Wave32).
+        if (pos > 0) {
+            pos = (pos / WAVEFRONT_ALIGN) * WAVEFRONT_ALIGN;
+            // If we got fewer than one wavefront of data, keep it as-is
+            // (final tail of training — we don't want to discard it).
+            if (pos == 0) pos = @min(WAVEFRONT_ALIGN, self.batch_len);
         }
+
+        self.batch_len = pos;
+
+        // Update active_count so callers can track stream death
+        self.active_count = 0;
+        for (self.streams) |s| {
+            if (!s.done) self.active_count += 1;
+        }
+
         return self.batch_len;
     }
 
-    pub fn allDone(self: *const MultiStreamBatcher) bool {
+    pub fn allDone(self: *const GreedyBatcher) bool {
         for (self.streams) |s| {
             if (!s.done) return false;
         }
         return true;
     }
 
-    pub fn totalSize(self: *const MultiStreamBatcher) usize {
+    pub fn totalSize(self: *const GreedyBatcher) usize {
         var total: usize = 0;
         for (self.streams) |s| total += s.file_data.len;
         return total;
+    }
+
+    /// Returns a snapshot of per-stream rotor pairs for the current batch.
+    /// Format: [stream0_lex, stream0_sem, stream1_lex, stream1_sem, ...]
+    /// This is uploaded to the GPU once per dispatch so each wavefront can
+    /// resolve its context via batch_index[] without re-reading the CPU state.
+    pub fn buildRotorSnapshot(self: *const GreedyBatcher, out: []u64) void {
+        for (self.streams, 0..) |s, i| {
+            if (i * 2 + 1 >= out.len) break;
+            out[i * 2]     = s.lexical_rotor;
+            out[i * 2 + 1] = s.semantic_rotor;
+        }
     }
 };
 
@@ -236,9 +277,11 @@ fn main_wrapped() !void {
     }
 
     const batch_size = @intFromEnum(tier);
+    // Constrain batch to 4096 (our buffer cap) and wavefront-align it
+    const aligned_batch_size: u32 = @min(batch_size, 4096);
     const num_streams: usize = switch (tier) {
-        .max => @min(MAX_STREAMS, cpu_cores * 2),
-        .high => cpu_cores,
+        .max      => @min(MAX_STREAMS, cpu_cores * 2),
+        .high     => cpu_cores,
         .standard => @min(cpu_cores, 4),
         .background => 1,
     };
@@ -247,9 +290,9 @@ fn main_wrapped() !void {
         else => 0,
     };
 
-    sys.print("\nGhost Trainer {s}: Sovereign Trinity Engine (Accelerated)\n", .{VERSION});
+    sys.print("\nGhost Trainer {s}: Sovereign Trinity Engine (V28 Greedy Saturation)\n", .{VERSION});
     sys.printOut("========================================================\n\n");
-    sys.print("[TIER] {s} | batch={d} | streams={d} | cpu_cores={d}\n\n", .{ @tagName(tier), batch_size, num_streams, cpu_cores });
+    sys.print("[TIER] {s} | batch={d} (wavefront-aligned) | streams={d} | cpu_cores={d}\n\n", .{ @tagName(tier), aligned_batch_size, num_streams, cpu_cores });
 
     // ── 2. Map the 1GB Unified Lattice ──
     sys.printOut("[CORTEX] Mapping 1GB Unified Lattice...\n");
@@ -351,13 +394,17 @@ fn main_wrapped() !void {
     for (extra_locks) |r| meaning_matrix.hardLockUniversalSigil(ghost_state.wyhash(0, r), r);
     sys.printOut("[SIGIL] Done.\n");
 
-    // ── 7. Initialize Streams and Batcher ──
+    // ── 7. Initialize Greedy Stream Pool ──
     var streams: [MAX_STREAMS]StreamState = undefined;
     for (0..num_streams) |si| streams[si] = StreamState.init(stream_data[si], stream_names[si]);
-    var batcher = MultiStreamBatcher.init(streams[0..num_streams]);
+    var batcher = GreedyBatcher.init(streams[0..num_streams]);
+    // Pre-allocated rotor snapshot buffer: 2 u64s per stream (lex + sem)
+    var rotor_snapshot: [MAX_STREAMS * 2]u64 = [_]u64{0} ** (MAX_STREAMS * 2);
 
-    // ── 8. Training Loop ──
-    sys.printOut("\n[TRAIN] Starting accelerated training pass...\n");
+    // ── 8. Greedy Training Loop ──
+    sys.printOut("\n[TRAIN] Starting V28 Greedy Saturation training pass...\n");
+    sys.print("[TRAIN] Buffer: 4096 slots | Wavefront align: {d} | Active streams: {d}\n",
+        .{ WAVEFRONT_ALIGN, num_streams });
     const start_time = sys.getMilliTick();
     var last_report_time = start_time;
     var last_report_bytes: usize = 0;
@@ -366,20 +413,27 @@ fn main_wrapped() !void {
     var dispatch_count: usize = 0;
 
     while (!batcher.allDone()) {
-        var starting_rotors: [MAX_STREAMS * 2]u64 = undefined;
-        for (batcher.streams, 0..) |s, i| {
-            starting_rotors[i * 2] = s.lexical_rotor;
-            starting_rotors[i * 2 + 1] = s.semantic_rotor;
-        }
+        // ── V28: Build per-stream rotor snapshot BEFORE greedy fill ──
+        // The snapshot captures each stream's current rotating context.
+        // After fillBatch() advances cursors, rotors will be in the NEXT state.
+        // We send the STARTING state to the GPU so it can reconstruct context.
+        batcher.buildRotorSnapshot(rotor_snapshot[0 .. num_streams * 2]);
 
-        const filled = try batcher.fillBatch(batch_size);
+        // ── V28 Greedy Fill: fills from any active stream, wavefront-aligned ──
+        const filled = batcher.fillBatch(aligned_batch_size);
         if (filled == 0) break;
 
         if (active_compute) |compute| {
-            try compute.etch(@intCast(filled), starting_rotors[0..batcher.streams.len * 2], batcher.batch_bytes[0..filled]);
+            // etch() signature V28: (total_batch, num_streams, rotors, chars, rotor_indices)
+            try compute.etch(
+                @intCast(filled),
+                @intCast(num_streams),
+                rotor_snapshot[0 .. num_streams * 2],
+                batcher.batch_bytes[0..filled],
+                batcher.batch_index[0..filled],
+            );
         } else {
-            // CPU fallback (simplified)
-            sys.printOut("[WARN] CPU Fallback active.\n");
+            sys.printOut("[WARN] CPU Fallback active — no GPU etch this batch.\n");
         }
 
         total_bytes_processed += filled;
@@ -397,12 +451,17 @@ fn main_wrapped() !void {
             const total_size = batcher.totalSize();
             const overall_pct = if (total_size > 0) @as(f64, @floatFromInt(total_bytes_processed)) / @as(f64, @floatFromInt(total_size)) * 100.0 else 0;
 
-            sys.print("[TRAIN] {d:.1}% | {d} KB/s instant | {d} KB/s avg | {d:.1}% occ | streams: {d}\n",
-                .{ overall_pct, instant_throughput / 1024, total_throughput / 1024, @as(f64, @floatFromInt(occupancy)) / 100.0, num_streams });
+            // V28: Report active stream count for saturation visibility
+            sys.print("[TRAIN] {d:.1}% | {d} KB/s inst | {d} KB/s avg | {d:.1}% occ | active={d}/{d} | buf={d}/{d}\n",
+                .{ overall_pct, instant_throughput / 1024, total_throughput / 1024,
+                   @as(f64, @floatFromInt(occupancy)) / 100.0,
+                   batcher.active_count, num_streams,
+                   filled, aligned_batch_size });
 
             for (batcher.streams) |s| {
-                sys.print("  [{d}] {s}: {d:.1}% ({d:.1} MB / {d:.1} MB)\n", .{
-                    s.cursor, s.name, s.progress(), 
+                const status: []const u8 = if (s.done) "[DONE]" else "[ OK ]";
+                sys.print("  {s} {s}: {d:.1}% ({d:.1} MB / {d:.1} MB)\n", .{
+                    status, s.name, s.progress(),
                     @as(f64, @floatFromInt(s.cursor)) / 1048576.0,
                     @as(f64, @floatFromInt(s.file_data.len)) / 1048576.0
                 });
