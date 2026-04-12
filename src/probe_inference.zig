@@ -29,12 +29,16 @@ pub fn main() !void {
         .tags = null
     };
 
-    var soul = ghost_state.GhostSoul.init(allocator);
+    var soul = try allocator.create(ghost_state.GhostSoul);
+    soul.* = ghost_state.GhostSoul.init(allocator);
+    defer soul.deinit();
+    defer allocator.destroy(soul);
+
     soul.meaning_matrix = &meaning_matrix;
 
     const prompt = "The Ghost Engine is ";
     sys.print("Prompting: {s}\n", .{prompt});
-    for (prompt) |byte| _ = try soul.absorb(vsa.generate(byte), byte, null);
+    for (prompt) |rune| _ = try soul.absorb(vsa.generate(rune), rune, null);
 
     const mc_engine = mc.MonteCarloEngine.init(allocator, vk_engine, &meaning_matrix);
 
@@ -63,7 +67,7 @@ pub fn main() !void {
         }
 
         // System 2: Monte Carlo picks the winner
-        const winner_idx = mc_engine.resolve(&soul, &top_chars, &top_energies);
+        const winner_idx = mc_engine.resolve(soul, &top_chars, &top_energies) catch 0;
         const chosen = top_chars[winner_idx];
         sys.print("\n  -> chosen: '{c}' (lane {d})\n", .{@as(u8, @intCast(chosen)), winner_idx});
         _ = try soul.absorb(vsa.generate(@intCast(chosen)), @intCast(chosen), null);

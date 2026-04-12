@@ -11,9 +11,9 @@ layout(std430, binding = 0) buffer Matrix {
     uint data[]; // Packed 2 x u16 per uint (1024 u16s -> 512 u32s)
 } meaning_matrix;
 
-// ── 2. Input Batch Starting Rotors (1 pair per STREAM, not per workgroup) ──
-layout(std430, binding = 1) readonly buffer StartingRotors {
-    uint64_t rotors[]; // [stream0_lex, stream0_sem, stream1_lex, stream1_sem, ...]
+// ── 2. Input Batch Per-Rune Rotors ──
+layout(std430, binding = 1) readonly buffer BatchRotors {
+    uint64_t rotors[]; // [lex0, sem0, lex1, sem1, ...] one pair per rune
 } batch_rotors;
 
 // ── 3. Batch Chars (greedy-packed, mixed from any stream) ──
@@ -36,20 +36,18 @@ layout(std430, binding = 4) buffer Tags {
 // ── Parameter Block ──
 layout(push_constant) uniform Constants {
     uint batch_size;
-    uint num_streams; // New: total stream count for bounds check
+    uint num_streams;       // total stream count for bounds check
+    uint slot_count;        // dynamic matrix_slots (replaces hardcoded 1048576)
+    uint lattice_quarter;   // dynamic gpu_lattice_size / 8
 } params;
 
-// ── Temporal Cache (shared within workgroup) ──
-// V28: We do NOT scan across streams, so we only XOR within-stream chars.
-// The workgroup processes a contiguous slice of the unified buffer.
-shared uint temporal_cache[1024];
-
-const uint64_t FNV_PRIME = 1099511628211ul;
+// No temporal cache needed anymore because rotors are calculated per-rune by the CPU.
 
 uint findSlot(uint64_t rotor) {
-    uint base_slot = uint(rotor % 1048576ul);
+    uint base_slot = uint(rotor % uint64_t(params.slot_count));
+    uint stride = uint((rotor >> 32) | 1ul);
     for (uint p = 0; p < 8; p++) {
-        uint slot = (base_slot + p) % 1048576u;
+        uint slot = (base_slot + p * stride) % params.slot_count;
         uint64_t tag = matrix_tags.entries[slot];
         if (tag == rotor) return slot;
         if (tag == 0ul) {
@@ -114,60 +112,17 @@ void main() {
     uint wg_size = gl_WorkGroupSize.x;
     uint global_idx = gl_WorkGroupID.x * wg_size + tid;
 
-    // ── V28 Greedy Demux ──
-    // Load this thread's stream ID and char. The temporal scan is now
-    // SOVEREIGN: only XOR-accumulates within the same stream. Threads from
-    // different streams do not pollute each other's context chain.
-
-    uint my_stream = 0u;
-    uint my_char   = 0u;
+    // ── V28 Corrected: Direct Per-Rune Lookup ──
+    // Threads pull their specific lexical and semantic rotor directly.
 
     if (global_idx < params.batch_size) {
-        my_stream = rotor_index.stream_ids[global_idx];
-        my_char   = batch_chars.target_chars[global_idx];
-    }
-
-    // Build intra-wg XOR scan, masked to same-stream entries only.
-    // We store char if same stream mask is consistent within a given workgroup.
-    // Because streams may interleave across workgroup boundaries, we carry the
-    // starting rotor from the host (updated per-batch by the CPU, as before).
-    // Within wavefront: accumulate XOR for the contiguous same-stream run.
-    temporal_cache[tid] = (global_idx < params.batch_size) ? my_char : 0u;
-    barrier();
-
-    // Blelloch XOR prefix scan (same as before — CPU still provides correct
-    // starting rotors, so accumulated XOR refines the context within batch)
-    for (uint d = 1u; d < wg_size; d *= 2u) {
-        uint partner = tid + d;
-        if ((tid & (d * 2u - 1u)) == (d * 2u - 1u) && partner < wg_size) {
-            temporal_cache[partner] ^= temporal_cache[tid];
-        }
-        barrier();
-    }
-    if (tid == wg_size - 1u) temporal_cache[tid] = 0u;
-    barrier();
-    for (uint d = wg_size / 2u; d >= 1u; d /= 2u) {
-        if ((tid & (d * 2u - 1u)) == (d * 2u - 1u)) {
-            uint left = temporal_cache[tid - d];
-            temporal_cache[tid - d] = temporal_cache[tid];
-            temporal_cache[tid] ^= left;
-        }
-        barrier();
-    }
-
-    if (global_idx < params.batch_size) {
-        uint aggregated_xor = temporal_cache[tid];
-
-        // ── V28: Per-rune rotor lookup via stream demux ──
-        // Each thread pulls its STREAM's rotor pair, not the workgroup's.
-        uint stream_rotor_base = my_stream * 2u;
-        uint64_t base_lex = batch_rotors.rotors[stream_rotor_base];
-        uint64_t current_lex = (base_lex ^ uint64_t(aggregated_xor)) * FNV_PRIME;
+        uint my_char = batch_chars.target_chars[global_idx];
+        
+        uint64_t current_lex = batch_rotors.rotors[global_idx * 2u];
         uint slot = findSlot(current_lex);
         etchSlotFull(slot, my_char);
 
-        uint64_t base_sem = batch_rotors.rotors[stream_rotor_base + 1u];
-        uint64_t current_sem = (base_sem ^ uint64_t(aggregated_xor)) * FNV_PRIME;
+        uint64_t current_sem = batch_rotors.rotors[global_idx * 2u + 1u];
         uint sem_slot = findSlot(current_sem);
         etchSlotFull(sem_slot, my_char);
     }

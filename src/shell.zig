@@ -82,18 +82,20 @@ const ShellStream = struct {
         self.done = false;
     }
 
-    pub fn nextByte(self: *ShellStream) ?u8 {
+    pub fn nextRune(self: *ShellStream) ?u32 {
         if (self.cursor >= self.file_data.len) {
             self.done = true;
             return null;
         }
         const b = self.file_data[self.cursor];
         self.cursor += 1;
-        // Update rotors
-        const rune_hash = @as(u64, b) *% ghost_state.FNV_PRIME;
+        
+        // Use full rune hash for rotor consistency with trainer
+        const rune: u32 = b;
+        const rune_hash = ghost_state.wyhash(ghost_state.FNV_OFFSET_BASIS, rune);
         self.lexical_rotor = (self.lexical_rotor ^ rune_hash) *% ghost_state.FNV_PRIME;
         self.semantic_rotor = (self.semantic_rotor ^ rune_hash) *% ghost_state.FNV_PRIME;
-        return b;
+        return rune;
     }
 };
 
@@ -102,9 +104,9 @@ const WAVEFRONT_ALIGN: usize = 64;
 fn backgroundTrainer(compute: *const compute_api.ComputeApi) void {
 
     var stream = ShellStream.init();
-    var batch_bytes: [4096]u8 = undefined;
+    var batch_runes: [4096]u32 = undefined;
     var batch_index: [4096]u32 = undefined;
-    var rotor_snapshot: [2]u64 = .{ 0, 0 };
+    var batch_rotors: [4096 * 2]u64 = undefined;
     var drain_buf: [8192]u8 = undefined;
     var pending: std.ArrayListUnmanaged(u8) = .empty;
 
@@ -125,10 +127,12 @@ fn backgroundTrainer(compute: *const compute_api.ComputeApi) void {
 
         // Fill batch
         var pos: usize = 0;
-        while (pos < batch_bytes.len) : (pos += 1) {
-            const b = stream.nextByte() orelse break;
-            batch_bytes[pos] = b;
+        while (pos < batch_runes.len) : (pos += 1) {
+            const r = stream.nextRune() orelse break;
+            batch_runes[pos] = r;
             batch_index[pos] = 0; // single stream
+            batch_rotors[pos * 2] = stream.lexical_rotor;
+            batch_rotors[pos * 2 + 1] = stream.semantic_rotor;
         }
 
         // Wavefront-align
@@ -139,16 +143,14 @@ fn backgroundTrainer(compute: *const compute_api.ComputeApi) void {
 
         if (pos == 0) continue;
 
-        // Build rotor snapshot
-        rotor_snapshot[0] = stream.lexical_rotor;
-        rotor_snapshot[1] = stream.semantic_rotor;
+
 
         // Dispatch etch
         compute.etch(
             @intCast(pos),
             1,
-            &rotor_snapshot,
-            batch_bytes[0..pos],
+            batch_rotors[0 .. pos * 2],
+            batch_runes[0..pos],
             batch_index[0..pos],
         ) catch {};
     }
@@ -169,7 +171,9 @@ pub fn main() !void {
         _ = SetConsoleCtrlHandler(ctrlHandler, 1);
     }
 
-    const allocator = std.heap.page_allocator;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
     sys.printOut("\nGhost V28 Shell: Sovereign Intelligence\n");
     sys.printOut("Type to interact. Empty line to exit.\n\n");
@@ -214,7 +218,11 @@ pub fn main() !void {
     };
 
     // ── 4. Spawn background trainer ──
-    var soul = ghost_state.GhostSoul.init(allocator);
+    var soul = try allocator.create(ghost_state.GhostSoul);
+    soul.* = ghost_state.GhostSoul.init(allocator);
+    defer soul.deinit();
+    defer allocator.destroy(soul);
+    
     soul.meaning_matrix = &meaning_matrix;
 
     training_queue = .{ .allocator = allocator };
@@ -226,6 +234,9 @@ pub fn main() !void {
             sys.printOut("[TRAINER] Background learning thread active.\n\n");
         }
     }
+
+    sys.printOut("[SILICON] Pre-calculating BMP VSA Space (65,536 identities)...\n");
+    const bmp_vectors = try engine_logic.SingularityEngine.precomputeBMP(allocator);
 
     // ── 5. REPL Loop ──
     while (!stop_flag.load(.acquire)) {
@@ -240,45 +251,50 @@ pub fn main() !void {
         training_queue.push(prompt);
 
         // Absorb with MASK_SCRIBE binding for inference
-        const gen_start = soul.concept;
-        for (prompt) |byte| {
-            const bound_vec = vsa.bind(vsa.generate(byte), vsa.MASK_SCRIBE);
-            _ = try soul.absorb(bound_vec, byte, null);
+        // Queue raw runes for background training
+        for (prompt) |rune| {
+            const bound_vec = vsa.bind(vsa.generate(rune), vsa.MASK_SCRIBE);
+            _ = try soul.absorb(bound_vec, rune, null);
         }
 
         // Generate response with Monte Carlo
         sys.printOut("Ghost > ");
-        var eng = engine_logic.SingularityEngine{
+        const gen_start = soul.concept;
+        
+        var eng = try allocator.create(engine_logic.SingularityEngine);
+        defer allocator.destroy(eng);
+        eng.* = engine_logic.SingularityEngine{
             .lattice = lattice,
             .meaning = &meaning_matrix,
-            .soul = &soul,
+            .soul = soul,
             .canvas = ghost_state.MesoLattice.initText(),
             .is_live = true,
             .inventory = [_]u8{0} ** 128,
             .inv_cursor = 0,
             .compute = global_compute,
             .vulkan = vsa_vulkan.getEngine(),
+            .bmp_vectors = bmp_vectors,
             .allocator = allocator,
         };
 
-        var tokens: u32 = 0;
-        const MAX_TOKENS = 2048;
-        while (tokens < MAX_TOKENS) : (tokens += 1) {
+        var runes: u32 = 0;
+        const MAX_RUNES = 2048;
+        while (runes < MAX_RUNES) : (runes += 1) {
             const chosen = eng.resolveTopology() orelse break;
             sys.printOut(&[_]u8{chosen});
             eng.inventory[eng.inv_cursor] = chosen;
             eng.inv_cursor = (eng.inv_cursor + 1) % 128;
 
-            // Absorb generated token into soul (bound)
+            // Absorb generated rune into soul (bound)
             const bound_chosen = vsa.bind(vsa.generate(chosen), vsa.MASK_SCRIBE);
             _ = try soul.absorb(bound_chosen, chosen, null);
 
-            // Queue generated tokens for training too
+            // Queue generated runes for training too
             training_queue.push(&[_]u8{chosen});
 
             if (soul.last_boundary == .paragraph or vsa.hammingDistance(soul.concept, gen_start) > 450) break;
         }
-        if (tokens == MAX_TOKENS) {
+        if (runes == MAX_RUNES) {
             sys.printOut("\n[SAFETY] Concept Drift Limit.\n");
         }
         sys.printOut("\n\n");

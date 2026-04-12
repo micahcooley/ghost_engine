@@ -115,12 +115,14 @@ pub const MeaningMatrix = struct {
     }
 
     pub fn collapseToBinary(self: *const MeaningMatrix, hash: u64) HyperVector {
-        const base_idx = @as(u32, @intCast(hash % 1_048_576));
         if (self.tags) |tags| {
+            const num_slots = @as(u32, @intCast(tags.len));
+            const base_idx = @as(u32, @intCast(@as(u32, @truncate(hash)) % num_slots));
+            const stride = @as(u32, @intCast((hash >> 32) | 1));
             var p: u32 = 0;
-            // Linear Probing: Hardware-preferred over chaining
+            // Double Hashing: Eliminate Primary Clustering
             while (p < 8) : (p += 1) {
-                const slot = (base_idx + p) % 1_048_576;
+                const slot = (base_idx + p *% stride) % num_slots;
                 if (tags[slot] == hash) return self.collapseToBinaryAtSlot(slot);
                 if (tags[slot] == 0) return @splat(0);
             }
@@ -131,12 +133,14 @@ pub const MeaningMatrix = struct {
     /// The Gravity Rule: Microscopic addition toward a concept neighborhood.
     /// Vectorized for AVX-2/AVX-512 (1024-bit saturation via @Vector).
     pub fn applyGravity(self: *MeaningMatrix, word_hash: u64, sentence_pool: HyperVector) u64 {
-        const base_idx = @as(u32, @intCast(word_hash % 1_048_576));
         var slot_idx: ?u32 = null;
         if (self.tags) |tags| {
+            const num_slots = @as(u32, @intCast(tags.len));
+            const base_idx = @as(u32, @intCast(@as(u32, @truncate(word_hash)) % num_slots));
+            const stride = @as(u32, @intCast((word_hash >> 32) | 1));
             var p: u32 = 0;
             while (p < 8) : (p += 1) {
-                const slot = (base_idx + p) % 1_048_576;
+                const slot = (base_idx + p *% stride) % num_slots;
                 if (tags[slot] == word_hash) { slot_idx = slot; break; }
                 if (tags[slot] == 0) { tags[slot] = word_hash; slot_idx = slot; break; }
             }
@@ -197,12 +201,14 @@ pub const MeaningMatrix = struct {
 
     /// Universal Sigil Locking: Handles any 32-bit rune.
     pub fn hardLockUniversalSigil(self: *MeaningMatrix, hash: u64, rune: u32) void {
-        const base_idx = @as(u32, @intCast(hash % 1_048_576));
         var slot_idx: ?u32 = null;
         if (self.tags) |tags| {
+            const num_slots = @as(u32, @intCast(tags.len));
+            const base_idx = @as(u32, @intCast(@as(u32, @truncate(hash)) % num_slots));
+            const stride = @as(u32, @intCast((hash >> 32) | 1));
             var p: u32 = 0;
             while (p < 8) : (p += 1) {
-                const slot = (base_idx + p) % 1_048_576;
+                const slot = (base_idx + p *% stride) % num_slots;
                 if (tags[slot] == hash) { slot_idx = slot; break; }
                 if (tags[slot] == 0) { tags[slot] = hash; slot_idx = slot; break; }
             }
@@ -219,13 +225,34 @@ pub const MeaningMatrix = struct {
 
 /// Deterministic, infinite-context record-keeping.
 pub const Panopticon = struct {
-    ledger: std.ArrayListUnmanaged(u8),
+    ledger: std.ArrayListUnmanaged(u32),
     concepts: std.ArrayListUnmanaged(HyperVector),
     allocator: std.mem.Allocator,
+    max_ledger_size: usize = 100_000,
+    max_concepts_size: usize = 10_000,
+
     pub fn init(allocator: std.mem.Allocator) Panopticon { return .{ .ledger = .empty, .concepts = .empty, .allocator = allocator }; }
     pub fn deinit(self: *Panopticon) void { self.ledger.deinit(self.allocator); self.concepts.deinit(self.allocator); }
-    pub fn pushByte(self: *Panopticon, byte: u8) !void { try self.ledger.append(self.allocator, byte); }
-    pub fn markSentence(self: *Panopticon, concept: HyperVector) !void { try self.concepts.append(self.allocator, concept); }
+
+    pub fn pushRune(self: *Panopticon, rune: u32) !void {
+        if (self.ledger.items.len >= self.max_ledger_size) {
+            const keep = self.max_ledger_size / 2;
+            const start = self.ledger.items.len - keep;
+            std.mem.copyForwards(u32, self.ledger.items[0..keep], self.ledger.items[start..]);
+            self.ledger.shrinkRetainingCapacity(keep);
+        }
+        try self.ledger.append(self.allocator, rune);
+    }
+
+    pub fn markSentence(self: *Panopticon, concept: HyperVector) !void {
+        if (self.concepts.items.len >= self.max_concepts_size) {
+            const keep = self.max_concepts_size / 2;
+            const start = self.concepts.items.len - keep;
+            std.mem.copyForwards(HyperVector, self.concepts.items[0..keep], self.concepts.items[start..]);
+            self.concepts.shrinkRetainingCapacity(keep);
+        }
+        try self.concepts.append(self.allocator, concept);
+    }
 };
 
 pub fn koryphaiosBrickwall(current: HyperVector, primary: HyperVector, manager_limit: u64, critic_limit: u64) struct { passed: bool, manager_drift: u16, critic_drift: u16 } {

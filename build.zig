@@ -142,4 +142,56 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
+
+    // ── 9. Unit & Integration Tests ──
+    const main_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    main_tests.root_module.addImport("ghost_core", ghost_core);
+    main_tests.root_module.linkSystemLibrary("c", .{});
+    if (target.result.os.tag == .windows) {
+        if (vulkan_sdk) |sdk| {
+            const include_path = b.pathJoin(&.{ sdk, "Include" });
+            const lib_path = b.pathJoin(&.{ sdk, "Lib" });
+            main_tests.root_module.addIncludePath(.{ .cwd_relative = include_path });
+            main_tests.root_module.addLibraryPath(.{ .cwd_relative = lib_path });
+        }
+        main_tests.root_module.linkSystemLibrary("vulkan-1", .{});
+    } else {
+        main_tests.root_module.linkSystemLibrary("vulkan", .{});
+    }
+
+    const run_main_tests = b.addRunArtifact(main_tests);
+    const test_step = b.step("test", "Run all tests");
+    test_step.dependOn(&run_main_tests.step);
+
+    // ── 10. Parity Test ──
+    const parity_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_parity.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    parity_test.root_module.addImport("ghost_core", ghost_core);
+    parity_test.root_module.linkSystemLibrary("c", .{});
+    if (target.result.os.tag == .windows) {
+        if (vulkan_sdk) |sdk| {
+            const include_path = b.pathJoin(&.{ sdk, "Include" });
+            const lib_path = b.pathJoin(&.{ sdk, "Lib" });
+            parity_test.root_module.addIncludePath(.{ .cwd_relative = include_path });
+            parity_test.root_module.addLibraryPath(.{ .cwd_relative = lib_path });
+        }
+        parity_test.root_module.linkSystemLibrary("vulkan-1", .{});
+    } else {
+        parity_test.root_module.linkSystemLibrary("vulkan", .{});
+    }
+
+    const run_parity_test = b.addRunArtifact(parity_test);
+    const parity_step = b.step("test-parity", "Run Vulkan GPU <-> CPU Parity Tests");
+    parity_step.dependOn(&run_parity_test.step);
 }

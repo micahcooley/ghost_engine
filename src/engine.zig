@@ -87,7 +87,15 @@ pub const SingularityEngine = struct {
     inv_cursor: usize,
     compute: ?*const compute_api.ComputeApi,
     vulkan: ?*vsa_vulkan.VulkanEngine,
+    bmp_vectors: *const [65536]vsa.HyperVector,
     allocator: std.mem.Allocator,
+
+    pub fn precomputeBMP(allocator: std.mem.Allocator) !*const [65536]vsa.HyperVector {
+        // V27: Allocate contiguous, 256KB aligned BMP VSA Space
+        const bmp_vectors_slice = try allocator.alignedAlloc(vsa.HyperVector, std.mem.Alignment.fromByteUnits(262144), 65536);
+        for (0..65536) |i| bmp_vectors_slice[i] = vsa.generate(@intCast(i));
+        return @as(*const [65536]vsa.HyperVector, @ptrCast(bmp_vectors_slice.ptr));
+    }
 
     pub fn measureNoise(self: *SingularityEngine, candidate_vec: vsa.HyperVector, position: u32) u16 {
         const pos_hash = ghost_state.wyhash(self.soul.active_context_hash, @as(u64, position));
@@ -126,16 +134,27 @@ pub const SingularityEngine = struct {
                     energy = energy -| boredom;
                     insertTopK(&top_chars, &top_energies, cb, energy);
                 }
-            } else |_| {}
+            } else |err| {
+                sys.print("\n[VULKAN WARNING] Resonance Query Failed: {any}. Falling back to Silicon Heuristics...\n", .{err});
+            }
         }
 
         if (!gpu_success) {
-            // Minimal Heuristic Fallback (replaces the exhaustive 65k BMP search)
+            // 🛡️ Sovereign VSA SIMD Sweep: Measuring the entire 65,536 codepoint BMP space.
+            // No heuristics, no bias, no "active lexicon" prison. Pure measurement.
             const boredom = self.soul.getBoredomPenalty(self.soul.lexical_rotor);
-            var cp: u32 = 32;
-            while (cp < 127) : (cp += 1) { // ASCII fast path only
-                const e_lex = vsa.calculateResonance(self.meaning.collapseToBinary(self.soul.lexical_rotor), vsa.generate(cp));
-                const e_sem = vsa.calculateResonance(self.meaning.collapseToBinary(self.soul.semantic_rotor), vsa.generate(cp));
+            const target_lex = self.meaning.collapseToBinary(self.soul.lexical_rotor);
+            const target_sem = self.meaning.collapseToBinary(self.soul.semantic_rotor);
+
+            var cp: u32 = 0;
+            while (cp <= 0xFFFF) : (cp += 1) {
+                if (!isAllowed(cp)) continue;
+                
+                // Hardware-accelerated bitwise resonance
+                const v = self.bmp_vectors[cp];
+                const e_lex = vsa.calculateResonance(target_lex, v);
+                const e_sem = vsa.calculateResonance(target_sem, v);
+                
                 var energy: u32 = if (e_lex > 0) (e_lex * 2 + e_sem) / 3 else e_sem;
                 if (energy == 0) energy = 512;
                 if (cp == prev1 and cp == prev2 and cp == prev3) energy = energy -| 50;
@@ -150,26 +169,31 @@ pub const SingularityEngine = struct {
         // System 2: Monte Carlo rollout (when Vulkan is available)
         if (self.vulkan) |vk_engine| {
             const mc_engine = mc.MonteCarloEngine.init(self.allocator, vk_engine, self.meaning);
-            const winner_idx = mc_engine.resolve(self.soul, &top_chars, &top_energies);
+            const winner_idx = mc_engine.resolve(self.soul, &top_chars, &top_energies) catch 0;
             reason_best_char = top_chars[winner_idx];
         } else {
             // Fallback: shallow koryphaios reasoning (no GPU)
             var reason_best_score: u32 = 0;
             var frustration: u64 = 0;
 
+            // V27: Pre-calculate candidate metadata to avoid redundant loop work
+            var candidate_encoded = [_][4]u8{ [_]u8{0} ** 4 } ** REASON_TOP_K;
+            var candidate_lens = [_]u8{0} ** REASON_TOP_K;
+            var candidate_vecs = [_]vsa.HyperVector{ @as(vsa.HyperVector, @splat(0)) } ** REASON_TOP_K;
+            for (top_chars, 0..) |candidate, ki| {
+                candidate_lens[ki] = @as(u8, @intCast(std.unicode.utf8Encode(@intCast(candidate), &candidate_encoded[ki]) catch 0));
+                candidate_vecs[ki] = vsa.generate(candidate);
+            }
+
             while (true) {
                 for (top_chars, 0..) |candidate, ki| {
-                    if (top_energies[ki] == 0) continue;
+                    if (top_energies[ki] == 0 or candidate_lens[ki] == 0) continue;
                     const snapshot = saveSoul(self.soul);
 
-                    var utf8_buf: [4]u8 = undefined;
-                    const len = std.unicode.utf8Encode(@intCast(candidate), &utf8_buf) catch {
-                        restoreSoul(self.soul, snapshot);
-                        continue;
-                    };
-
-                    for (utf8_buf[0..len]) |b| {
-                        self.soul.simulateAbsorb(vsa.generate(b), b, null);
+                    const len = candidate_lens[ki];
+                    for (candidate_encoded[ki][0..len]) |b| {
+                        // V27 Optimization: use pre-generated VSA vector
+                        self.soul.simulateAbsorb(candidate_vecs[ki], b, null);
                     }
 
                     const sigmoid_leniency = (200 * (frustration * frustration)) / ((frustration * frustration) + 25);

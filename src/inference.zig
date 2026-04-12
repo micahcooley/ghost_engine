@@ -6,7 +6,7 @@ const vsa_vulkan = @import("vsa_vulkan.zig");
 /// Monte Carlo Inference Engine (System 2 Reasoning)
 /// Takes top-K candidates from fast-path resonance, then simulates each one
 /// forward N steps to measure terminal coherence. The lane with the highest
-/// terminal resonance wins. This replaces greedy next-token prediction with
+/// terminal resonance wins. This replaces greedy next-rune prediction with
 /// consequential reasoning.
 
 pub const MC_NUM_LANES: u32 = 5;
@@ -28,28 +28,30 @@ pub const MonteCarloEngine = struct {
 
     /// Run Monte Carlo rollout over the given top-K candidates.
     /// Returns the index into top_chars that wins.
-    pub fn resolve(self: *const MonteCarloEngine, soul: *const ghost_state.GhostSoul, top_chars: []const u32, top_energies: []const u32) u32 {
+    pub fn resolve(self: *const MonteCarloEngine, soul: *const ghost_state.GhostSoul, top_chars: []const u32, top_energies: []const u32) !u32 {
         var best_terminal: u32 = 0;
         var best_idx: u32 = 0;
 
         for (top_chars, 0..) |prime_char, idx| {
             if (top_energies[idx] == 0) continue;
 
-            // Clone soul state for this lane
-            var sim_soul = soul.*;
+            // Clone soul state for this lane on the heap
+            var sim_soul = try self.allocator.create(ghost_state.GhostSoul);
+            defer self.allocator.destroy(sim_soul);
+            sim_soul.* = soul.*;
             sim_soul.simulateAbsorb(vsa.generate(prime_char), prime_char, null);
 
             // Roll forward
             var steps: u32 = 0;
             while (steps < MC_ROLLOUT_DEPTH) : (steps += 1) {
-                const next = self.greedyStep(&sim_soul) orelse break;
+                const next = self.greedyStep(sim_soul) orelse break;
                 sim_soul.simulateAbsorb(vsa.generate(next), next, null);
                 if (next == '\n') break;
             }
 
             // Score: terminal resonance + MSB bonus
             var terminal_res: u32 = @intCast(vsa.calculateResonance(sim_soul.concept, soul.concept));
-            terminal_res += self.msbBonus(&sim_soul);
+            terminal_res += self.msbBonus(sim_soul);
 
             if (terminal_res > best_terminal) {
                 best_terminal = terminal_res;

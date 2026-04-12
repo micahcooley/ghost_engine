@@ -40,6 +40,8 @@ layout(std430, binding = 6) buffer BatchOutput {
 layout(push_constant) uniform Constants {
     uint batch_size;
     uint mode; // 0 = Training, 1 = Inference
+    uint slot_count;       // dynamic matrix_slots (replaces hardcoded 1048576)
+    uint lattice_quarter;  // dynamic gpu_lattice_size / 8
 } params;
 
 uint getRealityBit(uint char_id, uint bit_idx) {
@@ -67,9 +69,10 @@ uint collapseChunk(uint base_idx, uint chunk_idx) {
 }
 
 uint findSlot(uint64_t rotor) {
-    uint base_slot = uint(rotor % 1048576ul);
+    uint base_slot = uint(rotor % uint64_t(params.slot_count));
+    uint stride = uint((rotor >> 32) | 1ul);
     for (uint p = 0; p < 8; p++) {
-        uint slot = (base_slot + p) % 1048576u;
+        uint slot = (base_slot + p * stride) % params.slot_count;
         if (matrix_tags.entries[slot] == rotor) return slot;
         if (matrix_tags.entries[slot] == 0ul) return slot;
     }
@@ -98,18 +101,17 @@ void main() {
     uint g_id = gl_GlobalInvocationID.x;
     if (params.mode == 0u) {
         if (g_id >= params.batch_size) return;
-        uint64_t lex = batch_rotors.rotors[g_id * 2];
-        uint64_t sem = batch_rotors.rotors[g_id * 2 + 1];
-        energy_output.energies[g_id] = (computeEnergy(lex, batch_chars.target_chars[g_id]) + computeEnergy(sem, batch_chars.target_chars[g_id])) / 2;
+        uint64_t lex = batch_rotors.rotors[g_id * 2u];
+        uint64_t sem = batch_rotors.rotors[g_id * 2u + 1u];
+        energy_output.energies[g_id] = (computeEnergy(lex, batch_chars.target_chars[g_id]) + computeEnergy(sem, batch_chars.target_chars[g_id])) / 2u;
     } else {
-        if (g_id >= 256u) return;
+        if (g_id >= 65536u) return; // Full BMP support!
         uint64_t lex = batch_rotors.rotors[0];
         uint64_t sem = batch_rotors.rotors[1];
 
         uint e_lex = computeEnergy(lex, g_id);
         uint e_sem = computeEnergy(sem, g_id);
 
-        energy_output.energies[g_id] = (e_lex * 2 + e_sem) / 3;
-        if (energy_output.energies[g_id] < 512) energy_output.energies[g_id] = 512;
+        energy_output.energies[g_id] = (e_lex * 2u + e_sem) / 3u;
     }
 }
