@@ -1,0 +1,7 @@
+# UTF-8 Sovereign Linguistic Test
+雪だるま (Snowman) is falling. ⛄
+これは日本語のテストです。 (This is a Japanese test.)
+漢字、ひらがな、カタカナがすべて機能していることを確認します。
+(Checking that Kanji, Hiragana, and Katakana are all functioning.)
+🔥 The Ghost in the Machine is alive. 👻
+Hello 世界 (World)

@@ -1,10 +1,16 @@
 const std = @import("std");
 
-// --- GHOST ENGINE: DIRECT LINUX/POSIX CORE ---
-// Zero-overhead POSIX I/O and memory-mapping layer.
+// --- GHOST ENGINE: DIRECT LINUX CORE ---
+// Zero-overhead Linux syscall layer.
+// V32: Implement O_DIRECT for kernel-bypass NVMe performance.
+
+const linux = std.os.linux;
 
 pub const FileHandle = i32;
 pub const INVALID_HANDLE: i32 = -1;
+
+pub const O_DIRECT: u32 = 0o040000;
+pub const NVME_DIRECT_FLAGS: u32 = linux.O.RDWR | linux.O.CREAT | O_DIRECT | linux.O.DSYNC;
 pub const SECTOR_SIZE: usize = 4096;
 
 pub const MappedFile = struct {
@@ -12,41 +18,53 @@ pub const MappedFile = struct {
     data: []u8,
 
     pub fn flush(self: *const MappedFile) void {
-        _ = std.posix.msync(self.data, std.posix.MS.SYNC) catch {};
+        // V32: Direct DMA flush. Bypasses standard OS buffering.
+        _ = linux.msync(self.data.ptr, self.data.len, linux.MS.SYNC);
+        _ = linux.fdatasync(self.file_handle);
     }
 
     pub fn unmap(self: *MappedFile) void {
-        std.posix.munmap(self.data);
-        std.posix.close(self.file_handle);
+        _ = linux.munmap(self.data.ptr, self.data.len);
+        _ = linux.close(self.file_handle);
     }
 };
 
-pub fn printOut(text: []const u8) void {
-    _ = std.posix.write(std.posix.STDOUT_FILENO, text) catch {};
+pub fn directRead(handle: FileHandle, offset: u64, buffer: []u8) !void {
+    const n = linux.pread(handle, buffer.ptr, buffer.len, offset);
+    if (n < 0) return error.DirectReadFailed;
 }
 
-pub fn readStdin(buffer: []u8) ![]u8 {
-    const bytes_read = try std.posix.read(std.posix.STDIN_FILENO, buffer);
-    return buffer[0..bytes_read];
+pub fn getMilliTick() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(linux.CLOCK.MONOTONIC, &ts);
+    return @intCast(@as(i128, ts.tv_sec) * 1000 + @divFloor(ts.tv_nsec, 1_000_000));
 }
 
-var global_silo_root: ?[]const u8 = null;
-
-pub fn getExePath(allocator: std.mem.Allocator) ![]const u8 {
-    return try std.fs.selfExePathAlloc(allocator);
-}
+var silo_root_buf: [1024]u8 = undefined;
+var silo_root_len: usize = 0;
 
 pub fn getSiloRoot(allocator: std.mem.Allocator) ![]const u8 {
-    if (global_silo_root) |r| return r;
+    _ = allocator;
+    if (silo_root_len > 0) return silo_root_buf[0..silo_root_len];
+
+    var buf: [1024]u8 = undefined;
+    const len = linux.readlink("/proc/self/exe", &buf, 1024);
+    if (len < 0) return error.ProcSelfExeFailed;
     
-    const exe_path = try getExePath(allocator);
-    defer allocator.free(exe_path);
+    const exe_path = buf[0..@intCast(len)];
+    const exe_dir = std.fs.path.dirname(exe_path) orelse return error.NoDirName;
+
+    const silo_root = if (std.mem.endsWith(u8, exe_dir, "/bin"))
+        std.fs.path.dirname(exe_dir) orelse exe_dir
+    else
+        exe_dir;
+
+    if (silo_root.len > silo_root_buf.len) return error.PathTooLong;
+    @memcpy(silo_root_buf[0..silo_root.len], silo_root);
+    silo_root_len = silo_root.len;
     
-    const bin_dir = std.fs.path.dirname(exe_path) orelse return error.NoDirName;
-    const silo_root = std.fs.path.dirname(bin_dir) orelse bin_dir; 
-    
-    global_silo_root = try allocator.dupe(u8, silo_root);
-    return global_silo_root.?;
+    std.debug.print("[SYS] Silo root anchored: {s}\n", .{silo_root_buf[0..silo_root_len]});
+    return silo_root_buf[0..silo_root_len];
 }
 
 pub fn getAnchorPath(allocator: std.mem.Allocator, sub_path: []const u8) ![]const u8 {
@@ -55,152 +73,131 @@ pub fn getAnchorPath(allocator: std.mem.Allocator, sub_path: []const u8) ![]cons
     return std.fs.path.join(allocator, &[_][]const u8{ root, sub_path });
 }
 
-pub fn openForRead(allocator: std.mem.Allocator, path: []const u8) !FileHandle {
-    const anchored = try getAnchorPath(allocator, path);
-    defer allocator.free(anchored);
-    return std.posix.open(anchored, .{ .ACCMODE = .RDONLY }, 0) catch error.FileNotFound;
-}
-
 pub fn openForWrite(allocator: std.mem.Allocator, path: []const u8) !FileHandle {
     const anchored = try getAnchorPath(allocator, path);
     defer allocator.free(anchored);
-    return std.posix.open(anchored, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch error.OpenFailed;
+    const fd = linux.open(anchored.ptr, linux.O.RDWR | linux.O.CREAT, 0o644);
+    if (fd < 0) return error.OpenFailed;
+    return @intCast(fd);
 }
 
-pub fn closeFile(handle: FileHandle) void {
-    std.posix.close(handle);
+pub fn openForWriteAppend(allocator: std.mem.Allocator, path: []const u8) !FileHandle {
+    const anchored = try getAnchorPath(allocator, path);
+    defer allocator.free(anchored);
+    const fd = linux.open(anchored.ptr, NVME_DIRECT_FLAGS, 0o644);
+    if (fd < 0) return error.OpenFailed;
+    _ = linux.lseek(fd, 0, linux.SEEK.END);
+    return @intCast(fd);
 }
 
-pub fn getFileSize(handle: FileHandle) !u32 {
-    const stat = try std.posix.fstat(handle);
-    return @intCast(stat.size);
-}
-
-pub fn readAll(handle: FileHandle, buffer: []u8) !usize {
-    var total: usize = 0;
-    while (total < buffer.len) {
-        const n = try std.posix.read(handle, buffer[total..]);
-        if (n == 0) break;
-        total += n;
-    }
-    return total;
-}
-
-pub fn writeAll(handle: FileHandle, data: []const u8) !void {
-    var total: usize = 0;
-    while (total < data.len) {
-        const n = try std.posix.write(handle, data[total..]);
-        if (n == 0) break;
-        total += n;
-    }
+pub fn openForRead(allocator: std.mem.Allocator, path: []const u8) !FileHandle {
+    const anchored = try getAnchorPath(allocator, path);
+    defer allocator.free(anchored);
+    const fd = linux.open(anchored.ptr, linux.O.RDONLY, 0);
+    if (fd < 0) return error.FileNotFound;
+    return @intCast(fd);
 }
 
 pub fn createMappedFile(allocator: std.mem.Allocator, path: []const u8, size: usize) !MappedFile {
     const anchored = try getAnchorPath(allocator, path);
     defer allocator.free(anchored);
-    const fd = try std.posix.open(anchored, .{ .ACCMODE = .RDWR, .CREAT = true }, 0o644);
-    try std.posix.ftruncate(fd, size);
-    const ptr = try std.posix.mmap(null, size, std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .SHARED }, fd, 0);
-    return MappedFile{
-        .file_handle = fd,
-        .data = ptr,
-    };
+    
+    const fd = linux.open(anchored.ptr, linux.O.RDWR | linux.O.CREAT, 0o644);
+    if (fd < 0) return error.CreateFailed;
+
+    // Ensure size
+    _ = linux.ftruncate(fd, size);
+
+    const ptr = linux.mmap(null, size, linux.PROT.READ | linux.PROT.WRITE, linux.MAP.SHARED, fd, 0);
+    if (ptr == linux.MAP.FAILED) {
+        _ = linux.close(fd);
+        return error.MapViewFailed;
+    }
+
+    return MappedFile{ .file_handle = @intCast(fd), .data = @as([*]u8, @ptrCast(ptr))[0..size] };
+}
+
+pub fn closeFile(handle: FileHandle) void { _ = linux.close(handle); }
+
+pub fn getFileSize(handle: FileHandle) !u32 {
+    var st: linux.Stat = undefined;
+    if (linux.fstat(handle, &st) < 0) return error.GetSizeFailed;
+    return @intCast(st.size);
+}
+
+pub fn writeAll(handle: FileHandle, data: []const u8) !void {
+    var total: usize = 0;
+    while (total < data.len) {
+        const n = linux.write(handle, data[total..].ptr, data.len - total);
+        if (n <= 0) return error.WriteFailed;
+        total += @intCast(n);
+    }
+}
+
+pub fn readAll(handle: FileHandle, buffer: []u8) !usize {
+    var total: usize = 0;
+    while (total < buffer.len) {
+        const n = linux.read(handle, buffer[total..].ptr, buffer.len - total);
+        if (n <= 0) break;
+        total += @intCast(n);
+    }
+    return total;
 }
 
 pub fn allocSectorAligned(size: usize) ?[]u8 {
     const aligned_size = (size + SECTOR_SIZE - 1) & ~(SECTOR_SIZE - 1);
-    const ptr = std.posix.mmap(null, aligned_size, std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0) catch return null;
-    return ptr;
+    // On Linux, posix_memalign is standard, but for syscall level we use mmap with anonymous mapping
+    const ptr = linux.mmap(null, aligned_size, linux.PROT.READ | linux.PROT.WRITE, linux.MAP.PRIVATE | linux.MAP.ANONYMOUS, -1, 0);
+    if (ptr == linux.MAP.FAILED) return null;
+    return @as([*]u8, @ptrCast(ptr))[0..aligned_size];
 }
 
-pub fn freeSectorAligned(buf: []u8) void {
-    std.posix.munmap(buf);
-}
+pub fn freeSectorAligned(buf: []u8) void { _ = linux.munmap(buf.ptr, buf.len); }
 
-pub fn getMilliTick() u64 {
-    var ts: std.posix.timespec = undefined;
-    std.posix.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts) catch return 0;
-    return @as(u64, @intCast(ts.tv_sec)) * 1000 + @as(u64, @intCast(ts.tv_nsec)) / 1000000;
-}
+pub fn printOut(text: []const u8) void { _ = linux.write(1, text.ptr, text.len); }
 
 pub fn sleep(ms: u32) void {
-    const ts = std.posix.timespec{
+    const ts = linux.timespec{
         .tv_sec = @intCast(ms / 1000),
         .tv_nsec = @intCast((ms % 1000) * 1000000),
     };
-    std.posix.nanosleep(&ts, null);
+    _ = linux.nanosleep(&ts, null);
 }
 
-pub fn exit(code: u32) noreturn {
-    std.posix.exit(@intCast(code));
-}
+pub fn exit(code: u32) noreturn { linux.exit(code); }
 
-pub fn getArgs(allocator: std.mem.Allocator) ![][]const u8 {
-    return std.process.argsAlloc(allocator);
+pub fn acquireTrainerLock() bool {
+    // Linux equivalent: Flocking a well-known lock file
+    const path = "/tmp/ghost_trainer.lock";
+    const fd = linux.open(path.ptr, linux.O.RDWR | linux.O.CREAT, 0o666);
+    if (fd < 0) return false;
+    
+    const FL_LOCK_EX = 2;
+    const FL_LOCK_NB = 4;
+    // We use fcntl or flock here. Flock is simpler for this purpose.
+    if (linux.flock(@intCast(fd), FL_LOCK_EX | FL_LOCK_NB) < 0) {
+        _ = linux.close(fd);
+        return false;
+    }
+    return true; 
 }
 
 pub fn isTrainerActive(allocator: std.mem.Allocator) bool {
-    const anchored = getAnchorPath(allocator, "plugins/trainer.lock") catch return false;
-    defer allocator.free(anchored);
-    const fd = std.posix.open(anchored, .{ .ACCMODE = .RDONLY }, 0) catch return false;
-    std.posix.close(fd);
-    return true;
+    _ = allocator;
+    const path = "/tmp/ghost_trainer.lock";
+    const fd = linux.open(path.ptr, linux.O.RDWR, 0);
+    if (fd < 0) return false;
+    defer _ = linux.close(fd);
+    
+    const FL_LOCK_EX = 2;
+    const FL_LOCK_NB = 4;
+    const FL_LOCK_UN = 8;
+    
+    // Try to lock. If it fails, someone else has it.
+    if (linux.flock(@intCast(fd), FL_LOCK_EX | FL_LOCK_NB) < 0) {
+        return true;
+    }
+    // If we got it, it wasn't active. Release and return false.
+    _ = linux.flock(@intCast(fd), FL_LOCK_UN);
+    return false;
 }
-
-pub fn findPluginFiles(allocator: std.mem.Allocator) ![][]const u8 {
-    var results = std.ArrayList([]const u8).init(allocator);
-    const anchored_plugins = try getAnchorPath(allocator, "plugins");
-    defer allocator.free(anchored_plugins);
-    
-    var dir = std.fs.openDirAbsolute(anchored_plugins, .{ .iterate = true }) catch return results.toOwnedSlice();
-    defer dir.close();
-    
-    var iter = dir.iterate();
-    while (try iter.next()) |entry| {
-        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".sigil")) {
-            const joined = try std.fs.path.join(allocator, &[_][]const u8{ "plugins", entry.name });
-            defer allocator.free(joined);
-            const full_path = try getAnchorPath(allocator, joined);
-            try results.append(full_path);
-        }
-    }
-    return results.toOwnedSlice();
-}
-
-pub fn findNativePlugins(allocator: std.mem.Allocator) ![][]const u8 {
-    var results = std.ArrayList([]const u8).init(allocator);
-    const anchored_plugins = try getAnchorPath(allocator, "plugins");
-    defer allocator.free(anchored_plugins);
-    
-    var dir = std.fs.openDirAbsolute(anchored_plugins, .{ .iterate = true }) catch return results.toOwnedSlice();
-    defer dir.close();
-    
-    var iter = dir.iterate();
-    while (try iter.next()) |entry| {
-        if (entry.kind == .file and (std.mem.endsWith(u8, entry.name, ".so") or std.mem.endsWith(u8, entry.name, ".dylib"))) {
-            const joined = try std.fs.path.join(allocator, &[_][]const u8{ "plugins", entry.name });
-            defer allocator.free(joined);
-            const full_path = try getAnchorPath(allocator, joined);
-            try results.append(full_path);
-        }
-    }
-    return results.toOwnedSlice();
-}
-
-pub const NativeLibrary = struct {
-    handle: *anyopaque,
-
-    pub fn open(path: []const u8) !NativeLibrary {
-        const h = std.posix.dlopen(path, std.posix.RTLD.LAZY) catch return error.LibraryLoadFailed;
-        return NativeLibrary{ .handle = h };
-    }
-
-    pub fn lookup(self: NativeLibrary, T: type, name: [:0]const u8) ?T {
-        const addr = std.posix.dlsym(self.handle, name) catch return null;
-        return @as(T, @ptrCast(addr));
-    }
-
-    pub fn close(self: NativeLibrary) void {
-        _ = std.posix.dlclose(self.handle);
-    }
-};

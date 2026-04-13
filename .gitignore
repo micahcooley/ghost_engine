@@ -32,3 +32,8 @@ cimport.zig
 
 # Large training datasets (too large for GitHub LFS free tier)
 **/corpus/wikitext_train.txt
+
+# Transient telemetry and local config
+trainer.log
+ghost_config.json
+**/web/node_modules/

@@ -6,21 +6,21 @@ const ghost_state = core.ghost_state;
 const vsa_vulkan = core.vsa_vulkan;
 const mc = core.inference;
 
-pub fn main() !void {
-    const allocator = std.heap.page_allocator;
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    _ = init.io;
 
     const silo_root = try sys.getSiloRoot(allocator);
     sys.print("Silo Root: {s}\n", .{silo_root});
 
-    const compute = try vsa_vulkan.GHOST_COMPUTE_PLUGIN.init(allocator);
-    defer vsa_vulkan.GHOST_COMPUTE_PLUGIN.deinit();
-    const vk_engine = vsa_vulkan.getEngine() orelse return error.NoVulkan;
+    const vk_engine = try vsa_vulkan.initRuntime(allocator, init.io);
+    defer vsa_vulkan.deinitRuntime();
 
     // Upload CPU-trained data to GPU buffers
-    const mapped_meaning = try sys.createMappedFile(allocator, "state/semantic_monolith.bin", 1024*1024*1024);
-    const gpu_matrix = compute.getMatrixData();
-    const src_ptr: [*]const u16 = @ptrCast(@alignCast(mapped_meaning.data.ptr));
-    const src_len = mapped_meaning.data.len / 2;
+    const mapped_meaning = try sys.createMappedFile(allocator, "state/semantic_monolith.bin", @sizeOf(u32) * 512 * 1024 * 1024);
+    const gpu_matrix = vk_engine.getMatrixData();
+    const src_ptr: [*]const u32 = @ptrCast(@alignCast(mapped_meaning.data.ptr));
+    const src_len = mapped_meaning.data.len / 4;
     const copy_len = @min(gpu_matrix.len, src_len);
     @memcpy(gpu_matrix[0..copy_len], src_ptr[0..copy_len]);
 
@@ -30,9 +30,9 @@ pub fn main() !void {
     };
 
     var soul = try allocator.create(ghost_state.GhostSoul);
-    soul.* = ghost_state.GhostSoul.init(allocator);
-    defer soul.deinit();
+    soul.* = try ghost_state.GhostSoul.init(allocator);
     defer allocator.destroy(soul);
+    defer soul.deinit();
 
     soul.meaning_matrix = &meaning_matrix;
 
@@ -40,14 +40,14 @@ pub fn main() !void {
     sys.print("Prompting: {s}\n", .{prompt});
     for (prompt) |rune| _ = try soul.absorb(vsa.generate(rune), rune, null);
 
-    const mc_engine = mc.MonteCarloEngine.init(allocator, vk_engine, &meaning_matrix);
+    const beam = mc.BeamSearchPool.init(allocator, vk_engine, &meaning_matrix);
 
     sys.print("Response: ", .{});
     var i: usize = 0;
     while (i < 40) : (i += 1) {
         // Fast-path: get top-5 from GPU resonance
-        const energies = vk_engine.dispatchResonance(soul.lexical_rotor, soul.semantic_rotor, allocator) catch break;
-        defer allocator.free(energies);
+        const energies = try vk_engine.dispatchResonance(soul.lexical_rotor, soul.semantic_rotor);
+        if (energies.len == 0) break;
 
         var top_chars: [5]u32 = [_]u32{0} ** 5;
         var top_energies: [5]u32 = [_]u32{0} ** 5;
@@ -66,8 +66,8 @@ pub fn main() !void {
             });
         }
 
-        // System 2: Monte Carlo picks the winner
-        const winner_idx = mc_engine.resolve(soul, &top_chars, &top_energies) catch 0;
+        // Beam search picks the winner
+        const winner_idx = beam.resolve(soul, &top_chars, &top_energies) catch 0;
         const chosen = top_chars[winner_idx];
         sys.print("\n  -> chosen: '{c}' (lane {d})\n", .{@as(u8, @intCast(chosen)), winner_idx});
         _ = try soul.absorb(vsa.generate(@intCast(chosen)), @intCast(chosen), null);

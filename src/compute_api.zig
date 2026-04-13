@@ -1,34 +1,37 @@
 const std = @import("std");
 
-/// [ASPIRATIONAL] This interface is not yet used by any production code.
-/// Currently vsa_vulkan.zig implements compute directly. This abstraction
-/// will enable CUDA and CPU backends in future releases.
+/// This abstraction will enable CUDA and CPU backends in future releases.
 pub const ComputeApi = struct {
     /// Human-readable name of the provider (e.g., "Vulkan-V27", "CUDA-X")
     name: []const u8,
 
     /// Returns the raw pointer to the Meaning Matrix memory managed by the provider.
     /// This memory must be host-visible and aligned.
-    getMatrixData: *const fn () []u16,
-    
+    getMatrixData: *const fn () []u32,
+
     /// Returns the raw pointer to the Semantic Tags memory.
     getTagsData: *const fn () []u64,
 
     /// Returns the raw pointer to the Unified Lattice memory.
     getLatticeData: *const fn () []u16,
 
-    /// Perform a batch etch operation. V28: Greedy Saturation.
-    /// 'starting_rotors' contains (lexical, semantic) pairs for each stream — one pair per stream.
-    /// 'chars' contains the greedy-packed rune buffer (runes from any stream, contiguous).
-    /// 'rotor_indices' is a parallel array of u32 stream IDs, one per slot in 'chars'.
-    /// 'num_streams' is the active stream count (for shader bounds-checking).
-    etch: *const fn (total_batch: u32, num_streams: u32, starting_rotors: []const u64, chars: []const u8, rotor_indices: []const u32) anyerror!void,
+    /// Perform a batch etch operation.
+    etch: *const fn (total_batch: u32, num_streams: u32, per_rune_rotors: []const u64, chars: []const u32, rotor_indices: []const u32) anyerror!void,
+
+    /// Query resonance for a batch of contexts. Returns energy scores per slot.
+    queryResonanceBatch: *const fn (total_batch: u32, per_rune_rotors: []const u64) anyerror![]u32,
+
+    /// Submit N queries to dedicated execution pools in parallel.
+    queryResonanceWide: *const fn (num_lanes: u32, rotor_pairs: []const u64) anyerror![]u32,
 
     /// Query resonance for a specific context. Returns top-K energy scores.
     queryResonance: *const fn (lexical_rotor: u64, semantic_rotor: u64, allocator: std.mem.Allocator) anyerror![]u32,
 
     /// Perform recursive lookahead for reasoning.
-    lookahead: *const fn (num_rotors: u32, depth: u32, allocator: std.mem.Allocator) anyerror![]u32,
+    lookahead: *const fn (num_rotors: u32, depth: u32, allocator: std.mem.Allocator) anyerror!u64,
+
+    /// Collect lookahead results using the ticket returned by lookahead().
+    lookaheadCollect: *const fn (ticket: u64, num_rotors: u32) []u32,
 
     /// Apply thermal pruning to the lattice.
     prune: *const fn () anyerror!void,
@@ -44,10 +47,10 @@ pub const ComputeApi = struct {
 pub const ComputePlugin = struct {
     name: []const u8,
     version: u32,
-    
+
     /// Factory function to initialize the provider
-    init: *const fn (allocator: std.mem.Allocator) anyerror!*const ComputeApi,
-    
+    init: *const fn (allocator: std.mem.Allocator, io: std.Io) anyerror!*const ComputeApi,
+
     /// Cleanup function
     deinit: *const fn () void,
 };

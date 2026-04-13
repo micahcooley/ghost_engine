@@ -1,0 +1,9 @@
+[DEBUG] createMappedFile: C:\ghost_engine\platforms/windows/x86_64/state/unified_lattice.bin
+[DEBUG] anchored path: C:\ghost_engine\platforms/windows/x86_64/state/unified_lattice.bin
+[DEBUG] CreateFileW success
+[DEBUG] createMappedFile: C:\ghost_engine\platforms/windows/x86_64/state/semantic_monolith.bin
+[DEBUG] anchored path: C:\ghost_engine\platforms/windows/x86_64/state/semantic_monolith.bin
+[DEBUG] CreateFileW success
+[DEBUG] createMappedFile: C:\ghost_engine\platforms/windows/x86_64/state/semantic_tags.bin
+[DEBUG] anchored path: C:\ghost_engine\platforms/windows/x86_64/state/semantic_tags.bin
+[DEBUG] CreateFileW success

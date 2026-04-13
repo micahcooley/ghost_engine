@@ -1,0 +1,24 @@
+[DEBUG] createMappedFile: state/semantic_monolith.bin
+[DEBUG] anchored path: C:\ghost_engine\zig-out\state/semantic_monolith.bin
+[DEBUG] CreateFileW success
+Segmentation fault at address 0x291147e1000
+C:\ghost_engine\src\vsa_core.zig:508:17: 0x7ff62836a3a4 in deinit (probe_inference_zcu.obj)
+            self.page_count,
+                ^
+C:\ghost_engine\src\ghost_state.zig:194:31: 0x7ff6282479d1 in deinit (probe_inference_zcu.obj)
+        self.panopticon.deinit();
+                              ^
+C:\ghost_engine\src\probe_inference.zig:34:22: 0x7ff628246a4c in main (probe_inference_zcu.obj)
+    defer soul.deinit();
+                     ^
+C:\zig\lib\std\start.zig:657:28: 0x7ff6282486b6 in main (probe_inference_zcu.obj)
+            return callMain(std.os.windows.peb().ProcessParameters.CommandLine.slice(), .global);
+                           ^
+C:\zig\lib\libc\mingw\crt\crtexe.c:259:0: 0x7ff6283b33cb in __tmainCRTStartup (crt2.obj)
+    mainret = _tmain (argc, argv, envp);
+
+C:\zig\lib\libc\mingw\crt\crtexe.c:179:0: 0x7ff6283b342b in mainCRTStartup (crt2.obj)
+  ret = __tmainCRTStartup ();
+
+???:?:?: 0x7ffcd81ce8d6 in ??? (KERNEL32.DLL)
+???:?:?: 0x7ffcd8eec3fb in ??? (ntdll.dll)

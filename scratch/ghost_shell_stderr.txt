@@ -1,0 +1,237 @@
+[DEBUG] createMappedFile: C:\ghost_engine\platforms/windows/x86_64/state/unified_lattice.bin
+[DEBUG] anchored path: C:\ghost_engine\platforms/windows/x86_64/state/unified_lattice.bin
+[DEBUG] CreateFileW success
+[DEBUG] createMappedFile: C:\ghost_engine\platforms/windows/x86_64/state/semantic_monolith.bin
+[DEBUG] anchored path: C:\ghost_engine\platforms/windows/x86_64/state/semantic_monolith.bin
+[DEBUG] CreateFileW success
+[DEBUG] createMappedFile: C:\ghost_engine\platforms/windows/x86_64/state/semantic_tags.bin
+[DEBUG] anchored path: C:\ghost_engine\platforms/windows/x86_64/state/semantic_tags.bin
+[DEBUG] CreateFileW success
+error: OutOfMemory
+C:\zig\lib\std\mem\Allocator.zig:300:82: 0x7ff7cf5f8a82 in allocBytesWithAlignment__anon_77529 (ghost_shell_zcu.obj)
+    const byte_ptr = self.rawAlloc(byte_count, alignment, return_address) orelse return error.OutOfMemory;
+                                                                                 ^
+C:\zig\lib\std\mem\Allocator.zig:286:5: 0x7ff7cf5f8884 in allocWithSizeAndAlignment__anon_77525 (ghost_shell_zcu.obj)
+    return self.allocBytesWithAlignment(alignment, byte_count, return_address);
+    ^
+C:\zig\lib\std\mem\Allocator.zig:262:5: 0x7ff7cf458350 in alignedAlloc__anon_5033 (ghost_shell_zcu.obj)
+    return self.allocAdvancedWithRetAddr(T, alignment, n, @returnAddress());
+    ^
+C:\ghost_engine\src\engine.zig:118:39: 0x7ff7cf456fe5 in precomputeBMP (ghost_shell_zcu.obj)
+            const bmp_vectors_slice = try allocator.alignedAlloc(vsa.HyperVector, std.mem.Alignment.fromByteUnits(262144), 65536);
+                                      ^
+C:\ghost_engine\src\shell.zig:1279:17: 0x7ff7cf45b061 in main (ghost_shell_zcu.obj)
+    const bmp = try engine.SingularityEngine.precomputeBMP(global_allocator);
+                ^
+error(DebugAllocator): memory address 0x19b783b0460 leaked: 
+C:\ghost_engine\src\shell.zig:1274:48: 0x7ff7cf45aaac in main (ghost_shell_zcu.obj)
+    const meaning = try global_allocator.create(vsa.MeaningMatrix);
+                                               ^
+C:\zig\lib\std\start.zig:657:28: 0x7ff7cf45cff6 in main (ghost_shell_zcu.obj)
+            return callMain(std.os.windows.peb().ProcessParameters.CommandLine.slice(), .global);
+                           ^
+C:\zig\lib\libc\mingw\crt\crtexe.c:259:0: 0x7ff7cf6335ab in __tmainCRTStartup (crt2.obj)
+    mainret = _tmain (argc, argv, envp);
+
+C:\zig\lib\libc\mingw\crt\crtexe.c:179:0: 0x7ff7cf63360b in mainCRTStartup (crt2.obj)
+  ret = __tmainCRTStartup ();
+
+???:?:?: 0x7ffcd81ce8d6 in ??? (KERNEL32.DLL)
+???:?:?: 0x7ffcd8eec3fb in ??? (ntdll.dll)
+
+error(DebugAllocator): memory address 0x19b78411000 leaked: 
+C:\ghost_engine\src\vsa_vulkan.zig:262:44: 0x7ff7cf44d7f2 in init (ghost_shell_zcu.obj)
+        const engine = try allocator.create(VulkanEngine);
+                                           ^
+C:\ghost_engine\src\vsa_vulkan.zig:1442:44: 0x7ff7cf450e85 in initRuntime (ghost_shell_zcu.obj)
+    global_instance = try VulkanEngine.init(allocator, io);
+                                           ^
+C:\ghost_engine\src\shell.zig:1255:38: 0x7ff7cf459c85 in main (ghost_shell_zcu.obj)
+    const vk = vsa_vulkan.initRuntime(global_allocator, init.io) catch null;
+                                     ^
+C:\zig\lib\std\start.zig:657:28: 0x7ff7cf45cff6 in main (ghost_shell_zcu.obj)
+            return callMain(std.os.windows.peb().ProcessParameters.CommandLine.slice(), .global);
+                           ^
+C:\zig\lib\libc\mingw\crt\crtexe.c:259:0: 0x7ff7cf6335ab in __tmainCRTStartup (crt2.obj)
+    mainret = _tmain (argc, argv, envp);
+
+C:\zig\lib\libc\mingw\crt\crtexe.c:179:0: 0x7ff7cf63360b in mainCRTStartup (crt2.obj)
+  ret = __tmainCRTStartup ();
+
+
+error(DebugAllocator): memory address 0x19b7f200000 leaked: 
+C:\ghost_engine\src\shell.zig:1256:45: 0x7ff7cf459ce5 in main (ghost_shell_zcu.obj)
+    const soul = try global_allocator.create(ghost_state.GhostSoul);
+                                            ^
+C:\zig\lib\std\start.zig:657:28: 0x7ff7cf45cff6 in main (ghost_shell_zcu.obj)
+            return callMain(std.os.windows.peb().ProcessParameters.CommandLine.slice(), .global);
+                           ^
+C:\zig\lib\libc\mingw\crt\crtexe.c:259:0: 0x7ff7cf6335ab in __tmainCRTStartup (crt2.obj)
+    mainret = _tmain (argc, argv, envp);
+
+C:\zig\lib\libc\mingw\crt\crtexe.c:179:0: 0x7ff7cf63360b in mainCRTStartup (crt2.obj)
+  ret = __tmainCRTStartup ();
+
+???:?:?: 0x7ffcd81ce8d6 in ??? (KERNEL32.DLL)
+???:?:?: 0x7ffcd8eec3fb in ??? (ntdll.dll)
+
+error(DebugAllocator): memory address 0x19b787e0000 leaked: 
+C:\ghost_engine\src\vsa_vulkan.zig:269:49: 0x7ff7cf44dcaf in init (ghost_shell_zcu.obj)
+            .result_buffer = try allocator.alloc(u32, 65536),
+                                                ^
+C:\ghost_engine\src\vsa_vulkan.zig:1442:44: 0x7ff7cf450e85 in initRuntime (ghost_shell_zcu.obj)
+    global_instance = try VulkanEngine.init(allocator, io);
+                                           ^
+C:\ghost_engine\src\shell.zig:1255:38: 0x7ff7cf459c85 in main (ghost_shell_zcu.obj)
+    const vk = vsa_vulkan.initRuntime(global_allocator, init.io) catch null;
+                                     ^
+C:\zig\lib\std\start.zig:657:28: 0x7ff7cf45cff6 in main (ghost_shell_zcu.obj)
+            return callMain(std.os.windows.peb().ProcessParameters.CommandLine.slice(), .global);
+                           ^
+C:\zig\lib\libc\mingw\crt\crtexe.c:259:0: 0x7ff7cf6335ab in __tmainCRTStartup (crt2.obj)
+    mainret = _tmain (argc, argv, envp);
+
+C:\zig\lib\libc\mingw\crt\crtexe.c:179:0: 0x7ff7cf63360b in mainCRTStartup (crt2.obj)
+  ret = __tmainCRTStartup ();
+
+
+error(DebugAllocator): memory address 0x19b7f6f0000 leaked: 
+C:\ghost_engine\src\vsa_core.zig:873:51: 0x7ff7cf451234 in init (ghost_shell_zcu.obj)
+            .neighbor_counts = try allocator.alloc(u8, max_nodes),
+                                                  ^
+C:\ghost_engine\src\vsa_core.zig:501:35: 0x7ff7cf451c19 in init (ghost_shell_zcu.obj)
+            .hnsw = HnswIndex.init(allocator, MAX_CONCEPTS, concepts) catch null,
+                                  ^
+C:\ghost_engine\src\ghost_state.zig:176:55: 0x7ff7cf45204f in init (ghost_shell_zcu.obj)
+            .panopticon = try vsa.PagedPanopticon.init(allocator),
+                                                      ^
+C:\ghost_engine\src\shell.zig:1257:44: 0x7ff7cf459d9c in main (ghost_shell_zcu.obj)
+    soul.* = try ghost_state.GhostSoul.init(global_allocator);
+                                           ^
+C:\zig\lib\std\start.zig:657:28: 0x7ff7cf45cff6 in main (ghost_shell_zcu.obj)
+            return callMain(std.os.windows.peb().ProcessParameters.CommandLine.slice(), .global);
+                           ^
+C:\zig\lib\libc\mingw\crt\crtexe.c:259:0: 0x7ff7cf6335ab in __tmainCRTStartup (crt2.obj)
+    mainret = _tmain (argc, argv, envp);
+
+
+error(DebugAllocator): memory address 0x19b7fbe0000 leaked: 
+C:\ghost_engine\src\vsa_core.zig:879:51: 0x7ff7cf45147a in init (ghost_shell_zcu.obj)
+            .scratch_visited = try allocator.alloc(bool, max_nodes),
+                                                  ^
+C:\ghost_engine\src\vsa_core.zig:501:35: 0x7ff7cf451c19 in init (ghost_shell_zcu.obj)
+            .hnsw = HnswIndex.init(allocator, MAX_CONCEPTS, concepts) catch null,
+                                  ^
+C:\ghost_engine\src\ghost_state.zig:176:55: 0x7ff7cf45204f in init (ghost_shell_zcu.obj)
+            .panopticon = try vsa.PagedPanopticon.init(allocator),
+                                                      ^
+C:\ghost_engine\src\shell.zig:1257:44: 0x7ff7cf459d9c in main (ghost_shell_zcu.obj)
+    soul.* = try ghost_state.GhostSoul.init(global_allocator);
+                                           ^
+C:\zig\lib\std\start.zig:657:28: 0x7ff7cf45cff6 in main (ghost_shell_zcu.obj)
+            return callMain(std.os.windows.peb().ProcessParameters.CommandLine.slice(), .global);
+                           ^
+C:\zig\lib\libc\mingw\crt\crtexe.c:259:0: 0x7ff7cf6335ab in __tmainCRTStartup (crt2.obj)
+    mainret = _tmain (argc, argv, envp);
+
+
+error(DebugAllocator): memory address 0x19b1c5b0000 leaked: 
+C:\ghost_engine\src\vsa_core.zig:872:45: 0x7ff7cf4511bc in init (ghost_shell_zcu.obj)
+            .neighbors = try allocator.alloc(u32, @as(u64, spn) * @as(u64, max_nodes)),
+                                            ^
+C:\ghost_engine\src\vsa_core.zig:501:35: 0x7ff7cf451c19 in init (ghost_shell_zcu.obj)
+            .hnsw = HnswIndex.init(allocator, MAX_CONCEPTS, concepts) catch null,
+                                  ^
+C:\ghost_engine\src\ghost_state.zig:176:55: 0x7ff7cf45204f in init (ghost_shell_zcu.obj)
+            .panopticon = try vsa.PagedPanopticon.init(allocator),
+                                                      ^
+C:\ghost_engine\src\shell.zig:1257:44: 0x7ff7cf459d9c in main (ghost_shell_zcu.obj)
+    soul.* = try ghost_state.GhostSoul.init(global_allocator);
+                                           ^
+C:\zig\lib\std\start.zig:657:28: 0x7ff7cf45cff6 in main (ghost_shell_zcu.obj)
+            return callMain(std.os.windows.peb().ProcessParameters.CommandLine.slice(), .global);
+                           ^
+C:\zig\lib\libc\mingw\crt\crtexe.c:259:0: 0x7ff7cf6335ab in __tmainCRTStartup (crt2.obj)
+    mainret = _tmain (argc, argv, envp);
+
+
+error(DebugAllocator): memory address 0x19b7f5f0000 leaked: 
+C:\ghost_engine\src\vsa_core.zig:871:42: 0x7ff7cf451097 in init (ghost_shell_zcu.obj)
+            .levels = try allocator.alloc(u8, max_nodes),
+                                         ^
+C:\ghost_engine\src\vsa_core.zig:501:35: 0x7ff7cf451c19 in init (ghost_shell_zcu.obj)
+            .hnsw = HnswIndex.init(allocator, MAX_CONCEPTS, concepts) catch null,
+                                  ^
+C:\ghost_engine\src\ghost_state.zig:176:55: 0x7ff7cf45204f in init (ghost_shell_zcu.obj)
+            .panopticon = try vsa.PagedPanopticon.init(allocator),
+                                                      ^
+C:\ghost_engine\src\shell.zig:1257:44: 0x7ff7cf459d9c in main (ghost_shell_zcu.obj)
+    soul.* = try ghost_state.GhostSoul.init(global_allocator);
+                                           ^
+C:\zig\lib\std\start.zig:657:28: 0x7ff7cf45cff6 in main (ghost_shell_zcu.obj)
+            return callMain(std.os.windows.peb().ProcessParameters.CommandLine.slice(), .global);
+                           ^
+C:\zig\lib\libc\mingw\crt\crtexe.c:259:0: 0x7ff7cf6335ab in __tmainCRTStartup (crt2.obj)
+    mainret = _tmain (argc, argv, envp);
+
+
+error(DebugAllocator): memory address 0x19b14b90000 leaked: 
+C:\ghost_engine\src\vsa_core.zig:493:45: 0x7ff7cf451a10 in init (ghost_shell_zcu.obj)
+        const concepts = try allocator.alloc(HyperVector, MAX_CONCEPTS);
+                                            ^
+C:\ghost_engine\src\ghost_state.zig:176:55: 0x7ff7cf45204f in init (ghost_shell_zcu.obj)
+            .panopticon = try vsa.PagedPanopticon.init(allocator),
+                                                      ^
+C:\ghost_engine\src\shell.zig:1257:44: 0x7ff7cf459d9c in main (ghost_shell_zcu.obj)
+    soul.* = try ghost_state.GhostSoul.init(global_allocator);
+                                           ^
+C:\zig\lib\std\start.zig:657:28: 0x7ff7cf45cff6 in main (ghost_shell_zcu.obj)
+            return callMain(std.os.windows.peb().ProcessParameters.CommandLine.slice(), .global);
+                           ^
+C:\zig\lib\libc\mingw\crt\crtexe.c:259:0: 0x7ff7cf6335ab in __tmainCRTStartup (crt2.obj)
+    mainret = _tmain (argc, argv, envp);
+
+C:\zig\lib\libc\mingw\crt\crtexe.c:179:0: 0x7ff7cf63360b in mainCRTStartup (crt2.obj)
+  ret = __tmainCRTStartup ();
+
+
+error(DebugAllocator): memory address 0x19b7f800000 leaked: 
+C:\ghost_engine\src\vsa_core.zig:874:46: 0x7ff7cf451342 in init (ghost_shell_zcu.obj)
+            .node_bases = try allocator.alloc(u32, max_nodes),
+                                             ^
+C:\ghost_engine\src\vsa_core.zig:501:35: 0x7ff7cf451c19 in init (ghost_shell_zcu.obj)
+            .hnsw = HnswIndex.init(allocator, MAX_CONCEPTS, concepts) catch null,
+                                  ^
+C:\ghost_engine\src\ghost_state.zig:176:55: 0x7ff7cf45204f in init (ghost_shell_zcu.obj)
+            .panopticon = try vsa.PagedPanopticon.init(allocator),
+                                                      ^
+C:\ghost_engine\src\shell.zig:1257:44: 0x7ff7cf459d9c in main (ghost_shell_zcu.obj)
+    soul.* = try ghost_state.GhostSoul.init(global_allocator);
+                                           ^
+C:\zig\lib\std\start.zig:657:28: 0x7ff7cf45cff6 in main (ghost_shell_zcu.obj)
+            return callMain(std.os.windows.peb().ProcessParameters.CommandLine.slice(), .global);
+                           ^
+C:\zig\lib\libc\mingw\crt\crtexe.c:259:0: 0x7ff7cf6335ab in __tmainCRTStartup (crt2.obj)
+    mainret = _tmain (argc, argv, envp);
+
+
+error(DebugAllocator): memory address 0x19b7f210000 leaked: 
+C:\ghost_engine\src\vsa_core.zig:499:51: 0x7ff7cf451ae7 in init (ghost_shell_zcu.obj)
+            .concept_offsets = try allocator.alloc(u32, MAX_CONCEPTS),
+                                                  ^
+C:\ghost_engine\src\ghost_state.zig:176:55: 0x7ff7cf45204f in init (ghost_shell_zcu.obj)
+            .panopticon = try vsa.PagedPanopticon.init(allocator),
+                                                      ^
+C:\ghost_engine\src\shell.zig:1257:44: 0x7ff7cf459d9c in main (ghost_shell_zcu.obj)
+    soul.* = try ghost_state.GhostSoul.init(global_allocator);
+                                           ^
+C:\zig\lib\std\start.zig:657:28: 0x7ff7cf45cff6 in main (ghost_shell_zcu.obj)
+            return callMain(std.os.windows.peb().ProcessParameters.CommandLine.slice(), .global);
+                           ^
+C:\zig\lib\libc\mingw\crt\crtexe.c:259:0: 0x7ff7cf6335ab in __tmainCRTStartup (crt2.obj)
+    mainret = _tmain (argc, argv, envp);
+
+C:\zig\lib\libc\mingw\crt\crtexe.c:179:0: 0x7ff7cf63360b in mainCRTStartup (crt2.obj)
+  ret = __tmainCRTStartup ();
+
+

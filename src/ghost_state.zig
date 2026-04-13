@@ -1,92 +1,192 @@
 const std = @import("std");
 const vsa = @import("vsa_core.zig");
-const sys = @import("sys.zig");
+const config = @import("config.zig");
+const sigil_runtime = @import("sigil_runtime.zig");
 
-pub const VERSION = "V27";
+pub const GENESIS_SEED: u64 = 0x1415926535897932;
+pub const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+pub const FNV_PRIME: u64 = 0x100000001b3;
+pub const UNIFIED_SIZE_BYTES: usize = config.UNIFIED_SIZE_BYTES;
 
-pub const GENESIS_SEED: u64 = 0x5A5A5A5A5A5A5A5A;
+pub const UnifiedLattice = struct {
+    // V31: Block Checksum Manifest — per-block hashes persisted at the tail of the 1GB buffer.
+    // Hash space: 1GB / 64MB = 16 blocks * 8 bytes = 128 bytes.
+    pub const HASH_OFFSET = UNIFIED_SIZE_BYTES - config.CHECKSUM_RESERVED_BYTES;
 
-/// ── Sovereign Architecture: Dual-State Engine ──
-/// The Rotor provides the statistical spine (trigram CMS keys with ~33
-/// observations per key during training). The Fractal State provides
-/// holographic infinite context via rotate+XOR binding. Both coexist:
-/// the rotor determines WHERE to look, the fractal state determines
-/// HOW to interpret what we find.
+    pub fn getData(self: *const UnifiedLattice) []const u16 {
+        const ptr = @as([*]const u16, @ptrCast(@alignCast(self)));
+        return ptr[0 .. (UNIFIED_SIZE_BYTES / 2)];
+    }
 
-// ── Avalanche Rotor: FNV-1a rolling hash ──
-// Replaces the 24-bit bit-shift with an infinite-context word fingerprint.
-// Compresses the entire word (since last TRP boundary) into a 64-bit key.
-pub const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
-pub const FNV_PRIME: u64 = 1099511628211;
 
-/// Solstice Decay: when lattice saturation exceeds this percentage,
-/// trigger a global >> 1 to free counter headroom.
-pub const SOLSTICE_THRESHOLD: u64 = 8000; // x10000 fixed-point: 80.00%
+    pub fn getHashes(self: *const UnifiedLattice) [*]u64 {
+        const byte_ptr = @as([*]const u8, @ptrCast(@alignCast(self)));
+        return @as([*]u64, @ptrCast(@constCast(@alignCast(byte_ptr + HASH_OFFSET))));
+    }
+
+    pub fn verifyBlock(self: *const UnifiedLattice, block_idx: usize) bool {
+        const sys = @import("sys.zig");
+        const block_size_u16 = config.CHECKSUM_BLOCK_SIZE / 2;
+        const start = block_idx * block_size_u16;
+        const data = self.getData();
+        const block_data = data[start .. start + block_size_u16];
+        const byte_data = std.mem.sliceAsBytes(block_data);
+        
+        const current_hash = wyhash(GENESIS_SEED, std.hash.Fnv1a_64.hash(byte_data));
+        const stored_hashes = self.getHashes();
+        
+        if (stored_hashes[block_idx] == 0) {
+            sys.print("[CHECKSUM] Block {d} initial hash: 0x{x}\n", .{block_idx, current_hash});
+            stored_hashes[block_idx] = current_hash;
+            return true;
+        }
+        if (stored_hashes[block_idx] != current_hash) {
+            sys.print("[CHECKSUM] Block {d} mismatch! 0x{x} vs 0x{x}\n", .{block_idx, stored_hashes[block_idx], current_hash});
+            return false;
+        }
+        return true;
+    }
+
+    pub fn resetBlock(self: *UnifiedLattice, block_idx: usize) void {
+        const block_size_u16 = config.CHECKSUM_BLOCK_SIZE / 2;
+        const start = block_idx * block_size_u16;
+        // WARNING: This zeroes the block. Data is destroyed, not recovered.
+        // A true repair would require redundant encoding (e.g., erasure coding).
+        const ptr = @as([*]u16, @ptrCast(@alignCast(self)));
+        const data = ptr[0 .. (UNIFIED_SIZE_BYTES / 2)];
+        @memset(data[start .. start + block_size_u16], 0);
+        const stored_hashes = self.getHashes();
+        stored_hashes[block_idx] = 0; // Reset for re-etch
+    }
+};
+
+pub const MesoLattice = struct {
+    pub const TEXT_BUFFER_SIZE: usize = 4096;
+
+    cells: []vsa.HyperVector,
+    noise: []u16,
+    topology: enum { text_1d, image_2d, audio_1d_time } = .text_1d,
+    cursor: u32 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    allocator: std.mem.Allocator,
+
+    pub fn initText(allocator: std.mem.Allocator) !MesoLattice {
+        const cells = try allocator.alloc(vsa.HyperVector, TEXT_BUFFER_SIZE);
+        @memset(std.mem.sliceAsBytes(cells), 0);
+        const noise = try allocator.alloc(u16, TEXT_BUFFER_SIZE);
+        @memset(noise, 0);
+        return .{
+            .cells = cells,
+            .noise = noise,
+            .topology = .text_1d,
+            .cursor = 0,
+            .width = 0,
+            .height = 0,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn initGrid(allocator: std.mem.Allocator, w: u32, h: u32) !MesoLattice {
+        const total = @as(usize, w) * h;
+        const cells = try allocator.alloc(vsa.HyperVector, total);
+        @memset(std.mem.sliceAsBytes(cells), 0);
+        const noise = try allocator.alloc(u16, total);
+        @memset(noise, 0);
+        return .{
+            .cells = cells,
+            .noise = noise,
+            .topology = .image_2d,
+            .cursor = 0,
+            .width = w,
+            .height = h,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *MesoLattice) void {
+        self.allocator.free(self.cells);
+        self.allocator.free(self.noise);
+    }
+
+    pub fn cellIndex(self: *const MesoLattice, x: usize, y: usize) usize {
+        return y * self.width + x;
+    }
+
+    pub fn getCell(self: *const MesoLattice, x: usize, y: usize) vsa.HyperVector {
+        const idx = self.cellIndex(x, y);
+        if (idx >= self.cells.len) return @splat(@as(u64, 0));
+        return self.cells[idx];
+    }
+
+    pub fn setCell(self: *MesoLattice, x: usize, y: usize, vec: vsa.HyperVector) void {
+        const idx = self.cellIndex(x, y);
+        if (idx >= self.cells.len) return;
+        self.cells[idx] = vec;
+    }
+
+    pub fn advance(self: *MesoLattice) void {
+        self.cursor += 1;
+    }
+
+    pub fn coordHash(self: *const MesoLattice, x: usize, y: usize) u64 {
+        _ = self;
+        const combined = (@as(u64, x) << 32) | @as(u64, y);
+        return wyhash(GENESIS_SEED, combined);
+    }
+};
 
 pub const GhostSoul = struct {
     syntax: vsa.HyperVector,
     phrase: vsa.HyperVector,
     concept: vsa.HyperVector,
     global: vsa.HyperVector,
-    panopticon: vsa.Panopticon,
+    fractal_state: vsa.HyperVector = @splat(0),
+    spell_vector: vsa.HyperVector = @splat(0),
+    sentence_pool: vsa.HyperVector = @splat(0),
+    panopticon: vsa.PagedPanopticon,
+    meaning_matrix: ?*vsa.MeaningMatrix = null,
     active_context_hash: u64,
-    entropy_flatline: bool, // Task 4 fallback state
+    entropy_flatline: bool,
 
-    // ── Orthogonal Snap: Resonance Physics (Prediction Error) ──
     last_energy: u16,
-    last_boundary: Boundary,
-
-    // ── Dual-State: Rotor (spine) + Fractal (holographic memory) + Spell (word VSA) ──
+    last_boundary: vsa.Boundary,
+    spatial_rotor: vsa.HyperRotor,
     lexical_rotor: u64,
+    phrase_rotor: u64,
+    concept_rotor: u64,
     semantic_rotor: u64,
-    fractal_state: vsa.HyperVector,
-    spell_vector: vsa.HyperVector,
-
-    // ── L2 Semantic Cache (Phantom Lobe) ──
-    l2_cache: [256]vsa.HyperVector,
-    l2_ptr: usize,
-
-    // Vectorial Gravity: Semantic Pool
-    sentence_pool: vsa.HyperVector,
-    meaning_matrix: ?*vsa.MeaningMatrix,
-    allocator: std.mem.Allocator,
-
-    // ── Rotor Satiation: Boredom/Decay ──
-    rotor_history: [16]u64,
-    history_ptr: usize,
-
-    // ── Entropy Heartbeat ──
-    rolling_buffer: [65536]u8,
+    rune_count: u64,
+    
     rolling_idx: u32,
-    energy_word_threshold: u16,
-    energy_sentence_threshold: u16,
+    
+    // Anchor Buffer: 16 most recent conceptual snapshots
+    anchor_buffer: [16]vsa.HyperVector,
+    anchor_idx: u4,
 
-    pub fn init(allocator: std.mem.Allocator) GhostSoul {
+    energy_word_threshold: u16 = config.ENERGY_WORD_THRESHOLD,
+    energy_phrase_threshold: u16 = config.ENERGY_PHRASE_THRESHOLD,
+
+    pub fn init(allocator: std.mem.Allocator) !GhostSoul {
         return .{
             .syntax = @splat(0),
             .phrase = @splat(0),
             .concept = @splat(0),
             .global = @splat(0),
-            .panopticon = vsa.Panopticon.init(allocator),
+            .panopticon = try vsa.PagedPanopticon.init(allocator),
             .active_context_hash = GENESIS_SEED,
             .entropy_flatline = false,
             .last_energy = 1024,
             .last_boundary = .none,
+            .spatial_rotor = vsa.HyperRotor.init(GENESIS_SEED),
             .lexical_rotor = FNV_OFFSET_BASIS,
+            .phrase_rotor = FNV_OFFSET_BASIS,
+            .concept_rotor = FNV_OFFSET_BASIS,
             .semantic_rotor = FNV_OFFSET_BASIS,
-            .fractal_state = vsa.generate(GENESIS_SEED),
-            .spell_vector = @splat(0),
-            .sentence_pool = @splat(0),
-            .meaning_matrix = null,
-            .allocator = allocator,
-            .rotor_history = [_]u64{0} ** 16,
-            .history_ptr = 0,
-            .l2_cache = [_]vsa.HyperVector{@as(vsa.HyperVector, @splat(0))} ** 256,
-            .l2_ptr = 0,
-            .rolling_buffer = [_]u8{0} ** 65536,
+            .rune_count = 0,
             .rolling_idx = 0,
-            .energy_word_threshold = 700,
-            .energy_sentence_threshold = 500,
+            .anchor_buffer = [_]vsa.HyperVector{@splat(0)} ** 16,
+            .anchor_idx = 0,
         };
     }
 
@@ -94,624 +194,107 @@ pub const GhostSoul = struct {
         self.panopticon.deinit();
     }
 
-    /// Avalanche Rotor: FNV-1a rolling hash. Each byte is XOR-multiply
-    /// compressed into a 64-bit fingerprint of the current sequence.
-    /// Infinite context depth: the rotor carries the state of every previous
-    /// character in the session. O(1) cost. 
-    /// Avalanche Rotor: wyhash + FNV-1a rolling hash. 
-    /// Updated to use Rune hashes for language-agnostic threading.
-    pub fn pushRotor(self: *GhostSoul, rune: u32) void {
-        const rune_hash = wyhash(FNV_OFFSET_BASIS, rune);
-        self.lexical_rotor = (self.lexical_rotor ^ rune_hash) *% FNV_PRIME;
+    pub fn absorb(self: *GhostSoul, rune_vec: vsa.HyperVector, rune: u32, energy: ?u16) !u64 {
+        self.spatial_rotor.evolve(rune);
+        return self.absorbInternal(rune_vec, rune, energy, true);
+    }
+
+    pub fn simulateAbsorb(self: *GhostSoul, rune_vec: vsa.HyperVector, rune: u32, energy: ?u16) !void {
+        _ = try self.absorbInternal(rune_vec, rune, energy, false);
+    }
+
+    fn absorbInternal(self: *GhostSoul, rune_vec: vsa.HyperVector, rune: u32, energy: ?u16, permanent: bool) !u64 {
+        var boundary = if (energy) |e| self.detectBoundary(e) else .none;
         
-        // Universal Boundary Check: Statistical Snap priority
-        const is_boundary = (rune <= 32 or rune == '.' or rune == ';' or rune == '=' or rune == 0x3000);
-        if (is_boundary) {
-            self.semantic_rotor = FNV_OFFSET_BASIS;
-        } else {
-            self.semantic_rotor = (self.semantic_rotor ^ rune_hash) *% FNV_PRIME;
+        // V30: Syntactic Boundary Detection
+        const syntactic = vsa.detectSyntacticBoundary(rune);
+        if (@intFromEnum(syntactic) > @intFromEnum(boundary)) {
+            boundary = syntactic;
         }
 
-        // Update history for satiation
-        self.rotor_history[self.history_ptr] = self.lexical_rotor;
-        self.history_ptr = (self.history_ptr + 1) % 16;
-    }
+        self.last_boundary = boundary;
 
-    pub fn pushRotorFast(self: *GhostSoul, rune: u32) void {
-        const rune_hash = wyhash(FNV_OFFSET_BASIS, rune);
-        self.lexical_rotor = (self.lexical_rotor ^ rune_hash) *% FNV_PRIME;
-        
-        const is_boundary = (rune <= 32 or rune == '.' or rune == ';' or rune == '=' or rune == 0x3000);
-        if (is_boundary) self.semantic_rotor = FNV_OFFSET_BASIS;
-    }
+        // Update context rotors via non-linear projection
+        self.lexical_rotor ^= rune;
+        self.lexical_rotor = std.math.rotl(u64, self.lexical_rotor, 13) *% FNV_PRIME;
 
-    pub fn getBoredomPenalty(self: *const GhostSoul, rotor: u64) u32 {
-        var count: u32 = 0;
-        for (self.rotor_history) |h| {
-            if (h == rotor) count += 1;
+        // Fractal evolution: Bundle the new rune into the current lobes
+        self.syntax = vsa.bundle(self.syntax, rune_vec, vsa.generate(self.lexical_rotor));
+        self.phrase = vsa.bundle(vsa.rotate(self.phrase, 1), rune_vec, vsa.generate(self.phrase_rotor));
+
+        // ── Cascade Etching: Multi-Scale Context Hierarchy ──
+        // When a boundary is detected, lower-level state cascades into higher levels.
+        // This mechanically forces the VSA lattice to build a true multi-dimensional
+        // memory hierarchy (word -> phrase -> paragraph -> soul).
+        switch (boundary) {
+            .word => {
+                // Word boundary (space-like): fold lexical state into phrase level
+                self.phrase_rotor ^= self.lexical_rotor;
+                self.phrase_rotor = std.math.rotl(u64, self.phrase_rotor, 13) *% FNV_PRIME;
+                self.phrase = vsa.bundle(self.phrase, self.syntax, vsa.generate(self.phrase_rotor));
+            },
+            .phrase => {
+                // Phrase boundary (punctuation): fold phrase into concept level
+                self.phrase_rotor ^= self.lexical_rotor;
+                self.phrase_rotor = std.math.rotl(u64, self.phrase_rotor, 13) *% FNV_PRIME;
+                self.concept_rotor ^= self.phrase_rotor;
+                self.concept_rotor = std.math.rotl(u64, self.concept_rotor, 13) *% FNV_PRIME;
+                self.concept = vsa.bundle(self.concept, self.phrase, vsa.generate(self.concept_rotor));
+            },
+            .paragraph => {
+                // Paragraph boundary: fold concept into semantic/global level
+                self.concept_rotor ^= self.phrase_rotor;
+                self.concept_rotor = std.math.rotl(u64, self.concept_rotor, 13) *% FNV_PRIME;
+                self.semantic_rotor ^= self.concept_rotor;
+                self.semantic_rotor = std.math.rotl(u64, self.semantic_rotor, 13) *% FNV_PRIME;
+                self.global = vsa.bundle(self.global, self.concept, vsa.generate(self.semantic_rotor));
+            },
+            .soul => {
+                // Soul boundary (deep context shift): integrate all levels
+                self.semantic_rotor ^= self.concept_rotor;
+                self.semantic_rotor = std.math.rotl(u64, self.semantic_rotor, 13) *% FNV_PRIME;
+                self.global = vsa.bundle(self.global, self.concept, vsa.generate(self.semantic_rotor));
+                self.sentence_pool = self.concept;
+            },
+            .none => {},
         }
-        return count * 40; // Calibrated: 40 energy penalty per repetition
-    }
 
-    /// Rotor as u64 for CMS addressing — direct FNV-1a fingerprint.
-    pub fn rotorKey(self: *const GhostSoul) u64 {
+        if (permanent) try self.panopticon.pushRune(rune);
+
+        if (permanent) {
+            self.rune_count += 1;
+            if (self.rune_count % 64 == 0) {
+                self.panopticon.markSentence(self.concept);
+                self.anchor_buffer[self.anchor_idx] = self.concept;
+                self.anchor_idx +%= 1;
+            }
+        }
+
         return self.lexical_rotor;
     }
 
-    /// Fractal State Update: MAP operation (Multiply-Add-Permute).
-    /// Now rune-aware: each character gets exactly one Permute cycle.
-    pub fn fractalPush(self: *GhostSoul, rune: u32) void {
-        self.fractal_state = vsa.rotate(self.fractal_state, 1) ^ vsa.generate(rune);
-    }
-
-    /// Fractal Resonance: hamming distance between two fractal states.
-    /// Lower = more coherent. Used by REASON to measure which candidate
-    /// keeps the holographic memory on a stable attractor.
-    pub fn fractalResonance(self: *const GhostSoul, candidate_state: vsa.HyperVector) u64 {
-        return vsa.hammingDistance(self.fractal_state, candidate_state);
-    }
-
-    /// Spell Vector Push: rotate + XOR binding for word-level VSA encoding.
-    /// Rune-aware word representation.
-    pub fn spellPush(self: *GhostSoul, rune: u32) void {
-        self.spell_vector = vsa.rotate(self.spell_vector, 1) ^ vsa.generate(rune);
-    }
-
-    /// Detect boundary type from Resonance Energy.
-    pub fn detectSnap(self: *const GhostSoul, energy: u16) Boundary {
-        if (energy <= self.energy_sentence_threshold) return .sentence;
+    fn detectBoundary(self: *const GhostSoul, energy: u16) vsa.Boundary {
+        if (energy < config.BOUNDARY_SOUL_THRESHOLD) return .soul;
+        if (energy < config.BOUNDARY_PARAGRAPH_THRESHOLD) return .paragraph;
+        if (energy < self.energy_phrase_threshold) return .phrase;
         if (energy < self.energy_word_threshold) return .word;
         return .none;
     }
 
-    /// The core evolution: absorb a new token into the state.
-    /// Boundaries are detected dynamically via Prediction Error (Resonance Drop).
-    /// Returns the semantic drift occurred (if any).
-    /// The core evolution: absorb a new token into the state.
-    /// Rune-aware: processes any Unicode character as a semantic atom.
-    pub fn absorb(self: *GhostSoul, token_vec: vsa.HyperVector, rune: u32, energy: ?u16) !u64 {
-        const raw_byte = @as(u8, @truncate(rune)); // For rolling buffer heartbeat
-        self.rolling_buffer[self.rolling_idx % 65536] = raw_byte;
-        self.rolling_idx +%= 1;
-        // Phase-Change Detector (Entropy Heartbeat)
-        if (self.rolling_idx % 65536 == 0) {
-            var hamming_variance: u32 = 0;
-            for (1..8192) |i| {
-                hamming_variance += @popCount(self.rolling_buffer[i*8] ^ self.rolling_buffer[(i-1)*8]);
-            }
-            
-            if (hamming_variance == 0) {
-                // Structural Fallback: rely on ASCII/Universal delimiters
-                self.entropy_flatline = true;
-            } else if (hamming_variance > 20000) {
-                // High entropy (Code, Compressed Data)
-                self.entropy_flatline = false;
-                self.energy_word_threshold = 600;
-                self.energy_sentence_threshold = 400;
-            } else {
-                // Universal Text (Multi-lingual)
-                self.entropy_flatline = false;
-                self.energy_word_threshold = 750;
-                self.energy_sentence_threshold = 550;
-            }
-        }
-
-        // 1. Calculate Resonance
-        if (energy) |e| {
-            self.last_energy = e;
-        } else if (self.meaning_matrix) |mm| {
-            const expectation = mm.collapseToBinary(self.lexical_rotor);
-            self.last_energy = vsa.calculateResonance(expectation, token_vec);
-        } else {
-            self.last_energy = 1024;
-        }
-
-        const boundary = if (self.entropy_flatline) blk: {
-            // Task 4: Universal Hardcoded Fallback
-            if (rune == '\n' or rune == '\r' or rune == 0) break :blk Boundary.sentence;
-            if (rune <= 32 or rune == ',' or rune == ';' or rune == 0x3000) break :blk Boundary.word;
-            break :blk Boundary.none;
-        } else self.detectSnap(self.last_energy);
-
-        self.last_boundary = boundary;
-
-        // 1b. L2 Ring Buffer Management (Phantom Lobe)
-        if (boundary == .sentence or boundary == .paragraph) {
-            self.l2_cache[self.l2_ptr] = self.fractal_state;
-            self.l2_ptr = (self.l2_ptr + 1) % 256;
-        }
-
-        // 1c. L2 Retrieval (Semantic Page Fault)
-        // If resonance is garbage (< 15%), attempt recovery from L2 cache
-        if (self.last_energy < 150) {
-            var best_res: u16 = 0;
-            var best_idx: ?usize = null;
-            for (self.l2_cache, 0..) |past_state, i| {
-                const r = vsa.calculateResonance(past_state, token_vec);
-                if (r > best_res) {
-                    best_res = r;
-                    best_idx = i;
-                }
-            }
-            if (best_res > 700) { // Found a resonant past context
-                self.fractal_state = self.l2_cache[best_idx.?];
-            }
-        }
-
-        // 2. Update state based on boundary detection
-        self.pushRotor(rune);
-        self.fractalPush(rune);
-
-        // Continuous Concept Update (every rune)
-        self.concept = vsa.bundle(vsa.permute(self.concept), token_vec, vsa.generate(0xD00));
-
-        // Accumulate spell_vector only for non-boundary characters
-        if (boundary == .none) {
-            self.spellPush(rune);
-        }
-
-        try self.panopticon.pushByte(@as(u8, @truncate(rune)));
-        self.sentence_pool = vsa.bundle(self.sentence_pool, token_vec, vsa.generate(0x1337));
-        self.syntax = vsa.bundle(vsa.permute(self.syntax), token_vec, vsa.generate(0xB00));
-        self.phrase = vsa.bundle(vsa.permute(self.phrase), token_vec, vsa.generate(0xC00));
-        var drift: u64 = 0;
-
-        // Word-level semantic gravity at any snap boundary (using spell_vector)
-        if (boundary != .none) {
-            if (self.meaning_matrix) |mm| {
-                const word_hash = vsa.collapse(self.spell_vector);
-                drift = mm.applyGravity(word_hash, self.concept);
-            }
-            self.spell_vector = @splat(0);
-        }
-
-        switch (boundary) {
-            .sentence, .paragraph => {
-                self.concept = vsa.bundle(self.concept, self.phrase, vsa.generate(0xD10));
-                try self.panopticon.markSentence(self.concept);
-                self.sentence_pool = @splat(0);
-                self.active_context_hash = wyhash(self.active_context_hash, vsa.collapse(self.concept));
-            },
-            else => {},
-        }
-        return drift;
-    }
-
-    /// Simulation absorb for lookahead -- mirrors absorb() physics.
-    pub fn simulateAbsorb(self: *GhostSoul, token_vec: vsa.HyperVector, rune: u32, energy: ?u16) void {
-        // 1. Calculate Resonance
-        if (energy) |e| {
-            self.last_energy = e;
-        } else if (self.meaning_matrix) |mm| {
-            const expectation = mm.collapseToBinary(self.lexical_rotor);
-            self.last_energy = vsa.calculateResonance(expectation, token_vec);
-        } else {
-            self.last_energy = 1024;
-        }
-
-        const boundary = self.detectSnap(self.last_energy);
-        self.last_boundary = boundary;
-
-        // 2. Update state
-        self.pushRotor(rune);
-        self.fractalPush(rune);
-
-        self.concept = vsa.bundle(vsa.permute(self.concept), token_vec, vsa.generate(0xD00));
-
-        if (boundary == .none) {
-            self.spellPush(rune);
-        }
-
-        self.sentence_pool = vsa.bundle(self.sentence_pool, token_vec, vsa.generate(0x1337));
-        self.syntax = vsa.bundle(vsa.permute(self.syntax), token_vec, vsa.generate(0xB00));
-        self.phrase = vsa.bundle(vsa.permute(self.phrase), token_vec, vsa.generate(0xC00));
-
-        if (boundary != .none) {
-            self.spell_vector = @splat(0);
-        }
-
-        switch (boundary) {
-            .sentence, .paragraph => {
-                self.concept = vsa.bundle(self.concept, self.phrase, vsa.generate(0xD10));
-                self.active_context_hash = wyhash(self.active_context_hash, vsa.collapse(self.concept));
-            },
-            else => {},
-        }
-    }
-
-    pub fn contextVector(self: *const GhostSoul) vsa.HyperVector {
-        const s1 = self.syntax;
-        const s2 = rotateTrack(self.phrase, 3);
-        const s3 = rotateTrack(self.concept, 7);
-        const s4 = rotateTrack(self.global, 11);
-        return s1 ^ s2 ^ s3 ^ s4;
-    }
-
-    pub inline fn rotateTrack(v: vsa.HyperVector, comptime n: comptime_int) vsa.HyperVector {
-        var result: vsa.HyperVector = undefined;
-        inline for (0..16) |i| {
-            result[i] = v[(i + n) % 16];
-        }
-        return result;
+    /// Penalize repetitive output: low conceptual drift between recent anchors means we're stuck.
+    pub fn getBoredomPenalty(self: *const GhostSoul) u32 {
+        if (self.anchor_idx < 2) return 0;
+        const a = self.anchor_idx -% 1;
+        const b = self.anchor_idx -% 2;
+        const drift = vsa.hammingDistance(self.anchor_buffer[a], self.anchor_buffer[b]);
+        if (drift < config.BOREDOM_DRIFT_HIGH) return sigil_runtime.getBoredomPenaltyHigh();
+        if (drift < config.BOREDOM_DRIFT_LOW) return sigil_runtime.getBoredomPenaltyLow();
+        return 0;
     }
 };
 
-pub const Boundary = enum(u8) {
-    none = 0,
-    word = 1,
-    sentence = 2,
-    paragraph = 3,
-};
-
-
-
-
-// ────────────────────────────────────────────────────────────────
-// The Unified 1GB Holographic Monolith
-// ────────────────────────────────────────────────────────────────
-pub const UNIFIED_ENTRIES: usize = 536_870_912;
-pub const UNIFIED_SIZE_BYTES: usize = UNIFIED_ENTRIES * 2;
-
-pub const DOMAIN_SYNTAX: u64    = 0x9E3779B97F4A7C15;
-pub const DOMAIN_INTUITION: u64 = 0x6C62272E07BB0142;
-pub const DOMAIN_CONCEPT: u64   = 0xC7115792D0E47B43;
-pub const DOMAIN_ROLES: u64     = 0x517CC1B727220A95;
-pub const DOMAIN_TRINITY: u64   = 0x3C2B1A0987654321;
-pub const DOMAIN_MOMENTUM: u64  = 0xA5A5A5A5A5A5A5A5;
-
-/// ── Koryphaios Protocol: Hemispheric Domain Isolation ──
-/// DOMAIN_STYLE is XOR-mixed into Manager hemisphere lattice writes (Lanes 0–7).
-/// DOMAIN_FACT is XOR-mixed into Critic hemisphere lattice writes (Lanes 8–15).
-/// These seeds are orthogonal to all existing domains and to each other.
-pub const DOMAIN_STYLE: u64     = 0xD15C0_DEAD_BEEF_01;
-pub const DOMAIN_FACT: u64      = 0xFAC75_C0DE_CAFE_02;
-
-/// ── Phantom Lobe: 128MB Dense Cartridge Format ──
-/// The Console & Cartridge architecture. Each lobe is a focused 128MB
-/// CMS array that the OS pages directly into L3 cache on first touch.
-/// Zero allocation, zero copy — MapViewOfFile is the only instruction.
-///
-/// File Layout:
-///   [0..127]     : VSA Identity Header (128 bytes = 1 HyperVector)
-///   [128..end]   : Dense CMS array (67,108,864 × u16 = 128 MiB)
-///   Total size   : 134,217,856 bytes
-pub const LOBE_CMS_ENTRIES: u32 = 67_108_864;               // 128 MiB / sizeof(u16)
-pub const LOBE_CMS_BYTES: usize = @as(usize, LOBE_CMS_ENTRIES) * 2;  // 134,217,728 bytes
-pub const LOBE_HEADER_SIZE: usize = 128;                     // 1 HyperVector
-pub const LOBE_TOTAL_SIZE: usize = LOBE_HEADER_SIZE + LOBE_CMS_BYTES; // 134,217,856 bytes
-
-pub const LOBE_TILE_SIZE: usize = 2 * 1024 * 1024; // 2 MiB matching x86_64 Huge Page
-pub const LOBE_TILE_COUNT: usize = 64;             // 128 MiB / 2 MiB
-
-pub const TileManager = struct {
-    lobe: *const PhantomLobe,
-
-    /// Predicted prefetch for a set of candidate bytes.
-    /// Calculates the CMS probe locations and triggers Windows PrefetchVirtualMemory
-    /// on the specific 2MB tiles those probes land in.
-    pub fn prefetchTilesForCandidates(self: *const TileManager, context: u64, domain: u64, candidates: []const u8) void {
-        const base_ptr = self.lobe.data orelse return;
-        var tile_mask: u64 = 0; // 64 bits = 64 tiles
-
-        for (candidates) |cb| {
-            const h = wyhash(context ^ domain, @as(u64, cb));
-            const s: u32 = LOBE_CMS_ENTRIES / 4;
-            const probes = [4]u32{
-                @as(u32, @truncate(h & 0xFFFFFFFF)) % s,
-                (@as(u32, @truncate(h >> 32)) % s) + s,
-                (@as(u32, @truncate(wyhash(h, 0x12345678))) % s) + (s * 2),
-                (@as(u32, @truncate(wyhash(h, 0x87654321))) % s) + (s * 3),
-            };
-
-            inline for (probes) |idx| {
-                const byte_offset = idx * 2;
-                const tile_idx = @as(u6, @truncate(byte_offset / LOBE_TILE_SIZE));
-                tile_mask |= (@as(u64, 1) << tile_idx);
-            }
-        }
-
-        // Trigger Windows Prefetch for all "hot" tiles
-        var i: u6 = 0;
-        while (i < LOBE_TILE_COUNT) : (i += 1) {
-            if ((tile_mask >> i) & 1 == 1) {
-                const tile_addr = @as(?*anyopaque, @ptrFromInt(@intFromPtr(base_ptr) + (@as(usize, i) * LOBE_TILE_SIZE)));
-                @import("sys.zig").prefetchMemory(tile_addr, LOBE_TILE_SIZE);
-            }
-        }
-    }
-};
-
-pub const PhantomLobe = struct {
-    /// The identity vector of this lobe (from the 128-byte header).
-    /// Used for resonance matching against the soul's fractal_state.
-    identity: vsa.HyperVector,
-
-    /// Direct pointer to the dense CMS array (memory-mapped, zero-copy).
-    /// Points to the first u16 AFTER the 128-byte header in the mapped file.
-    data: ?[*]const u16,
-
-    /// The underlying sys.MappedFile handle (for unmapping on swap).
-    mapped: ?sys.MappedFile,
-
-    /// Filesystem path of the loaded lobe (for swap detection).
-    path: ?[]const u8,
-
-    pub fn empty() PhantomLobe {
-        return .{
-            .identity = @splat(0),
-            .data = null,
-            .mapped = null,
-            .path = null,
-        };
-    }
-
-    /// Read a CMS value from the lobe's dense array.
-    /// Uses the same 4-probe orthogonal CMS addressing as the Unified Lattice,
-    /// but with the lobe's smaller address space (67M entries vs 536M).
-    /// Single-cycle L3 cache hit on x86_64 once the page is warm.
-    pub inline fn read(self: *const PhantomLobe, context: u64, char_byte: u8, domain: u64) u16 {
-        const cms = self.data orelse return 0;
-        const h = wyhash(context ^ domain, @as(u64, char_byte));
-        const s: u32 = LOBE_CMS_ENTRIES / 4;
-        const probes = [4]u32{
-            @as(u32, @truncate(h & 0xFFFFFFFF)) % s,
-            (@as(u32, @truncate(h >> 32)) % s) + s,
-            (@as(u32, @truncate(wyhash(h, 0x12345678))) % s) + (s * 2),
-            (@as(u32, @truncate(wyhash(h, 0x87654321))) % s) + (s * 3),
-        };
-        var min: u16 = 0xFFFF;
-        inline for (probes) |idx| {
-            const val = cms[idx];
-            if (val < min) min = val;
-        }
-        return if (min == 0xFFFF) 0 else min;
-    }
-
-    /// Check if this lobe is currently loaded.
-    pub inline fn isLoaded(self: *const PhantomLobe) bool {
-        return self.data != null;
-    }
-
-    /// Unmap the current lobe (flush from virtual address space).
-    /// The OS will evict the pages from L3 cache as they become cold.
-    pub fn unload(self: *PhantomLobe) void {
-        if (self.mapped) |*m| {
-            m.unmap();
-        }
-        self.data = null;
-        self.mapped = null;
-        self.path = null;
-        self.identity = @splat(0);
-    }
-
-    pub fn tileManager(self: *const PhantomLobe) TileManager {
-        return .{ .lobe = self };
-    }
-};
-// These domain hashes feed into the CMS for coordinate-aware etching.
-// For text (1D), only SPATIAL_X matters (sequence position).
-// For images (2D), SPATIAL_X and SPATIAL_Y encode the grid.
-// For audio (1D+T), SPATIAL_X is the frequency bin, TEMPORAL is time.
-pub const DOMAIN_SPATIAL_X: u64 = 0x7A7A7A7A7A7A7A7A;
-pub const DOMAIN_SPATIAL_Y: u64 = 0x3B3B3B3B3B3B3B3B;
-pub const DOMAIN_TEMPORAL: u64  = 0x4C4C4C4C4C4C4C4C;
-
-// ── Topology: The Shape of the Canvas ──
-pub const Topology = enum(u8) {
-    text_1d = 0,
-    image_2d = 1,
-    audio_1d_time = 2,
-};
-
-// ── The MesoLattice: Universal Canvas ──
-// A pre-allocated grid of 1024-bit vectors. Zero allocation once booted.
-// Topology determines how indices map to spatial/temporal coordinates.
-// 1D text: sequential chain. 2D image: grid. 1D+T audio: bins over time.
-pub const MESO_MAX_CELLS: u32 = 4096;
-
-pub const MesoLattice = struct {
-    topology: Topology,
-    width: u32,
-    height: u32,
-    active_count: u32,
-    cells: [MESO_MAX_CELLS]vsa.HyperVector,
-    noise: [MESO_MAX_CELLS]u16,
-    cursor: u32,
-
-    pub fn initText() MesoLattice {
-        return .{
-            .topology = .text_1d,
-            .width = MESO_MAX_CELLS,
-            .height = 1,
-            .active_count = 0,
-            .cells = [_]vsa.HyperVector{@as(vsa.HyperVector, @splat(0))} ** MESO_MAX_CELLS,
-            .noise = [_]u16{0} ** MESO_MAX_CELLS,
-            .cursor = 0,
-        };
-    }
-
-    pub fn initImage(w: u32, h: u32) MesoLattice {
-        const count = @min(w * h, MESO_MAX_CELLS);
-        return .{
-            .topology = .image_2d,
-            .width = w,
-            .height = h,
-            .active_count = count,
-            .cells = [_]vsa.HyperVector{@as(vsa.HyperVector, @splat(0))} ** MESO_MAX_CELLS,
-            .noise = [_]u16{0} ** MESO_MAX_CELLS,
-            .cursor = 0,
-        };
-    }
-
-    pub fn initAudio(bins: u32, time_steps: u32) MesoLattice {
-        const count = @min(bins * time_steps, MESO_MAX_CELLS);
-        return .{
-            .topology = .audio_1d_time,
-            .width = bins,
-            .height = time_steps,
-            .active_count = count,
-            .cells = [_]vsa.HyperVector{@as(vsa.HyperVector, @splat(0))} ** MESO_MAX_CELLS,
-            .noise = [_]u16{0} ** MESO_MAX_CELLS,
-            .cursor = 0,
-        };
-    }
-
-    /// Cell index from 2D coordinates. Wraps for safety.
-    pub inline fn cellIndex(self: *const MesoLattice, x: u32, y: u32) u32 {
-        return (y % self.height) * self.width + (x % self.width);
-    }
-
-    /// Coordinate-aware CMS hash: mixes spatial position into the domain hash.
-    /// This is what makes the same concept produce different vectors at different
-    /// positions in the canvas — the topology mask.
-    pub fn coordHash(self: *const MesoLattice, x: u32, y: u32) u64 {
-        var h: u64 = DOMAIN_SPATIAL_X ^ @as(u64, x);
-        switch (self.topology) {
-            .text_1d => {
-                h = wyhash(h, @as(u64, x));
-            },
-            .image_2d => {
-                h = wyhash(h ^ DOMAIN_SPATIAL_Y, @as(u64, y));
-            },
-            .audio_1d_time => {
-                h = wyhash(h ^ DOMAIN_TEMPORAL, @as(u64, y));
-            },
-        }
-        return h;
-    }
-
-    /// Write a vector to the canvas at a position.
-    pub inline fn setCell(self: *MesoLattice, x: u32, y: u32, vec: vsa.HyperVector) void {
-        const idx = self.cellIndex(x, y);
-        self.cells[idx] = vec;
-    }
-
-    /// Read a vector from the canvas.
-    pub inline fn getCell(self: *const MesoLattice, x: u32, y: u32) vsa.HyperVector {
-        return self.cells[self.cellIndex(x, y)];
-    }
-
-    /// Advance the cursor for sequential (1D) resolution.
-    pub inline fn advance(self: *MesoLattice) void {
-        self.cursor +|= 1;
-        if (self.cursor >= MESO_MAX_CELLS) self.cursor = 0;
-    }
-
-    /// Reset canvas for a new generation pass.
-    pub fn reset(self: *MesoLattice) void {
-        self.cursor = 0;
-        self.noise = [_]u16{0} ** MESO_MAX_CELLS;
-    }
-};
-
-pub const UnifiedLattice = struct {
-    data: [UNIFIED_ENTRIES]u16,
-
-    pub fn etch(self: *UnifiedLattice, context: u64, char_byte: u8, domain: u64) void {
-        const LEAKY_MASK: u64 = 0xEFEFEFEFEFEFEFEF;
-        const leaky_domain = domain & LEAKY_MASK;
-        const h = wyhash(context ^ leaky_domain, @as(u64, char_byte));
-        const probes = getProbesUnified(h);
-        inline for (probes) |idx| {
-            const current = self.data[idx];
-            if (current == 0) {
-                self.data[idx] = 1;
-            } else {
-                // Probabilistic Leaky Etching: rand() % current == 0
-                // Math flattening: frequency bulb scales down naturally
-                if ((wyhash(h, idx) % @as(u64, current)) == 0) {
-                    if (current < 65535) self.data[idx] += 1;
-                }
-            }
-        }
-    }
-
-    /// Prefetch the cache lines that etch() will touch, without writing.
-    /// Call this N bytes ahead of the actual etch to warm L1/L2 cache.
-    /// On x86-64, compiles to a single PREFETCHW instruction per probe.
-    pub fn prefetchEtch(self: *const UnifiedLattice, context: u64, char_byte: u8, domain: u64) void {
-        const LEAKY_MASK: u64 = 0xEFEFEFEFEFEFEFEF;
-        const leaky_domain = domain & LEAKY_MASK;
-        const h = wyhash(context ^ leaky_domain, @as(u64, char_byte));
-        const probes = getProbesUnified(h);
-        inline for (probes) |idx| {
-            @prefetch(&self.data[idx], .{ .rw = .write, .locality = 3, .cache = .data });
-        }
-    }
-
-    pub fn read(self: *const UnifiedLattice, context: u64, char_byte: u8, domain: u64) u16 {
-        const LEAKY_MASK: u64 = 0xEFEFEFEFEFEFEFEF;
-        const leaky_domain = domain & LEAKY_MASK;
-        const h = wyhash(context ^ leaky_domain, @as(u64, char_byte));
-        const probes = getProbesUnified(h);
-        var min: u16 = 0xFFFF;
-        inline for (probes) |idx| {
-            if (self.data[idx] < min) min = self.data[idx];
-        }
-        return min;
-    }
-
-    fn getProbesUnified(h: u64) [4]u32 {
-        const s: u32 = UNIFIED_ENTRIES / 4;
-        return .{
-            @as(u32, @truncate(h & 0xFFFFFFFF)) % s,
-            (@as(u32, @truncate(h >> 32)) % s) + s,
-            (@as(u32, @truncate(wyhash(h, 0x12345678))) % s) + (s * 2),
-            (@as(u32, @truncate(wyhash(h, 0x87654321))) % s) + (s * 3),
-        };
-    }
-
-    /// Solstice Decay: global >> 1 across the entire 1GB Monolith.
-    /// Halves all counters to free headroom, preserving relative rankings.
-    /// Called when sampled occupancy exceeds SOLSTICE_THRESHOLD.
-    /// Global shift and check for Scaling Realignment (V27).
-    /// Returns true if expansion is required (saturation exceeds 85.00%).
-    pub fn solsticeDecay(self: *UnifiedLattice) bool {
-        const occ = self.sampleOccupancy(0x1337);
-        for (&self.data) |*entry| {
-            // Masked Bit-Shifting (Myelination): Skip if MSB is locked (0x8000)
-            if (entry.* < 0x8000) {
-                entry.* >>= 1;
-            }
-        }
-        return occ > 8500;
-    }
-
-    /// Chunked Solstice Decay: process 1MB at a time to avoid stalls.
-    /// Returns true when a full pass is complete.
-    pub const SOLSTICE_CHUNK: usize = 524_288; // 1MB / sizeof(u16)
-    pub fn chunkedSolsticeDecay(self: *UnifiedLattice, position: *usize) bool {
-        const end = @min(position.* + SOLSTICE_CHUNK, UNIFIED_ENTRIES);
-        for (position.*..end) |i| {
-            if (self.data[i] < 0x8000) {
-                self.data[i] >>= 1;
-            }
-        }
-        position.* = end;
-        if (position.* >= UNIFIED_ENTRIES) {
-            position.* = 0;
-            return true;
-        }
-        return false;
-    }
-
-    /// Sample occupancy: integer percentage. Zero floats.
-    pub fn sampleOccupancy(self: *const UnifiedLattice, seed: u64) u64 {
-        var non_zero: usize = 0;
-        const samples: u64 = 10000;
-        var s = seed;
-        for (0..samples) |_| {
-            s = wyhash(s, 0x1337);
-            const idx = s % UNIFIED_ENTRIES;
-            if (self.data[idx] > 0) non_zero += 1;
-        }
-        return (non_zero * 10000) / samples;
-    }
-};
-
-pub inline fn wyhash(state: u64, input: u64) u64 {
-    const x = state ^ 0x60bee2bee120fc15;
-    const y = input ^ 0xa3b195354a39b70d;
-    const m = @as(u128, x) * @as(u128, y);
-    return @as(u64, @truncate(m ^ (m >> 64)));
+pub fn wyhash(seed: u64, input: u64) u64 {
+    var h = seed ^ (input *% 0xbf58476d1ce4e5b9);
+    h = std.math.rotl(u64, h, 31) *% 0x94d049bb133111eb;
+    return h ^ (h >> 31);
 }

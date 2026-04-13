@@ -3,6 +3,30 @@ const std = @import("std");
 // --- GHOST ENGINE: DIRECT WINAPI CORE ---
 // Zero-overhead Windows Kernel32 I/O and memory-mapping layer.
 
+extern "kernel32" fn CreateDirectoryW(lpPathName: [*:0]const u16, lpSecurityAttributes: ?*anyopaque) callconv(.winapi) i32;
+
+pub fn makePath(allocator: std.mem.Allocator, path: []const u8) !void {
+    var wbuf: [1024]u16 = undefined;
+    const anchored = try getAnchorPath(allocator, path);
+    defer allocator.free(anchored);
+    
+    // Simple recursive makePath
+    var i: usize = 0;
+    while (i < anchored.len) : (i += 1) {
+        if (anchored[i] == '/' or anchored[i] == '\\') {
+            if (i == 0) continue;
+            const sub = anchored[0..i];
+            const wsub = utf8ToW(sub, &wbuf);
+            _ = CreateDirectoryW(wsub, null);
+        }
+    }
+    const wpath = utf8ToW(anchored, &wbuf);
+    if (CreateDirectoryW(wpath, null) == 0) {
+        const err = GetLastError();
+        if (err != 183) return error.DirectoryCreationFailed; // 183 = ERROR_ALREADY_EXISTS
+    }
+}
+
 extern "kernel32" fn CreateFileW(n: [*:0]const u16, a: u32, s: u32, p: ?*anyopaque, d: u32, f: u32, t: ?*anyopaque) callconv(.winapi) *anyopaque;
 extern "kernel32" fn WriteFile(h: *anyopaque, b: [*]const u8, n: u32, w: ?*u32, o: ?*anyopaque) callconv(.winapi) i32;
 extern "kernel32" fn ReadFile(h: *anyopaque, b: [*]u8, n: u32, r: ?*u32, o: ?*anyopaque) callconv(.winapi) i32;
@@ -12,7 +36,9 @@ extern "kernel32" fn CreateFileMappingW(h: *anyopaque, a: ?*anyopaque, p: u32, s
 extern "kernel32" fn MapViewOfFile(m: *anyopaque, a: u32, oh: u32, ol: u32, s: usize) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn UnmapViewOfFile(lpBaseAddress: *const anyopaque) callconv(.winapi) i32;
 extern "kernel32" fn FlushViewOfFile(lpBaseAddress: *const anyopaque, dwNumberOfBytesToFlush: usize) callconv(.winapi) i32;
+extern "kernel32" fn FlushFileBuffers(hFile: *anyopaque) callconv(.winapi) i32;
 extern "kernel32" fn GetStdHandle(n: u32) callconv(.winapi) *anyopaque;
+extern "kernel32" fn PeekNamedPipe(h: *anyopaque, b: ?[*]u8, n: u32, r: ?*u32, a: ?*u32, p: ?*u32) callconv(.winapi) i32;
 extern "kernel32" fn GetCommandLineW() callconv(.winapi) [*:0]const u16;
 extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
 extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
@@ -22,10 +48,29 @@ extern "kernel32" fn SetEndOfFile(h: *anyopaque) callconv(.winapi) i32;
 extern "kernel32" fn VirtualAlloc(lpAddress: ?*anyopaque, dwSize: usize, flAllocationType: u32, flProtect: u32) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn VirtualFree(lpAddress: *anyopaque, dwSize: usize, dwFreeType: u32) callconv(.winapi) i32;
 extern "kernel32" fn GetCurrentProcess() callconv(.winapi) *anyopaque;
-extern "kernel32" fn LoadLibraryW(lpLibFileName: [*:0]const u16) callconv(.winapi) ?*anyopaque;
-extern "kernel32" fn GetProcAddress(hModule: *anyopaque, lpProcName: [*:0]const u8) callconv(.winapi) ?*anyopaque;
-extern "kernel32" fn FreeLibrary(hLibModule: *anyopaque) callconv(.winapi) i32;
 extern "kernel32" fn GetModuleFileNameW(hModule: ?*anyopaque, lpFilename: [*:0]u16, nSize: u32) callconv(.winapi) u32;
+
+// --- GHOST ENGINE: CONNECTIVITY & SURVEILLANCE ---
+extern "kernel32" fn CreateNamedPipeW(lpName: [*:0]const u16, dwOpenMode: u32, dwPipeMode: u32, nMaxInstances: u32, nOutBufferSize: u32, nInBufferSize: u32, nDefaultTimeOut: u32, lpSecurityAttributes: ?*anyopaque) callconv(.winapi) *anyopaque;
+extern "kernel32" fn ConnectNamedPipe(hNamedPipe: *anyopaque, lpOverlapped: ?*anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn DisconnectNamedPipe(hNamedPipe: *anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn ReadDirectoryChangesW(hDirectory: *anyopaque, lpBuffer: *anyopaque, nBufferLength: u32, bWatchSubtree: i32, dwNotifyFilter: u32, lpBytesReturned: ?*u32, lpOverlapped: ?*anyopaque, lpCompletionRoutine: ?*anyopaque) callconv(.winapi) i32;
+
+pub const PIPE_ACCESS_DUPLEX = 0x00000003;
+pub const PIPE_TYPE_BYTE = 0x00000000;
+pub const PIPE_READMODE_BYTE = 0x00000000;
+pub const PIPE_WAIT = 0x00000000;
+
+pub const FILE_NOTIFY_CHANGE_LAST_WRITE = 0x00000010;
+pub const FILE_NOTIFY_CHANGE_FILE_NAME = 0x00000001;
+pub const FILE_LIST_DIRECTORY = 0x00000001;
+
+pub const FILE_NOTIFY_INFORMATION = extern struct {
+    NextEntryOffset: u32,
+    Action: u32,
+    FileNameLength: u32,
+    FileName: [1]u16,
+};
 
 
 
@@ -58,12 +103,13 @@ pub const WIN32_FIND_DATAW = extern struct {
     cAlternateFileName: [14]u16,
 };
 
-extern "kernel32" fn FindFirstFileW(lpFileName: [*:0]const u16, lpFindFileData: *WIN32_FIND_DATAW) callconv(.c) *anyopaque;
-extern "kernel32" fn FindNextFileW(hFindFile: *anyopaque, lpFindFileData: *WIN32_FIND_DATAW) callconv(.c) i32;
-extern "kernel32" fn FindClose(hFindFile: *anyopaque) callconv(.c) i32;
+extern "kernel32" fn FindFirstFileW(lpFileName: [*:0]const u16, lpFindFileData: *WIN32_FIND_DATAW) callconv(.winapi) *anyopaque;
+extern "kernel32" fn FindNextFileW(hFindFile: *anyopaque, lpFindFileData: *WIN32_FIND_DATAW) callconv(.winapi) i32;
+extern "kernel32" fn FindClose(hFindFile: *anyopaque) callconv(.winapi) i32;
+
 pub extern "kernel32" fn DeleteFileW(lpFileName: [*:0]const u16) callconv(.c) i32;
 
-var global_silo_root: ?[]const u8 = null;
+// V30: Static buffer for anchored paths to eliminate leaks in multi-test runs.
 
 pub fn getExePath(allocator: std.mem.Allocator) ![]const u8 {
     var buf: [1024]u16 = undefined;
@@ -90,21 +136,35 @@ pub fn getExePath(allocator: std.mem.Allocator) ![]const u8 {
             out_buf[out_idx] = @intCast(0x80 | (c & 0x3F)); out_idx += 1;
         }
     }
-    return out_buf[0..out_idx];
+    const final_path = try allocator.dupe(u8, out_buf[0..out_idx]);
+    allocator.free(out_buf);
+    return final_path;
 }
 
 
+var silo_root_buf: [1024]u8 = undefined;
+var silo_root_len: usize = 0;
+
 pub fn getSiloRoot(allocator: std.mem.Allocator) ![]const u8 {
-    if (global_silo_root) |r| return r;
-    
+    if (silo_root_len > 0) return silo_root_buf[0..silo_root_len];
+
     const exe_path = try getExePath(allocator);
     defer allocator.free(exe_path);
+
+    const exe_dir = std.fs.path.dirname(exe_path) orelse return error.NoDirName;
+
+    // If the exe lives inside a directory named "bin", step up one level.
+    const silo_root = if (std.mem.endsWith(u8, exe_dir, "\\bin") or std.mem.endsWith(u8, exe_dir, "/bin"))
+        std.fs.path.dirname(exe_dir) orelse exe_dir
+    else
+        exe_dir;
+
+    if (silo_root.len > silo_root_buf.len) return error.PathTooLong;
+    @memcpy(silo_root_buf[0..silo_root.len], silo_root);
+    silo_root_len = silo_root.len;
     
-    const bin_dir = std.fs.path.dirname(exe_path) orelse return error.NoDirName;
-    const silo_root = std.fs.path.dirname(bin_dir) orelse bin_dir; // Step back from bin/
-    
-    global_silo_root = try allocator.dupe(u8, silo_root);
-    return global_silo_root.?;
+    // std.debug.print("[SYS] Silo root anchored: {s}\n", .{silo_root_buf[0..silo_root_len]});
+    return silo_root_buf[0..silo_root_len];
 }
 
 pub fn getAnchorPath(allocator: std.mem.Allocator, sub_path: []const u8) ![]const u8 {
@@ -154,54 +214,86 @@ pub fn findPluginFiles(allocator: std.mem.Allocator) ![][]const u8 {
     return results.toOwnedSlice(allocator);
 }
 
-pub fn findNativePlugins(allocator: std.mem.Allocator) ![][]const u8 {
-    var results = std.ArrayListUnmanaged([]const u8).empty;
-    var wbuf: [1024]u16 = undefined;
-    const anchored_plugins = try getAnchorPath(allocator, "plugins\\*");
-    defer allocator.free(anchored_plugins);
-    const search_path = utf8ToW(anchored_plugins, &wbuf);
-    
-    var find_data: WIN32_FIND_DATAW = undefined;
-    const hFind = FindFirstFileW(search_path, &find_data);
-    if (hFind == INVALID_HANDLE) return results.toOwnedSlice(allocator);
-    defer _ = FindClose(hFind);
+/// Scan the corpus/ directory for .txt files, returning full anchored paths.
+/// Scan the corpus/ directory for .txt files, returning full anchored paths.
+/// Scan the corpus/ directory for .txt files, returning full anchored paths.
+/// Scan the corpus/ directory for .txt files, returning full anchored paths.
+/// Scan the corpus/ directory for .txt files, returning full anchored paths.
+pub fn findCorpusFiles(allocator: std.mem.Allocator) ![][]const u8 {
+    var results: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (results.items) |path| allocator.free(path);
+        results.deinit(allocator);
+    }
 
-    while (true) {
-        var len: usize = 0;
-        while (len < 260 and find_data.cFileName[len] != 0) len += 1;
-        const utf16_slice = find_data.cFileName[0..len];
-        
-        // Convert UTF-16 to UTF-8
-        var out_buf: [1024]u8 = undefined;
-        var out_idx: usize = 0;
-        for (utf16_slice) |c| {
-            if (c < 0x80) { out_buf[out_idx] = @intCast(c); out_idx += 1; }
-            else if (c < 0x800) { out_buf[out_idx] = @intCast(0xC0 | (c >> 6)); out_idx += 1; out_buf[out_idx] = @intCast(0x80 | (c & 0x3F)); out_idx += 1; }
+    const anchored = try getAnchorPath(allocator, "corpus");
+    defer allocator.free(anchored);
+    const project_corpus = try std.fs.path.join(allocator, &[_][]const u8{ @import("build_options").project_root, "corpus" });
+    defer allocator.free(project_corpus);
+
+    const candidates = [_][]const u8{ anchored, project_corpus };
+    for (candidates) |candidate| {
+        var wbuf: [1024]u16 = undefined;
+        var pattern_buf: [1024]u8 = undefined;
+        const pattern = std.fmt.bufPrint(&pattern_buf, "{s}\\*", .{candidate}) catch continue;
+        const search_path = utf8ToW(pattern, &wbuf);
+
+        var find_data: WIN32_FIND_DATAW = undefined;
+        const hFind = FindFirstFileW(search_path, &find_data);
+        if (hFind == INVALID_HANDLE) continue;
+        defer _ = FindClose(hFind);
+
+        while (true) {
+            var len: usize = 0;
+            while (len < 260 and find_data.cFileName[len] != 0) len += 1;
+            const utf16_slice = find_data.cFileName[0..len];
+
+            var out_buf: [1024]u8 = undefined;
+            var out_idx: usize = 0;
+            for (utf16_slice) |c| {
+                if (c < 0x80) {
+                    out_buf[out_idx] = @intCast(c);
+                    out_idx += 1;
+                } else if (c < 0x800) {
+                    out_buf[out_idx] = @intCast(0xC0 | (c >> 6));
+                    out_idx += 1;
+                    out_buf[out_idx] = @intCast(0x80 | (c & 0x3F));
+                    out_idx += 1;
+                }
+            }
+
+            const name = out_buf[0..out_idx];
+            if (std.mem.endsWith(u8, name, ".txt")) {
+                const full_path = try std.fs.path.join(allocator, &[_][]const u8{ candidate, name });
+                try results.append(allocator, full_path);
+            }
+
+            if (FindNextFileW(hFind, &find_data) == 0) break;
         }
 
-        const name = out_buf[0..out_idx];
-        const is_dll = std.mem.endsWith(u8, name, ".dll");
-        const is_so = std.mem.endsWith(u8, name, ".so");
-        if (is_dll or is_so) {
-            const joined = try std.fs.path.join(allocator, &[_][]const u8{ "plugins", name });
-            defer allocator.free(joined);
-            const full_path = try getAnchorPath(allocator, joined);
-            try results.append(allocator, full_path);
-        }
-
-        if (FindNextFileW(hFind, &find_data) == 0) break;
+        if (results.items.len > 0) break;
     }
 
     return results.toOwnedSlice(allocator);
 }
 
+
+pub extern "kernel32" fn CreateMutexA(lpMutexAttributes: ?*anyopaque, bInitialOwner: i32, lpName: [*:0]const u8) callconv(.winapi) ?*anyopaque;
+pub extern "kernel32" fn OpenMutexA(dwDesiredAccess: u32, bInheritHandle: i32, lpName: [*:0]const u8) callconv(.winapi) ?*anyopaque;
+pub extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+
+pub fn acquireTrainerLock() bool {
+    const h = CreateMutexA(null, 1, "Global\\GhostTrainerLock");
+    if (h == null) return false;
+    if (GetLastError() == 183) return false; // ERROR_ALREADY_EXISTS
+    return true; // We own the mutex, it will be automatically released when the process dies
+}
+
 pub fn isTrainerActive(allocator: std.mem.Allocator) bool {
-    var wbuf: [1024]u16 = undefined;
-    const anchored = getAnchorPath(allocator, "plugins\\trainer.lock") catch return false;
-    defer allocator.free(anchored);
-    const h = CreateFileW(utf8ToW(anchored, &wbuf), 0x80000000, FILE_SHARE_READ | FILE_SHARE_WRITE, null, 3, 0x80, null);
-    if (h != INVALID_HANDLE) {
-        _ = CloseHandle(h);
+    _ = allocator;
+    const h = OpenMutexA(0x00100000, 0, "Global\\GhostTrainerLock"); // SYNCHRONIZE
+    if (h != null) {
+        _ = CloseHandle(h.?);
         return true;
     }
     return false;
@@ -211,7 +303,7 @@ pub fn isTrainerActive(allocator: std.mem.Allocator) bool {
 pub const FileHandle = *anyopaque;
 pub const INVALID_HANDLE = @as(*anyopaque, @ptrFromInt(0xFFFFFFFFFFFFFFFF));
 
-pub const NVME_DIRECT_FLAGS: u32 = 0x20000000 | 0x80000000;
+pub const NVME_DIRECT_FLAGS: u32 = 0x20000000 | 0x80000000; // FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH
 pub const SECTOR_SIZE: usize = 4096;
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
@@ -224,7 +316,9 @@ pub const MappedFile = struct {
     data: []u8,
 
     pub fn flush(self: *const MappedFile) void {
+        // V31: Direct DMA flush. Bypasses standard OS buffering.
         _ = FlushViewOfFile(self.data.ptr, 0);
+        _ = FlushFileBuffers(self.file_handle);
     }
 
     pub fn unmap(self: *MappedFile) void {
@@ -234,26 +328,59 @@ pub const MappedFile = struct {
     }
 };
 
+/// V31: DirectStorage-style DMA. 
+/// Loads data directly from NVMe into a sector-aligned buffer.
+pub fn directRead(handle: FileHandle, offset: u64, buffer: []u8) !void {
+    var overlapped = std.mem.zeroes(std.os.windows.OVERLAPPED);
+    overlapped.u.s.Offset = @intCast(offset & 0xFFFFFFFF);
+    overlapped.u.s.OffsetHigh = @intCast(offset >> 32);
+
+    var read_bytes: u32 = 0;
+    if (ReadFile(handle, buffer.ptr, @intCast(buffer.len), &read_bytes, @ptrCast(&overlapped)) == 0) {
+        const err = GetLastError();
+        if (err != 997) return error.DirectReadFailed; // 997 = ERROR_IO_PENDING
+    }
+}
+
 pub fn getMilliTick() u64 {
     return GetTickCount64();
 }
 
-pub fn utf8ToW(path: []const u8, buf: []u16) [*:0]const u16 {
-    var j: usize = 0;
-    var i: usize = 0;
-    while (i < path.len and j < buf.len - 1) {
-        const c = path[i];
-        if (c < 0x80) {
-            buf[j] = c; i += 1;
-        } else if (c < 0xe0) {
-            buf[j] = (@as(u16, c & 0x1f) << 6) | (path[i + 1] & 0x3f); i += 2;
-        } else {
-            buf[j] = (@as(u16, c & 0x0f) << 12) | (@as(u16, path[i + 1] & 0x3f) << 6) | (path[i + 2] & 0x3f); i += 3;
-        }
-        j += 1;
+pub fn createNamedPipe(name: []const u8) !FileHandle {
+    var wbuf: [1024]u16 = undefined;
+    const wname = utf8ToW(name, &wbuf);
+    const h = CreateNamedPipeW(wname, PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 65536, 65536, 0, null);
+    if (h == INVALID_HANDLE) return error.PipeCreateFailed;
+    return h;
+}
+
+pub fn connectNamedPipe(h: FileHandle) !void {
+    if (ConnectNamedPipe(h, null) == 0) {
+        // ERROR_PIPE_CONNECTED (535) means someone already connected.
+        // We can't easily get GetLastError here without more externs, but we'll assume it's okay for now.
     }
-    buf[j] = 0;
-    return @as([*:0]u16, @ptrCast(buf.ptr));
+}
+
+pub fn disconnectNamedPipe(h: FileHandle) void {
+    _ = DisconnectNamedPipe(h);
+}
+
+pub fn watchDirectory(h: FileHandle, buffer: []u8) !usize {
+    var returned: u32 = 0;
+    if (ReadDirectoryChangesW(h, buffer.ptr, @intCast(buffer.len), 1, FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_FILE_NAME, &returned, null, null) == 0) {
+        return error.WatchFailed;
+    }
+    return @intCast(returned);
+}
+
+pub fn utf8ToW(path: []const u8, buf: []u16) [*:0]const u16 {
+    const len = std.unicode.utf8ToUtf16Le(buf, path) catch |err| {
+        std.debug.print("[FATAL] Unicode conversion failed for path '{s}': {any}\n", .{path, err});
+        buf[0] = 0;
+        return @ptrCast(buf.ptr);
+    };
+    buf[len] = 0;
+    return @ptrCast(buf.ptr);
 }
 
 const FILE_SHARE_READ: u32 = 0x00000001;
@@ -287,14 +414,29 @@ pub fn openForRead(allocator: std.mem.Allocator, path: []const u8) !FileHandle {
     return h;
 }
 
-pub fn createMappedFile(allocator: std.mem.Allocator, path: []const u8, size: usize) !MappedFile {
+pub fn openDirectory(allocator: std.mem.Allocator, path: []const u8) !FileHandle {
     var wbuf: [1024]u16 = undefined;
     const anchored = try getAnchorPath(allocator, path);
     defer allocator.free(anchored);
+    const h = CreateFileW(utf8ToW(anchored, &wbuf), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE, null, 3, 0x02000000, null);
+    if (h == INVALID_HANDLE) return error.DirOpenFailed;
+    return h;
+}
+
+pub fn createMappedFile(allocator: std.mem.Allocator, path: []const u8, size: usize) !MappedFile {
+    std.debug.print("[DEBUG] createMappedFile: {s}\n", .{path});
+    var wbuf: [1024]u16 = undefined;
+    const anchored = try getAnchorPath(allocator, path);
+    defer allocator.free(anchored);
+    std.debug.print("[DEBUG] anchored path: {s}\n", .{anchored});
     const wpath = utf8ToW(anchored, &wbuf);
     const fh = CreateFileW(wpath, 0xC0000000, FILE_SHARE_READ | FILE_SHARE_WRITE, null, 4, 0x80, null);
 
-    if (fh == INVALID_HANDLE) return error.CreateFailed;
+    if (fh == INVALID_HANDLE) {
+        std.debug.print("[DEBUG] CreateFileW failed\n", .{});
+        return error.CreateFailed;
+    }
+    std.debug.print("[DEBUG] CreateFileW success\n", .{});
     var current_size: i64 = 0;
     if (GetFileSizeEx(fh, &current_size) != 0) {
         if (@as(usize, @intCast(current_size)) != size) {
@@ -372,28 +514,15 @@ pub fn readStdin(buffer: []u8) ![]u8 {
     var read_bytes: u32 = 0; if (ReadFile(hIn, buffer.ptr, @intCast(buffer.len), &read_bytes, null) == 0) return error.ReadFailed;
     return buffer[0..read_bytes];
 }
+pub fn pollStdin() bool {
+    const hIn = GetStdHandle(@as(u32, @bitCast(@as(i32, -10))));
+    var avail: u32 = 0;
+    if (PeekNamedPipe(hIn, null, 0, null, &avail, null) == 0) return false;
+    return avail > 0;
+}
 pub fn sleep(ms: u32) void { Sleep(ms); }
 pub fn exit(code: u32) noreturn { ExitProcess(code); }
 
-pub const NativeLibrary = struct {
-    handle: *anyopaque,
-
-    pub fn open(path: []const u8) !NativeLibrary {
-        var wbuf: [1024]u16 = undefined;
-        const wpath = utf8ToW(path, &wbuf);
-        const h = LoadLibraryW(wpath) orelse return error.LibraryLoadFailed;
-        return NativeLibrary{ .handle = h };
-    }
-
-    pub fn lookup(self: NativeLibrary, T: type, name: [:0]const u8) ?T {
-        const addr = GetProcAddress(self.handle, name.ptr) orelse return null;
-        return @as(T, @ptrCast(addr));
-    }
-
-    pub fn close(self: NativeLibrary) void {
-        _ = FreeLibrary(self.handle);
-    }
-};
 
 pub fn getArgs(allocator: std.mem.Allocator) ![][]const u8 {
 

@@ -1,0 +1,21 @@
+{
+  "clients": 1,
+  "durationMs": 8000,
+  "connected": 1,
+  "connect_failed": 0,
+  "requests_started": 1,
+  "requests_done": 0,
+  "requests_failed": 0,
+  "forced_shutdowns": 1,
+  "socket_errors": 0,
+  "socket_closed_early": 0,
+  "done_without_output": 0,
+  "stats_ok": 36,
+  "stats_failed": 0,
+  "bytes_received": 0,
+  "latencies_ms": [],
+  "requests_unfinished": 1,
+  "p50_ms": 0,
+  "p95_ms": 0,
+  "p99_ms": 0
+}

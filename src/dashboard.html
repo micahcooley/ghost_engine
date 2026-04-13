@@ -1,0 +1,1009 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ghost Operator Console</title>
+  <style>
+    :root {
+      --bg: #07090d;
+      --panel: #0f131b;
+      --panel-2: #121824;
+      --border: rgba(255,255,255,0.08);
+      --text: #eef3ff;
+      --muted: #8a97b5;
+      --accent: #38bdf8;
+      --accent-2: #7dd3fc;
+      --green: #34d399;
+      --amber: #f59e0b;
+      --red: #f87171;
+      --font: ui-sans-serif, system-ui, sans-serif;
+      --mono: ui-monospace, "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at top left, rgba(56,189,248,0.18), transparent 28%),
+        radial-gradient(circle at bottom right, rgba(125,211,252,0.12), transparent 24%),
+        var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      display: flex;
+      flex-direction: column;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(10, 14, 20, 0.92);
+      backdrop-filter: blur(10px);
+    }
+
+    .brand {
+      font-family: var(--mono);
+      font-size: 13px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .brand span { color: var(--accent-2); }
+    .spacer { flex: 1; }
+
+    .pill {
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 6px 12px;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .pill.online {
+      border-color: rgba(52,211,153,0.45);
+      color: var(--green);
+    }
+
+    nav {
+      display: flex;
+      gap: 4px;
+      padding: 10px 12px 0;
+    }
+
+    .tab-btn {
+      background: transparent;
+      color: var(--muted);
+      border: 1px solid transparent;
+      border-bottom: none;
+      border-radius: 12px 12px 0 0;
+      padding: 10px 16px;
+      cursor: pointer;
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .tab-btn.active {
+      color: var(--text);
+      border-color: var(--border);
+      background: var(--panel);
+    }
+
+    #main {
+      flex: 1;
+      display: flex;
+      padding: 0 12px 12px;
+      min-height: 0;
+    }
+
+    .panel {
+      display: none;
+      flex: 1;
+      gap: 16px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 0 16px 16px 16px;
+      padding: 16px;
+      min-height: 0;
+    }
+
+    .panel.active { display: flex; }
+    .stack { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+    .grow { flex: 1; min-height: 0; }
+    .side { width: 320px; flex-shrink: 0; }
+
+    .card {
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 14px;
+    }
+
+    .card h3, .card h4 {
+      margin: 0 0 10px;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-family: var(--mono);
+      color: var(--muted);
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 12px;
+    }
+
+    .stat-value {
+      font-family: var(--mono);
+      font-size: 28px;
+      font-weight: 700;
+      line-height: 1;
+      margin-bottom: 6px;
+    }
+
+    .stat-label {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .mono { font-family: var(--mono); }
+    .muted { color: var(--muted); }
+    .accent { color: var(--accent-2); }
+    .green { color: var(--green); }
+    .amber { color: var(--amber); }
+    .red { color: var(--red); }
+
+    #chat-messages {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      padding-right: 6px;
+    }
+
+    .message {
+      max-width: 80%;
+      padding: 12px 14px;
+      border-radius: 14px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.55;
+      font-family: var(--mono);
+      font-size: 13px;
+    }
+
+    .message.user {
+      align-self: flex-end;
+      background: rgba(56,189,248,0.14);
+      border: 1px solid rgba(56,189,248,0.28);
+    }
+
+    .message.ghost {
+      align-self: flex-start;
+      background: rgba(255,255,255,0.03);
+      border: 1px solid var(--border);
+    }
+
+    .message.system {
+      align-self: center;
+      background: transparent;
+      border: none;
+      color: var(--muted);
+      font-size: 11px;
+      padding: 4px 0;
+    }
+
+    #chat-form {
+      display: flex;
+      gap: 10px;
+    }
+
+    textarea, select, button {
+      font: inherit;
+    }
+
+    textarea {
+      flex: 1;
+      min-height: 54px;
+      max-height: 160px;
+      resize: vertical;
+      background: #0a0f17;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px 14px;
+      font-family: var(--mono);
+    }
+
+    button, select {
+      background: #0a0f17;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 10px 14px;
+    }
+
+    button.primary {
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      color: #04111a;
+      border: none;
+      font-weight: 700;
+    }
+
+    button.danger {
+      border-color: rgba(248,113,113,0.4);
+      color: var(--red);
+    }
+
+    .progress {
+      height: 10px;
+      background: rgba(255,255,255,0.06);
+      border-radius: 999px;
+      overflow: hidden;
+    }
+
+    .progress > div {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, var(--accent), var(--green));
+      transition: width 0.25s ease;
+    }
+
+    .corpus-list {
+      display: grid;
+      gap: 8px;
+      max-height: 220px;
+      overflow-y: auto;
+      padding-right: 4px;
+    }
+
+    .corpus-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: rgba(255,255,255,0.02);
+      border: 1px solid rgba(255,255,255,0.04);
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+
+    .matrix-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+    }
+
+    #probe-canvas {
+      width: 100%;
+      height: 220px;
+      border-radius: 14px;
+      background: #09101a;
+      border: 1px solid var(--border);
+      display: block;
+    }
+
+    .kv {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 8px 12px;
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+
+    .toolbar {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .control-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 12px;
+    }
+
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .field input, .field select {
+      width: 100%;
+      background: #0a0f17;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-family: var(--mono);
+      text-transform: none;
+      letter-spacing: normal;
+    }
+
+    .split {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 12px;
+      min-height: 0;
+    }
+
+    .list-box {
+      display: grid;
+      gap: 8px;
+      max-height: 260px;
+      overflow-y: auto;
+      padding-right: 4px;
+    }
+
+    .list-row {
+      display: grid;
+      gap: 6px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.05);
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+
+    .list-row strong {
+      font-size: 12px;
+      color: var(--text);
+    }
+
+    .meta-line {
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .corpus-row {
+      display: grid;
+      grid-template-columns: auto 1fr minmax(70px, 90px);
+      align-items: center;
+      gap: 10px;
+    }
+
+    .corpus-row input[type="number"] {
+      width: 100%;
+      background: #0a0f17;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-family: var(--mono);
+    }
+
+    .device-list {
+      display: grid;
+      gap: 8px;
+    }
+
+    .device-row {
+      display: grid;
+      gap: 4px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.05);
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+
+    .device-row label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 8px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.08);
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .pill.warn {
+      border-color: rgba(245,158,11,0.4);
+      color: var(--amber);
+    }
+
+    .canvas-stack {
+      display: grid;
+      gap: 12px;
+    }
+
+    #bands-canvas {
+      width: 100%;
+      height: 120px;
+      border-radius: 14px;
+      background: #09101a;
+      border: 1px solid var(--border);
+      display: block;
+    }
+
+    @media (max-width: 980px) {
+      .panel.active { flex-direction: column; }
+      .side { width: auto; }
+      .message { max-width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">Ghost <span>Operator Console</span></div>
+    <div class="pill mono" id="version-pill">V31</div>
+    <div class="spacer"></div>
+    <div class="pill mono" id="status-pill">Offline</div>
+  </header>
+
+  <nav>
+    <button class="tab-btn active" data-tab="chat">Chat</button>
+    <button class="tab-btn" data-tab="training">Training</button>
+    <button class="tab-btn" data-tab="matrix">Matrix</button>
+  </nav>
+
+  <div id="main">
+    <section class="panel active" id="panel-chat">
+      <div class="stack grow">
+        <div class="card stack grow">
+          <div id="chat-messages"></div>
+          <form id="chat-form">
+            <textarea id="chat-input" placeholder="Type into the live lattice..."></textarea>
+            <button class="primary" id="send-btn" type="submit">Send</button>
+          </form>
+        </div>
+      </div>
+      <aside class="stack side">
+        <div class="card">
+          <h3>Runtime</h3>
+          <div class="kv">
+            <div class="muted">Compute</div><div id="runtime-compute" class="accent mono">Detecting</div>
+            <div class="muted">Device</div><div id="runtime-device" class="mono">Detecting</div>
+            <div class="muted">Slots</div><div id="runtime-slots" class="mono">-</div>
+            <div class="muted">Usage</div><div id="runtime-usage" class="mono">-</div>
+            <div class="muted">EMA Avg</div><div id="runtime-ema" class="mono">-</div>
+            <div class="muted">EMA Dev</div><div id="runtime-ema-dev" class="mono">-</div>
+          </div>
+        </div>
+        <div class="card">
+          <h3>Progress</h3>
+          <div class="progress"><div id="chat-progress"></div></div>
+          <div class="mono muted" style="margin-top:10px;" id="chat-progress-label">Training idle.</div>
+        </div>
+      </aside>
+    </section>
+
+    <section class="panel" id="panel-training">
+      <div class="stack grow">
+        <div class="stats">
+          <div class="card"><div class="stat-value green mono" id="t-throughput">0</div><div class="stat-label">MiB / s</div></div>
+          <div class="card"><div class="stat-value accent mono" id="t-usage">0</div><div class="stat-label">Slot Usage %</div></div>
+          <div class="card"><div class="stat-value mono" id="t-streams">0</div><div class="stat-label">Active Streams</div></div>
+          <div class="card"><div class="stat-value amber mono" id="t-progress">0</div><div class="stat-label">Progress %</div></div>
+          <div class="card"><div class="stat-value mono" id="t-eta">0s</div><div class="stat-label">ETA</div></div>
+          <div class="card"><div class="stat-value mono" id="t-bottleneck">idle</div><div class="stat-label">Bottleneck</div></div>
+        </div>
+
+        <div class="card stack">
+          <h3>Trainer Controls</h3>
+          <div class="toolbar">
+            <button class="primary" id="start-btn" type="button">Start Training</button>
+            <button id="apply-btn" type="button">Apply Live Control</button>
+            <button id="pause-btn" type="button">Pause</button>
+            <button id="resume-btn" type="button">Resume</button>
+            <button id="checkpoint-btn" type="button">Checkpoint Now</button>
+            <button class="danger" id="stop-btn" type="button">Stop Training</button>
+          </div>
+          <div class="control-grid">
+            <label class="field">Tier
+              <select id="tier-select">
+                <option value="background">Background</option>
+                <option value="standard" selected>Standard</option>
+                <option value="high">High</option>
+                <option value="max">Max</option>
+                <option value="extreme">Extreme</option>
+                <option value="ultra">Ultra</option>
+              </select>
+            </label>
+            <label class="field">Batch Override
+              <input id="batch-size" type="number" min="0" step="1" value="0" />
+            </label>
+            <label class="field">Max Active Streams
+              <input id="max-streams" type="number" min="0" step="1" value="0" />
+            </label>
+            <label class="field">Checkpoint Seconds
+              <input id="checkpoint-interval" type="number" min="5" step="1" value="60" />
+            </label>
+            <label class="field">Stop After Minutes
+              <input id="stop-minutes" type="number" min="0" step="1" value="0" />
+            </label>
+            <label class="field">Stop After Runes
+              <input id="stop-runes" type="number" min="0" step="1" value="0" />
+            </label>
+            <label class="field">Stop At Slot Usage %
+              <input id="stop-slot-usage" type="number" min="0" max="100" step="0.1" value="0" />
+            </label>
+            <label class="field">Idle Sleep Ms
+              <input id="idle-sleep" type="number" min="1" step="1" value="10" />
+            </label>
+          </div>
+          <div class="progress"><div id="train-progress"></div></div>
+          <div class="mono muted" style="margin-top:10px;" id="train-status">Waiting for a real trainer session.</div>
+        </div>
+
+        <div class="card grow stack">
+          <div class="toolbar" style="justify-content:space-between;">
+            <h3 style="margin:0;">Corpora</h3>
+            <button id="reload-corpora" type="button">Reload</button>
+          </div>
+          <div class="corpus-list" id="corpus-list"></div>
+        </div>
+
+        <div class="card grow stack">
+          <h3>Live Session</h3>
+          <div class="split grow">
+            <div class="stack">
+              <h4>Stream Progress</h4>
+              <div class="list-box" id="stream-list"></div>
+            </div>
+            <div class="stack">
+              <h4>GPU Fleet</h4>
+              <div class="list-box" id="gpu-runtime-list"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <aside class="stack side">
+        <div class="card">
+          <h3>Device Selection</h3>
+          <div class="device-list" id="gpu-select-list"></div>
+        </div>
+        <div class="card">
+          <h3>Diagnostics</h3>
+          <div class="kv">
+            <div class="muted">EMA Avg</div><div id="diag-ema" class="mono">-</div>
+            <div class="muted">EMA Dev</div><div id="diag-ema-dev" class="mono">-</div>
+            <div class="muted">Drops</div><div id="diag-drops" class="mono">-</div>
+            <div class="muted">Stalls</div><div id="diag-stalls" class="mono">-</div>
+            <div class="muted">Checkpoint Age</div><div id="diag-checkpoint-age" class="mono">-</div>
+            <div class="muted">Processed</div><div id="diag-runes" class="mono">-</div>
+            <div class="muted">Stop Reason</div><div id="diag-stop-reason" class="mono">-</div>
+            <div class="muted">Selected GPUs</div><div id="diag-selected-gpus" class="mono">-</div>
+          </div>
+        </div>
+      </aside>
+    </section>
+
+    <section class="panel" id="panel-matrix">
+      <div class="stack grow">
+        <div class="matrix-grid">
+          <div class="card"><h3>Unified Lattice</h3><div class="stat-value accent mono" id="m-lattice">-</div><div class="muted mono">Mapped bytes</div></div>
+          <div class="card"><h3>Semantic Monolith</h3><div class="stat-value accent mono" id="m-monolith">-</div><div class="muted mono">Mapped bytes</div></div>
+          <div class="card"><h3>Tag Store</h3><div class="stat-value accent mono" id="m-tags">-</div><div class="muted mono">Mapped bytes</div></div>
+        </div>
+        <div class="card grow stack">
+          <h3>Lattice Sweep</h3>
+          <div class="canvas-stack">
+            <canvas id="probe-canvas" width="900" height="220"></canvas>
+            <canvas id="bands-canvas" width="900" height="120"></canvas>
+          </div>
+          <div class="mono muted" id="probe-label">Waiting for live probe data.</div>
+        </div>
+      </div>
+
+      <aside class="stack side">
+        <div class="card">
+          <h3>Architecture</h3>
+          <div class="kv">
+            <div class="muted">Version</div><div id="a-version" class="mono">-</div>
+            <div class="muted">Bitspace</div><div id="a-bits" class="mono">-</div>
+            <div class="muted">Slots</div><div id="a-slots" class="mono">-</div>
+            <div class="muted">GPU Slots</div><div id="a-gpu-slots" class="mono">-</div>
+            <div class="muted">Compute</div><div id="a-compute" class="mono">-</div>
+            <div class="muted">Device</div><div id="a-device" class="mono">-</div>
+          </div>
+        </div>
+        <div class="card">
+          <h3>Hot Cells</h3>
+          <div class="list-box" id="hot-cell-list"></div>
+        </div>
+      </aside>
+    </section>
+  </div>
+
+  <script>
+    const HTTP_BASE = location.protocol === "file:" ? "http://127.0.0.1:8080" : "";
+    const WS_BASE = location.protocol === "file:" ? "ws://127.0.0.1:8080" : `ws://${location.host}`;
+
+    let chatSocket = null;
+    let currentGhost = null;
+    let lastState = null;
+
+    const tabs = document.querySelectorAll(".tab-btn");
+    tabs.forEach(btn => btn.addEventListener("click", () => switchTab(btn.dataset.tab)));
+
+    function switchTab(name) {
+      tabs.forEach(btn => btn.classList.toggle("active", btn.dataset.tab === name));
+      document.querySelectorAll(".panel").forEach(panel => panel.classList.toggle("active", panel.id === `panel-${name}`));
+    }
+
+    function el(id) { return document.getElementById(id); }
+    function fmtPct(value) { return `${Number(value || 0).toFixed(1)}%`; }
+    function fmtMiB(bytes) { return `${(Number(bytes || 0) / 1048576).toFixed(1)} MiB`; }
+    function fmtNum(value) { return Number(value || 0).toLocaleString(); }
+    function fmtDuration(ms) {
+      const total = Math.max(0, Math.floor(Number(ms || 0) / 1000));
+      const hours = Math.floor(total / 3600);
+      const minutes = Math.floor((total % 3600) / 60);
+      const seconds = total % 60;
+      if (hours) return `${hours}h ${minutes}m`;
+      if (minutes) return `${minutes}m ${seconds}s`;
+      return `${seconds}s`;
+    }
+    function checkedRows(selector) {
+      return Array.from(document.querySelectorAll(selector)).filter(node => node.checked);
+    }
+    async function postJson(path, payload = {}) {
+      const res = await fetch(`${HTTP_BASE}${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      return res.json();
+    }
+
+    function setStatus(online) {
+      const pill = el("status-pill");
+      pill.textContent = online ? "Online" : "Offline";
+      pill.className = `pill mono${online ? " online" : ""}`;
+    }
+
+    function appendMessage(kind, text) {
+      const node = document.createElement("div");
+      node.className = `message ${kind}`;
+      node.textContent = text;
+      el("chat-messages").appendChild(node);
+      el("chat-messages").scrollTop = el("chat-messages").scrollHeight;
+      return node;
+    }
+
+    function connectChat() {
+      if (chatSocket && chatSocket.readyState < 2) return;
+      chatSocket = new WebSocket(`${WS_BASE}/?channel=chat`);
+      chatSocket.onopen = () => setStatus(true);
+      chatSocket.onclose = () => {
+        setStatus(false);
+        setTimeout(connectChat, 2000);
+      };
+      chatSocket.onerror = () => chatSocket.close();
+      chatSocket.onmessage = evt => {
+        const msg = JSON.parse(evt.data);
+        if (msg.type === "connected") appendMessage("system", msg.text);
+        if (msg.type === "error") appendMessage("system", msg.text);
+        if (msg.type === "output") {
+          if (!currentGhost) currentGhost = appendMessage("ghost", "");
+          currentGhost.textContent += msg.text;
+          el("chat-messages").scrollTop = el("chat-messages").scrollHeight;
+        }
+        if (msg.type === "done") currentGhost = null;
+      };
+    }
+
+    el("chat-form").addEventListener("submit", event => {
+      event.preventDefault();
+      const text = el("chat-input").value.trim();
+      if (!text || !chatSocket || chatSocket.readyState !== 1) return;
+      appendMessage("user", text);
+      chatSocket.send(JSON.stringify({ type: "input", text }));
+      el("chat-input").value = "";
+      currentGhost = null;
+    });
+
+    function selectedCorpora() {
+      return checkedRows("#corpus-list input[type='checkbox']").map(input => input.value);
+    }
+
+    function selectedGpuIds() {
+      return checkedRows("#gpu-select-list input[type='checkbox']").map(input => Number(input.value));
+    }
+
+    function corpusWeights() {
+      const weights = {};
+      document.querySelectorAll("#corpus-list .corpus-row").forEach(row => {
+        const checkbox = row.querySelector("input[type='checkbox']");
+        const weight = row.querySelector("input[type='number']");
+        if (checkbox && weight) weights[checkbox.value] = Math.max(1, Number(weight.value || 1));
+      });
+      return weights;
+    }
+
+    function collectControls() {
+      return {
+        tier: el("tier-select").value,
+        batchSize: Number(el("batch-size").value || 0),
+        maxActiveStreams: Number(el("max-streams").value || 0),
+        checkpointIntervalMs: Number(el("checkpoint-interval").value || 60) * 1000,
+        stopAfterMinutes: Number(el("stop-minutes").value || 0),
+        stopAfterRunes: Number(el("stop-runes").value || 0),
+        stopAfterSlotUsagePct: Number(el("stop-slot-usage").value || 0),
+        idleSleepMs: Number(el("idle-sleep").value || 10),
+      };
+    }
+
+    function renderCorpora(files) {
+      const panel = el("corpus-list");
+      const currentSelections = new Set(selectedCorpora());
+      const currentWeights = corpusWeights();
+      panel.innerHTML = "";
+      if (!files.length) {
+        panel.innerHTML = `<div class="muted mono">No corpus files found.</div>`;
+        return;
+      }
+      files.forEach(file => {
+        const row = document.createElement("label");
+        row.className = "corpus-row";
+        const checked = currentSelections.size ? currentSelections.has(file.name) : true;
+        const weight = currentWeights[file.name] || 1;
+        row.innerHTML = `
+          <input type="checkbox" value="${file.name}" ${checked ? "checked" : ""}>
+          <span><strong>${file.name}</strong><br><span class="meta-line">${fmtMiB(file.sizeBytes || 0)}</span></span>
+          <input type="number" min="1" step="1" value="${weight}" title="Corpus weight">
+        `;
+        panel.appendChild(row);
+      });
+    }
+
+    function renderDevices(devices) {
+      const box = el("gpu-select-list");
+      const selected = new Set(selectedGpuIds());
+      box.innerHTML = "";
+      if (!devices.length) {
+        box.innerHTML = `<div class="muted mono">No GPU fleet detected.</div>`;
+        return;
+      }
+      devices.forEach(device => {
+        const row = document.createElement("div");
+        row.className = "device-row";
+        const checked = selected.size ? selected.has(device.index) : true;
+        row.innerHTML = `
+          <label><input type="checkbox" value="${device.index}" ${checked ? "checked" : ""}> <strong>${device.name}</strong></label>
+          <div class="meta-line">GPU ${device.index} • ${device.vramMiB} MiB • ${device.queues} queues • ${fmtNum(device.matrixSlots)} slots</div>
+        `;
+        box.appendChild(row);
+      });
+    }
+
+    function renderStreams(streams) {
+      const box = el("stream-list");
+      box.innerHTML = "";
+      if (!streams.length) {
+        box.innerHTML = `<div class="muted mono">No active stream data.</div>`;
+        return;
+      }
+      streams.forEach(stream => {
+        const row = document.createElement("div");
+        row.className = "list-row";
+        row.innerHTML = `
+          <strong>${stream.name}</strong>
+          <div class="meta-line">${fmtPct(stream.progressPct)} • ${fmtNum(stream.cursor)} / ${fmtNum(stream.sizeBytes)} bytes</div>
+          <div class="meta-line">weight ${stream.weight} • ${stream.done ? "complete" : "live"}</div>
+        `;
+        box.appendChild(row);
+      });
+    }
+
+    function renderGpuRuntime(gpus) {
+      const box = el("gpu-runtime-list");
+      box.innerHTML = "";
+      if (!gpus.length) {
+        box.innerHTML = `<div class="muted mono">No GPU runtime data.</div>`;
+        return;
+      }
+      gpus.forEach(gpu => {
+        const row = document.createElement("div");
+        row.className = "list-row";
+        row.innerHTML = `
+          <strong>${gpu.name}</strong>
+          <div class="meta-line">GPU ${gpu.index} • ${gpu.tier} • ${gpu.vramMiB} MiB</div>
+          <div class="meta-line">batch ${gpu.lastBatchSize}/${gpu.targetBatchSize} • busy ${fmtPct(gpu.busyPct)} • dispatch ${fmtDuration(gpu.lastDispatchMs)}</div>
+          <div class="meta-line">${fmtNum(gpu.processedRunes)} runes • ${fmtNum(gpu.dispatchedBatches)} batches</div>
+        `;
+        box.appendChild(row);
+      });
+    }
+
+    function renderHotCells(cells) {
+      const box = el("hot-cell-list");
+      box.innerHTML = "";
+      if (!cells.length) {
+        box.innerHTML = `<div class="muted mono">No peaks sampled yet.</div>`;
+        return;
+      }
+      cells.forEach(cell => {
+        const row = document.createElement("div");
+        row.className = "list-row";
+        row.innerHTML = `<strong>Index ${fmtNum(cell.index)}</strong><div class="meta-line">value ${fmtNum(cell.value)}</div>`;
+        box.appendChild(row);
+      });
+    }
+
+    async function loadCorpora() {
+      const files = await fetch(`${HTTP_BASE}/api/corpora`).then(r => r.json());
+      renderCorpora(files || []);
+    }
+
+    async function startTraining() {
+      const corpora = selectedCorpora();
+      if (!corpora.length) {
+        el("train-status").textContent = "Select at least one corpus file.";
+        return;
+      }
+      const resp = await postJson("/api/train", {
+        ...collectControls(),
+        corpora,
+        gpuIds: selectedGpuIds(),
+        weights: corpusWeights(),
+      });
+      el("train-status").textContent =
+        resp.status === "started" ? "Trainer started." :
+        resp.status === "already_running" ? "Trainer already running." :
+        `Trainer error: ${resp.error || "unknown"}`;
+      refreshStats();
+    }
+
+    el("start-btn").addEventListener("click", startTraining);
+    el("apply-btn").addEventListener("click", async () => {
+      const resp = await postJson("/api/control", collectControls());
+      el("train-status").textContent = resp.status === "updated" ? "Live control updated." : "Trainer idle.";
+      refreshStats();
+    });
+    el("pause-btn").addEventListener("click", async () => {
+      const resp = await postJson("/api/pause");
+      el("train-status").textContent = resp.status === "paused" ? "Trainer paused." : "Trainer idle.";
+      refreshStats();
+    });
+    el("resume-btn").addEventListener("click", async () => {
+      const resp = await postJson("/api/resume");
+      el("train-status").textContent = resp.status === "resumed" ? "Trainer resumed." : "Trainer idle.";
+      refreshStats();
+    });
+    el("checkpoint-btn").addEventListener("click", async () => {
+      const resp = await postJson("/api/checkpoint");
+      el("train-status").textContent = resp.status === "queued" ? "Checkpoint requested." : "Trainer idle.";
+      refreshStats();
+    });
+    el("stop-btn").addEventListener("click", async () => {
+      const resp = await postJson("/api/stoptrain");
+      el("train-status").textContent = resp.status === "stopping" ? "Trainer stopping." : "Trainer idle.";
+      refreshStats();
+    });
+    el("reload-corpora").addEventListener("click", loadCorpora);
+
+    function applyStats(payload) {
+      const stats = payload.stats || {};
+      const streams = payload.streams || [];
+      const gpus = payload.gpus || [];
+      el("t-throughput").textContent = Number(stats.throughputMiBs || 0).toFixed(2);
+      el("t-usage").textContent = Number(stats.slotUsagePct || 0).toFixed(1);
+      el("t-streams").textContent = `${stats.activeStreams || 0}/${stats.totalStreams || 0}`;
+      el("t-progress").textContent = Number(stats.overallPct || 0).toFixed(1);
+      el("t-eta").textContent = fmtDuration(stats.etaMs || 0);
+      el("t-bottleneck").textContent = stats.bottleneck || "idle";
+      el("diag-ema").textContent = Number(stats.emaAverage || 0).toFixed(2);
+      el("diag-ema-dev").textContent = Number(stats.emaDeviation || 0).toFixed(2);
+      el("diag-drops").textContent = stats.droppedRunes || 0;
+      el("diag-stalls").textContent = stats.collisionStalls || 0;
+      el("diag-checkpoint-age").textContent = fmtDuration(stats.checkpointAgeMs || 0);
+      el("diag-runes").textContent = fmtNum(stats.processedRunes || 0);
+      el("diag-stop-reason").textContent = stats.stopReason || "none";
+      el("diag-selected-gpus").textContent = stats.selectedGpuCount || 0;
+      el("runtime-usage").textContent = `${stats.slotUsage || 0}/${stats.slotCapacity || 0} (${fmtPct(stats.slotUsagePct)})`;
+      el("runtime-ema").textContent = Number(stats.emaAverage || 0).toFixed(2);
+      el("runtime-ema-dev").textContent = Number(stats.emaDeviation || 0).toFixed(2);
+      el("chat-progress").style.width = `${stats.overallPct || 0}%`;
+      el("train-progress").style.width = `${stats.overallPct || 0}%`;
+      el("chat-progress-label").textContent = stats.isTraining
+        ? `${stats.isPaused ? "Trainer paused" : "Trainer live"} • ${fmtPct(stats.overallPct)} • ${stats.bottleneck || "balanced"}`
+        : "Training idle.";
+      if (stats.isTraining) {
+        el("train-status").textContent = `${stats.isPaused ? "Trainer paused." : "Trainer live."} ${stats.activeStreams || 0} active streams. Checkpoint age ${fmtDuration(stats.checkpointAgeMs || 0)}.`;
+      }
+      renderStreams(streams);
+      renderGpuRuntime(gpus);
+    }
+
+    function refreshStats() {
+      fetch(`${HTTP_BASE}/api/stats`).then(r => r.json()).then(applyStats);
+    }
+
+    function loadState() {
+      fetch(`${HTTP_BASE}/api/state`).then(r => r.json()).then(data => {
+        lastState = data;
+        const arch = data.architecture || {};
+        const files = data.files || {};
+        const defaults = data.defaults || {};
+        el("version-pill").textContent = arch.version || "V31";
+        el("runtime-compute").textContent = arch.computeMode || "-";
+        el("runtime-device").textContent = arch.device || "-";
+        el("runtime-slots").textContent = `${arch.gpuMatrixSlots || 0} GPU / ${arch.semanticSlots || 0} mapped`;
+        el("m-lattice").textContent = fmtMiB(files["unified_lattice.bin"]);
+        el("m-monolith").textContent = fmtMiB(files["semantic_monolith.bin"]);
+        el("m-tags").textContent = fmtMiB(files["semantic_tags.bin"]);
+        el("a-version").textContent = arch.version || "-";
+        el("a-bits").textContent = `${arch.hypervectorBits || 0}-bit`;
+        el("a-slots").textContent = arch.semanticSlots || 0;
+        el("a-gpu-slots").textContent = arch.gpuMatrixSlots || 0;
+        el("a-compute").textContent = arch.computeMode || "-";
+        el("a-device").textContent = arch.device || "-";
+        el("checkpoint-interval").value = Math.round((defaults.checkpointIntervalMs || 60000) / 1000);
+        el("idle-sleep").value = defaults.idleSleepMs || 10;
+        renderDevices(data.devices || []);
+        renderCorpora(data.corpora || []);
+      });
+    }
+
+    function drawBars(canvasId, values, colorFn) {
+      const canvas = el(canvasId);
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#09101a";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      const width = canvas.width / Math.max(values.length, 1);
+      const max = Math.max(...values, 1);
+      values.forEach((value, index) => {
+        const height = (value / max) * (canvas.height - 18);
+        ctx.fillStyle = colorFn(value, index, max);
+        ctx.fillRect(index * width + 1, canvas.height - height - 6, Math.max(width - 2, 2), height);
+      });
+    }
+
+    function drawProbe(payload) {
+      const lattice = payload.lattice || [];
+      const slotBands = payload.slotBands || [];
+      drawBars("probe-canvas", lattice, value => value >= 0x8000 ? "#34d399" : "#38bdf8");
+      drawBars("bands-canvas", slotBands, value => value >= 60 ? "#f59e0b" : "#7dd3fc");
+      renderHotCells(payload.hotCells || []);
+      el("probe-label").textContent =
+        `Lattice occupancy ${fmtPct((Number(payload.occupiedLattice || 0) * 100))} • monolith occupancy ${fmtPct((Number(payload.occupiedMonolith || 0) * 100))} • peak ${payload.maxLattice || 0}`;
+    }
+
+    function refreshProbe() {
+      fetch(`${HTTP_BASE}/api/probe`).then(r => r.json()).then(drawProbe);
+    }
+
+    connectChat();
+    loadState();
+    loadCorpora();
+    refreshStats();
+    refreshProbe();
+    setInterval(refreshStats, 1500);
+    setInterval(refreshProbe, 3000);
+  </script>
+</body>
+</html>

@@ -4,315 +4,1324 @@ const sys = core.sys;
 const vsa = core.vsa;
 const ghost_state = core.ghost_state;
 const vsa_vulkan = core.vsa_vulkan;
-const engine_logic = core.engine;
-const compute_api = core.compute_api;
+const engine = core.engine;
+const config = core.config;
+const trainer = @import("trainer.zig");
 
 const builtin = @import("builtin");
 const WINAPI = if (builtin.os.tag == .windows) std.builtin.CallingConvention.winapi else .C;
 extern "kernel32" fn SetConsoleCtrlHandler(handler: ?*const fn (u32) callconv(WINAPI) i32, add: i32) callconv(WINAPI) i32;
+extern "ws2_32" fn WSAStartup(wVersionRequired: u16, lpWSAData: *anyopaque) callconv(WINAPI) i32;
+extern "ws2_32" fn WSACleanup() callconv(WINAPI) i32;
+extern "ws2_32" fn socket(af: i32, type_: i32, protocol: i32) callconv(WINAPI) usize;
+extern "ws2_32" fn bind(s: usize, name: *const anyopaque, namelen: i32) callconv(WINAPI) i32;
+extern "ws2_32" fn listen(s: usize, backlog: i32) callconv(WINAPI) i32;
+extern "ws2_32" fn accept(s: usize, addr: ?*anyopaque, addrlen: ?*i32) callconv(WINAPI) usize;
+extern "ws2_32" fn recv(s: usize, buf: [*]u8, len: i32, flags: i32) callconv(WINAPI) i32;
+extern "ws2_32" fn send(s: usize, buf: [*]const u8, len: i32, flags: i32) callconv(WINAPI) i32;
+extern "ws2_32" fn closesocket(s: usize) callconv(WINAPI) i32;
 
-// ── Shared State ──
-var stop_flag = std.atomic.Value(bool).init(false);
-var global_vk_engine: ?*vsa_vulkan.VulkanEngine = null;
-var global_compute: ?*const compute_api.ComputeApi = null;
-var global_mapped_lattice: ?sys.MappedFile = null;
+const AF_INET = 2;
+const SOCK_STREAM = 1;
+const IPPROTO_TCP = 6;
+const INVALID_SOCKET = ~@as(usize, 0);
+const DASHBOARD_HTML = @embedFile("dashboard.html");
+const DEFAULT_CHECKPOINT_INTERVAL_MS: u32 = 60_000;
+const DEFAULT_IDLE_SLEEP_MS: u32 = 10;
+const DEFAULT_SAMPLE_BINS: usize = 96;
+const DEFAULT_HISTOGRAM_BINS: usize = 16;
+const DEFAULT_HOT_CELLS: usize = 8;
+const CHAT_QUEUE_CAPACITY = 32;
+const CHAT_PROMPT_CAPACITY = 2048;
+const CHAT_CHUNK_CAPACITY = 128;
+const CHAT_RESPONSE_CHUNKS = 32;
+const FALLBACK_CORPORA = [_][]const u8{
+    "tiny_shakespeare.txt",
+    "mixed_sovereign.txt",
+};
 
-// ── Thread-safe input queue ──
-const TrainingQueue = struct {
-    mutex: std.atomic.Mutex = .unlocked,
-    data: std.ArrayListUnmanaged(u8) = .empty,
-    allocator: std.mem.Allocator,
+comptime {
+    if (!std.math.isPowerOfTwo(CHAT_QUEUE_CAPACITY)) @compileError("CHAT_QUEUE_CAPACITY must be a power of two");
+    if ((CHAT_PROMPT_CAPACITY & (CHAT_PROMPT_CAPACITY - 1)) != 0) @compileError("CHAT_PROMPT_CAPACITY must be a power of two");
+}
 
-    fn acquire(m: *std.atomic.Mutex) void {
-        while (!m.tryLock()) {
+const sockaddr_in = extern struct {
+    sin_family: u16,
+    sin_port: u16,
+    sin_addr: u32,
+    sin_zero: [8]u8 = [_]u8{0} ** 8,
+};
+
+const CorpusFile = struct {
+    name: []const u8,
+    size_bytes: usize,
+};
+
+const HotCell = struct {
+    index: usize = 0,
+    value: u16 = 0,
+};
+
+const TrainRequest = struct {
+    tier: u32,
+    corpora: [][]const u8,
+    gpu_ids: []u32,
+    weights: []trainer.CorpusWeight,
+    batch_size_override: u32,
+    max_active_streams: u32,
+    checkpoint_interval_ms: u32,
+    stop_after_minutes: u32,
+    stop_after_runes: u64,
+    stop_after_slot_usage_bp: u32,
+    idle_sleep_ms: u32,
+};
+
+const ChatResponse = struct {
+    kind: enum(u8) { ok, failed },
+    chunk_count: u16,
+    chunk_lens: [CHAT_RESPONSE_CHUNKS]u16,
+    chunks: [CHAT_RESPONSE_CHUNKS][CHAT_CHUNK_CAPACITY]u8,
+    error_len: u16,
+    error_buf: [CHAT_CHUNK_CAPACITY]u8,
+    truncated: bool,
+
+    fn clear(self: *ChatResponse) void {
+        self.* = std.mem.zeroes(ChatResponse);
+    }
+
+    fn pushChunk(self: *ChatResponse, chunk: []const u8) bool {
+        if (chunk.len == 0) return true;
+        if (self.chunk_count >= CHAT_RESPONSE_CHUNKS or chunk.len > CHAT_CHUNK_CAPACITY) {
+            self.truncated = true;
+            return false;
+        }
+
+        const idx: usize = self.chunk_count;
+        self.chunk_lens[idx] = @intCast(chunk.len);
+        @memcpy(self.chunks[idx][0..chunk.len], chunk);
+        self.chunk_count += 1;
+        return true;
+    }
+
+    fn setError(self: *ChatResponse, message: []const u8) void {
+        self.clear();
+        self.kind = .failed;
+        const len = @min(message.len, self.error_buf.len);
+        @memcpy(self.error_buf[0..len], message[0..len]);
+        self.error_len = @intCast(len);
+        self.truncated = len < message.len;
+    }
+
+    fn errorText(self: *const ChatResponse) []const u8 {
+        return self.error_buf[0..self.error_len];
+    }
+};
+
+const ChatExchange = struct {
+    ready: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    response: ChatResponse = std.mem.zeroes(ChatResponse),
+};
+
+const ChatRequest = struct {
+    exchange: *ChatExchange,
+    prompt_len: u16,
+    prompt: [CHAT_PROMPT_CAPACITY]u8,
+};
+
+const RawChatRequestQueue = core.sync.LockFreeQueue(ChatRequest, CHAT_QUEUE_CAPACITY);
+
+const ChatRequestQueue = struct {
+    inner: RawChatRequestQueue = .{},
+
+    fn push(self: *ChatRequestQueue, exchange: *ChatExchange, prompt: []const u8) !void {
+        if (prompt.len > CHAT_PROMPT_CAPACITY) return error.PromptTooLong;
+
+        var request: ChatRequest = undefined;
+        request.exchange = exchange;
+        request.prompt_len = @intCast(prompt.len);
+        @memset(request.prompt[0..], 0);
+        @memcpy(request.prompt[0..prompt.len], prompt);
+
+        self.inner.push(request) catch |err| switch (err) {
+            error.QueueFull => return error.ChatQueueFull,
+            error.QueueStopped => return error.ChatQueueStopped,
+        };
+    }
+
+    fn pop(self: *ChatRequestQueue) ?ChatRequest {
+        return self.inner.pop();
+    }
+
+    fn shutdown(self: *ChatRequestQueue) void {
+        self.inner.shutdown();
+    }
+
+    fn isShutdown(self: *const ChatRequestQueue) bool {
+        return self.inner.isShutdown();
+    }
+};
+
+const Lock = struct {
+    state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    fn lock(self: *Lock) void {
+        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
             std.atomic.spinLoopHint();
         }
     }
 
-    pub fn push(self: *TrainingQueue, bytes: []const u8) void {
-        acquire(&self.mutex);
-        defer self.mutex.unlock();
-        self.data.appendSlice(self.allocator, bytes) catch return;
-    }
-
-    pub fn drain(self: *TrainingQueue, buf: []u8) usize {
-        acquire(&self.mutex);
-        defer self.mutex.unlock();
-        const n = @min(buf.len, self.data.items.len);
-        if (n == 0) return 0;
-        @memcpy(buf[0..n], self.data.items[0..n]);
-        const remaining = self.data.items.len - n;
-        if (remaining > 0) {
-            std.mem.copyForwards(u8, self.data.items[0..remaining], self.data.items[n .. n + remaining]);
-        }
-        self.data.shrinkRetainingCapacity(remaining);
-        return n;
-    }
-
-    pub fn len(self: *TrainingQueue) usize {
-        acquire(&self.mutex);
-        defer self.mutex.unlock();
-        return self.data.items.len;
+    fn unlock(self: *Lock) void {
+        self.state.store(0, .release);
     }
 };
 
-var training_queue: TrainingQueue = undefined;
+const TrainingSession = struct {
+    allocator: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
+    batcher: trainer.GreedyBatcher,
+    trainer: trainer.OhlTrainer,
 
-// ── Background trainer state ──
-const ShellStream = struct {
-    lexical_rotor: u64,
-    semantic_rotor: u64,
-    file_data: []const u8,
-    cursor: usize,
-    done: bool,
+    fn init(allocator: std.mem.Allocator, req: TrainRequest) !*TrainingSession {
+        const fleet = vsa_vulkan.getFleet() orelse return error.TrainingRequiresGpu;
+        var session = try allocator.create(TrainingSession);
+        errdefer allocator.destroy(session);
 
-    pub fn init() ShellStream {
-        return .{
-            .lexical_rotor = ghost_state.FNV_OFFSET_BASIS,
-            .semantic_rotor = ghost_state.FNV_OFFSET_BASIS,
-            .file_data = &.{},
-            .cursor = 0,
-            .done = false,
+        session.* = .{
+            .allocator = allocator,
+            .arena = std.heap.ArenaAllocator.init(allocator),
+            .batcher = undefined,
+            .trainer = undefined,
         };
+        errdefer session.arena.deinit();
+
+        const arena = session.arena.allocator();
+        const streams = try loadStreams(arena, req.corpora, req.weights);
+        if (streams.len == 0) return error.NoCorpusSelected;
+
+        session.batcher = try trainer.GreedyBatcher.init(arena, streams);
+        session.trainer = try trainer.OhlTrainer.init(arena, fleet, &session.batcher, .{
+            .tier = req.tier,
+            .batch_size_override = req.batch_size_override,
+            .max_active_streams = req.max_active_streams,
+            .checkpoint_interval_ms = req.checkpoint_interval_ms,
+            .stop_after_minutes = req.stop_after_minutes,
+            .stop_after_runes = req.stop_after_runes,
+            .stop_after_slot_usage_bp = req.stop_after_slot_usage_bp,
+            .idle_sleep_ms = req.idle_sleep_ms,
+            .selected_gpu_ids = req.gpu_ids,
+        });
+        session.trainer.mapped_lattice = global_lattice;
+        session.trainer.mapped_meaning = global_meaning;
+        session.trainer.mapped_tags = global_tags;
+        if (global_lattice_file) |*m| session.trainer.lattice_file = m;
+        if (global_meaning_file) |*m| session.trainer.meaning_file = m;
+        if (global_tags_file) |*m| session.trainer.tags_file = m;
+        return session;
     }
 
-    pub fn feed(self: *ShellStream, data: []const u8) void {
-        self.file_data = data;
-        self.cursor = 0;
-        self.done = false;
-    }
-
-    pub fn nextRune(self: *ShellStream) ?u32 {
-        if (self.cursor >= self.file_data.len) {
-            self.done = true;
-            return null;
-        }
-        const b = self.file_data[self.cursor];
-        self.cursor += 1;
-        
-        // Use full rune hash for rotor consistency with trainer
-        const rune: u32 = b;
-        const rune_hash = ghost_state.wyhash(ghost_state.FNV_OFFSET_BASIS, rune);
-        self.lexical_rotor = (self.lexical_rotor ^ rune_hash) *% ghost_state.FNV_PRIME;
-        self.semantic_rotor = (self.semantic_rotor ^ rune_hash) *% ghost_state.FNV_PRIME;
-        return rune;
+    fn deinit(self: *TrainingSession) void {
+        self.trainer.deinit();
+        self.batcher.deinit();
+        self.arena.deinit();
+        self.allocator.destroy(self);
     }
 };
 
-const WAVEFRONT_ALIGN: usize = 64;
+var global_allocator: std.mem.Allocator = undefined;
+var global_io: std.Io = undefined;
+var stop_flag = std.atomic.Value(bool).init(false);
+var train_lock: Lock = .{};
+var global_training: ?*TrainingSession = null;
+var global_soul: ?*ghost_state.GhostSoul = null;
+var global_engine: ?*engine.SingularityEngine = null;
+var global_lattice_file: ?sys.MappedFile = null;
+var global_meaning_file: ?sys.MappedFile = null;
+var global_tags_file: ?sys.MappedFile = null;
+var global_lattice: ?[]u16 = null;
+var global_meaning: ?[]u32 = null;
+var global_tags: ?[]u64 = null;
+var global_last_stop_reason = std.atomic.Value(u32).init(@intFromEnum(trainer.StopReason.none));
+var global_last_checkpoint_ms = std.atomic.Value(u64).init(0);
+var global_chat_queue: ChatRequestQueue = .{};
+var global_ema_average = std.atomic.Value(u32).init(850 << 8);
+var global_ema_deviation = std.atomic.Value(u32).init(25 << 8);
+var global_runtime_lock: Lock = .{};
 
-fn backgroundTrainer(compute: *const compute_api.ComputeApi) void {
+pub const EmbeddedInit = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    soul: *ghost_state.GhostSoul,
+    live_engine: *engine.SingularityEngine,
+    lattice_file: sys.MappedFile,
+    meaning_file: sys.MappedFile,
+    tags_file: sys.MappedFile,
+    lattice_words: []u16,
+    meaning_words: []u32,
+    tags_words: []u64,
+    port: u16 = 8080,
+};
 
-    var stream = ShellStream.init();
-    var batch_runes: [4096]u32 = undefined;
-    var batch_index: [4096]u32 = undefined;
-    var batch_rotors: [4096 * 2]u64 = undefined;
-    var drain_buf: [8192]u8 = undefined;
-    var pending: std.ArrayListUnmanaged(u8) = .empty;
-
-    while (!stop_flag.load(.acquire)) {
-        const n = training_queue.drain(&drain_buf);
-        if (n > 0) {
-            pending.appendSlice(std.heap.page_allocator, drain_buf[0..n]) catch continue;
-        }
-
-        if (pending.items.len == 0) {
-            sys.sleep(15);
-            continue;
-        }
-
-        // Feed pending bytes into stream
-        stream.feed(pending.items);
-        pending.clearRetainingCapacity();
-
-        // Fill batch
-        var pos: usize = 0;
-        while (pos < batch_runes.len) : (pos += 1) {
-            const r = stream.nextRune() orelse break;
-            batch_runes[pos] = r;
-            batch_index[pos] = 0; // single stream
-            batch_rotors[pos * 2] = stream.lexical_rotor;
-            batch_rotors[pos * 2 + 1] = stream.semantic_rotor;
-        }
-
-        // Wavefront-align
-        if (pos > 0) {
-            const aligned = (pos / WAVEFRONT_ALIGN) * WAVEFRONT_ALIGN;
-            pos = if (aligned > 0) aligned else @min(WAVEFRONT_ALIGN, pos);
-        }
-
-        if (pos == 0) continue;
-
-
-
-        // Dispatch etch
-        compute.etch(
-            @intCast(pos),
-            1,
-            batch_rotors[0 .. pos * 2],
-            batch_runes[0..pos],
-            batch_index[0..pos],
-        ) catch {};
-    }
+pub fn lockInference() void {
+    global_runtime_lock.lock();
 }
 
-// ── Ctrl+C Handler ──
+pub fn unlockInference() void {
+    global_runtime_lock.unlock();
+}
+
 fn ctrlHandler(ctrl_type: u32) callconv(WINAPI) i32 {
     if (ctrl_type == 0) {
-        sys.printOut("\n[SIGNAL] Releasing Silicon...\n");
-        stop_flag.store(true, .release);
-        return 1;
+        _ = requestStop();
     }
     return 1;
 }
 
-pub fn main() !void {
-    if (builtin.os.tag == .windows) {
-        _ = SetConsoleCtrlHandler(ctrlHandler, 1);
+pub fn requestStop() bool {
+    const first = stop_flag.cmpxchgStrong(false, true, .acq_rel, .acquire) == null;
+    global_chat_queue.shutdown();
+    _ = requestStopTraining();
+    return first;
+}
+
+fn sendBytes(sock: usize, bytes: []const u8) void {
+    if (bytes.len > 0) _ = send(sock, bytes.ptr, @intCast(bytes.len), 0);
+}
+
+fn sendResponse(sock: usize, status: []const u8, content_type: []const u8, body: []const u8) void {
+    var buf: [1024]u8 = undefined;
+    const header = std.fmt.bufPrint(
+        &buf,
+        "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Sec-WebSocket-Key, Sec-WebSocket-Version\r\nConnection: close\r\n\r\n",
+        .{ status, content_type, body.len },
+    ) catch return;
+    sendBytes(sock, header);
+    sendBytes(sock, body);
+}
+
+fn trimName(buf: []const u8) []const u8 {
+    var end: usize = 0;
+    while (end < buf.len and buf[end] != 0) : (end += 1) {}
+    return buf[0..end];
+}
+
+fn contains(items: [][]const u8, needle: []const u8) bool {
+    for (items) |item| if (std.mem.eql(u8, item, needle)) return true;
+    return false;
+}
+
+fn decodeJsonString(raw: []const u8, out: []u8) ?[]const u8 {
+    var r: usize = 0;
+    var w: usize = 0;
+    while (r < raw.len) : (r += 1) {
+        if (raw[r] == '"') return out[0..w];
+        if (w >= out.len) return null;
+        if (raw[r] != '\\') {
+            out[w] = raw[r];
+            w += 1;
+            continue;
+        }
+        r += 1;
+        if (r >= raw.len) return null;
+        out[w] = switch (raw[r]) {
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            '"', '\\', '/' => raw[r],
+            'u' => blk: {
+                if (r + 4 >= raw.len) return null;
+                r += 4;
+                break :blk '?';
+            },
+            else => return null,
+        };
+        w += 1;
     }
+    return null;
+}
 
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
+fn jsonString(body: []const u8, key: []const u8, out: []u8) ?[]const u8 {
+    var pat_buf: [96]u8 = undefined;
+    const pat = std.fmt.bufPrint(&pat_buf, "\"{s}\":\"", .{key}) catch return null;
+    const idx = std.mem.indexOf(u8, body, pat) orelse return null;
+    return decodeJsonString(body[idx + pat.len ..], out);
+}
 
-    sys.printOut("\nGhost V28 Shell: Sovereign Intelligence\n");
-    sys.printOut("Type to interact. Empty line to exit.\n\n");
-
-    // ── 1. Map State ──
-    sys.printOut("[MONOLITH] Mapping Cortex...\n");
-    const mapped_lattice = try sys.createMappedFile(allocator, "state/unified_lattice.bin", ghost_state.UNIFIED_SIZE_BYTES);
-    global_mapped_lattice = mapped_lattice;
-    const lattice: *ghost_state.UnifiedLattice = @as(*ghost_state.UnifiedLattice, @ptrCast(@alignCast(mapped_lattice.data.ptr)));
-
-    sys.printOut("[MEANING] Mapping Hippocampus...\n");
-    const mapped_meaning = try sys.createMappedFile(allocator, "state/semantic_monolith.bin", 1024 * 1024 * 1024);
-    const mapped_tags = try sys.createMappedFile(allocator, "state/semantic_tags.bin", 1048576 * 8);
-
-    // ── 2. Init Vulkan ──
-    sys.printOut("[VULKAN] Initializing Sovereign Compute...\n");
-    if (vsa_vulkan.GHOST_COMPUTE_PLUGIN.init(allocator)) |compute| {
-        global_compute = compute;
-        sys.printOut("[COMPUTE] ");
-        sys.printOut(compute.name);
-        sys.printOut(" active.\n");
-
-        // Upload CPU-trained data to GPU
-        const gpu_matrix = compute.getMatrixData();
-        const src_ptr: [*]const u16 = @ptrCast(@alignCast(mapped_meaning.data.ptr));
-        const copy_len = @min(gpu_matrix.len, mapped_meaning.data.len / 2);
-        @memcpy(gpu_matrix[0..copy_len], src_ptr[0..copy_len]);
-
-        // Upload lattice
-        const gpu_lattice = compute.getLatticeData();
-        const lattice_ptr: [*]const u16 = @ptrCast(@alignCast(mapped_lattice.data.ptr));
-        const lattice_copy_len = @min(gpu_lattice.len, mapped_lattice.data.len / 2);
-        @memcpy(gpu_lattice[0..lattice_copy_len], lattice_ptr[0..lattice_copy_len]);
-    } else |_| {
-        sys.printOut("[VULKAN] Failed. Running CPU-only.\n");
+fn jsonStringArray(allocator: std.mem.Allocator, body: []const u8, key: []const u8) ![][]const u8 {
+    var pat_buf: [96]u8 = undefined;
+    const pat = try std.fmt.bufPrint(&pat_buf, "\"{s}\":[", .{key});
+    const idx = std.mem.indexOf(u8, body, pat) orelse return allocator.alloc([]const u8, 0);
+    var items: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (items.items) |item| allocator.free(item);
+        items.deinit(allocator);
     }
+    var pos = idx + pat.len;
+    while (pos < body.len) {
+        while (pos < body.len and (body[pos] == ' ' or body[pos] == ',')) : (pos += 1) {}
+        if (pos >= body.len or body[pos] == ']') break;
+        if (body[pos] != '"') return error.InvalidJson;
+        pos += 1;
+        var tmp: [512]u8 = undefined;
+        const value = decodeJsonString(body[pos..], &tmp) orelse return error.InvalidJson;
+        try items.append(allocator, try allocator.dupe(u8, value));
+        while (pos < body.len and body[pos] != '"') : (pos += 1) {}
+        if (pos < body.len) pos += 1;
+    }
+    return items.toOwnedSlice(allocator);
+}
 
-    // ── 3. Init Meaning Matrix ──
-    var meaning_matrix = vsa.MeaningMatrix{
-        .data = @as([*]u16, @ptrCast(@alignCast(mapped_meaning.data.ptr)))[0..(1024 * 1024 * 512)],
-        .tags = @as([*]u64, @ptrCast(@alignCast(mapped_tags.data.ptr)))[0..1048576],
+fn jsonNumberSlice(body: []const u8, key: []const u8) ?[]const u8 {
+    var pat_buf: [96]u8 = undefined;
+    const pat = std.fmt.bufPrint(&pat_buf, "\"{s}\":", .{key}) catch return null;
+    const idx = std.mem.indexOf(u8, body, pat) orelse return null;
+    var pos = idx + pat.len;
+    while (pos < body.len and body[pos] == ' ') : (pos += 1) {}
+    const start = pos;
+    while (pos < body.len and ((body[pos] >= '0' and body[pos] <= '9') or body[pos] == '.' or body[pos] == '-' or body[pos] == '+' or body[pos] == 'e' or body[pos] == 'E')) : (pos += 1) {}
+    if (pos == start) return null;
+    return body[start..pos];
+}
+
+fn jsonU32(body: []const u8, key: []const u8, fallback: u32) u32 {
+    const raw = jsonNumberSlice(body, key) orelse return fallback;
+    return std.fmt.parseInt(u32, raw, 10) catch fallback;
+}
+
+fn jsonU64(body: []const u8, key: []const u8, fallback: u64) u64 {
+    const raw = jsonNumberSlice(body, key) orelse return fallback;
+    return std.fmt.parseInt(u64, raw, 10) catch fallback;
+}
+
+fn jsonF64(body: []const u8, key: []const u8, fallback: f64) f64 {
+    const raw = jsonNumberSlice(body, key) orelse return fallback;
+    return std.fmt.parseFloat(f64, raw) catch fallback;
+}
+
+fn parseTierFlag(flag: []const u8) u32 {
+    return if (std.mem.eql(u8, flag, "--background"))
+        @intFromEnum(vsa_vulkan.OperationalTier.background)
+    else if (std.mem.eql(u8, flag, "--high"))
+        @intFromEnum(vsa_vulkan.OperationalTier.high)
+    else if (std.mem.eql(u8, flag, "--max"))
+        @intFromEnum(vsa_vulkan.OperationalTier.max)
+    else
+        @intFromEnum(vsa_vulkan.OperationalTier.standard);
+}
+
+fn jsonU32Array(allocator: std.mem.Allocator, body: []const u8, key: []const u8) ![]u32 {
+    var pat_buf: [96]u8 = undefined;
+    const pat = try std.fmt.bufPrint(&pat_buf, "\"{s}\":[", .{key});
+    const idx = std.mem.indexOf(u8, body, pat) orelse return allocator.alloc(u32, 0);
+    var items: std.ArrayList(u32) = .empty;
+    errdefer items.deinit(allocator);
+    var pos = idx + pat.len;
+    while (pos < body.len) {
+        while (pos < body.len and (body[pos] == ' ' or body[pos] == ',')) : (pos += 1) {}
+        if (pos >= body.len or body[pos] == ']') break;
+        const start = pos;
+        while (pos < body.len and body[pos] >= '0' and body[pos] <= '9') : (pos += 1) {}
+        if (pos == start) return error.InvalidJson;
+        try items.append(allocator, try std.fmt.parseInt(u32, body[start..pos], 10));
+    }
+    return items.toOwnedSlice(allocator);
+}
+
+fn jsonWeightMap(allocator: std.mem.Allocator, body: []const u8, key: []const u8) ![]trainer.CorpusWeight {
+    var pat_buf: [96]u8 = undefined;
+    const pat = try std.fmt.bufPrint(&pat_buf, "\"{s}\":{{", .{key});
+    const idx = std.mem.indexOf(u8, body, pat) orelse return allocator.alloc(trainer.CorpusWeight, 0);
+    var items: std.ArrayList(trainer.CorpusWeight) = .empty;
+    errdefer {
+        for (items.items) |item| allocator.free(item.name);
+        items.deinit(allocator);
+    }
+    var pos = idx + pat.len;
+    while (pos < body.len) {
+        while (pos < body.len and (body[pos] == ' ' or body[pos] == ',')) : (pos += 1) {}
+        if (pos >= body.len or body[pos] == '}') break;
+        if (body[pos] != '"') return error.InvalidJson;
+        pos += 1;
+        var tmp: [512]u8 = undefined;
+        const name = decodeJsonString(body[pos..], &tmp) orelse return error.InvalidJson;
+        while (pos < body.len and body[pos] != '"') : (pos += 1) {}
+        if (pos >= body.len) return error.InvalidJson;
+        pos += 1;
+        while (pos < body.len and (body[pos] == ' ' or body[pos] == ':')) : (pos += 1) {}
+        const start = pos;
+        while (pos < body.len and body[pos] >= '0' and body[pos] <= '9') : (pos += 1) {}
+        if (pos == start) return error.InvalidJson;
+        try items.append(allocator, .{
+            .name = try allocator.dupe(u8, name),
+            .weight = try std.fmt.parseInt(u32, body[start..pos], 10),
+        });
+    }
+    return items.toOwnedSlice(allocator);
+}
+
+fn tierValueFromText(flag: []const u8) u32 {
+    return if (std.mem.eql(u8, flag, "--background") or std.mem.eql(u8, flag, "background"))
+        @intFromEnum(vsa_vulkan.OperationalTier.background)
+    else if (std.mem.eql(u8, flag, "--high") or std.mem.eql(u8, flag, "high"))
+        @intFromEnum(vsa_vulkan.OperationalTier.high)
+    else if (std.mem.eql(u8, flag, "--max") or std.mem.eql(u8, flag, "max"))
+        @intFromEnum(vsa_vulkan.OperationalTier.max)
+    else if (std.mem.eql(u8, flag, "extreme"))
+        @intFromEnum(vsa_vulkan.OperationalTier.extreme)
+    else if (std.mem.eql(u8, flag, "ultra"))
+        @intFromEnum(vsa_vulkan.OperationalTier.ultra)
+    else if (std.mem.eql(u8, flag, "hyper"))
+        @intFromEnum(vsa_vulkan.OperationalTier.hyper)
+    else if (std.mem.eql(u8, flag, "god"))
+        @intFromEnum(vsa_vulkan.OperationalTier.god)
+    else
+        @intFromEnum(vsa_vulkan.OperationalTier.standard);
+}
+
+fn tierNameFromValue(value: u32) []const u8 {
+    return @tagName(@as(vsa_vulkan.OperationalTier, @enumFromInt(value)));
+}
+
+fn stopReasonName(reason: trainer.StopReason) []const u8 {
+    return @tagName(reason);
+}
+
+fn parseTrainRequest(allocator: std.mem.Allocator, body: []const u8) !TrainRequest {
+    var tier_buf: [64]u8 = undefined;
+    const tier_text = jsonString(body, "tier", &tier_buf) orelse "standard";
+    const corpora = try jsonStringArray(allocator, body, "corpora");
+    errdefer {
+        for (corpora) |item| allocator.free(item);
+        allocator.free(corpora);
+    }
+    const gpu_ids = try jsonU32Array(allocator, body, "gpuIds");
+    errdefer allocator.free(gpu_ids);
+    const weights = try jsonWeightMap(allocator, body, "weights");
+    errdefer {
+        for (weights) |item| allocator.free(item.name);
+        allocator.free(weights);
+    }
+    return .{
+        .tier = tierValueFromText(tier_text),
+        .corpora = corpora,
+        .gpu_ids = gpu_ids,
+        .weights = weights,
+        .batch_size_override = jsonU32(body, "batchSize", 0),
+        .max_active_streams = jsonU32(body, "maxActiveStreams", 0),
+        .checkpoint_interval_ms = jsonU32(body, "checkpointIntervalMs", DEFAULT_CHECKPOINT_INTERVAL_MS),
+        .stop_after_minutes = jsonU32(body, "stopAfterMinutes", 0),
+        .stop_after_runes = jsonU64(body, "stopAfterRunes", 0),
+        .stop_after_slot_usage_bp = @intFromFloat(@max(jsonF64(body, "stopAfterSlotUsagePct", 0) * 100.0, 0.0)),
+        .idle_sleep_ms = jsonU32(body, "idleSleepMs", DEFAULT_IDLE_SLEEP_MS),
     };
+}
 
-    // ── 4. Spawn background trainer ──
-    var soul = try allocator.create(ghost_state.GhostSoul);
-    soul.* = ghost_state.GhostSoul.init(allocator);
-    defer soul.deinit();
-    defer allocator.destroy(soul);
-    
-    soul.meaning_matrix = &meaning_matrix;
+fn freeTrainRequest(allocator: std.mem.Allocator, req: TrainRequest) void {
+    for (req.corpora) |item| allocator.free(item);
+    allocator.free(req.corpora);
+    allocator.free(req.gpu_ids);
+    for (req.weights) |item| allocator.free(item.name);
+    allocator.free(req.weights);
+}
 
-    training_queue = .{ .allocator = allocator };
+fn weightForCorpus(weights: []const trainer.CorpusWeight, corpus_name: []const u8) u32 {
+    for (weights) |weight| {
+        if (std.mem.eql(u8, weight.name, corpus_name)) return @max(weight.weight, 1);
+    }
+    return 1;
+}
 
-    var trainer_thread: ?std.Thread = null;
-    if (global_compute) |compute| {
-        trainer_thread = std.Thread.spawn(.{ .allocator = allocator }, backgroundTrainer, .{compute}) catch null;
-        if (trainer_thread != null) {
-            sys.printOut("[TRAINER] Background learning thread active.\n\n");
+fn loadStreams(
+    allocator: std.mem.Allocator,
+    wanted: [][]const u8,
+    weights: []const trainer.CorpusWeight,
+) ![]trainer.StreamState {
+    const corpus_files = try sys.findCorpusFiles(allocator);
+    defer {
+        for (corpus_files) |path| allocator.free(path);
+        allocator.free(corpus_files);
+    }
+    var list: std.ArrayList(trainer.StreamState) = .empty;
+    errdefer list.deinit(allocator);
+    for (corpus_files) |full_path| {
+        const base = std.fs.path.basename(full_path);
+        if (wanted.len > 0 and !contains(wanted, base)) continue;
+        const name = try allocator.dupe(u8, base);
+        var stream = trainer.StreamState.initFile(
+            allocator,
+            full_path,
+            name,
+            weightForCorpus(weights, base),
+        ) catch continue;
+        if (stream.totalSizeBytes() == 0) {
+            stream.deinit();
+            continue;
+        }
+        try list.append(allocator, stream);
+    }
+
+    if (list.items.len == 0 and wanted.len > 0) {
+        for (wanted) |name| {
+            const full_path = projectCorpusPath(allocator, name) catch continue;
+            defer allocator.free(full_path);
+            const display_name = try allocator.dupe(u8, std.fs.path.basename(name));
+            var stream = trainer.StreamState.initFile(
+                allocator,
+                full_path,
+                display_name,
+                weightForCorpus(weights, std.fs.path.basename(name)),
+            ) catch continue;
+            if (stream.totalSizeBytes() == 0) {
+                stream.deinit();
+                continue;
+            }
+            try list.append(allocator, stream);
         }
     }
 
-    sys.printOut("[SILICON] Pre-calculating BMP VSA Space (65,536 identities)...\n");
-    const bmp_vectors = try engine_logic.SingularityEngine.precomputeBMP(allocator);
+    return list.toOwnedSlice(allocator);
+}
 
-    // ── 5. REPL Loop ──
-    while (!stop_flag.load(.acquire)) {
-        sys.printOut("User > ");
-        var input_buf: [4096]u8 = undefined;
-        const raw_line = sys.readStdin(&input_buf) catch break;
-        if (raw_line.len == 0) break;
-        const prompt = std.mem.trim(u8, raw_line, " \r\n");
-        if (prompt.len == 0) break;
+fn requestStopTraining() bool {
+    train_lock.lock();
+    defer train_lock.unlock();
+    if (global_training) |session| {
+        session.trainer.requestStop(.manual);
+        return true;
+    }
+    return false;
+}
 
-        // Queue raw bytes for background training
-        training_queue.push(prompt);
+fn trainingThread(session: *TrainingSession) void {
+    session.trainer.start() catch |err| sys.print("[TRAIN] {any}\n", .{err});
+    session.trainer.checkpoint() catch |err| sys.print("[CHECKPOINT] {any}\n", .{err});
+    global_last_stop_reason.store(@intFromEnum(session.trainer.getStopReason()), .release);
+    global_last_checkpoint_ms.store(session.trainer.getLastCheckpointMs(), .release);
+    train_lock.lock();
+    global_training = null;
+    train_lock.unlock();
+    session.deinit();
+}
 
-        // Absorb with MASK_SCRIBE binding for inference
-        // Queue raw runes for background training
-        for (prompt) |rune| {
-            const bound_vec = vsa.bind(vsa.generate(rune), vsa.MASK_SCRIBE);
-            _ = try soul.absorb(bound_vec, rune, null);
+fn startTraining(req: TrainRequest) ![]const u8 {
+    train_lock.lock();
+    defer train_lock.unlock();
+    if (global_training != null) return "{\"status\":\"already_running\"}";
+    const session = try TrainingSession.init(global_allocator, req);
+    global_training = session;
+    const thread = try std.Thread.spawn(.{ .allocator = global_allocator }, trainingThread, .{session});
+    thread.detach();
+    return "{\"status\":\"started\"}";
+}
+
+fn pauseTraining() bool {
+    train_lock.lock();
+    defer train_lock.unlock();
+    if (global_training) |session| {
+        trainer.OhlTrainer.pause(&session.trainer);
+        return true;
+    }
+    return false;
+}
+
+fn resumeTraining() bool {
+    train_lock.lock();
+    defer train_lock.unlock();
+    if (global_training) |session| {
+        session.trainer.resumeTraining();
+        return true;
+    }
+    return false;
+}
+
+fn requestCheckpointNow() bool {
+    train_lock.lock();
+    defer train_lock.unlock();
+    if (global_training) |session| {
+        trainer.OhlTrainer.requestCheckpoint(&session.trainer);
+        return true;
+    }
+    return false;
+}
+
+fn applyControlUpdate(body: []const u8) ![]const u8 {
+    train_lock.lock();
+    defer train_lock.unlock();
+    const session = global_training orelse return "{\"status\":\"idle\"}";
+    var tier_buf: [64]u8 = undefined;
+    const tier_value = if (jsonString(body, "tier", &tier_buf)) |tier_text| tierValueFromText(tier_text) else session.trainer.getCurrentTier();
+    session.trainer.applyOptions(.{
+        .tier = tier_value,
+        .batch_size_override = jsonU32(body, "batchSize", session.trainer.getBatchSizeOverride()),
+        .max_active_streams = jsonU32(body, "maxActiveStreams", session.trainer.getMaxActiveStreams()),
+        .checkpoint_interval_ms = jsonU32(body, "checkpointIntervalMs", session.trainer.getCheckpointIntervalMs()),
+        .stop_after_minutes = jsonU32(body, "stopAfterMinutes", session.trainer.getStopAfterMinutes()),
+        .stop_after_runes = jsonU64(body, "stopAfterRunes", session.trainer.getStopAfterRunes()),
+        .stop_after_slot_usage_bp = @intFromFloat(@max(jsonF64(body, "stopAfterSlotUsagePct", @as(f64, @floatFromInt(session.trainer.getStopAfterSlotUsageBp())) / 100.0) * 100.0, 0.0)),
+        .idle_sleep_ms = jsonU32(body, "idleSleepMs", DEFAULT_IDLE_SLEEP_MS),
+        .selected_gpu_ids = &.{},
+    });
+    return "{\"status\":\"updated\"}";
+}
+
+fn isTrainingActive() bool {
+    train_lock.lock();
+    defer train_lock.unlock();
+    return global_training != null;
+}
+
+fn appendEscaped(list: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) !void {
+    for (text) |c| switch (c) {
+        '\\' => try list.appendSlice(allocator, "\\\\"),
+        '"' => try list.appendSlice(allocator, "\\\""),
+        '\n' => try list.appendSlice(allocator, "\\n"),
+        '\r' => try list.appendSlice(allocator, "\\r"),
+        '\t' => try list.appendSlice(allocator, "\\t"),
+        else => try list.append(allocator, c),
+    };
+}
+
+fn appendPrint(list: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
+    var buf: [4096]u8 = undefined;
+    const rendered = try std.fmt.bufPrint(&buf, fmt, args);
+    try list.appendSlice(allocator, rendered);
+}
+
+fn countUsed(tags: []const u64) usize {
+    var n: usize = 0;
+    for (tags) |tag| {
+        if (tag != 0) n += 1;
+    }
+    return n;
+}
+
+fn appendCorpusFilesJson(list: *std.ArrayList(u8), allocator: std.mem.Allocator, corpora: []const CorpusFile) !void {
+    try list.append(allocator, '[');
+    for (corpora, 0..) |item, i| {
+        if (i > 0) try list.append(allocator, ',');
+        try list.appendSlice(allocator, "{\"name\":\"");
+        try appendEscaped(list, allocator, item.name);
+        try appendPrint(list, allocator, "\",\"sizeBytes\":{d}}}", .{item.size_bytes});
+    }
+    try list.append(allocator, ']');
+}
+
+fn projectCorpusPath(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+    const corpus_root = try config.getPath(allocator, "corpus");
+    defer allocator.free(corpus_root);
+    return std.fs.path.join(allocator, &[_][]const u8{ corpus_root, name });
+}
+
+fn appendFallbackCorpusFiles(items: *std.ArrayList(CorpusFile), allocator: std.mem.Allocator) !void {
+    for (FALLBACK_CORPORA) |name| {
+        const full_path = try projectCorpusPath(allocator, name);
+        defer allocator.free(full_path);
+        const file = sys.openForRead(allocator, full_path) catch continue;
+        defer sys.closeFile(file);
+        const size = sys.getFileSize(file) catch 0;
+        if (size == 0) continue;
+        try items.append(allocator, .{
+            .name = try allocator.dupe(u8, name),
+            .size_bytes = size,
+        });
+    }
+}
+
+fn loadCorpusFiles(allocator: std.mem.Allocator) ![]CorpusFile {
+    const files = try sys.findCorpusFiles(allocator);
+    errdefer {
+        for (files) |path| allocator.free(path);
+        allocator.free(files);
+    }
+
+    var items: std.ArrayList(CorpusFile) = .empty;
+    errdefer {
+        for (items.items) |item| allocator.free(item.name);
+        items.deinit(allocator);
+    }
+    for (files) |path| {
+        const file = sys.openForRead(allocator, path) catch continue;
+        const size = sys.getFileSize(file) catch 0;
+        sys.closeFile(file);
+        try items.append(allocator, .{
+            .name = try allocator.dupe(u8, std.fs.path.basename(path)),
+            .size_bytes = size,
+        });
+    }
+    for (files) |path| allocator.free(path);
+    allocator.free(files);
+    if (items.items.len == 0) {
+        try appendFallbackCorpusFiles(&items, allocator);
+    }
+    return items.toOwnedSlice(allocator);
+}
+
+fn freeCorpusFiles(allocator: std.mem.Allocator, corpora: []CorpusFile) void {
+    for (corpora) |item| allocator.free(item.name);
+    allocator.free(corpora);
+}
+
+fn buildCorporaJson(allocator: std.mem.Allocator) ![]u8 {
+    const corpora = try loadCorpusFiles(allocator);
+    defer freeCorpusFiles(allocator, corpora);
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(allocator);
+    try appendCorpusFilesJson(&list, allocator, corpora);
+    return list.toOwnedSlice(allocator);
+}
+
+fn updateHotCells(hot_cells: *[DEFAULT_HOT_CELLS]HotCell, idx: usize, value: u16) void {
+    if (value == 0) return;
+    var insert_at: ?usize = null;
+    for (hot_cells, 0..) |cell, i| {
+        if (value > cell.value) {
+            insert_at = i;
+            break;
+        }
+    }
+    if (insert_at) |slot| {
+        var j = hot_cells.len - 1;
+        while (j > slot) : (j -= 1) {
+            hot_cells[j] = hot_cells[j - 1];
+        }
+        hot_cells[slot] = .{ .index = idx, .value = value };
+    }
+}
+
+fn buildStatsJson(allocator: std.mem.Allocator) ![]u8 {
+    const vk = vsa_vulkan.getEngine();
+    const tags = if (vk) |live| live.getTagsData() else (global_tags orelse &[_]u64{});
+    const slot_capacity: u32 = if (vk) |live| live.matrix_slots else @intCast(tags.len);
+    const used = countUsed(tags);
+    const slot_pct = if (slot_capacity == 0) 0.0 else (@as(f64, @floatFromInt(used)) / @as(f64, @floatFromInt(slot_capacity))) * 100.0;
+    const ema_avg = @as(f64, @floatFromInt(global_ema_average.load(.acquire))) / 256.0;
+    const ema_dev = @as(f64, @floatFromInt(global_ema_deviation.load(.acquire))) / 256.0;
+    const last_stop = @as(trainer.StopReason, @enumFromInt(global_last_stop_reason.load(.acquire)));
+    const last_checkpoint = global_last_checkpoint_ms.load(.acquire);
+
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(allocator);
+    try list.appendSlice(allocator, "{\"stats\":{");
+    try appendPrint(&list, allocator, "\"slotUsagePct\":{d:.2},\"slotUsage\":{d},\"slotCapacity\":{d},\"emaAverage\":{d:.2},\"emaDeviation\":{d:.2},", .{
+        slot_pct,
+        used,
+        slot_capacity,
+        ema_avg,
+        ema_dev,
+    });
+
+    train_lock.lock();
+    defer train_lock.unlock();
+    if (global_training) |session| {
+        const t = &session.trainer;
+        try appendPrint(&list, allocator, "\"throughputMiBs\":{d:.2},\"activeStreams\":{d},\"totalStreams\":{d},\"overallPct\":{d:.2},\"processedRunes\":{d},\"elapsedMs\":{d},\"etaMs\":{d},\"droppedRunes\":{d},\"collisionStalls\":{d},\"isTraining\":true,\"isPaused\":{s},\"checkpointing\":{s},\"batchFillPct\":{d:.2},\"batchSize\":{d},\"maxActiveStreams\":{d},\"checkpointIntervalMs\":{d},\"lastCheckpointMs\":{d},\"checkpointAgeMs\":{d},\"stopAfterMinutes\":{d},\"stopAfterRunes\":{d},\"stopAfterSlotUsagePct\":{d:.2},\"selectedGpuCount\":{d},\"tier\":\"{s}\",\"bottleneck\":\"{s}\",\"stopReason\":\"{s}\",\"timestamp\":{d}}},\"streams\":[", .{
+            t.getThroughput(),
+            t.getActiveStreamCount(),
+            t.getTotalStreamCount(),
+            t.getOverallProgress() * 100.0,
+            t.getProcessedRunes(),
+            t.getElapsedMs(),
+            t.getEtaMs(),
+            t.getDroppedRunes(),
+            t.getCollisionStalls(),
+            if (t.is_paused.load(.acquire)) "true" else "false",
+            if (t.checkpoint_in_progress.load(.acquire)) "true" else "false",
+            t.getBatchFillPct(),
+            t.getBatchSizeOverride(),
+            t.getMaxActiveStreams(),
+            t.getCheckpointIntervalMs(),
+            t.getLastCheckpointMs(),
+            t.getCheckpointAgeMs(),
+            t.getStopAfterMinutes(),
+            t.getStopAfterRunes(),
+            @as(f64, @floatFromInt(t.getStopAfterSlotUsageBp())) / 100.0,
+            t.getSelectedGpuCount(),
+            tierNameFromValue(t.getCurrentTier()),
+            t.getBottleneckReason(),
+            stopReasonName(t.getStopReason()),
+            sys.getMilliTick(),
+        });
+
+        for (session.batcher.streams, 0..) |stream, i| {
+            if (i > 0) try list.append(allocator, ',');
+            const cursor = stream.cursor.load(.monotonic);
+            const size = stream.totalSizeBytes();
+            const pct = if (size == 0) 100.0 else (@as(f64, @floatFromInt(cursor)) / @as(f64, @floatFromInt(size))) * 100.0;
+            try list.appendSlice(allocator, "{\"name\":\"");
+            try appendEscaped(&list, allocator, stream.name);
+            try appendPrint(&list, allocator, "\",\"progressPct\":{d:.2},\"cursor\":{d},\"sizeBytes\":{d},\"weight\":{d},\"done\":{s}}}", .{
+                pct,
+                cursor,
+                size,
+                stream.weight,
+                if (stream.done.load(.monotonic)) "true" else "false",
+            });
         }
 
-        // Generate response with Monte Carlo
-        sys.printOut("Ghost > ");
-        const gen_start = soul.concept;
-        
-        var eng = try allocator.create(engine_logic.SingularityEngine);
-        defer allocator.destroy(eng);
-        eng.* = engine_logic.SingularityEngine{
-            .lattice = lattice,
-            .meaning = &meaning_matrix,
-            .soul = soul,
-            .canvas = ghost_state.MesoLattice.initText(),
-            .is_live = true,
-            .inventory = [_]u8{0} ** 128,
-            .inv_cursor = 0,
-            .compute = global_compute,
-            .vulkan = vsa_vulkan.getEngine(),
-            .bmp_vectors = bmp_vectors,
-            .allocator = allocator,
+        try list.appendSlice(allocator, "],\"gpus\":[");
+        for (t.engines, 0..) |gpu, i| {
+            if (i > 0) try list.append(allocator, ',');
+            const stat = t.gpu_stats[i];
+            const elapsed_ms = @max(t.getElapsedMs(), 1);
+            const busy_pct = (@as(f64, @floatFromInt(stat.busy_time_ms.load(.monotonic))) / @as(f64, @floatFromInt(elapsed_ms))) * 100.0;
+            try list.appendSlice(allocator, "{\"index\":");
+            try appendPrint(&list, allocator, "{d},\"name\":\"", .{gpu.device_index});
+            try appendEscaped(&list, allocator, trimName(gpu.device_name[0..]));
+            try appendPrint(&list, allocator, "\",\"vramMiB\":{d},\"queues\":{d},\"matrixSlots\":{d},\"tier\":\"{s}\",\"targetBatchSize\":{d},\"lastBatchSize\":{d},\"processedRunes\":{d},\"dispatchedBatches\":{d},\"busyPct\":{d:.2},\"lastDispatchMs\":{d},\"selected\":true}}", .{
+                gpu.vram_size / 1048576,
+                gpu.num_queues,
+                gpu.matrix_slots,
+                tierNameFromValue(@intFromEnum(gpu.tier)),
+                stat.target_batch_size.load(.monotonic),
+                stat.last_batch_size.load(.monotonic),
+                stat.processed_runes.load(.monotonic),
+                stat.dispatched_batches.load(.monotonic),
+                @min(busy_pct, 100.0),
+                stat.last_dispatch_ms.load(.monotonic),
+            });
+        }
+        try list.append(allocator, ']');
+    } else {
+        try appendPrint(&list, allocator, "\"throughputMiBs\":0,\"activeStreams\":0,\"totalStreams\":0,\"overallPct\":0,\"processedRunes\":0,\"elapsedMs\":0,\"etaMs\":0,\"droppedRunes\":0,\"collisionStalls\":0,\"isTraining\":false,\"isPaused\":false,\"checkpointing\":false,\"batchFillPct\":0,\"batchSize\":0,\"maxActiveStreams\":0,\"checkpointIntervalMs\":{d},\"lastCheckpointMs\":{d},\"checkpointAgeMs\":{d},\"stopAfterMinutes\":0,\"stopAfterRunes\":0,\"stopAfterSlotUsagePct\":0,\"selectedGpuCount\":0,\"tier\":\"{s}\",\"bottleneck\":\"idle\",\"stopReason\":\"{s}\",\"timestamp\":{d}}},\"streams\":[],\"gpus\":[]", .{
+            DEFAULT_CHECKPOINT_INTERVAL_MS,
+            last_checkpoint,
+            if (last_checkpoint == 0) @as(u64, 0) else sys.getMilliTick() - last_checkpoint,
+            tierNameFromValue(@intFromEnum(vsa_vulkan.OperationalTier.standard)),
+            stopReasonName(last_stop),
+            sys.getMilliTick(),
+        });
+    }
+    try list.append(allocator, '}');
+    return list.toOwnedSlice(allocator);
+}
+
+fn buildStateJson(allocator: std.mem.Allocator) ![]u8 {
+    const vk = vsa_vulkan.getEngine();
+    const compute = if (vk != null) "Vulkan" else "CPU-only";
+    const device = if (vk) |live| trimName(live.device_name[0..]) else "No GPU";
+    const corpora = try loadCorpusFiles(allocator);
+    defer freeCorpusFiles(allocator, corpora);
+
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(allocator);
+    try appendPrint(&list, allocator, "{{\"files\":{{\"unified_lattice.bin\":{d},\"semantic_monolith.bin\":{d},\"semantic_tags.bin\":{d}}},\"architecture\":{{\"version\":\"{s}\",\"hypervectorBits\":{d},\"semanticSlots\":{d},\"gpuMatrixSlots\":{d},\"unifiedSizeBytes\":{d},\"semanticSizeBytes\":{d},\"tagSizeBytes\":{d},\"computeMode\":\"{s}\",\"device\":\"{s}\"}},\"defaults\":{{\"checkpointIntervalMs\":{d},\"idleSleepMs\":{d}}},\"devices\":[", .{
+        if (global_lattice_file) |m| m.data.len else config.UNIFIED_SIZE_BYTES,
+        if (global_meaning_file) |m| m.data.len else config.SEMANTIC_SIZE_BYTES,
+        if (global_tags_file) |m| m.data.len else config.TAG_SIZE_BYTES,
+        core.VERSION,
+        config.HYPERVECTOR_BITS,
+        config.SEMANTIC_SLOTS,
+        if (vk) |live| live.matrix_slots else @as(u32, @intCast(config.SEMANTIC_SLOTS)),
+        config.UNIFIED_SIZE_BYTES,
+        config.SEMANTIC_SIZE_BYTES,
+        config.TAG_SIZE_BYTES,
+        compute,
+        device,
+        DEFAULT_CHECKPOINT_INTERVAL_MS,
+        DEFAULT_IDLE_SLEEP_MS,
+    });
+    if (vsa_vulkan.getFleet()) |fleet| {
+        for (fleet.engines, 0..) |gpu, i| {
+            if (i > 0) try list.append(allocator, ',');
+            try list.appendSlice(allocator, "{\"index\":");
+            try appendPrint(&list, allocator, "{d},\"name\":\"", .{gpu.device_index});
+            try appendEscaped(&list, allocator, trimName(gpu.device_name[0..]));
+            try appendPrint(&list, allocator, "\",\"vramMiB\":{d},\"queues\":{d},\"matrixSlots\":{d},\"tier\":\"{s}\"}}", .{
+                gpu.vram_size / 1048576,
+                gpu.num_queues,
+                gpu.matrix_slots,
+                tierNameFromValue(@intFromEnum(gpu.tier)),
+            });
+        }
+    }
+    try list.appendSlice(allocator, "],\"corpora\":");
+    try appendCorpusFilesJson(&list, allocator, corpora);
+    try list.append(allocator, '}');
+    return list.toOwnedSlice(allocator);
+}
+
+fn buildProbeJson(allocator: std.mem.Allocator) ![]u8 {
+    const vk = vsa_vulkan.getEngine();
+    const lattice = if (vk) |live| live.getLatticeData() else (global_lattice orelse &[_]u16{});
+    const tags = if (vk) |live| live.getTagsData() else (global_tags orelse &[_]u64{});
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(allocator);
+    var histogram: [DEFAULT_HISTOGRAM_BINS]u32 = [_]u32{0} ** DEFAULT_HISTOGRAM_BINS;
+    var hot_cells: [DEFAULT_HOT_CELLS]HotCell = [_]HotCell{.{}} ** DEFAULT_HOT_CELLS;
+    var max_val: u16 = 0;
+    var lattice_nonzero: usize = 0;
+    const lattice_step = @max(if (lattice.len == 0) 1 else lattice.len / DEFAULT_SAMPLE_BINS, 1);
+    const hist_step = @max(if (lattice.len == 0) 1 else lattice.len / 2048, 1);
+    try list.appendSlice(allocator, "{\"lattice\":[");
+    for (0..DEFAULT_SAMPLE_BINS) |i| {
+        if (i > 0) try list.append(allocator, ',');
+        const idx = if (lattice.len == 0) 0 else @min(i * lattice_step, lattice.len - 1);
+        const value: u16 = if (lattice.len == 0) 0 else lattice[idx];
+        if (value != 0) lattice_nonzero += 1;
+        if (value > max_val) max_val = value;
+        updateHotCells(&hot_cells, idx, value);
+        try appendPrint(&list, allocator, "{d}", .{value});
+    }
+    if (lattice.len > 0) {
+        var pos: usize = 0;
+        while (pos < lattice.len) : (pos += hist_step) {
+            const value = lattice[pos];
+            const bucket = @min(@as(usize, value) * DEFAULT_HISTOGRAM_BINS / 65536, DEFAULT_HISTOGRAM_BINS - 1);
+            histogram[bucket] += 1;
+            if (value > max_val) max_val = value;
+            updateHotCells(&hot_cells, pos, value);
+        }
+    }
+
+    try list.appendSlice(allocator, "],\"slotBands\":[");
+    const tag_step = @max(if (tags.len == 0) 1 else tags.len / DEFAULT_SAMPLE_BINS, 1);
+    const used = countUsed(tags);
+    for (0..DEFAULT_SAMPLE_BINS) |i| {
+        if (i > 0) try list.append(allocator, ',');
+        const start = if (tags.len == 0) 0 else @min(i * tag_step, tags.len);
+        const end = if (tags.len == 0) 0 else @min(start + tag_step, tags.len);
+        var occupied: usize = 0;
+        for (tags[start..end]) |tag| {
+            if (tag != 0) occupied += 1;
+        }
+        const pct = if (end <= start) 0.0 else (@as(f64, @floatFromInt(occupied)) / @as(f64, @floatFromInt(end - start))) * 100.0;
+        try appendPrint(&list, allocator, "{d:.2}", .{pct});
+    }
+
+    try list.appendSlice(allocator, "],\"histogram\":[");
+    for (histogram, 0..) |bucket, i| {
+        if (i > 0) try list.append(allocator, ',');
+        try appendPrint(&list, allocator, "{d}", .{bucket});
+    }
+
+    try list.appendSlice(allocator, "],\"hotCells\":[");
+    for (hot_cells, 0..) |cell, i| {
+        if (cell.value == 0) break;
+        if (i > 0) try list.append(allocator, ',');
+        try appendPrint(&list, allocator, "{{\"index\":{d},\"value\":{d}}}", .{ cell.index, cell.value });
+    }
+    try appendPrint(&list, allocator, "],\"occupiedLattice\":{d:.4},\"occupiedMonolith\":{d:.4},\"maxLattice\":{d},\"timestamp\":{d}}}", .{
+        @as(f64, @floatFromInt(lattice_nonzero)) / @as(f64, @floatFromInt(DEFAULT_SAMPLE_BINS)),
+        if (tags.len == 0) 0.0 else @as(f64, @floatFromInt(used)) / @as(f64, @floatFromInt(tags.len)),
+        max_val,
+        sys.getMilliTick(),
+    });
+    return list.toOwnedSlice(allocator);
+}
+
+fn wsHandshake(sock: usize, req: []const u8) bool {
+    const key_hdr = "Sec-WebSocket-Key: ";
+    const idx = std.mem.indexOf(u8, req, key_hdr) orelse return false;
+    const start = idx + key_hdr.len;
+    const end = std.mem.indexOf(u8, req[start..], "\r\n") orelse return false;
+    const key = req[start .. start + end];
+    var concat: [256]u8 = undefined;
+    const joined = std.fmt.bufPrint(&concat, "{s}258EAFA5-E914-47DA-95CA-C5AB0DC85B11", .{key}) catch return false;
+    var hash: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
+    std.crypto.hash.Sha1.hash(joined, &hash, .{});
+    var b64: [64]u8 = undefined;
+    const accept_key = std.base64.standard.Encoder.encode(&b64, &hash);
+    var resp: [256]u8 = undefined;
+    const text = std.fmt.bufPrint(&resp, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n", .{accept_key}) catch return false;
+    sendBytes(sock, text);
+    return true;
+}
+
+fn recvExact(sock: usize, buf: []u8) bool {
+    var got: usize = 0;
+    while (got < buf.len) {
+        const n = recv(sock, buf[got..].ptr, @intCast(buf.len - got), 0);
+        if (n <= 0) return false;
+        got += @intCast(n);
+    }
+    return true;
+}
+
+fn recvWsText(sock: usize, out: []u8) ?[]u8 {
+    var hdr: [2]u8 = undefined;
+    if (!recvExact(sock, &hdr)) return null;
+    if ((hdr[0] & 0x0F) == 0x8 or (hdr[0] & 0x0F) != 0x1) return null;
+    var len: usize = hdr[1] & 0x7F;
+    if (len == 126) {
+        var ext: [2]u8 = undefined;
+        if (!recvExact(sock, &ext)) return null;
+        len = (@as(usize, ext[0]) << 8) | @as(usize, ext[1]);
+    } else if (len == 127 or len > out.len or (hdr[1] & 0x80) == 0) return null;
+    var mask: [4]u8 = undefined;
+    if (!recvExact(sock, &mask) or !recvExact(sock, out[0..len])) return null;
+    for (out[0..len], 0..) |*b, i| b.* ^= mask[i % 4];
+    return out[0..len];
+}
+
+fn sendWsJson(sock: usize, typ: []const u8, text: ?[]const u8) void {
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(global_allocator);
+    payload.appendSlice(global_allocator, "{\"type\":\"") catch return;
+    appendEscaped(&payload, global_allocator, typ) catch return;
+    payload.append(global_allocator, '"') catch return;
+    if (text) |value| {
+        payload.appendSlice(global_allocator, ",\"text\":\"") catch return;
+        appendEscaped(&payload, global_allocator, value) catch return;
+        payload.append(global_allocator, '"') catch return;
+    }
+    payload.append(global_allocator, '}') catch return;
+    var hdr: [4]u8 = undefined;
+    if (payload.items.len < 126) {
+        hdr[0] = 0x81;
+        hdr[1] = @intCast(payload.items.len);
+        sendBytes(sock, hdr[0..2]);
+    } else {
+        hdr = .{ 0x81, 126, @intCast((payload.items.len >> 8) & 0xFF), @intCast(payload.items.len & 0xFF) };
+        sendBytes(sock, &hdr);
+    }
+    sendBytes(sock, payload.items);
+}
+
+fn absorbPrompt(soul: *ghost_state.GhostSoul, text: []const u8) !void {
+    var iter = (std.unicode.Utf8View.init(text) catch return error.InvalidUtf8).iterator();
+    while (iter.nextCodepoint()) |rune| _ = try soul.absorb(vsa.generate(rune), rune, null);
+}
+
+fn resetChatEngine(live: *engine.SingularityEngine) void {
+    @memset(std.mem.sliceAsBytes(live.canvas.cells), 0);
+    @memset(live.canvas.noise, 0);
+    live.canvas.cursor = 0;
+    @memset(live.inventory[0..], 0);
+    live.inv_cursor = 0;
+    live.rune_counter = 0;
+    live.ema = .{};
+    live.is_live = isTrainingActive();
+}
+
+fn renderChatResponse(live: *engine.SingularityEngine, prompt: []const u8, response: *ChatResponse) !void {
+    response.clear();
+    if (config.force_cpu_inference) {
+        var chunk_buf: [CHAT_CHUNK_CAPACITY]u8 = undefined;
+        const clipped = prompt[0..@min(prompt.len, 48)];
+        const text = std.fmt.bufPrint(&chunk_buf, "CPU bypass ok: {s}", .{clipped}) catch "CPU bypass ok";
+        _ = response.pushChunk(text);
+        return;
+    }
+
+    lockInference();
+    errdefer unlockInference();
+    resetChatEngine(live);
+    try absorbPrompt(live.soul, prompt);
+    unlockInference();
+
+    var chunk: [CHAT_CHUNK_CAPACITY]u8 = undefined;
+    var chunk_len: usize = 0;
+
+    for (0..200) |_| {
+        lockInference();
+        const maybe_cp = live.resolveText1D();
+        unlockInference();
+        const cp = maybe_cp orelse break;
+        if (cp == 0 or cp == 0x10FFFF) break;
+
+        var utf8: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(@intCast(cp), &utf8) catch 0;
+        if (n == 0) continue;
+
+        if (chunk_len + n > chunk.len) {
+            if (!response.pushChunk(chunk[0..chunk_len])) break;
+            chunk_len = 0;
+        }
+
+        @memcpy(chunk[chunk_len .. chunk_len + n], utf8[0..n]);
+        chunk_len += n;
+
+        if (chunk_len >= 48 or cp == ' ' or cp == '\n') {
+            if (!response.pushChunk(chunk[0..chunk_len])) break;
+            chunk_len = 0;
+        }
+
+        std.Thread.yield() catch {};
+    }
+
+    if (chunk_len > 0) _ = response.pushChunk(chunk[0..chunk_len]);
+}
+
+fn waitForExchange(exchange: *ChatExchange) void {
+    var spins: u32 = 0;
+    while (exchange.ready.load(.acquire) == 0) {
+        if (spins < 256) {
+            spins += 1;
+            std.atomic.spinLoopHint();
+        } else {
+            spins = 0;
+            std.Thread.yield() catch {};
+        }
+    }
+}
+
+fn inferenceActorThread() void {
+    while (true) {
+        const request = global_chat_queue.pop() orelse {
+            if (global_chat_queue.isShutdown()) break;
+            std.Thread.yield() catch {};
+            continue;
+        };
+        const exchange = request.exchange;
+
+        const live = global_engine;
+        if (live) |engine_ref| {
+            renderChatResponse(engine_ref, request.prompt[0..request.prompt_len], &exchange.response) catch |err| {
+                var message_buf: [CHAT_CHUNK_CAPACITY]u8 = undefined;
+                const message = std.fmt.bufPrint(&message_buf, "Inference failed: {any}", .{err}) catch "Inference failed.";
+                exchange.response.setError(message);
+            };
+            global_ema_average.store(engine_ref.ema.average, .release);
+            global_ema_deviation.store(engine_ref.ema.deviation, .release);
+        } else {
+            exchange.response.setError("Engine unavailable.");
+        }
+        exchange.ready.store(1, .release);
+    }
+}
+
+fn sendChatResponse(sock: usize, response: *const ChatResponse) void {
+    switch (response.kind) {
+        .ok => {
+            var i: usize = 0;
+            while (i < response.chunk_count) : (i += 1) {
+                const len = response.chunk_lens[i];
+                sendWsJson(sock, "output", response.chunks[i][0..len]);
+            }
+            if (response.truncated) sendWsJson(sock, "error", "Chat response truncated.");
+            sendWsJson(sock, "done", null);
+        },
+        .failed => {
+            sendWsJson(sock, "error", response.errorText());
+            sendWsJson(sock, "done", null);
+        },
+    }
+}
+
+fn chatThread(sock: usize) void {
+    defer _ = closesocket(sock);
+    sendWsJson(sock, "connected", "Ghost link established.");
+    var frame: [4096]u8 = undefined;
+    while (!stop_flag.load(.acquire)) {
+        const msg = recvWsText(sock, &frame) orelse break;
+        var kind_buf: [64]u8 = undefined;
+        const kind = jsonString(msg, "type", &kind_buf) orelse continue;
+        if (!std.mem.eql(u8, kind, "input")) continue;
+        var text_buf: [2048]u8 = undefined;
+        const prompt = jsonString(msg, "text", &text_buf) orelse continue;
+        var exchange = ChatExchange{};
+        global_chat_queue.push(&exchange, prompt) catch |err| {
+            var err_buf: [CHAT_CHUNK_CAPACITY]u8 = undefined;
+            const message = std.fmt.bufPrint(&err_buf, "Prompt rejected: {any}", .{err}) catch "Prompt rejected.";
+            sendWsJson(sock, "error", message);
+            continue;
         };
 
-        var runes: u32 = 0;
-        const MAX_RUNES = 2048;
-        while (runes < MAX_RUNES) : (runes += 1) {
-            const chosen = eng.resolveTopology() orelse break;
-            sys.printOut(&[_]u8{chosen});
-            eng.inventory[eng.inv_cursor] = chosen;
-            eng.inv_cursor = (eng.inv_cursor + 1) % 128;
-
-            // Absorb generated rune into soul (bound)
-            const bound_chosen = vsa.bind(vsa.generate(chosen), vsa.MASK_SCRIBE);
-            _ = try soul.absorb(bound_chosen, chosen, null);
-
-            // Queue generated runes for training too
-            training_queue.push(&[_]u8{chosen});
-
-            if (soul.last_boundary == .paragraph or vsa.hammingDistance(soul.concept, gen_start) > 450) break;
-        }
-        if (runes == MAX_RUNES) {
-            sys.printOut("\n[SAFETY] Concept Drift Limit.\n");
-        }
-        sys.printOut("\n\n");
+        waitForExchange(&exchange);
+        sendChatResponse(sock, &exchange.response);
     }
+}
 
-    // ── 6. Clean shutdown ──
-    sys.printOut("[SHUTDOWN] Stopping trainer...\n");
-    stop_flag.store(true, .release);
-    if (trainer_thread) |t| t.join();
+fn serve(allocator: std.mem.Allocator, port: u16) !void {
+    var wsadata: [512]u8 = undefined;
+    _ = WSAStartup(0x0202, &wsadata);
+    defer _ = WSACleanup();
+    const server = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (server == INVALID_SOCKET) return error.SocketCreateFailed;
+    defer _ = closesocket(server);
+    const addr = sockaddr_in{ .sin_family = AF_INET, .sin_port = std.mem.nativeToBig(u16, port), .sin_addr = std.mem.nativeToBig(u32, 0x7F000001) };
+    if (bind(server, @ptrCast(&addr), @sizeOf(sockaddr_in)) != 0) return error.BindFailed;
+    if (listen(server, 1024) != 0) return error.ListenFailed;
+    sys.printOut("[HTTP] Honest Operator Console at http://127.0.0.1:8080\n");
 
-    // Save state
-    if (global_compute) |compute| {
-        const gpu_lattice = compute.getLatticeData();
-        const dst_ptr: [*]u16 = @ptrCast(@alignCast(mapped_lattice.data.ptr));
-        @memcpy(dst_ptr[0..gpu_lattice.len], gpu_lattice);
-        mapped_lattice.flush();
+    while (!stop_flag.load(.acquire)) {
+        const client = accept(server, null, null);
+        if (client == INVALID_SOCKET) continue;
+        var req_buf: [16384]u8 = undefined;
+        const n = recv(client, &req_buf, req_buf.len, 0);
+        if (n <= 0) {
+            _ = closesocket(client);
+            continue;
+        }
+        const req = req_buf[0..@intCast(n)];
+        const body = if (std.mem.indexOf(u8, req, "\r\n\r\n")) |idx| req[idx + 4 ..] else req[0..0];
+
+        if (std.mem.startsWith(u8, req, "OPTIONS ")) {
+            sendResponse(client, "204 No Content", "text/plain", "");
+        } else if (std.mem.startsWith(u8, req, "GET /?channel=chat ") and std.mem.indexOf(u8, req, "Upgrade: websocket") != null and wsHandshake(client, req)) {
+            const t = try std.Thread.spawn(.{ .allocator = allocator }, chatThread, .{client});
+            t.detach();
+            continue;
+        } else if (std.mem.startsWith(u8, req, "GET /api/stats")) {
+            const json = try buildStatsJson(allocator);
+            defer allocator.free(json);
+            sendResponse(client, "200 OK", "application/json", json);
+        } else if (std.mem.startsWith(u8, req, "GET /api/corpora")) {
+            const json = try buildCorporaJson(allocator);
+            defer allocator.free(json);
+            sendResponse(client, "200 OK", "application/json", json);
+        } else if (std.mem.startsWith(u8, req, "GET /api/state")) {
+            const json = try buildStateJson(allocator);
+            defer allocator.free(json);
+            sendResponse(client, "200 OK", "application/json", json);
+        } else if (std.mem.startsWith(u8, req, "GET /api/probe")) {
+            const json = try buildProbeJson(allocator);
+            defer allocator.free(json);
+            sendResponse(client, "200 OK", "application/json", json);
+        } else if (std.mem.startsWith(u8, req, "POST /api/train")) {
+            const req_train = parseTrainRequest(allocator, body) catch |err| {
+                var tmp: [160]u8 = undefined;
+                const resp = std.fmt.bufPrint(&tmp, "{{\"status\":\"error\",\"error\":\"{any}\"}}", .{err}) catch "{\"status\":\"error\"}";
+                sendResponse(client, "200 OK", "application/json", resp);
+                _ = closesocket(client);
+                continue;
+            };
+            defer freeTrainRequest(allocator, req_train);
+            const resp = startTraining(req_train) catch |err| blk: {
+                var tmp: [160]u8 = undefined;
+                break :blk std.fmt.bufPrint(&tmp, "{{\"status\":\"error\",\"error\":\"{any}\"}}", .{err}) catch "{\"status\":\"error\"}";
+            };
+            sendResponse(client, "200 OK", "application/json", resp);
+        } else if (std.mem.startsWith(u8, req, "POST /api/stoptrain")) {
+            sendResponse(client, "200 OK", "application/json", if (requestStopTraining()) "{\"status\":\"stopping\"}" else "{\"status\":\"idle\"}");
+        } else if (std.mem.startsWith(u8, req, "POST /api/pause")) {
+            sendResponse(client, "200 OK", "application/json", if (pauseTraining()) "{\"status\":\"paused\"}" else "{\"status\":\"idle\"}");
+        } else if (std.mem.startsWith(u8, req, "POST /api/resume")) {
+            sendResponse(client, "200 OK", "application/json", if (resumeTraining()) "{\"status\":\"resumed\"}" else "{\"status\":\"idle\"}");
+        } else if (std.mem.startsWith(u8, req, "POST /api/checkpoint")) {
+            sendResponse(client, "200 OK", "application/json", if (requestCheckpointNow()) "{\"status\":\"queued\"}" else "{\"status\":\"idle\"}");
+        } else if (std.mem.startsWith(u8, req, "POST /api/control")) {
+            const resp = applyControlUpdate(body) catch |err| blk: {
+                var tmp: [160]u8 = undefined;
+                break :blk std.fmt.bufPrint(&tmp, "{{\"status\":\"error\",\"error\":\"{any}\"}}", .{err}) catch "{\"status\":\"error\"}";
+            };
+            sendResponse(client, "200 OK", "application/json", resp);
+        } else {
+            sendResponse(client, "200 OK", "text/html; charset=utf-8", DASHBOARD_HTML);
+        }
+        _ = closesocket(client);
     }
+}
 
-    if (global_vk_engine) |vk| vk.deinit();
-    sys.printOut("[SHUTDOWN] State saved. Goodbye.\n");
+pub fn startEmbedded(init: EmbeddedInit) !void {
+    global_allocator = init.allocator;
+    global_io = init.io;
+    stop_flag.store(false, .release);
+    global_chat_queue = .{};
+    global_soul = init.soul;
+    global_engine = init.live_engine;
+    global_lattice_file = init.lattice_file;
+    global_meaning_file = init.meaning_file;
+    global_tags_file = init.tags_file;
+    global_lattice = init.lattice_words;
+    global_meaning = init.meaning_words;
+    global_tags = init.tags_words;
+    global_ema_average.store(init.live_engine.ema.average, .release);
+    global_ema_deviation.store(init.live_engine.ema.deviation, .release);
+
+    const inference_actor = try std.Thread.spawn(.{ .allocator = global_allocator }, inferenceActorThread, .{});
+    inference_actor.detach();
+
+    const server = try std.Thread.spawn(.{ .allocator = global_allocator }, serve, .{ global_allocator, init.port });
+    server.detach();
+    sys.printOut("◈ Ghost Shell Online ◈\n");
 }

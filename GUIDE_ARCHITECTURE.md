@@ -20,3 +20,10 @@ All source code lives at the project root:
 
 ## 4. The No-Float Philosophy
 All calculations are performed using bitwise logic (XOR, POPCNT, Majority Rule). This eliminates rounding errors, overflows, and the non-deterministic nature of floating-point arithmetic, resulting in a perfectly stable, recurrent fractal state.
+
+## 5. Silicon Fragility: Memory & Alignment
+Ghost Engine is optimized for **zero-copy hardware saturation**. This makes several components extremely sensitive:
+*   **Memory Mapping (The Cortex)**: The ~2.1 GB semantic state is memory-mapped via native APIs (`MapViewOfFile`/`mmap`). **Fragility**: Any change to `src/config.zig` that alters the `TOTAL_STATE_BYTES` or shifts the offsets of `UnifiedLattice` and `MeaningMatrix` will render the existing `state/*.bin` files incompatible or cause immediate segfaults.
+*   **Bit-Perfect Parity**: The CPU code in `src/vsa_core.zig` and the Vulkan SPIR-V kernels in `src/shaders/` MUST be 100% identical in their bitwise behavior. **Fragility**: If the GPU implementation of `Majority Rule` or `POPCNT` differs from the CPU version, the engine will "split," where the Trainer and Inference engine effectively live in different realities.
+*   **Sector Alignment**: All I/O is performed in **4096-byte blocks** to match hardware sectors. **Fragility**: Breaking this alignment in `src/sys/` will lead to fatal I/O errors and state corruption.
+

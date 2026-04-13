@@ -1,64 +1,100 @@
 const std = @import("std");
 const sys = @import("sys.zig");
-const vsa = @import("vsa_core.zig");
-const ghost_state = @import("ghost_state.zig");
 
-pub const VERSION = "V27";
+pub const VERSION = "SVM1";
+pub const INVALID_STRING_INDEX = std.math.maxInt(u32);
 
-// ── Canvas Constants (must match ghost.zig exactly) ──
-const FLUENT_SIZE: u32 = 268_435_456;       // 256MB logical
-const FLUENT_ELEMS: u32 = FLUENT_SIZE / 2;
+pub const Opcode = enum(u8) {
+    halt,
+    mood,
+    loom,
+    lock,
+    scan,
+    bind,
+    etch,
+    void_op,
+    jmp_if_false,
+};
 
-// ══════════════════════════════════════════════════════
-//  Lexer
-// ══════════════════════════════════════════════════════
+pub const OperandMode = enum(u8) {
+    none,
+    string,
+    integer,
+    rune_and_string,
+    loom_command,
+    immediate_bool,
+};
 
-const TokenTag = enum {
-    keyword_let,
-    keyword_test,
-    keyword_loom,
-    keyword_var,
-    keyword_mood,
-    keyword_etch,
-    keyword_void,
-    keyword_lock,
-    keyword_scan,
+pub const LoomCommand = enum(u8) {
+    none,
+    vulkan_init,
+    cpu_only,
+};
+
+pub const Instruction = extern struct {
+    opcode: Opcode,
+    mode: OperandMode,
+    a: i64,
+    b: i64,
+    string_index: u32,
+};
+
+pub const Program = struct {
+    allocator: std.mem.Allocator,
+    instructions: []Instruction,
+    strings: [][]const u8,
+
+    pub fn deinit(self: *Program) void {
+        for (self.strings) |item| self.allocator.free(item);
+        self.allocator.free(self.strings);
+        self.allocator.free(self.instructions);
+    }
+};
+
+const AtomTag = enum {
     keyword_bind,
+    keyword_etch,
+    keyword_loom,
+    keyword_lock,
+    keyword_mood,
+    keyword_scan,
+    keyword_test,
+    keyword_void,
     identifier,
     string_literal,
     number_literal,
-    weight_literal,   // @N
-    arrow,            // ->
-    colon_colon,      // ::
-    equal,            // =
-    bracket_open,     // [
-    bracket_close,    // ]
-    brace_open,       // {
-    brace_close,      // }
-    op_lt,            // <
-    op_gt,            // >
-    semicolon,        // ;
+    weight_literal,
+    brace_open,
+    brace_close,
     eof,
     invalid,
 };
 
-const Token = struct {
-    tag:  TokenTag,
+const Atom = struct {
+    tag: AtomTag,
     text: []const u8,
     line: u32,
-    col:  u32,
+    col: u32,
+};
+
+const CompileError = error{
+    ParseFailed,
 };
 
 const Lexer = struct {
     buffer: []const u8,
-    pos:    usize = 0,
-    line:   u32   = 1,
-    col:    u32   = 1,
+    pos: usize = 0,
+    line: u32 = 1,
+    col: u32 = 1,
 
     fn advance(self: *Lexer) void {
         if (self.pos >= self.buffer.len) return;
-        if (self.buffer[self.pos] == '\n') { self.line += 1; self.col = 1; }
-        else { self.col += 1; }
+        if (self.buffer[self.pos] == '\n') {
+            self.line += 1;
+            self.col = 1;
+        } else {
+            self.col += 1;
+        }
         self.pos += 1;
     }
 
@@ -76,62 +112,60 @@ const Lexer = struct {
                 while (self.pos < self.buffer.len and self.buffer[self.pos] != '\n') self.advance();
             } else if (c == '#') {
                 while (self.pos < self.buffer.len and self.buffer[self.pos] != '\n') self.advance();
-            } else break;
+            } else {
+                break;
+            }
         }
     }
 
-    fn next(self: *Lexer) Token {
+    fn next(self: *Lexer) Atom {
         self.skipWhitespace();
-        const sl = self.pos;
-        const ll = self.line;
-        const cl = self.col;
-        if (self.pos >= self.buffer.len) return .{ .tag = .eof, .text = "", .line = ll, .col = cl };
+        const start = self.pos;
+        const line = self.line;
+        const col = self.col;
+
+        if (self.pos >= self.buffer.len) {
+            return .{ .tag = .eof, .text = "", .line = line, .col = col };
+        }
 
         const c = self.buffer[self.pos];
-
         if (c == '"') {
             self.advance();
             const str_start = self.pos;
             while (self.pos < self.buffer.len and self.buffer[self.pos] != '"') self.advance();
-            if (self.pos < self.buffer.len) {
-                const text = self.buffer[str_start..self.pos];
-                self.advance();
-                return .{ .tag = .string_literal, .text = text, .line = ll, .col = cl };
+            if (self.pos >= self.buffer.len) {
+                return .{ .tag = .invalid, .text = "Unterminated string", .line = line, .col = col };
             }
-            return .{ .tag = .invalid, .text = "Unterminated string", .line = ll, .col = cl };
+            const text = self.buffer[str_start..self.pos];
+            self.advance();
+            return .{ .tag = .string_literal, .text = text, .line = line, .col = col };
         }
 
         if (c == '@') {
             self.advance();
-            const ws = self.pos;
-            while (self.pos < self.buffer.len and std.ascii.isDigit(self.buffer[self.pos])) self.advance();
-            return .{ .tag = .weight_literal, .text = self.buffer[ws..self.pos], .line = ll, .col = cl };
+            const weight_start = self.pos;
+            while (self.pos < self.buffer.len and isNumberChar(self.buffer[self.pos])) self.advance();
+            return .{ .tag = .weight_literal, .text = self.buffer[weight_start..self.pos], .line = line, .col = col };
         }
 
         if (std.ascii.isDigit(c)) {
-            while (self.pos < self.buffer.len and std.ascii.isDigit(self.buffer[self.pos])) self.advance();
-            return .{ .tag = .number_literal, .text = self.buffer[sl..self.pos], .line = ll, .col = cl };
-        }
-
-        if (c == '-' and self.peek() == '>') {
-            self.advance(); self.advance();
-            return .{ .tag = .arrow, .text = "->", .line = ll, .col = cl };
-        }
-
-        if (c == ':' and self.peek() == ':') {
-            self.advance(); self.advance();
-            return .{ .tag = .colon_colon, .text = "::", .line = ll, .col = cl };
+            self.advance();
+            if (c == '0' and (self.pos < self.buffer.len) and (self.buffer[self.pos] == 'x' or self.buffer[self.pos] == 'X')) {
+                self.advance();
+            }
+            while (self.pos < self.buffer.len and isNumberChar(self.buffer[self.pos])) self.advance();
+            return .{ .tag = .number_literal, .text = self.buffer[start..self.pos], .line = line, .col = col };
         }
 
         switch (c) {
-            '=' => { self.advance(); return .{ .tag = .equal,         .text = "=", .line = ll, .col = cl }; },
-            '<' => { self.advance(); return .{ .tag = .op_lt,         .text = "<", .line = ll, .col = cl }; },
-            '>' => { self.advance(); return .{ .tag = .op_gt,         .text = ">", .line = ll, .col = cl }; },
-            '[' => { self.advance(); return .{ .tag = .bracket_open,  .text = "[", .line = ll, .col = cl }; },
-            ']' => { self.advance(); return .{ .tag = .bracket_close, .text = "]", .line = ll, .col = cl }; },
-            '{' => { self.advance(); return .{ .tag = .brace_open,    .text = "{", .line = ll, .col = cl }; },
-            '}' => { self.advance(); return .{ .tag = .brace_close,   .text = "}", .line = ll, .col = cl }; },
-            ';' => { self.advance(); return .{ .tag = .semicolon,     .text = ";", .line = ll, .col = cl }; },
+            '{' => {
+                self.advance();
+                return .{ .tag = .brace_open, .text = "{", .line = line, .col = col };
+            },
+            '}' => {
+                self.advance();
+                return .{ .tag = .brace_close, .text = "}", .line = line, .col = col };
+            },
             else => {},
         }
 
@@ -140,259 +174,349 @@ const Lexer = struct {
                 const peek_c = self.buffer[self.pos];
                 if (peek_c > 127 or std.ascii.isAlphanumeric(peek_c) or peek_c == '_') {
                     self.advance();
-                } else break;
+                } else {
+                    break;
+                }
             }
-            const text = self.buffer[sl..self.pos];
-            if (std.mem.eql(u8, text, "LET"))  return .{ .tag = .keyword_let,  .text = text, .line = ll, .col = cl };
-            if (std.mem.eql(u8, text, "TEST")) return .{ .tag = .keyword_test, .text = text, .line = ll, .col = cl };
-            if (std.mem.eql(u8, text, "LOOM")) return .{ .tag = .keyword_loom, .text = text, .line = ll, .col = cl };
-            if (std.mem.eql(u8, text, "VAR"))  return .{ .tag = .keyword_var,  .text = text, .line = ll, .col = cl };
-            if (std.mem.eql(u8, text, "MOOD")) return .{ .tag = .keyword_mood, .text = text, .line = ll, .col = cl };
-            if (std.mem.eql(u8, text, "ETCH")) return .{ .tag = .keyword_etch, .text = text, .line = ll, .col = cl };
-            if (std.mem.eql(u8, text, "VOID")) return .{ .tag = .keyword_void, .text = text, .line = ll, .col = cl };
-            if (std.mem.eql(u8, text, "LOCK")) return .{ .tag = .keyword_lock, .text = text, .line = ll, .col = cl };
-            if (std.mem.eql(u8, text, "SCAN")) return .{ .tag = .keyword_scan, .text = text, .line = ll, .col = cl };
-            if (std.mem.eql(u8, text, "BIND")) return .{ .tag = .keyword_bind, .text = text, .line = ll, .col = cl };
-            return .{ .tag = .identifier, .text = text, .line = ll, .col = cl };
+
+            const text = self.buffer[start..self.pos];
+            if (std.mem.eql(u8, text, "BIND")) return .{ .tag = .keyword_bind, .text = text, .line = line, .col = col };
+            if (std.mem.eql(u8, text, "ETCH")) return .{ .tag = .keyword_etch, .text = text, .line = line, .col = col };
+            if (std.mem.eql(u8, text, "LOOM")) return .{ .tag = .keyword_loom, .text = text, .line = line, .col = col };
+            if (std.mem.eql(u8, text, "LOCK")) return .{ .tag = .keyword_lock, .text = text, .line = line, .col = col };
+            if (std.mem.eql(u8, text, "MOOD")) return .{ .tag = .keyword_mood, .text = text, .line = line, .col = col };
+            if (std.mem.eql(u8, text, "SCAN")) return .{ .tag = .keyword_scan, .text = text, .line = line, .col = col };
+            if (std.mem.eql(u8, text, "TEST")) return .{ .tag = .keyword_test, .text = text, .line = line, .col = col };
+            if (std.mem.eql(u8, text, "VOID")) return .{ .tag = .keyword_void, .text = text, .line = line, .col = col };
+            return .{ .tag = .identifier, .text = text, .line = line, .col = col };
         }
 
         self.advance();
-        return .{ .tag = .invalid, .text = self.buffer[sl..self.pos], .line = ll, .col = cl };
+        return .{ .tag = .invalid, .text = self.buffer[start..self.pos], .line = line, .col = col };
     }
 };
 
-// ══════════════════════════════════════════════════════
-//  Dense Cartridge State (128MB Phantom Lobe output)
-// ══════════════════════════════════════════════════════
+const Parser = struct {
+    allocator: std.mem.Allocator,
+    tokens: []Atom,
+    idx: usize = 0,
+    instructions: std.ArrayList(Instruction),
+    strings: std.ArrayList([]const u8),
 
-var arena_alloc: std.heap.ArenaAllocator = undefined;
-var vars: std.StringHashMap(u16) = undefined;
-
-var loom_stack: u16 = 0;
-var loom_depth: u8  = 0;
-
-var current_sigil_path: ?[]const u8 = null;
-var current_id_vector: vsa.HyperVector = @splat(0);
-
-/// Dense CMS buffer for the cartridge output.
-/// We use it to accumulate deltas before writing a sparse cartridge.
-var dense_cms: ?[]u16 = null;
-
-const SparseDelta = extern struct {
-    index: u32,
-    delta: i16,
-};
-
-
-fn sigilErr(line: u32, col: u32, msg: []const u8, extra: []const u8) void {
-    var buf: [128]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "\n[SIGIL ERR {d}:{d}] {s} '{s}'\n", .{line, col, msg, extra}) catch "";
-    sys.printOut(s);
-}
-
-fn canExecute() bool {
-    if (loom_depth == 0) return true;
-    const mask = (@as(u16, 1) << @as(u4, @truncate(loom_depth))) - 1;
-    return (loom_stack & mask) == mask;
-}
-
-fn executeBind(lex: *Lexer) void {
-    const path_tok = lex.next();
-    if (path_tok.tag != .string_literal) {
-        sigilErr(path_tok.line, path_tok.col, "BIND expects quoted filename", "");
-        return;
-    }
-    
-    // Standalone Sigil Compiler always outputs to .sigil files
-    if (!std.mem.endsWith(u8, path_tok.text, ".sigil")) {
-        sigilErr(path_tok.line, path_tok.col, "Standalone Sigil must bind to .sigil files", path_tok.text);
-        return;
+    fn init(allocator: std.mem.Allocator, tokens: []Atom) Parser {
+        return .{
+            .allocator = allocator,
+            .tokens = tokens,
+            .instructions = .empty,
+            .strings = .empty,
+        };
     }
 
-    current_sigil_path = arena_alloc.allocator().dupe(u8, path_tok.text) catch return;
-    current_id_vector = @splat(0);
-    // Zero the dense CMS buffer for the new cartridge target
-    if (dense_cms) |cms| {
-        const cms_bytes: []u8 = @as([*]u8, @ptrCast(@alignCast(cms.ptr)))[0..ghost_state.LOBE_CMS_BYTES];
-        @memset(cms_bytes, 0);
-    }
-    sys.printOut("[BIND] Targeted: "); sys.printOut(path_tok.text); sys.printOut("\n");
-}
-
-fn generateWordVec(word: []const u8) vsa.HyperVector {
-    var v: vsa.HyperVector = @splat(0);
-    for (word) |c| v ^= vsa.generate(c);
-    return v;
-}
-
-fn executeEtch(lex: *Lexer) void {
-    const concept_tok = lex.next();
-    const weight_tok  = lex.next();
-
-    if (concept_tok.tag != .string_literal) {
-        sigilErr(concept_tok.line, concept_tok.col, "ETCH expects quoted string", "");
-        return;
+    fn deinit(self: *Parser) void {
+        self.instructions.deinit(self.allocator);
+        self.strings.deinit(self.allocator);
     }
 
-    if (!canExecute()) return;
-
-    const raw_w = if (weight_tok.tag == .weight_literal)
-        std.fmt.parseInt(u16, weight_tok.text[1..], 10) catch 15
-    else 15;
-    const weight: u16 = if (raw_w == 0) 0 else std.math.mul(u16, raw_w, 4096) catch std.math.maxInt(u16);
-
-    // Update ID Vector
-    const concept_vec = generateWordVec(concept_tok.text);
-    current_id_vector ^= concept_vec;
-
-    // Etch directly into the CMS buffer using saturated addition
-    const cms = dense_cms orelse return;
-    var window: u64 = 0;
-    for (concept_tok.text) |c| {
-        const h1 = ghost_state.wyhash(window & 0xFFFF, @as(u64, c));
-        const h2 = ghost_state.wyhash(window & 0xFFFFFFFF, @as(u64, c));
-        const idx1 = getLobeIndices(h1);
-        const idx2 = getLobeIndices(h2);
-        inline for (idx1) |i| cms[i] = std.math.add(u16, cms[i], weight) catch std.math.maxInt(u16);
-        inline for (idx2) |i| cms[i] = std.math.add(u16, cms[i], weight) catch std.math.maxInt(u16);
-        window = std.math.rotl(u64, window, 7) ^ @as(u64, c);
+    fn current(self: *Parser) Atom {
+        return self.tokens[@min(self.idx, self.tokens.len - 1)];
     }
 
-    sys.printOut("[ETCH] "); sys.printOut(concept_tok.text); sys.printOut("\n");
-}
-
-fn executeVoid(lex: *Lexer) void {
-    const concept_tok = lex.next();
-
-    if (concept_tok.tag != .string_literal) {
-        sigilErr(concept_tok.line, concept_tok.col, "VOID expects quoted string", "");
-        return;
+    fn advance(self: *Parser) void {
+        if (self.idx < self.tokens.len - 1) self.idx += 1;
     }
 
-    if (!canExecute()) return;
-    
-    // Update ID Vector
-    const concept_vec = generateWordVec(concept_tok.text);
-    current_id_vector ^= concept_vec;
-
-    const cms = dense_cms orelse return;
-    var window: u64 = 0;
-    for (concept_tok.text) |c| {
-        const h1 = ghost_state.wyhash(window & 0xFFFF, @as(u64, c));
-        const h2 = ghost_state.wyhash(window & 0xFFFFFFFF, @as(u64, c));
-        const idx1 = getLobeIndices(h1);
-        const idx2 = getLobeIndices(h2);
-        
-        // Use 0xFFFF as a tombstone marker for VOID instructions
-        inline for (idx1) |i| cms[i] = 0xFFFF;
-        inline for (idx2) |i| cms[i] = 0xFFFF;
-        
-        window = std.math.rotl(u64, window, 7) ^ @as(u64, c);
+    fn consume(self: *Parser, expected: AtomTag, comptime message: []const u8) anyerror!Atom {
+        const token = self.current();
+        if (token.tag != expected) {
+            reportError(token.line, token.col, message, token.text);
+            return error.ParseFailed;
+        }
+        self.advance();
+        return token;
     }
 
-    sys.printOut("[VOID] "); sys.printOut(concept_tok.text); sys.printOut("\n");
-}
+    fn appendString(self: *Parser, text: []const u8) anyerror!u32 {
+        const owned = try self.allocator.dupe(u8, text);
+        try self.strings.append(self.allocator, owned);
+        return @intCast(self.strings.items.len - 1);
+    }
 
-/// CMS probe indices for the Lobe's 67M-entry address space.
-fn getLobeIndices(h: u64) [4]u32 {
-    const s: u32 = ghost_state.LOBE_CMS_ENTRIES / 4;
-    return .{
-        @as(u32, @truncate(h & 0xFFFFFFFF)) % s,
-        (@as(u32, @truncate(h >> 32)) % s) + s,
-        (@as(u32, @truncate(ghost_state.wyhash(h, 0x12345678))) % s) + (s * 2),
-        (@as(u32, @truncate(ghost_state.wyhash(h, 0x87654321))) % s) + (s * 3),
-    };
-}
+    fn emit(self: *Parser, opcode: Opcode, mode: OperandMode, a: i64, b: i64, string_index: u32) anyerror!usize {
+        try self.instructions.append(self.allocator, .{
+            .opcode = opcode,
+            .mode = mode,
+            .a = a,
+            .b = b,
+            .string_index = string_index,
+        });
+        return self.instructions.items.len - 1;
+    }
 
-fn finalizeSigil(allocator: std.mem.Allocator) !void {
-    const path = current_sigil_path orelse return;
-    const cms = dense_cms orelse return;
-    const h = try sys.openForWrite(allocator, path);
-    defer sys.closeFile(h);
+    fn parseProgram(self: *Parser) anyerror!void {
+        while (self.current().tag != .eof and self.current().tag != .brace_close) {
+            try self.parseStatement();
+        }
+        _ = try self.emit(.halt, .none, 0, 0, INVALID_STRING_INDEX);
+    }
 
-
-    // 1. Write VSA Identity Header (128 bytes)
-    const id_bytes: [128]u8 = @bitCast(current_id_vector);
-    try sys.writeAll(h, &id_bytes);
-
-    // 2. Generate Sparse Deltas
-    var output_deltas = std.ArrayListUnmanaged(SparseDelta).empty;
-    const alloc = arena_alloc.allocator();
-    for (cms, 0..) |val, i| {
-        if (val > 0) {
-            const index = @as(u32, @intCast(i));
-            var delta: i16 = 0;
-            if (val == 0xFFFF) {
-                // VOID marker
-                delta = -32768;
-            } else {
-                delta = @as(i16, @intCast(@min(val, 32767)));
-            }
-            try output_deltas.append(alloc, SparseDelta{ .index = index, .delta = delta });
+    fn parseStatement(self: *Parser) anyerror!void {
+        switch (self.current().tag) {
+            .keyword_mood => try self.parseMood(),
+            .keyword_loom => try self.parseLoom(),
+            .keyword_lock => try self.parseLock(),
+            .keyword_scan => try self.parseScan(),
+            .keyword_bind => try self.parseBind(),
+            .keyword_etch => try self.parseEtch(),
+            .keyword_void => try self.parseVoid(),
+            .keyword_test => try self.parseTest(),
+            .brace_close => {},
+            .invalid => {
+                const token = self.current();
+                reportError(token.line, token.col, "Invalid token", token.text);
+                return error.ParseFailed;
+            },
+            else => self.advance(),
         }
     }
 
-    // 3. Write Sparse Array bounds
-    try sys.writeAll(h, std.mem.sliceAsBytes(output_deltas.items));
+    fn parseMood(self: *Parser) anyerror!void {
+        self.advance();
+        const token = self.current();
+        switch (token.tag) {
+            .string_literal, .identifier => {
+                const idx = try self.appendString(token.text);
+                self.advance();
+                _ = try self.emit(.mood, .string, 0, 0, idx);
+            },
+            .number_literal => {
+                const value = try parseInteger(token.text);
+                self.advance();
+                _ = try self.emit(.mood, .integer, value, 0, INVALID_STRING_INDEX);
+            },
+            else => {
+                reportError(token.line, token.col, "MOOD expects a name or integer", token.text);
+                return error.ParseFailed;
+            },
+        }
+    }
 
-    sys.printOut("[SIGIL] Saved sparse cartridge: "); sys.printOut(path);
-    sys.printOut(" (");
-    var buf: [32]u8 = undefined;
-    const bytes_saved = output_deltas.items.len * @sizeOf(SparseDelta);
-    sys.printOut(std.fmt.bufPrint(&buf, "{d}", .{bytes_saved + 128}) catch "?");
-    sys.printOut(" bytes)\n");
+    fn parseLoom(self: *Parser) anyerror!void {
+        self.advance();
+        const token = try self.consume(.identifier, "LOOM expects an identifier");
+        const command = parseLoomCommand(token.text);
+        _ = try self.emit(.loom, .loom_command, @intFromEnum(command), 0, INVALID_STRING_INDEX);
+    }
+
+    fn parseLock(self: *Parser) anyerror!void {
+        self.advance();
+        const token = self.current();
+        switch (token.tag) {
+            .number_literal => {
+                const value = try parseInteger(token.text);
+                self.advance();
+                _ = try self.emit(.lock, .integer, value, 0, INVALID_STRING_INDEX);
+            },
+            .string_literal, .identifier => {
+                const idx = try self.appendString(token.text);
+                self.advance();
+                _ = try self.emit(.lock, .string, 0, 0, idx);
+            },
+            else => {
+                reportError(token.line, token.col, "LOCK expects a slot number or symbol", token.text);
+                return error.ParseFailed;
+            },
+        }
+    }
+
+    fn parseScan(self: *Parser) anyerror!void {
+        self.advance();
+        const token = self.current();
+        if (token.tag != .string_literal and token.tag != .identifier) {
+            reportError(token.line, token.col, "SCAN expects a string or identifier target", token.text);
+            return error.ParseFailed;
+        }
+        const idx = try self.appendString(token.text);
+        self.advance();
+        _ = try self.emit(.scan, .string, 0, 0, idx);
+    }
+
+    fn parseBind(self: *Parser) anyerror!void {
+        self.advance();
+        const rune_token = self.current();
+        if (rune_token.tag != .number_literal) {
+            reportError(rune_token.line, rune_token.col, "BIND expects a rune literal", rune_token.text);
+            return error.ParseFailed;
+        }
+        const rune_value = try parseInteger(rune_token.text);
+        self.advance();
+
+        const maybe_to = self.current();
+        if (maybe_to.tag == .identifier and std.ascii.eqlIgnoreCase(maybe_to.text, "TO")) self.advance();
+
+        const label_token = self.current();
+        if (label_token.tag != .string_literal and label_token.tag != .identifier) {
+            reportError(label_token.line, label_token.col, "BIND expects a label", label_token.text);
+            return error.ParseFailed;
+        }
+        const idx = try self.appendString(label_token.text);
+        self.advance();
+        _ = try self.emit(.bind, .rune_and_string, rune_value, 0, idx);
+    }
+
+    fn parseEtch(self: *Parser) anyerror!void {
+        self.advance();
+        const text_token = self.current();
+        if (text_token.tag != .string_literal and text_token.tag != .identifier) {
+            reportError(text_token.line, text_token.col, "ETCH expects a string payload", text_token.text);
+            return error.ParseFailed;
+        }
+        const idx = try self.appendString(text_token.text);
+        self.advance();
+
+        var weight: i64 = 1;
+        if (self.current().tag == .weight_literal or self.current().tag == .number_literal) {
+            weight = try parseInteger(self.current().text);
+            self.advance();
+        }
+        _ = try self.emit(.etch, .string, weight, 0, idx);
+    }
+
+    fn parseVoid(self: *Parser) anyerror!void {
+        self.advance();
+        const token = self.current();
+        if (token.tag != .string_literal and token.tag != .identifier) {
+            reportError(token.line, token.col, "VOID expects a string payload", token.text);
+            return error.ParseFailed;
+        }
+        const idx = try self.appendString(token.text);
+        self.advance();
+        _ = try self.emit(.void_op, .string, 0, 0, idx);
+    }
+
+    fn parseTest(self: *Parser) anyerror!void {
+        self.advance();
+        const condition_token = self.current();
+        const cond = switch (condition_token.tag) {
+            .number_literal => (try parseInteger(condition_token.text)) != 0,
+            .identifier => !std.ascii.eqlIgnoreCase(condition_token.text, "FALSE") and !std.ascii.eqlIgnoreCase(condition_token.text, "OFF"),
+            .string_literal => condition_token.text.len > 0,
+            else => {
+                reportError(condition_token.line, condition_token.col, "TEST expects a literal condition", condition_token.text);
+                return error.ParseFailed;
+            },
+        };
+        self.advance();
+        _ = try self.consume(.brace_open, "TEST expects a '{' block");
+        const jmp_index = try self.emit(.jmp_if_false, .immediate_bool, if (cond) 1 else 0, 0, INVALID_STRING_INDEX);
+        while (self.current().tag != .brace_close and self.current().tag != .eof) {
+            try self.parseStatement();
+        }
+        _ = try self.consume(.brace_close, "Missing closing '}' for TEST block");
+        self.instructions.items[jmp_index].b = @intCast(self.instructions.items.len);
+    }
+};
+
+pub fn compileScript(allocator: std.mem.Allocator, source: []const u8) !Program {
+    var lexer = Lexer{ .buffer = source };
+    var tokens: std.ArrayList(Atom) = .empty;
+    defer tokens.deinit(allocator);
+
+    while (true) {
+        const token = lexer.next();
+        try tokens.append(allocator, token);
+        if (token.tag == .eof) break;
+    }
+
+    var parser = Parser.init(allocator, tokens.items);
+    defer parser.deinit();
+    try parser.parseProgram();
+
+    return .{
+        .allocator = allocator,
+        .instructions = try parser.instructions.toOwnedSlice(allocator),
+        .strings = try parser.strings.toOwnedSlice(allocator),
+    };
+}
+
+pub fn serializeProgram(allocator: std.mem.Allocator, program: *const Program) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+
+    try output.appendSlice(allocator, "SVM1");
+
+    var counts: [2]u32 = .{
+        @intCast(program.instructions.len),
+        @intCast(program.strings.len),
+    };
+    try output.appendSlice(allocator, std.mem.asBytes(&counts));
+    try output.appendSlice(allocator, std.mem.sliceAsBytes(program.instructions));
+
+    for (program.strings) |item| {
+        const len: u32 = @intCast(item.len);
+        try output.appendSlice(allocator, std.mem.asBytes(&len));
+        try output.appendSlice(allocator, item);
+    }
+
+    return output.toOwnedSlice(allocator);
+}
+
+fn parseLoomCommand(text: []const u8) LoomCommand {
+    if (std.ascii.eqlIgnoreCase(text, "VULKAN_INIT")) return .vulkan_init;
+    if (std.ascii.eqlIgnoreCase(text, "CPU_ONLY")) return .cpu_only;
+    return .none;
+}
+
+fn parseInteger(text: []const u8) !i64 {
+    if (std.mem.startsWith(u8, text, "0x") or std.mem.startsWith(u8, text, "0X")) {
+        return std.fmt.parseInt(i64, text[2..], 16);
+    }
+    return std.fmt.parseInt(i64, text, 10);
+}
+
+fn isNumberChar(c: u8) bool {
+    return std.ascii.isDigit(c) or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F') or c == 'x' or c == 'X';
+}
+
+fn reportError(line: u32, col: u32, msg: []const u8, extra: []const u8) void {
+    var buf: [256]u8 = undefined;
+    const rendered = std.fmt.bufPrint(&buf, "[SIGIL ERR {d}:{d}] {s}: {s}\n", .{ line, col, msg, extra }) catch return;
+    sys.printOut(rendered);
 }
 
 pub fn main() !void {
-    arena_alloc = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena_alloc.deinit();
-    vars = std.StringHashMap(u16).init(arena_alloc.allocator());
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
-    // Allocate the 128MB dense CMS buffer (zero-initialized)
-    const cms_raw = sys.allocSectorAligned(ghost_state.LOBE_CMS_BYTES) orelse {
-        sys.printOut("[SIGIL] FATAL: Failed to allocate 128 MiB CMS buffer.\n");
-        return;
-    };
-    defer sys.freeSectorAligned(cms_raw);
-    // Reinterpret as u16 array
-    dense_cms = @as([*]u16, @ptrCast(@alignCast(cms_raw.ptr)))[0..ghost_state.LOBE_CMS_ENTRIES];
-    // Zero-init
-    @memset(cms_raw, 0);
-
-    const args = try sys.getArgs(arena_alloc.allocator());
+    const args = try sys.getArgs(allocator);
     if (args.len < 2) {
-        sys.printOut("Usage: sigil_core <script.sgl>\n");
+        sys.printOut("Usage: sigil_core <script.sigil> [output.sigbc]\n");
         return;
     }
 
-    const script_path = args[1];
-    const fh = try sys.openForRead(arena_alloc.allocator(), script_path);
-    defer sys.closeFile(fh);
+    const input_path = args[1];
+    const input_handle = try sys.openForRead(allocator, input_path);
+    defer sys.closeFile(input_handle);
 
+    const input_size = try sys.getFileSize(input_handle);
+    const buffer = try allocator.alloc(u8, input_size);
+    _ = try sys.readAll(input_handle, buffer);
 
-    const size = try sys.getFileSize(fh);
-    const buffer = try arena_alloc.allocator().alloc(u8, size);
-    _ = try sys.readAll(fh, buffer);
+    var program = try compileScript(allocator, buffer);
+    defer program.deinit();
 
-    var lex = Lexer{ .buffer = buffer };
-    while (true) {
-        const tok = lex.next();
-        if (tok.tag == .eof) break;
-        switch (tok.tag) {
-            .keyword_bind => executeBind(&lex),
-            .keyword_etch => executeEtch(&lex),
-            .keyword_void => executeVoid(&lex),
-            .keyword_let => {
-                _ = lex.next(); // var
-                _ = lex.next(); // =
-                _ = lex.next(); // val
-            },
-            .brace_close => { if (loom_depth > 0) loom_depth -= 1; },
-            else => {},
-        }
-    }
+    const output_path = if (args.len >= 3) args[2] else blk: {
+        const ext = std.fs.path.extension(input_path);
+        if (ext.len == 0) break :blk try std.fmt.allocPrint(allocator, "{s}.sigbc", .{input_path});
+        const stem = input_path[0 .. input_path.len - ext.len];
+        break :blk try std.fmt.allocPrint(allocator, "{s}.sigbc", .{stem});
+    };
 
-    try finalizeSigil(arena_alloc.allocator());
+    const output_handle = try sys.openForWrite(allocator, output_path);
+    defer sys.closeFile(output_handle);
 
-    sys.printOut("\nSigil compilation complete (128 MiB dense cartridge format).\n");
+    const serialized = try serializeProgram(allocator, &program);
+    try sys.writeAll(output_handle, serialized);
+
+    sys.print("[SIGIL] Compiled {s} -> {s} ({d} instructions)\n", .{ input_path, output_path, program.instructions.len });
 }

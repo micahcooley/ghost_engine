@@ -18,3 +18,10 @@ The engine detects "meaning" by monitoring the flux of resonance. When a new inp
 
 ## 4. No-Float Determinism
 By using only bitwise operations, the engine achieves **Absolute Determinism**. The same input will always produce the exact same resonance across any hardware that supports the standard VSA instruction set.
+
+## 5. DETERMINISM & RESONANCE SAFETY
+The mathematical core of Ghost is **fragile by design**. Any divergence in how bitwise logic is applied will lead to catastrophic semantic decay:
+*   **The No-Float Mandate**: Never introduce floating-point math (`f32`, `f64`) into `vsa_core.zig` or `src/shaders/`. Even a single rounding error will destroy the engine's bit-perfect determinism across different hardware architectures.
+*   **Resonance Thresholds**: The **Hamming Distance** thresholds (< 400 for near, > 600 for void) are calibrated for 1024-bit bitspace. Modifying these in `src/config.zig` or `src/vsa_core.zig` will fundamentally change the engine's "perception." If tuned incorrectly, the engine will either "flatline" (perceive all input as noise) or "hallucinate" (resonate with everything).
+*   **Vector Bundling (Majority Rule)**: The Majority Rule implementation (a & b) | (b & c) | (c & a) is the engine's only way to "memorize." Any change to how bitwise bundling is handled in the GPU kernels will result in a state that the CPU cannot interpret correctly.
+

@@ -12,6 +12,8 @@ layout(std430, binding = 5) buffer Lattice {
 layout(push_constant) uniform Constants {
     uint lattice_size_uints;
     uint unused;
+    uint slot_count;       // dynamic matrix_slots
+    uint lattice_quarter;  // dynamic gpu_lattice_size / 8
 } params;
 
 void main() {

@@ -1,0 +1,22 @@
+[MONOLITH] Mapping Cortex...
+[MERKLE] Verifying Lattice Integrity (16 Blocks / 64MB each)...
+[MERKLE] Block 0 initial hash: 0x189b47c4ab7e433a
+[MERKLE] Block 1 initial hash: 0x497696568031622f
+[MERKLE] Block 2 initial hash: 0x34b05066448c791f
+[MERKLE] Block 3 initial hash: 0x3cc3d1093e1895cc
+[MERKLE] Block 4 initial hash: 0x29a92b31d6026570
+[MERKLE] Block 5 initial hash: 0x1a9e16075b7d1b23
+[MERKLE] Block 6 initial hash: 0xaa2af7a34e4ace5e
+[MERKLE] Block 7 initial hash: 0x155d135859968452
+[MERKLE] Block 8 initial hash: 0x6df5259c21b6a5b3
+[MERKLE] Block 9 initial hash: 0xc0c8586873d611b9
+[MERKLE] Block 10 initial hash: 0xebfb74779a97fc71
+[MERKLE] Block 11 initial hash: 0xe44b483176c4d7c
+[MERKLE] Block 12 initial hash: 0xc1796a0ac7332f16
+[MERKLE] Block 13 initial hash: 0xb6c2c08ff1b213b5
+[MERKLE] Block 14 initial hash: 0xa6109b350d0111a8
+[MERKLE] Block 15 initial hash: 0x603321608bb3128c
+[MERKLE] All blocks healthy. Roots match.
+[VULKAN] Initializing Sovereign Compute...
+[COMPUTE] Ghost-Vulkan-Native active.
+[SILICON] Pre-calculating BMP VSA Space (65,536 identities)...

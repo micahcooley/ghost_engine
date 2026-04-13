@@ -39,7 +39,16 @@ layout(std430, binding = 6) buffer BatchOutput {
 layout(push_constant) uniform Constants {
     uint batch_size;
     uint depth;
+    uint slot_count;       // dynamic matrix_slots (replaces hardcoded 1048576)
+    uint lattice_quarter;  // dynamic gpu_lattice_size / 8
 } params;
+
+// ── 10. Engine Config Metadata (Binding 10) ──
+layout(std430, binding = 10) readonly buffer Config {
+    uint rotor_stride;
+    uint rotor_offset;
+    uint batch_size;
+} engine_config;
 
 shared uint shared_energies[256];
 shared uint shared_chars[256];
@@ -72,15 +81,17 @@ uint collapseChunk(uint base_uint, uint chunk_idx) {
 }
 
 uint findSlot(uint64_t rotor) {
-    uint base_slot = uint(rotor % 1048576ul);
+    uint slot_mask = params.slot_mask;
+    uint slot_count_local = slot_mask + 1u;
+    uint base_slot = uint(rotor % uint64_t(slot_count_local));
     for (uint p = 0; p < 1024u; p++) {
-        uint slot = (base_slot + p) % 1048576u;
+        uint slot = (base_slot + p) & slot_mask;
         uint64_t occ_hash = matrix_tags.entries[slot];
         if (occ_hash == rotor) return slot;
         if (occ_hash == 0ul) return 0xFFFFFFFFu;
 
-        uint occ_base = uint(occ_hash % 1048576ul);
-        uint occ_dist = (slot >= occ_base) ? (slot - occ_base) : ((1048576u - occ_base) + slot);
+        uint occ_base = uint(occ_hash % uint64_t(slot_count_local));
+        uint occ_dist = (slot >= occ_base) ? (slot - occ_base) : (slot_count_local - occ_base + slot);
         if (p > occ_dist) return 0xFFFFFFFFu;
     }
     return 0xFFFFFFFFu;
@@ -112,7 +123,7 @@ void main() {
     if (root_idx >= params.batch_size) return;
 
     uint char_idx = gl_LocalInvocationID.x;
-    uint64_t current_rotor = batch_rotors.rotors[root_idx];
+    uint64_t current_rotor = batch_rotors.rotors[root_idx * engine_config.rotor_stride + engine_config.rotor_offset];
 
     if (char_idx == 0u) path_killed = false;
     barrier();

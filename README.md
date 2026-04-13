@@ -1,124 +1,132 @@
 # Ghost Engine
 
-**Sovereign intelligence for every silicon, owned by no one but you.**
+Deterministic local inference and training over memory-mapped state, with Vulkan compute when available and CPU fallback when it is not.
 
-Ghost Engine is a bitwise inference engine that runs on your hardware, your terms. No cloud. No API keys. No floating-point non-determinism. Just deterministic, hardware-native intelligence on whatever machine you have — Windows, Linux, macOS. x86_64, ARM64. Your silicon, your ghost.
+## What Ships Today
 
-## Why Ghost Exists
+Ghost Engine currently builds and installs these executables from `build.zig`:
 
-Most AI systems require you to trust someone else's infrastructure. Ghost doesn't.
+- `ghost_sovereign` - interactive inference runtime
+- `ohl_trainer` - corpus-driven trainer
+- `probe_inference` - inference probe utility
+- `ghost_shell` - local HTTP/WebSocket dashboard
+- `sigil_core` - Sigil compiler
 
-- **No cloud.** Runs entirely local. Your data never leaves your machine.
-- **No floats.** All computation is bitwise (XOR, POPCNT, majority rule). Same input, same output, every time, on every platform. No rounding errors, no GPU nondeterminism.
-- **No vendor lock-in.** Cross-platform by design. The engine adapts to your OS and architecture, not the other way around.
-- **No black box.** Every resonance, every lattice state, is inspectable. You can see what the engine knows and why it generates what it generates.
+`build.zig` also exposes these named steps:
 
-## The No-Float Philosophy
+- `zig build run`
+- `zig build release`
+- `zig build test`
+- `zig build test-parity`
+- `zig build probe-unicode`
+- `zig build seed`
+- `zig build corpus`
 
-Ghost operates in a 1024-bit HyperVector space. Meaning lives in **Hamming distance** between vectors, not in floating-point weights. This means:
+## Windows Setup
 
-- Bit-perfect reproducibility across all hardware
-- No GPU-specific numerical drift
-- Training and inference are the same operation — there is no separate "model file"
-- The lattice is the model. It's always live, always updating, always yours.
-
-## Getting Started
-
-No global installs required. The forge provides everything.
-
-### 1. Bootstrap the toolchain
+### 1. Bootstrap Zig
 
 ```powershell
-.\sylor_forge.ps1
+.\platforms\windows\sylor_forge.ps1
 ```
 
-Downloads Zig and Vulkan SDK into `.toolchain/`. No system pollution.
+The forge installs Zig into `platforms/windows/.toolchain/zig`. It does not download the Vulkan SDK.
 
-### 2. Seed the state (~2.1 GB)
+### 2. Seed the mapped state
 
 ```powershell
 .\tools\seed_lattice.ps1
 ```
 
-Creates the lattice, meaning matrix, and tag store — tabula rasa, ready to learn.
+This creates the current Windows runtime state under `platforms/windows/x86_64/state/`:
 
-### 3. Build
+- `unified_lattice.bin`
+- `semantic_monolith.bin`
+- `semantic_tags.bin`
+
+### 3. Build from the repo root
 
 ```powershell
-$env:PATH = "$(Get-Location)\.toolchain\zig;" + $env:PATH
-$env:VULKAN_SDK = "$(Get-Location)\.toolchain\Vulkan"
-
+$env:PATH = "$(Get-Location)\platforms\windows\.toolchain\zig;" + $env:PATH
 zig build -Doptimize=ReleaseFast
 ```
 
-Two binaries come out: `ghost_sovereign` (inference REPL) and `ohl_trainer` (training pipeline).
+If your Windows toolchain needs Vulkan headers from a local SDK install, set `VULKAN_SDK` yourself before building. The forge does not provision one.
 
-### 4. Teach it
-
-```powershell
-cp zig-out/bin/ohl_trainer.exe platforms/windows/x86_64/bin/
-cd platforms/windows/x86_64
-.\bin\ohl_trainer.exe corpus\your_text.txt --standard
-```
-
-The trainer ingests your text and etches meaning directly into the lattice. No epochs, no loss curves, no checkpoint files. The lattice is always current.
-
-### 5. Talk to it
+### 4. Copy the binaries into the packaged runtime layout
 
 ```powershell
-.\bin\ghost_sovereign.exe
+Copy-Item .\zig-out\bin\*.exe .\platforms\windows\x86_64\bin\ -Force
 ```
 
-Interactive REPL. Type, it resonates. Every response is generated from the live lattice state.
+The Windows runtime layout expected by the packaged binaries is:
 
-## Architecture
+- `platforms/windows/x86_64/bin/`
+- `platforms/windows/x86_64/corpus/`
+- `platforms/windows/x86_64/state/`
 
-```
-src/
-  ghost.zig          -- Module root
-  vsa_core.zig       -- HyperVector, MeaningMatrix, Panopticon
-  ghost_state.zig    -- GhostSoul, UnifiedLattice, StreamState
-  engine.zig         -- SingularityEngine (inference topology)
-  trainer.zig        -- OHL trainer with 4-tier transmission
-  vsa_vulkan.zig     -- Vulkan compute engine
-  sigil_core.zig     -- Sigil parsing and etching
-  compute_api.zig    -- GPU abstraction layer
-  sys/               -- Platform abstraction (Windows, Linux, macOS)
-  shaders/           -- Vulkan SPIR-V compute kernels
+## Training
+
+`ohl_trainer` does not take a corpus filepath on the command line. It scans the runtime `corpus/` directory for `.txt` files and trains on every file it finds.
+
+On the packaged Windows layout, put your text files here:
+
+```text
+platforms/windows/x86_64/corpus/
 ```
 
-The engine maps ~2.1 GB of state into process memory (lattice + meaning matrix + tags). Training and inference share this memory zero-copy — what the trainer learns, the inference engine sees immediately. No serialization, no save steps.
+Then run:
 
-## The 4-Tier Operational System
+```powershell
+.\platforms\windows\x86_64\bin\ohl_trainer.exe
+```
 
-The trainer adapts to your hardware and needs:
+If no corpus files are present, the trainer falls back to a synthetic benchmark stream.
 
-| Tier | Flag | Throughput | Profile |
-|------|------|-----------|---------|
-| Max | `--max` | 4096 batch, 4 streams | Full saturation |
-| High | `--high` | 2048 batch, 2 streams | High flow |
-| Standard | `--standard` | 1024 batch, 1 stream | Nominal (default) |
-| Background | `--background` | 512 batch, throttled | Stealth / shared machine |
+## Runtime Modes
 
-## Roadmap
+### Interactive runtime
 
-- [ ] Linux and macOS runtime support (source already cross-platform via `src/sys/`)
-- [ ] ARM64 native builds
-- [ ] Agents (see `AGENTS_SPEC.md`)
-- [ ] Sigil scripting for memory surgery
-- [ ] Plugin hot-loading for custom compute kernels
+```powershell
+.\platforms\windows\x86_64\bin\ghost_sovereign.exe
+```
 
-## Pre-flight Checklist
+`ghost_sovereign` maps the state files, executes `boot.sigil` from the repo root if it exists, verifies lattice checksums, and enters the REPL.
 
-- [ ] Run `.\sylor_forge.ps1`
-- [ ] Run `.\tools\seed_lattice.ps1`
-- [ ] Verify Vulkan drivers are current
-- [ ] `zig build` from project root
+### Background daemon mode
+
+```powershell
+.\platforms\windows\x86_64\bin\ghost_sovereign.exe --daemon
+```
+
+Daemon mode starts the named-pipe bridge used by the surveillance layer while keeping the main runtime alive.
+
+### Local dashboard
+
+```powershell
+.\platforms\windows\x86_64\bin\ghost_shell.exe
+```
+
+`ghost_shell` serves a local dashboard on `http://127.0.0.1:8080` and exposes the current stats, corpus, state, probe, chat, and training control endpoints wired into `src/shell.zig`.
+
+## Sigil Control Plane
+
+The repo-root `boot.sigil` file is the current startup control plane for `ghost_sovereign`. The runtime executes it through the Sigil VM at boot. If `boot.sigil` is missing, the runtime falls back to `LOOM VULKAN_INIT`.
+
+To compile a Sigil source file into bytecode manually:
+
+```powershell
+.\zig-out\bin\sigil_core.exe .\boot.sigil
+```
+
+The runtime boot path currently executes `boot.sigil` source directly; it does not scan directories for scripts or plugins.
+
+## Determinism Constraints
+
+- Keep the core bitwise. Do not introduce floating point into the resonance path.
+- Keep CPU and Vulkan behavior aligned. `src/shaders/*.comp` must match the CPU logic.
+- Treat the mapped state files as live engine state, not disposable cache.
 
 ## License
 
 See [LICENSE](LICENSE).
-
----
-
-**SylorLabs — Sovereign AI for the Silicon Era.**

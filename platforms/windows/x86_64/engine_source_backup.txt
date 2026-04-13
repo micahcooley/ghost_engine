@@ -1,0 +1,2104 @@
+const std = @import("std");
+const builtin = @import("builtin");
+
+pub const VERSION = "V27";
+
+/// 1024-bit HyperVector represented as 16x 64-bit integers.
+/// Optimized for native SIMD registers (AVX, NEON).
+pub const HyperVector = @Vector(16, u64);
+
+// ── Role-Filler Binding Constants (Orthogonal Identities) ──
+pub const ROLE_SUBJECT   = generate(0x1234_5678_9ABC_DEF0);
+pub const ROLE_OBJECT    = generate(0x0FED_CBA9_8765_4321);
+pub const ROLE_PREDICATE = generate(0x5555_5555_AAAA_AAAA);
+
+// ── Orthogonal Namespace Masks ──
+pub const MASK_SCRIBE = generate(0x55AA_55AA_55AA_55AA);
+pub const MASK_CRITIC = generate(0xAA55_AA55_AA55_AA55);
+
+/// Hardware-accelerated concept generator.
+pub fn generate(seed: u64) HyperVector {
+    var v: HyperVector = undefined;
+    var s = seed ^ 0x60bee2bee120fc15;
+    const c1 = 0xa3b195354a39b70d;
+    const c2 = 0x123456789abcdef0;
+    
+    // Unrolled for maximum pipeline saturation
+    inline for (0..16) |i| {
+        s = (s ^ (s >> 33)) *% c1;
+        s = (s ^ (s >> 33)) *% c2;
+        s = s ^ (s >> 33);
+        v[i] = s;
+    }
+    return v;
+}
+
+/// Bitwise Binding (XOR) - 100% Symmetrical
+pub inline fn bind(a: HyperVector, b: HyperVector) HyperVector { return a ^ b; }
+
+/// Bitwise Bundling (Majority Rule)
+/// Implementation: (a & b) | (b & c) | (c & a)
+pub inline fn bundle(a: HyperVector, b: HyperVector, c: HyperVector) HyperVector { 
+    return (a & b) | (b & c) | (c & a); 
+}
+
+/// Circular Permutation (Shift logic)
+pub inline fn permute(v: HyperVector) HyperVector {
+    var result: HyperVector = undefined;
+    // Architecture optimization: use rotl if available natively
+    inline for (0..16) |i| { result[i] = std.math.rotl(u64, v[i], 19); }
+    return result;
+}
+
+/// Rotate HyperVector elements by N positions (used for fractal/spell push)
+pub inline fn rotate(v: HyperVector, comptime n: comptime_int) HyperVector {
+    var result: HyperVector = undefined;
+    inline for (0..16) |i| { result[i] = v[(i + n) % 16]; }
+    return result;
+}
+
+/// Collapse 1024-bit HyperVector to a 64-bit hash via XOR folding
+pub inline fn collapse(v: HyperVector) u64 {
+    var acc: u64 = v[0];
+    inline for (1..16) |i| { acc ^= v[i]; }
+    return acc;
+}
+
+/// Resonance score: alias for calculateResonance (used by engine noise measurement)
+pub inline fn resonanceScore(expectation: HyperVector, reality: HyperVector) u16 {
+    return calculateResonance(expectation, reality);
+}
+
+/// Calculate Resonance (Hamming Proximity)
+/// Optimized via hardware POPCNT instructions.
+pub inline fn calculateResonance(expectation: HyperVector, reality: HyperVector) u16 {
+    const diff = expectation ^ reality;
+    var dist: u32 = 0;
+    inline for (0..16) |i| { dist += @popCount(diff[i]); }
+    return @as(u16, @intCast(1024 -| dist));
+}
+
+/// Hamming Distance (Raw Drift)
+pub inline fn hammingDistance(a: HyperVector, b: HyperVector) u16 {
+    const diff = a ^ b;
+    var dist: u32 = 0;
+    inline for (0..16) |i| { dist += @popCount(diff[i]); }
+    return @as(u16, @intCast(dist));
+}
+
+pub const MeaningMatrix = struct {
+    data: []u16, // 16-bit depth for high-fidelity concept etching
+    tags: ?[]u64 = null,
+
+    /// SIMD-Optimized binary collapse.
+    /// Converts 1024 16-bit accumulators into 1024 bits via thresholding.
+    pub fn collapseToBinaryAtSlot(self: *const MeaningMatrix, slot: u32) HyperVector {
+        const acc = self.data[slot * 1024 .. slot * 1024 + 1024];
+        var res_bytes = [_]u8{0} ** 128;
+
+        // Use @Vector for architecture-level parallelism if possible
+        // Here we do a standard threshold pass, but unrolled for performance.
+        var i: usize = 0;
+        while (i < 128) : (i += 1) {
+            var byte: u8 = 0;
+            const base = i * 8;
+            if (acc[base + 0] > 32767) byte |= 1;
+            if (acc[base + 1] > 32767) byte |= 2;
+            if (acc[base + 2] > 32767) byte |= 4;
+            if (acc[base + 3] > 32767) byte |= 8;
+            if (acc[base + 4] > 32767) byte |= 16;
+            if (acc[base + 5] > 32767) byte |= 32;
+            if (acc[base + 6] > 32767) byte |= 64;
+            if (acc[base + 7] > 32767) byte |= 128;
+            res_bytes[i] = byte;
+        }
+        return @bitCast(res_bytes);
+    }
+
+    pub fn collapseToBinary(self: *const MeaningMatrix, hash: u64) HyperVector {
+        const base_idx = @as(u32, @intCast(hash % 1_048_576));
+        if (self.tags) |tags| {
+            var p: u32 = 0;
+            // Linear Probing: Hardware-preferred over chaining
+            while (p < 8) : (p += 1) {
+                const slot = (base_idx + p) % 1_048_576;
+                if (tags[slot] == hash) return self.collapseToBinaryAtSlot(slot);
+                if (tags[slot] == 0) return @splat(0);
+            }
+        }
+        return @splat(0);
+    }
+
+    /// The Gravity Rule: Microscopic addition toward a concept neighborhood.
+    /// Vectorized for AVX-2/AVX-512 (1024-bit saturation via @Vector).
+    pub fn applyGravity(self: *MeaningMatrix, word_hash: u64, sentence_pool: HyperVector) u64 {
+        const base_idx = @as(u32, @intCast(word_hash % 1_048_576));
+        var slot_idx: ?u32 = null;
+        if (self.tags) |tags| {
+            var p: u32 = 0;
+            while (p < 8) : (p += 1) {
+                const slot = (base_idx + p) % 1_048_576;
+                if (tags[slot] == word_hash) { slot_idx = slot; break; }
+                if (tags[slot] == 0) { tags[slot] = word_hash; slot_idx = slot; break; }
+            }
+        }
+        const sid = slot_idx orelse return 0;
+        
+        const acc_ptr = @as([*]u16, @ptrCast(@alignCast(&self.data[sid * 1024])));
+        const pool_bytes: [128]u8 = @bitCast(sentence_pool);
+        
+        // Process in 128-bit chunks (8x u16) for universal SIMD compatibility
+        // Zig's @Vector will optimally map this to AVX2/AVX-512 or NEON.
+        var total_drift: u64 = 0;
+        inline for (0..128) |byte_idx| {
+            const byte = pool_bytes[byte_idx];
+            const base = byte_idx * 8;
+            
+            // Vectorize 8-lane chunk
+            const chunk: @Vector(8, u16) = acc_ptr[base..][0..8].*;
+            const mask_bits: @Vector(8, u16) = .{
+                @as(u16, (byte >> 0) & 1), @as(u16, (byte >> 1) & 1),
+                @as(u16, (byte >> 2) & 1), @as(u16, (byte >> 3) & 1),
+                @as(u16, (byte >> 4) & 1), @as(u16, (byte >> 5) & 1),
+                @as(u16, (byte >> 6) & 1), @as(u16, (byte >> 7) & 1),
+            };
+
+            // Saturating increment for 1-bits, decrement for 0-bits
+            // Masked addition: (chunk +| 1) if mask[i]==1, else (chunk -| 1)
+            const ones: @Vector(8, u16) = @splat(1);
+            const inc = chunk +| ones;
+            const dec = chunk -| ones;
+            
+            // Branchless selection: res = (mask == 1) ? inc : dec
+            var res = @select(u16, mask_bits == ones, inc, dec);
+
+            // Myelination: If counter hits 1000, lock by flipping MSB
+            // Vectorized comparison and conditional OR
+            const threshold: @Vector(8, u16) = @splat(1000);
+            const lock_bit: @Vector(8, u16) = @splat(0x8000);
+            res = @select(u16, res == threshold, res | lock_bit, res);
+            
+            // Store back and count drift
+            acc_ptr[base..][0..8].* = res;
+            total_drift += 8; // Approximation for simplicity in this pass
+        }
+
+        return total_drift;
+    }
+
+    /// Bound gravity: XOR binds data to an agent mask before etching.
+    pub fn applyBoundGravity(self: *MeaningMatrix, word_hash: u64, data: HyperVector, mask: HyperVector) u64 {
+        return self.applyGravity(word_hash, data ^ mask);
+    }
+
+    /// Absolute Sigil Locking: Hardcoding a symbol into the matrix.
+    pub fn hardLockSigil(self: *MeaningMatrix, hash: u64, char: u8) void {
+        self.hardLockUniversalSigil(hash, @as(u32, char));
+    }
+
+    /// Universal Sigil Locking: Handles any 32-bit rune.
+    pub fn hardLockUniversalSigil(self: *MeaningMatrix, hash: u64, rune: u32) void {
+        const base_idx = @as(u32, @intCast(hash % 1_048_576));
+        var slot_idx: ?u32 = null;
+        if (self.tags) |tags| {
+            var p: u32 = 0;
+            while (p < 8) : (p += 1) {
+                const slot = (base_idx + p) % 1_048_576;
+                if (tags[slot] == hash) { slot_idx = slot; break; }
+                if (tags[slot] == 0) { tags[slot] = hash; slot_idx = slot; break; }
+            }
+        }
+        const sid = slot_idx orelse return;
+        const reality_bytes: [128]u8 = @bitCast(generate(@as(u64, rune)));
+        var word_acc = self.data[sid * 1024 .. sid * 1024 + 1024];
+        for (0..1024) |i| {
+            const bit = (reality_bytes[i / 8] >> @as(u3, @intCast(i % 8))) & 1;
+            word_acc[i] = if (bit == 1) 65535 else 0;
+        }
+    }
+};
+
+/// Deterministic, infinite-context record-keeping.
+pub const Panopticon = struct {
+    ledger: std.ArrayListUnmanaged(u8),
+    concepts: std.ArrayListUnmanaged(HyperVector),
+    allocator: std.mem.Allocator,
+    pub fn init(allocator: std.mem.Allocator) Panopticon { return .{ .ledger = .empty, .concepts = .empty, .allocator = allocator }; }
+    pub fn deinit(self: *Panopticon) void { self.ledger.deinit(self.allocator); self.concepts.deinit(self.allocator); }
+    pub fn pushByte(self: *Panopticon, byte: u8) !void { try self.ledger.append(self.allocator, byte); }
+    pub fn markSentence(self: *Panopticon, concept: HyperVector) !void { try self.concepts.append(self.allocator, concept); }
+};
+
+pub fn koryphaiosBrickwall(current: HyperVector, primary: HyperVector, manager_limit: u64, critic_limit: u64) struct { passed: bool, manager_drift: u16, critic_drift: u16 } {
+    const manager_drift = hammingDistance(current ^ @as(HyperVector, @splat(@as(u64, 0x00000000FFFFFFFF))), primary ^ @as(HyperVector, @splat(@as(u64, 0x00000000FFFFFFFF))));
+    const critic_drift = hammingDistance(current ^ @as(HyperVector, @splat(@as(u64, 0xFFFFFFFF00000000))), primary ^ @as(HyperVector, @splat(@as(u64, 0xFFFFFFFF00000000))));
+    
+    return .{
+        .passed = (manager_drift <= manager_limit) and (critic_drift <= critic_limit),
+        .manager_drift = manager_drift,
+        .critic_drift = critic_drift,
+    };
+}
+const std = @import("std");
+const vsa = @import("vsa_core.zig");
+const sys = @import("sys.zig");
+
+pub const VERSION = "V27";
+
+pub const GENESIS_SEED: u64 = 0x5A5A5A5A5A5A5A5A;
+
+/// ── Sovereign Architecture: Dual-State Engine ──
+/// The Rotor provides the statistical spine (trigram CMS keys with ~33
+/// observations per key during training). The Fractal State provides
+/// holographic infinite context via rotate+XOR binding. Both coexist:
+/// the rotor determines WHERE to look, the fractal state determines
+/// HOW to interpret what we find.
+
+// ── Avalanche Rotor: FNV-1a rolling hash ──
+// Replaces the 24-bit bit-shift with an infinite-context word fingerprint.
+// Compresses the entire word (since last TRP boundary) into a 64-bit key.
+pub const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
+pub const FNV_PRIME: u64 = 1099511628211;
+
+/// Solstice Decay: when lattice saturation exceeds this percentage,
+/// trigger a global >> 1 to free counter headroom.
+pub const SOLSTICE_THRESHOLD: u64 = 8000; // x10000 fixed-point: 80.00%
+
+pub const GhostSoul = struct {
+    syntax: vsa.HyperVector,
+    phrase: vsa.HyperVector,
+    concept: vsa.HyperVector,
+    global: vsa.HyperVector,
+    panopticon: vsa.Panopticon,
+    active_context_hash: u64,
+    entropy_flatline: bool, // Task 4 fallback state
+
+    // ── Orthogonal Snap: Resonance Physics (Prediction Error) ──
+    last_energy: u16,
+    last_boundary: Boundary,
+
+    // ── Dual-State: Rotor (spine) + Fractal (holographic memory) + Spell (word VSA) ──
+    lexical_rotor: u64,
+    semantic_rotor: u64,
+    fractal_state: vsa.HyperVector,
+    spell_vector: vsa.HyperVector,
+
+    // ── L2 Semantic Cache (Phantom Lobe) ──
+    l2_cache: [256]vsa.HyperVector,
+    l2_ptr: usize,
+
+    // Vectorial Gravity: Semantic Pool
+    sentence_pool: vsa.HyperVector,
+    meaning_matrix: ?*vsa.MeaningMatrix,
+    allocator: std.mem.Allocator,
+
+    // ── Rotor Satiation: Boredom/Decay ──
+    rotor_history: [16]u64,
+    history_ptr: usize,
+
+    // ── Entropy Heartbeat ──
+    rolling_buffer: [65536]u8,
+    rolling_idx: u32,
+    energy_word_threshold: u16,
+    energy_sentence_threshold: u16,
+
+    pub fn init(allocator: std.mem.Allocator) GhostSoul {
+        return .{
+            .syntax = @splat(0),
+            .phrase = @splat(0),
+            .concept = @splat(0),
+            .global = @splat(0),
+            .panopticon = vsa.Panopticon.init(allocator),
+            .active_context_hash = GENESIS_SEED,
+            .entropy_flatline = false,
+            .last_energy = 1024,
+            .last_boundary = .none,
+            .lexical_rotor = FNV_OFFSET_BASIS,
+            .semantic_rotor = FNV_OFFSET_BASIS,
+            .fractal_state = vsa.generate(GENESIS_SEED),
+            .spell_vector = @splat(0),
+            .sentence_pool = @splat(0),
+            .meaning_matrix = null,
+            .allocator = allocator,
+            .rotor_history = [_]u64{0} ** 16,
+            .history_ptr = 0,
+            .l2_cache = [_]vsa.HyperVector{@as(vsa.HyperVector, @splat(0))} ** 256,
+            .l2_ptr = 0,
+            .rolling_buffer = [_]u8{0} ** 65536,
+            .rolling_idx = 0,
+            .energy_word_threshold = 700,
+            .energy_sentence_threshold = 500,
+        };
+    }
+
+    pub fn deinit(self: *GhostSoul) void {
+        self.panopticon.deinit();
+    }
+
+    /// Avalanche Rotor: FNV-1a rolling hash. Each byte is XOR-multiply
+    /// compressed into a 64-bit fingerprint of the current sequence.
+    /// Infinite context depth: the rotor carries the state of every previous
+    /// character in the session. O(1) cost. 
+    /// Avalanche Rotor: wyhash + FNV-1a rolling hash. 
+    /// Updated to use Rune hashes for language-agnostic threading.
+    pub fn pushRotor(self: *GhostSoul, rune: u32) void {
+        const rune_hash = wyhash(FNV_OFFSET_BASIS, rune);
+        self.lexical_rotor = (self.lexical_rotor ^ rune_hash) *% FNV_PRIME;
+        
+        // Universal Boundary Check: Statistical Snap priority
+        const is_boundary = (rune <= 32 or rune == '.' or rune == ';' or rune == '=' or rune == 0x3000);
+        if (is_boundary) {
+            self.semantic_rotor = FNV_OFFSET_BASIS;
+        } else {
+            self.semantic_rotor = (self.semantic_rotor ^ rune_hash) *% FNV_PRIME;
+        }
+
+        // Update history for satiation
+        self.rotor_history[self.history_ptr] = self.lexical_rotor;
+        self.history_ptr = (self.history_ptr + 1) % 16;
+    }
+
+    pub fn pushRotorFast(self: *GhostSoul, rune: u32) void {
+        const rune_hash = wyhash(FNV_OFFSET_BASIS, rune);
+        self.lexical_rotor = (self.lexical_rotor ^ rune_hash) *% FNV_PRIME;
+        
+        const is_boundary = (rune <= 32 or rune == '.' or rune == ';' or rune == '=' or rune == 0x3000);
+        if (is_boundary) self.semantic_rotor = FNV_OFFSET_BASIS;
+    }
+
+    pub fn getBoredomPenalty(self: *const GhostSoul, rotor: u64) u32 {
+        var count: u32 = 0;
+        for (self.rotor_history) |h| {
+            if (h == rotor) count += 1;
+        }
+        return count * 40; // Calibrated: 40 energy penalty per repetition
+    }
+
+    /// Rotor as u64 for CMS addressing — direct FNV-1a fingerprint.
+    pub fn rotorKey(self: *const GhostSoul) u64 {
+        return self.lexical_rotor;
+    }
+
+    /// Fractal State Update: MAP operation (Multiply-Add-Permute).
+    /// Now rune-aware: each character gets exactly one Permute cycle.
+    pub fn fractalPush(self: *GhostSoul, rune: u32) void {
+        self.fractal_state = vsa.rotate(self.fractal_state, 1) ^ vsa.generate(rune);
+    }
+
+    /// Fractal Resonance: hamming distance between two fractal states.
+    /// Lower = more coherent. Used by REASON to measure which candidate
+    /// keeps the holographic memory on a stable attractor.
+    pub fn fractalResonance(self: *const GhostSoul, candidate_state: vsa.HyperVector) u64 {
+        return vsa.hammingDistance(self.fractal_state, candidate_state);
+    }
+
+    /// Spell Vector Push: rotate + XOR binding for word-level VSA encoding.
+    /// Rune-aware word representation.
+    pub fn spellPush(self: *GhostSoul, rune: u32) void {
+        self.spell_vector = vsa.rotate(self.spell_vector, 1) ^ vsa.generate(rune);
+    }
+
+    /// Detect boundary type from Resonance Energy.
+    pub fn detectSnap(self: *const GhostSoul, energy: u16) Boundary {
+        if (energy <= self.energy_sentence_threshold) return .sentence;
+        if (energy < self.energy_word_threshold) return .word;
+        return .none;
+    }
+
+    /// The core evolution: absorb a new rune into the state.
+    /// Boundaries are detected dynamically via Prediction Error (Resonance Drop).
+    /// Returns the semantic drift occurred (if any).
+    /// The core evolution: absorb a new rune into the state.
+    /// Rune-aware: processes any Unicode character as a semantic atom.
+    pub fn absorb(self: *GhostSoul, rune_vec: vsa.HyperVector, rune: u32, energy: ?u16) !u64 {
+        const raw_byte = @as(u8, @truncate(rune)); // For rolling buffer heartbeat
+        self.rolling_buffer[self.rolling_idx % 65536] = raw_byte;
+        self.rolling_idx +%= 1;
+        // Phase-Change Detector (Entropy Heartbeat)
+        if (self.rolling_idx % 65536 == 0) {
+            var hamming_variance: u32 = 0;
+            for (1..8192) |i| {
+                hamming_variance += @popCount(self.rolling_buffer[i*8] ^ self.rolling_buffer[(i-1)*8]);
+            }
+            
+            if (hamming_variance == 0) {
+                // Structural Fallback: rely on ASCII/Universal delimiters
+                self.entropy_flatline = true;
+            } else if (hamming_variance > 20000) {
+                // High entropy (Code, Compressed Data)
+                self.entropy_flatline = false;
+                self.energy_word_threshold = 600;
+                self.energy_sentence_threshold = 400;
+            } else {
+                // Universal Text (Multi-lingual)
+                self.entropy_flatline = false;
+                self.energy_word_threshold = 750;
+                self.energy_sentence_threshold = 550;
+            }
+        }
+
+        // 1. Calculate Resonance
+        if (energy) |e| {
+            self.last_energy = e;
+        } else if (self.meaning_matrix) |mm| {
+            const expectation = mm.collapseToBinary(self.lexical_rotor);
+            self.last_energy = vsa.calculateResonance(expectation, rune_vec);
+        } else {
+            self.last_energy = 1024;
+        }
+
+        const boundary = if (self.entropy_flatline) blk: {
+            // Task 4: Universal Hardcoded Fallback
+            if (rune == '\n' or rune == '\r' or rune == 0) break :blk Boundary.sentence;
+            if (rune <= 32 or rune == ',' or rune == ';' or rune == 0x3000) break :blk Boundary.word;
+            break :blk Boundary.none;
+        } else self.detectSnap(self.last_energy);
+
+        self.last_boundary = boundary;
+
+        // 1b. L2 Ring Buffer Management (Phantom Lobe)
+        if (boundary == .sentence or boundary == .paragraph) {
+            self.l2_cache[self.l2_ptr] = self.fractal_state;
+            self.l2_ptr = (self.l2_ptr + 1) % 256;
+        }
+
+        // 1c. L2 Retrieval (Semantic Page Fault)
+        // If resonance is garbage (< 15%), attempt recovery from L2 cache
+        if (self.last_energy < 150) {
+            var best_res: u16 = 0;
+            var best_idx: ?usize = null;
+            for (self.l2_cache, 0..) |past_state, i| {
+                const r = vsa.calculateResonance(past_state, rune_vec);
+                if (r > best_res) {
+                    best_res = r;
+                    best_idx = i;
+                }
+            }
+            if (best_res > 700) { // Found a resonant past context
+                self.fractal_state = self.l2_cache[best_idx.?];
+            }
+        }
+
+        // 2. Update state based on boundary detection
+        self.pushRotor(rune);
+        self.fractalPush(rune);
+
+        // Continuous Concept Update (every rune)
+        self.concept = vsa.bundle(vsa.permute(self.concept), rune_vec, vsa.generate(0xD00));
+
+        // Accumulate spell_vector only for non-boundary characters
+        if (boundary == .none) {
+            self.spellPush(rune);
+        }
+
+        try self.panopticon.pushByte(@as(u8, @truncate(rune)));
+        self.sentence_pool = vsa.bundle(self.sentence_pool, rune_vec, vsa.generate(0x1337));
+        self.syntax = vsa.bundle(vsa.permute(self.syntax), rune_vec, vsa.generate(0xB00));
+        self.phrase = vsa.bundle(vsa.permute(self.phrase), rune_vec, vsa.generate(0xC00));
+        var drift: u64 = 0;
+
+        // Word-level semantic gravity at any snap boundary (using spell_vector)
+        if (boundary != .none) {
+            if (self.meaning_matrix) |mm| {
+                const word_hash = vsa.collapse(self.spell_vector);
+                drift = mm.applyGravity(word_hash, self.concept);
+            }
+            self.spell_vector = @splat(0);
+        }
+
+        switch (boundary) {
+            .sentence, .paragraph => {
+                self.concept = vsa.bundle(self.concept, self.phrase, vsa.generate(0xD10));
+                try self.panopticon.markSentence(self.concept);
+                self.sentence_pool = @splat(0);
+                self.active_context_hash = wyhash(self.active_context_hash, vsa.collapse(self.concept));
+            },
+            else => {},
+        }
+        return drift;
+    }
+
+    /// Simulation absorb for lookahead -- mirrors absorb() physics.
+    pub fn simulateAbsorb(self: *GhostSoul, rune_vec: vsa.HyperVector, rune: u32, energy: ?u16) void {
+        // 1. Calculate Resonance
+        if (energy) |e| {
+            self.last_energy = e;
+        } else if (self.meaning_matrix) |mm| {
+            const expectation = mm.collapseToBinary(self.lexical_rotor);
+            self.last_energy = vsa.calculateResonance(expectation, rune_vec);
+        } else {
+            self.last_energy = 1024;
+        }
+
+        const boundary = self.detectSnap(self.last_energy);
+        self.last_boundary = boundary;
+
+        // 2. Update state
+        self.pushRotor(rune);
+        self.fractalPush(rune);
+
+        self.concept = vsa.bundle(vsa.permute(self.concept), rune_vec, vsa.generate(0xD00));
+
+        if (boundary == .none) {
+            self.spellPush(rune);
+        }
+
+        self.sentence_pool = vsa.bundle(self.sentence_pool, rune_vec, vsa.generate(0x1337));
+        self.syntax = vsa.bundle(vsa.permute(self.syntax), rune_vec, vsa.generate(0xB00));
+        self.phrase = vsa.bundle(vsa.permute(self.phrase), rune_vec, vsa.generate(0xC00));
+
+        if (boundary != .none) {
+            self.spell_vector = @splat(0);
+        }
+
+        switch (boundary) {
+            .sentence, .paragraph => {
+                self.concept = vsa.bundle(self.concept, self.phrase, vsa.generate(0xD10));
+                self.active_context_hash = wyhash(self.active_context_hash, vsa.collapse(self.concept));
+            },
+            else => {},
+        }
+    }
+
+    pub fn contextVector(self: *const GhostSoul) vsa.HyperVector {
+        const s1 = self.syntax;
+        const s2 = rotateTrack(self.phrase, 3);
+        const s3 = rotateTrack(self.concept, 7);
+        const s4 = rotateTrack(self.global, 11);
+        return s1 ^ s2 ^ s3 ^ s4;
+    }
+
+    pub inline fn rotateTrack(v: vsa.HyperVector, comptime n: comptime_int) vsa.HyperVector {
+        var result: vsa.HyperVector = undefined;
+        inline for (0..16) |i| {
+            result[i] = v[(i + n) % 16];
+        }
+        return result;
+    }
+};
+
+pub const Boundary = enum(u8) {
+    none = 0,
+    word = 1,
+    sentence = 2,
+    paragraph = 3,
+};
+
+
+
+
+// ────────────────────────────────────────────────────────────────
+// The Unified 1GB Holographic Monolith
+// ────────────────────────────────────────────────────────────────
+pub const UNIFIED_ENTRIES: usize = 536_870_912;
+pub const UNIFIED_SIZE_BYTES: usize = UNIFIED_ENTRIES * 2;
+
+pub const DOMAIN_SYNTAX: u64    = 0x9E3779B97F4A7C15;
+pub const DOMAIN_INTUITION: u64 = 0x6C62272E07BB0142;
+pub const DOMAIN_CONCEPT: u64   = 0xC7115792D0E47B43;
+pub const DOMAIN_ROLES: u64     = 0x517CC1B727220A95;
+pub const DOMAIN_TRINITY: u64   = 0x3C2B1A0987654321;
+pub const DOMAIN_MOMENTUM: u64  = 0xA5A5A5A5A5A5A5A5;
+
+/// ── Koryphaios Protocol: Hemispheric Domain Isolation ──
+/// DOMAIN_STYLE is XOR-mixed into Manager hemisphere lattice writes (Lanes 0–7).
+/// DOMAIN_FACT is XOR-mixed into Critic hemisphere lattice writes (Lanes 8–15).
+/// These seeds are orthogonal to all existing domains and to each other.
+pub const DOMAIN_STYLE: u64     = 0xD15C0_DEAD_BEEF_01;
+pub const DOMAIN_FACT: u64      = 0xFAC75_C0DE_CAFE_02;
+
+/// ── Phantom Lobe: 128MB Dense Cartridge Format ──
+/// The Console & Cartridge architecture. Each lobe is a focused 128MB
+/// CMS array that the OS pages directly into L3 cache on first touch.
+/// Zero allocation, zero copy — MapViewOfFile is the only instruction.
+///
+/// File Layout:
+///   [0..127]     : VSA Identity Header (128 bytes = 1 HyperVector)
+///   [128..end]   : Dense CMS array (67,108,864 × u16 = 128 MiB)
+///   Total size   : 134,217,856 bytes
+pub const LOBE_CMS_ENTRIES: u32 = 67_108_864;               // 128 MiB / sizeof(u16)
+pub const LOBE_CMS_BYTES: usize = @as(usize, LOBE_CMS_ENTRIES) * 2;  // 134,217,728 bytes
+pub const LOBE_HEADER_SIZE: usize = 128;                     // 1 HyperVector
+pub const LOBE_TOTAL_SIZE: usize = LOBE_HEADER_SIZE + LOBE_CMS_BYTES; // 134,217,856 bytes
+
+pub const LOBE_TILE_SIZE: usize = 2 * 1024 * 1024; // 2 MiB matching x86_64 Huge Page
+pub const LOBE_TILE_COUNT: usize = 64;             // 128 MiB / 2 MiB
+
+pub const TileManager = struct {
+    lobe: *const PhantomLobe,
+
+    /// Predicted prefetch for a set of candidate bytes.
+    /// Calculates the CMS probe locations and triggers Windows PrefetchVirtualMemory
+    /// on the specific 2MB tiles those probes land in.
+    pub fn prefetchTilesForCandidates(self: *const TileManager, context: u64, domain: u64, candidates: []const u8) void {
+        const base_ptr = self.lobe.data orelse return;
+        var tile_mask: u64 = 0; // 64 bits = 64 tiles
+
+        for (candidates) |cb| {
+            const h = wyhash(context ^ domain, @as(u64, cb));
+            const s: u32 = LOBE_CMS_ENTRIES / 4;
+            const probes = [4]u32{
+                @as(u32, @truncate(h & 0xFFFFFFFF)) % s,
+                (@as(u32, @truncate(h >> 32)) % s) + s,
+                (@as(u32, @truncate(wyhash(h, 0x12345678))) % s) + (s * 2),
+                (@as(u32, @truncate(wyhash(h, 0x87654321))) % s) + (s * 3),
+            };
+
+            inline for (probes) |idx| {
+                const byte_offset = idx * 2;
+                const tile_idx = @as(u6, @truncate(byte_offset / LOBE_TILE_SIZE));
+                tile_mask |= (@as(u64, 1) << tile_idx);
+            }
+        }
+
+        // Trigger Windows Prefetch for all "hot" tiles
+        var i: u6 = 0;
+        while (i < LOBE_TILE_COUNT) : (i += 1) {
+            if ((tile_mask >> i) & 1 == 1) {
+                const tile_addr = @as(?*anyopaque, @ptrFromInt(@intFromPtr(base_ptr) + (@as(usize, i) * LOBE_TILE_SIZE)));
+                @import("sys.zig").prefetchMemory(tile_addr, LOBE_TILE_SIZE);
+            }
+        }
+    }
+};
+
+pub const PhantomLobe = struct {
+    /// The identity vector of this lobe (from the 128-byte header).
+    /// Used for resonance matching against the soul's fractal_state.
+    identity: vsa.HyperVector,
+
+    /// Direct pointer to the dense CMS array (memory-mapped, zero-copy).
+    /// Points to the first u16 AFTER the 128-byte header in the mapped file.
+    data: ?[*]const u16,
+
+    /// The underlying sys.MappedFile handle (for unmapping on swap).
+    mapped: ?sys.MappedFile,
+
+    /// Filesystem path of the loaded lobe (for swap detection).
+    path: ?[]const u8,
+
+    pub fn empty() PhantomLobe {
+        return .{
+            .identity = @splat(0),
+            .data = null,
+            .mapped = null,
+            .path = null,
+        };
+    }
+
+    /// Read a CMS value from the lobe's dense array.
+    /// Uses the same 4-probe orthogonal CMS addressing as the Unified Lattice,
+    /// but with the lobe's smaller address space (67M entries vs 536M).
+    /// Single-cycle L3 cache hit on x86_64 once the page is warm.
+    pub inline fn read(self: *const PhantomLobe, context: u64, char_byte: u8, domain: u64) u16 {
+        const cms = self.data orelse return 0;
+        const h = wyhash(context ^ domain, @as(u64, char_byte));
+        const s: u32 = LOBE_CMS_ENTRIES / 4;
+        const probes = [4]u32{
+            @as(u32, @truncate(h & 0xFFFFFFFF)) % s,
+            (@as(u32, @truncate(h >> 32)) % s) + s,
+            (@as(u32, @truncate(wyhash(h, 0x12345678))) % s) + (s * 2),
+            (@as(u32, @truncate(wyhash(h, 0x87654321))) % s) + (s * 3),
+        };
+        var min: u16 = 0xFFFF;
+        inline for (probes) |idx| {
+            const val = cms[idx];
+            if (val < min) min = val;
+        }
+        return if (min == 0xFFFF) 0 else min;
+    }
+
+    /// Check if this lobe is currently loaded.
+    pub inline fn isLoaded(self: *const PhantomLobe) bool {
+        return self.data != null;
+    }
+
+    /// Unmap the current lobe (flush from virtual address space).
+    /// The OS will evict the pages from L3 cache as they become cold.
+    pub fn unload(self: *PhantomLobe) void {
+        if (self.mapped) |*m| {
+            m.unmap();
+        }
+        self.data = null;
+        self.mapped = null;
+        self.path = null;
+        self.identity = @splat(0);
+    }
+
+    pub fn tileManager(self: *const PhantomLobe) TileManager {
+        return .{ .lobe = self };
+    }
+};
+// These domain hashes feed into the CMS for coordinate-aware etching.
+// For text (1D), only SPATIAL_X matters (sequence position).
+// For images (2D), SPATIAL_X and SPATIAL_Y encode the grid.
+// For audio (1D+T), SPATIAL_X is the frequency bin, TEMPORAL is time.
+pub const DOMAIN_SPATIAL_X: u64 = 0x7A7A7A7A7A7A7A7A;
+pub const DOMAIN_SPATIAL_Y: u64 = 0x3B3B3B3B3B3B3B3B;
+pub const DOMAIN_TEMPORAL: u64  = 0x4C4C4C4C4C4C4C4C;
+
+// ── Topology: The Shape of the Canvas ──
+pub const Topology = enum(u8) {
+    text_1d = 0,
+    image_2d = 1,
+    audio_1d_time = 2,
+};
+
+// ── The MesoLattice: Universal Canvas ──
+// A pre-allocated grid of 1024-bit vectors. Zero allocation once booted.
+// Topology determines how indices map to spatial/temporal coordinates.
+// 1D text: sequential chain. 2D image: grid. 1D+T audio: bins over time.
+pub const MESO_MAX_CELLS: u32 = 4096;
+
+pub const MesoLattice = struct {
+    topology: Topology,
+    width: u32,
+    height: u32,
+    active_count: u32,
+    cells: [MESO_MAX_CELLS]vsa.HyperVector,
+    noise: [MESO_MAX_CELLS]u16,
+    cursor: u32,
+
+    pub fn initText() MesoLattice {
+        return .{
+            .topology = .text_1d,
+            .width = MESO_MAX_CELLS,
+            .height = 1,
+            .active_count = 0,
+            .cells = [_]vsa.HyperVector{@as(vsa.HyperVector, @splat(0))} ** MESO_MAX_CELLS,
+            .noise = [_]u16{0} ** MESO_MAX_CELLS,
+            .cursor = 0,
+        };
+    }
+
+    pub fn initImage(w: u32, h: u32) MesoLattice {
+        const count = @min(w * h, MESO_MAX_CELLS);
+        return .{
+            .topology = .image_2d,
+            .width = w,
+            .height = h,
+            .active_count = count,
+            .cells = [_]vsa.HyperVector{@as(vsa.HyperVector, @splat(0))} ** MESO_MAX_CELLS,
+            .noise = [_]u16{0} ** MESO_MAX_CELLS,
+            .cursor = 0,
+        };
+    }
+
+    pub fn initAudio(bins: u32, time_steps: u32) MesoLattice {
+        const count = @min(bins * time_steps, MESO_MAX_CELLS);
+        return .{
+            .topology = .audio_1d_time,
+            .width = bins,
+            .height = time_steps,
+            .active_count = count,
+            .cells = [_]vsa.HyperVector{@as(vsa.HyperVector, @splat(0))} ** MESO_MAX_CELLS,
+            .noise = [_]u16{0} ** MESO_MAX_CELLS,
+            .cursor = 0,
+        };
+    }
+
+    /// Cell index from 2D coordinates. Wraps for safety.
+    pub inline fn cellIndex(self: *const MesoLattice, x: u32, y: u32) u32 {
+        return (y % self.height) * self.width + (x % self.width);
+    }
+
+    /// Coordinate-aware CMS hash: mixes spatial position into the domain hash.
+    /// This is what makes the same concept produce different vectors at different
+    /// positions in the canvas — the topology mask.
+    pub fn coordHash(self: *const MesoLattice, x: u32, y: u32) u64 {
+        var h: u64 = DOMAIN_SPATIAL_X ^ @as(u64, x);
+        switch (self.topology) {
+            .text_1d => {
+                h = wyhash(h, @as(u64, x));
+            },
+            .image_2d => {
+                h = wyhash(h ^ DOMAIN_SPATIAL_Y, @as(u64, y));
+            },
+            .audio_1d_time => {
+                h = wyhash(h ^ DOMAIN_TEMPORAL, @as(u64, y));
+            },
+        }
+        return h;
+    }
+
+    /// Write a vector to the canvas at a position.
+    pub inline fn setCell(self: *MesoLattice, x: u32, y: u32, vec: vsa.HyperVector) void {
+        const idx = self.cellIndex(x, y);
+        self.cells[idx] = vec;
+    }
+
+    /// Read a vector from the canvas.
+    pub inline fn getCell(self: *const MesoLattice, x: u32, y: u32) vsa.HyperVector {
+        return self.cells[self.cellIndex(x, y)];
+    }
+
+    /// Advance the cursor for sequential (1D) resolution.
+    pub inline fn advance(self: *MesoLattice) void {
+        self.cursor +|= 1;
+        if (self.cursor >= MESO_MAX_CELLS) self.cursor = 0;
+    }
+
+    /// Reset canvas for a new generation pass.
+    pub fn reset(self: *MesoLattice) void {
+        self.cursor = 0;
+        self.noise = [_]u16{0} ** MESO_MAX_CELLS;
+    }
+};
+
+pub const UnifiedLattice = struct {
+    data: [UNIFIED_ENTRIES]u16,
+
+    pub fn etch(self: *UnifiedLattice, context: u64, char_byte: u8, domain: u64) void {
+        const LEAKY_MASK: u64 = 0xEFEFEFEFEFEFEFEF;
+        const leaky_domain = domain & LEAKY_MASK;
+        const h = wyhash(context ^ leaky_domain, @as(u64, char_byte));
+        const probes = getProbesUnified(h);
+        inline for (probes) |idx| {
+            const current = self.data[idx];
+            if (current == 0) {
+                self.data[idx] = 1;
+            } else {
+                // Probabilistic Leaky Etching: rand() % current == 0
+                // Math flattening: frequency bulb scales down naturally
+                if ((wyhash(h, idx) % @as(u64, current)) == 0) {
+                    if (current < 65535) self.data[idx] += 1;
+                }
+            }
+        }
+    }
+
+    /// Prefetch the cache lines that etch() will touch, without writing.
+    /// Call this N bytes ahead of the actual etch to warm L1/L2 cache.
+    /// On x86-64, compiles to a single PREFETCHW instruction per probe.
+    pub fn prefetchEtch(self: *const UnifiedLattice, context: u64, char_byte: u8, domain: u64) void {
+        const LEAKY_MASK: u64 = 0xEFEFEFEFEFEFEFEF;
+        const leaky_domain = domain & LEAKY_MASK;
+        const h = wyhash(context ^ leaky_domain, @as(u64, char_byte));
+        const probes = getProbesUnified(h);
+        inline for (probes) |idx| {
+            @prefetch(&self.data[idx], .{ .rw = .write, .locality = 3, .cache = .data });
+        }
+    }
+
+    pub fn read(self: *const UnifiedLattice, context: u64, char_byte: u8, domain: u64) u16 {
+        const LEAKY_MASK: u64 = 0xEFEFEFEFEFEFEFEF;
+        const leaky_domain = domain & LEAKY_MASK;
+        const h = wyhash(context ^ leaky_domain, @as(u64, char_byte));
+        const probes = getProbesUnified(h);
+        var min: u16 = 0xFFFF;
+        inline for (probes) |idx| {
+            if (self.data[idx] < min) min = self.data[idx];
+        }
+        return min;
+    }
+
+    fn getProbesUnified(h: u64) [4]u32 {
+        const s: u32 = UNIFIED_ENTRIES / 4;
+        return .{
+            @as(u32, @truncate(h & 0xFFFFFFFF)) % s,
+            (@as(u32, @truncate(h >> 32)) % s) + s,
+            (@as(u32, @truncate(wyhash(h, 0x12345678))) % s) + (s * 2),
+            (@as(u32, @truncate(wyhash(h, 0x87654321))) % s) + (s * 3),
+        };
+    }
+
+    /// Solstice Decay: global >> 1 across the entire 1GB Monolith.
+    /// Halves all counters to free headroom, preserving relative rankings.
+    /// Called when sampled occupancy exceeds SOLSTICE_THRESHOLD.
+    /// Global shift and check for Scaling Realignment (V27).
+    /// Returns true if expansion is required (saturation exceeds 85.00%).
+    pub fn solsticeDecay(self: *UnifiedLattice) bool {
+        const occ = self.sampleOccupancy(0x1337);
+        for (&self.data) |*entry| {
+            // Masked Bit-Shifting (Myelination): Skip if MSB is locked (0x8000)
+            if (entry.* < 0x8000) {
+                entry.* >>= 1;
+            }
+        }
+        return occ > 8500;
+    }
+
+    /// Chunked Solstice Decay: process 1MB at a time to avoid stalls.
+    /// Returns true when a full pass is complete.
+    pub const SOLSTICE_CHUNK: usize = 524_288; // 1MB / sizeof(u16)
+    pub fn chunkedSolsticeDecay(self: *UnifiedLattice, position: *usize) bool {
+        const end = @min(position.* + SOLSTICE_CHUNK, UNIFIED_ENTRIES);
+        for (position.*..end) |i| {
+            if (self.data[i] < 0x8000) {
+                self.data[i] >>= 1;
+            }
+        }
+        position.* = end;
+        if (position.* >= UNIFIED_ENTRIES) {
+            position.* = 0;
+            return true;
+        }
+        return false;
+    }
+
+    /// Sample occupancy: integer percentage. Zero floats.
+    pub fn sampleOccupancy(self: *const UnifiedLattice, seed: u64) u64 {
+        var non_zero: usize = 0;
+        const samples: u64 = 10000;
+        var s = seed;
+        for (0..samples) |_| {
+            s = wyhash(s, 0x1337);
+            const idx = s % UNIFIED_ENTRIES;
+            if (self.data[idx] > 0) non_zero += 1;
+        }
+        return (non_zero * 10000) / samples;
+    }
+};
+
+pub inline fn wyhash(state: u64, input: u64) u64 {
+    const x = state ^ 0x60bee2bee120fc15;
+    const y = input ^ 0xa3b195354a39b70d;
+    const m = @as(u128, x) * @as(u128, y);
+    return @as(u64, @truncate(m ^ (m >> 64)));
+}
+const std = @import("std");
+const sys = @import("sys.zig");
+const vsa = @import("vsa_core.zig");
+const ghost_state = @import("ghost_state.zig");
+const vsa_vulkan = @import("vsa_vulkan.zig");
+const compute_api = @import("compute_api.zig");
+const mc = @import("inference.zig");
+
+pub const VERSION = "V27";
+
+pub const REASON_DEPTH: u32 = 8;
+pub const REASON_TOP_K: u32 = 3;
+pub const KORYPHAIOS_MANAGER_THRESHOLD: u64 = 256;
+pub const KORYPHAIOS_CRITIC_THRESHOLD: u64 = 5;
+
+pub fn isAllowed(cp: u32) bool {
+    if (cp > 0x10FFFF) return false;
+    // ASCII Range
+    if (cp < 128) {
+        if (cp >= 'a' and cp <= 'z') return true;
+        if (cp >= 'A' and cp <= 'Z') return true;
+        if (cp >= '0' and cp <= '9') return true;
+        if (cp == ' ' or cp == '.' or cp == ',' or cp == '!' or cp == '?' or cp == '\'' or cp == '"' or cp == '-') return true;
+        if (cp == '\n' or cp == '\r' or cp == '\t') return true;
+        return false;
+    }
+    // Basic Multilingual Plane (BMP) support
+    // We allow any valid printable character in the BMP (0x0080 to 0xFFFF)
+    // Excluding surrogates (0xD800-0xDFFF) as they aren't valid codepoints
+    if (cp >= 0x0080 and cp <= 0xD7FF) return true;
+    if (cp >= 0xE000 and cp <= 0xFFFF) return true;
+    
+    return false;
+}
+
+pub const SoulSnapshot = struct {
+    syntax: vsa.HyperVector,
+    phrase: vsa.HyperVector,
+    concept: vsa.HyperVector,
+    global: vsa.HyperVector,
+    active_context_hash: u64,
+    lexical_rotor: u64,
+    fractal_state: vsa.HyperVector,
+    spell_vector: vsa.HyperVector,
+    sentence_pool: vsa.HyperVector,
+    last_energy: u16,
+    last_boundary: ghost_state.Boundary,
+};
+
+pub fn saveSoul(soul: *const ghost_state.GhostSoul) SoulSnapshot {
+    return .{
+        .syntax = soul.syntax,
+        .phrase = soul.phrase,
+        .concept = soul.concept,
+        .global = soul.global,
+        .active_context_hash = soul.active_context_hash,
+        .lexical_rotor = soul.lexical_rotor,
+        .fractal_state = soul.fractal_state,
+        .spell_vector = soul.spell_vector,
+        .sentence_pool = soul.sentence_pool,
+        .last_energy = soul.last_energy,
+        .last_boundary = soul.last_boundary,
+    };
+}
+
+pub fn restoreSoul(soul: *ghost_state.GhostSoul, snap: SoulSnapshot) void {
+    soul.syntax = snap.syntax;
+    soul.phrase = snap.phrase;
+    soul.concept = snap.concept;
+    soul.global = snap.global;
+    soul.active_context_hash = snap.active_context_hash;
+    soul.lexical_rotor = snap.lexical_rotor;
+    soul.fractal_state = snap.fractal_state;
+    soul.spell_vector = snap.spell_vector;
+    soul.sentence_pool = snap.sentence_pool;
+    soul.last_energy = snap.last_energy;
+    soul.last_boundary = snap.last_boundary;
+}
+
+pub const SingularityEngine = struct {
+    lattice: *ghost_state.UnifiedLattice,
+    meaning: *vsa.MeaningMatrix,
+    soul: *ghost_state.GhostSoul,
+    canvas: ghost_state.MesoLattice,
+    is_live: bool,
+    inventory: [128]u8,
+    inv_cursor: usize,
+    compute: ?*const compute_api.ComputeApi,
+    vulkan: ?*vsa_vulkan.VulkanEngine,
+    allocator: std.mem.Allocator,
+
+    pub fn measureNoise(self: *SingularityEngine, candidate_vec: vsa.HyperVector, position: u32) u16 {
+        const pos_hash = ghost_state.wyhash(self.soul.active_context_hash, @as(u64, position));
+        const target_vec = self.meaning.collapseToBinary(pos_hash);
+        return vsa.resonanceScore(candidate_vec, target_vec);
+    }
+
+    pub fn resolveTopology(self: *SingularityEngine) ?u8 {
+        switch (self.canvas.topology) {
+            .text_1d => return self.resolveText1D(),
+            .image_2d => { self.resolveImage2D(); return null; },
+            .audio_1d_time => { self.resolveAudio1DTime(); return null; },
+        }
+    }
+
+    pub fn resolveText1D(self: *SingularityEngine) ?u8 {
+        const position = self.canvas.cursor;
+        var top_chars: [REASON_TOP_K]u32 = [_]u32{' '} ** REASON_TOP_K;
+        var top_energies: [REASON_TOP_K]u32 = [_]u32{0} ** REASON_TOP_K;
+        const prev1 = self.inventory[(self.inv_cursor + 127) % 128];
+        const prev2 = self.inventory[(self.inv_cursor + 126) % 128];
+        const prev3 = self.inventory[(self.inv_cursor + 125) % 128];
+
+        var gpu_success: bool = false;
+        if (self.compute) |compute| {
+            if (compute.queryResonance(self.soul.lexical_rotor, self.soul.semantic_rotor, self.allocator)) |energies| {
+                defer self.allocator.free(energies);
+                gpu_success = true;
+                const boredom = self.soul.getBoredomPenalty(self.soul.lexical_rotor);
+                // V27: Heuristic Fast-Path (Top 256 common runes)
+                for (energies, 0..) |raw_e, i| {
+                    const cb: u32 = @intCast(i);
+                    if (!isAllowed(cb)) continue;
+                    var energy = raw_e;
+                    if (cb == prev1 and cb == prev2 and cb == prev3) energy = energy -| 50;
+                    energy = energy -| boredom;
+                    insertTopK(&top_chars, &top_energies, cb, energy);
+                }
+            } else |_| {}
+        }
+
+        if (!gpu_success) {
+            // Minimal Heuristic Fallback (replaces the exhaustive 65k BMP search)
+            const boredom = self.soul.getBoredomPenalty(self.soul.lexical_rotor);
+            var cp: u32 = 32;
+            while (cp < 127) : (cp += 1) { // ASCII fast path only
+                const e_lex = vsa.calculateResonance(self.meaning.collapseToBinary(self.soul.lexical_rotor), vsa.generate(cp));
+                const e_sem = vsa.calculateResonance(self.meaning.collapseToBinary(self.soul.semantic_rotor), vsa.generate(cp));
+                var energy: u32 = if (e_lex > 0) (e_lex * 2 + e_sem) / 3 else e_sem;
+                if (energy == 0) energy = 512;
+                if (cp == prev1 and cp == prev2 and cp == prev3) energy = energy -| 50;
+                energy = energy -| boredom;
+                insertTopK(&top_chars, &top_energies, cp, energy);
+            }
+        }
+
+        const primary_concept = self.soul.concept;
+        var reason_best_char: u32 = top_chars[0];
+
+        // System 2: Monte Carlo rollout (when Vulkan is available)
+        if (self.vulkan) |vk_engine| {
+            const mc_engine = mc.MonteCarloEngine.init(self.allocator, vk_engine, self.meaning);
+            const winner_idx = mc_engine.resolve(self.soul, &top_chars, &top_energies);
+            reason_best_char = top_chars[winner_idx];
+        } else {
+            // Fallback: shallow koryphaios reasoning (no GPU)
+            var reason_best_score: u32 = 0;
+            var frustration: u64 = 0;
+
+            while (true) {
+                for (top_chars, 0..) |candidate, ki| {
+                    if (top_energies[ki] == 0) continue;
+                    const snapshot = saveSoul(self.soul);
+
+                    var utf8_buf: [4]u8 = undefined;
+                    const len = std.unicode.utf8Encode(@intCast(candidate), &utf8_buf) catch {
+                        restoreSoul(self.soul, snapshot);
+                        continue;
+                    };
+
+                    for (utf8_buf[0..len]) |b| {
+                        self.soul.simulateAbsorb(vsa.generate(b), b, null);
+                    }
+
+                    const sigmoid_leniency = (200 * (frustration * frustration)) / ((frustration * frustration) + 25);
+                    const verdict = vsa.koryphaiosBrickwall(self.soul.concept, primary_concept, KORYPHAIOS_MANAGER_THRESHOLD, KORYPHAIOS_CRITIC_THRESHOLD + sigmoid_leniency);
+                    if (!verdict.passed) { restoreSoul(self.soul, snapshot); continue; }
+
+                    const future_energy: u32 = top_energies[ki] + @as(u32, @intCast(@min(verdict.manager_drift / 4, 64)));
+                    restoreSoul(self.soul, snapshot);
+                    if (future_energy > reason_best_score) { reason_best_score = future_energy; reason_best_char = candidate; }
+                }
+                if (reason_best_score > 0 or frustration >= 15) break;
+                frustration += 1;
+            }
+        }
+
+        const chosen: u32 = reason_best_char;
+        const chosen_vec = vsa.generate(chosen);
+        self.canvas.setCell(position, 0, chosen_vec);
+        self.canvas.noise[position] = self.measureNoise(chosen_vec, position);
+        self.canvas.advance();
+
+        // Encode and push to inventory
+        var utf8_fin: [4]u8 = undefined;
+        const len_fin = std.unicode.utf8Encode(@intCast(chosen), &utf8_fin) catch 1;
+        for (utf8_fin[0..len_fin]) |b| {
+            self.inventory[self.inv_cursor % 128] = b;
+            self.inv_cursor += 1;
+        }
+
+        return if (chosen < 256) @intCast(@as(u8, @truncate(chosen))) else '?';
+    }
+
+    pub fn resolveImage2D(self: *SingularityEngine) void {
+        const w = self.canvas.width; const h = self.canvas.height;
+        var total_noise: u64 = 0; var prev_noise: u64 = 0xFFFFFFFFFFFFFFFF; var iterations: u32 = 0;
+        while (iterations < 20) : (iterations += 1) {
+            total_noise = 0;
+            var y: u32 = 0; while (y < h) : (y += 1) {
+                var x: u32 = 0; while (x < w) : (x += 1) {
+                    const idx = self.canvas.cellIndex(x, y); const current = self.canvas.cells[idx];
+                    var neighbor_bundle = current;
+                    if (x > 0) neighbor_bundle = vsa.bundle(neighbor_bundle, self.canvas.getCell(x - 1, y), vsa.generate(0x2D00));
+                    if (x < w - 1) neighbor_bundle = vsa.bundle(neighbor_bundle, self.canvas.getCell(x + 1, y), vsa.generate(0x2D01));
+                    if (y > 0) neighbor_bundle = vsa.bundle(neighbor_bundle, self.canvas.getCell(x, y - 1), vsa.generate(0x2D10));
+                    if (y < h - 1) neighbor_bundle = vsa.bundle(neighbor_bundle, self.canvas.getCell(x, y + 1), vsa.generate(0x2D11));
+                    const pos_hash = self.canvas.coordHash(x, y); const target = self.meaning.collapseToBinary(pos_hash);
+                    self.canvas.cells[idx] = vsa.bundle(neighbor_bundle, target, vsa.generate(0x2DFF));
+                    const score = vsa.resonanceScore(self.canvas.cells[idx], target); self.canvas.noise[idx] = score; total_noise += score;
+                }
+            }
+            if (total_noise >= prev_noise) break; prev_noise = total_noise;
+        }
+    }
+
+    pub fn resolveAudio1DTime(self: *SingularityEngine) void {
+        const bins = self.canvas.width; const steps = self.canvas.height;
+        var t: u32 = 0; while (t < steps) : (t += 1) {
+            var b: u32 = 0; while (b < bins) : (b += 1) {
+                const idx = self.canvas.cellIndex(b, t); const current = self.canvas.cells[idx];
+                var ctx = current;
+                if (b > 0) ctx = vsa.bundle(ctx, self.canvas.getCell(b - 1, t), vsa.generate(0xA000));
+                if (b < bins - 1) ctx = vsa.bundle(ctx, self.canvas.getCell(b + 1, t), vsa.generate(0xA001));
+                if (t > 0) ctx = vsa.bundle(ctx, self.canvas.getCell(b, t - 1), vsa.generate(0xA100));
+                const pos_hash = self.canvas.coordHash(b, t); const target = self.meaning.collapseToBinary(pos_hash);
+                self.canvas.cells[idx] = vsa.bundle(ctx, target, vsa.generate(0xAFFF));
+                self.canvas.noise[idx] = vsa.resonanceScore(self.canvas.cells[idx], target);
+            }
+        }
+    }
+};
+
+pub fn insertTopK(chars: *[REASON_TOP_K]u32, energies: *[REASON_TOP_K]u32, candidate: u32, energy: u32) void {
+    var i: usize = 0; while (i < REASON_TOP_K) : (i += 1) {
+        if (energy > energies[i]) {
+            var j: usize = REASON_TOP_K - 1; while (j > i) : (j -= 1) { chars[j] = chars[j - 1]; energies[j] = energies[j - 1]; }
+            chars[i] = candidate; energies[i] = energy; return;
+        }
+    }
+}
+const std = @import("std");
+const sys = @import("sys.zig");
+const vsa = @import("vsa_core.zig");
+const ghost_state = @import("ghost_state.zig");
+
+pub const VERSION = "V27";
+
+// ── Canvas Constants (must match ghost.zig exactly) ──
+const FLUENT_SIZE: u32 = 268_435_456;       // 256MB logical
+const FLUENT_ELEMS: u32 = FLUENT_SIZE / 2;
+
+// ══════════════════════════════════════════════════════
+//  Lexer
+// ══════════════════════════════════════════════════════
+
+const runeTag = enum {
+    keyword_let,
+    keyword_test,
+    keyword_loom,
+    keyword_var,
+    keyword_mood,
+    keyword_etch,
+    keyword_void,
+    keyword_lock,
+    keyword_scan,
+    keyword_bind,
+    identifier,
+    string_literal,
+    number_literal,
+    weight_literal,   // @N
+    arrow,            // ->
+    colon_colon,      // ::
+    equal,            // =
+    bracket_open,     // [
+    bracket_close,    // ]
+    brace_open,       // {
+    brace_close,      // }
+    op_lt,            // <
+    op_gt,            // >
+    semicolon,        // ;
+    eof,
+    invalid,
+};
+
+const rune = struct {
+    tag:  runeTag,
+    text: []const u8,
+    line: u32,
+    col:  u32,
+};
+
+const Lexer = struct {
+    buffer: []const u8,
+    pos:    usize = 0,
+    line:   u32   = 1,
+    col:    u32   = 1,
+
+    fn advance(self: *Lexer) void {
+        if (self.pos >= self.buffer.len) return;
+        if (self.buffer[self.pos] == '\n') { self.line += 1; self.col = 1; }
+        else { self.col += 1; }
+        self.pos += 1;
+    }
+
+    fn peek(self: *Lexer) u8 {
+        if (self.pos + 1 >= self.buffer.len) return 0;
+        return self.buffer[self.pos + 1];
+    }
+
+    fn skipWhitespace(self: *Lexer) void {
+        while (self.pos < self.buffer.len) {
+            const c = self.buffer[self.pos];
+            if (std.ascii.isWhitespace(c)) {
+                self.advance();
+            } else if (c == '/' and self.peek() == '/') {
+                while (self.pos < self.buffer.len and self.buffer[self.pos] != '\n') self.advance();
+            } else if (c == '#') {
+                while (self.pos < self.buffer.len and self.buffer[self.pos] != '\n') self.advance();
+            } else break;
+        }
+    }
+
+    fn next(self: *Lexer) rune {
+        self.skipWhitespace();
+        const sl = self.pos;
+        const ll = self.line;
+        const cl = self.col;
+        if (self.pos >= self.buffer.len) return .{ .tag = .eof, .text = "", .line = ll, .col = cl };
+
+        const c = self.buffer[self.pos];
+
+        if (c == '"') {
+            self.advance();
+            const str_start = self.pos;
+            while (self.pos < self.buffer.len and self.buffer[self.pos] != '"') self.advance();
+            if (self.pos < self.buffer.len) {
+                const text = self.buffer[str_start..self.pos];
+                self.advance();
+                return .{ .tag = .string_literal, .text = text, .line = ll, .col = cl };
+            }
+            return .{ .tag = .invalid, .text = "Unterminated string", .line = ll, .col = cl };
+        }
+
+        if (c == '@') {
+            self.advance();
+            const ws = self.pos;
+            while (self.pos < self.buffer.len and std.ascii.isDigit(self.buffer[self.pos])) self.advance();
+            return .{ .tag = .weight_literal, .text = self.buffer[ws..self.pos], .line = ll, .col = cl };
+        }
+
+        if (std.ascii.isDigit(c)) {
+            while (self.pos < self.buffer.len and std.ascii.isDigit(self.buffer[self.pos])) self.advance();
+            return .{ .tag = .number_literal, .text = self.buffer[sl..self.pos], .line = ll, .col = cl };
+        }
+
+        if (c == '-' and self.peek() == '>') {
+            self.advance(); self.advance();
+            return .{ .tag = .arrow, .text = "->", .line = ll, .col = cl };
+        }
+
+        if (c == ':' and self.peek() == ':') {
+            self.advance(); self.advance();
+            return .{ .tag = .colon_colon, .text = "::", .line = ll, .col = cl };
+        }
+
+        switch (c) {
+            '=' => { self.advance(); return .{ .tag = .equal,         .text = "=", .line = ll, .col = cl }; },
+            '<' => { self.advance(); return .{ .tag = .op_lt,         .text = "<", .line = ll, .col = cl }; },
+            '>' => { self.advance(); return .{ .tag = .op_gt,         .text = ">", .line = ll, .col = cl }; },
+            '[' => { self.advance(); return .{ .tag = .bracket_open,  .text = "[", .line = ll, .col = cl }; },
+            ']' => { self.advance(); return .{ .tag = .bracket_close, .text = "]", .line = ll, .col = cl }; },
+            '{' => { self.advance(); return .{ .tag = .brace_open,    .text = "{", .line = ll, .col = cl }; },
+            '}' => { self.advance(); return .{ .tag = .brace_close,   .text = "}", .line = ll, .col = cl }; },
+            ';' => { self.advance(); return .{ .tag = .semicolon,     .text = ";", .line = ll, .col = cl }; },
+            else => {},
+        }
+
+        if (c > 127 or std.ascii.isAlphabetic(c) or c == '_') {
+            while (self.pos < self.buffer.len) {
+                const peek_c = self.buffer[self.pos];
+                if (peek_c > 127 or std.ascii.isAlphanumeric(peek_c) or peek_c == '_') {
+                    self.advance();
+                } else break;
+            }
+            const text = self.buffer[sl..self.pos];
+            if (std.mem.eql(u8, text, "LET"))  return .{ .tag = .keyword_let,  .text = text, .line = ll, .col = cl };
+            if (std.mem.eql(u8, text, "TEST")) return .{ .tag = .keyword_test, .text = text, .line = ll, .col = cl };
+            if (std.mem.eql(u8, text, "LOOM")) return .{ .tag = .keyword_loom, .text = text, .line = ll, .col = cl };
+            if (std.mem.eql(u8, text, "VAR"))  return .{ .tag = .keyword_var,  .text = text, .line = ll, .col = cl };
+            if (std.mem.eql(u8, text, "MOOD")) return .{ .tag = .keyword_mood, .text = text, .line = ll, .col = cl };
+            if (std.mem.eql(u8, text, "ETCH")) return .{ .tag = .keyword_etch, .text = text, .line = ll, .col = cl };
+            if (std.mem.eql(u8, text, "VOID")) return .{ .tag = .keyword_void, .text = text, .line = ll, .col = cl };
+            if (std.mem.eql(u8, text, "LOCK")) return .{ .tag = .keyword_lock, .text = text, .line = ll, .col = cl };
+            if (std.mem.eql(u8, text, "SCAN")) return .{ .tag = .keyword_scan, .text = text, .line = ll, .col = cl };
+            if (std.mem.eql(u8, text, "BIND")) return .{ .tag = .keyword_bind, .text = text, .line = ll, .col = cl };
+            return .{ .tag = .identifier, .text = text, .line = ll, .col = cl };
+        }
+
+        self.advance();
+        return .{ .tag = .invalid, .text = self.buffer[sl..self.pos], .line = ll, .col = cl };
+    }
+};
+
+// ══════════════════════════════════════════════════════
+//  Dense Cartridge State (128MB Phantom Lobe output)
+// ══════════════════════════════════════════════════════
+
+var arena_alloc: std.heap.ArenaAllocator = undefined;
+var vars: std.StringHashMap(u16) = undefined;
+
+var loom_stack: u16 = 0;
+var loom_depth: u8  = 0;
+
+var current_sigil_path: ?[]const u8 = null;
+var current_id_vector: vsa.HyperVector = @splat(0);
+
+/// Dense CMS buffer for the cartridge output.
+/// We use it to accumulate deltas before writing a sparse cartridge.
+var dense_cms: ?[]u16 = null;
+
+const SparseDelta = extern struct {
+    index: u32,
+    delta: i16,
+};
+
+
+fn sigilErr(line: u32, col: u32, msg: []const u8, extra: []const u8) void {
+    var buf: [128]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "\n[SIGIL ERR {d}:{d}] {s} '{s}'\n", .{line, col, msg, extra}) catch "";
+    sys.printOut(s);
+}
+
+fn canExecute() bool {
+    if (loom_depth == 0) return true;
+    const mask = (@as(u16, 1) << @as(u4, @truncate(loom_depth))) - 1;
+    return (loom_stack & mask) == mask;
+}
+
+fn executeBind(lex: *Lexer) void {
+    const path_tok = lex.next();
+    if (path_tok.tag != .string_literal) {
+        sigilErr(path_tok.line, path_tok.col, "BIND expects quoted filename", "");
+        return;
+    }
+    
+    // Standalone Sigil Compiler always outputs to .sigil files
+    if (!std.mem.endsWith(u8, path_tok.text, ".sigil")) {
+        sigilErr(path_tok.line, path_tok.col, "Standalone Sigil must bind to .sigil files", path_tok.text);
+        return;
+    }
+
+    current_sigil_path = arena_alloc.allocator().dupe(u8, path_tok.text) catch return;
+    current_id_vector = @splat(0);
+    // Zero the dense CMS buffer for the new cartridge target
+    if (dense_cms) |cms| {
+        const cms_bytes: []u8 = @as([*]u8, @ptrCast(@alignCast(cms.ptr)))[0..ghost_state.LOBE_CMS_BYTES];
+        @memset(cms_bytes, 0);
+    }
+    sys.printOut("[BIND] Targeted: "); sys.printOut(path_tok.text); sys.printOut("\n");
+}
+
+fn generateWordVec(word: []const u8) vsa.HyperVector {
+    var v: vsa.HyperVector = @splat(0);
+    for (word) |c| v ^= vsa.generate(c);
+    return v;
+}
+
+fn executeEtch(lex: *Lexer) void {
+    const concept_tok = lex.next();
+    const weight_tok  = lex.next();
+
+    if (concept_tok.tag != .string_literal) {
+        sigilErr(concept_tok.line, concept_tok.col, "ETCH expects quoted string", "");
+        return;
+    }
+
+    if (!canExecute()) return;
+
+    const raw_w = if (weight_tok.tag == .weight_literal)
+        std.fmt.parseInt(u16, weight_tok.text[1..], 10) catch 15
+    else 15;
+    const weight: u16 = if (raw_w == 0) 0 else std.math.mul(u16, raw_w, 4096) catch std.math.maxInt(u16);
+
+    // Update ID Vector
+    const concept_vec = generateWordVec(concept_tok.text);
+    current_id_vector ^= concept_vec;
+
+    // Etch directly into the CMS buffer using saturated addition
+    const cms = dense_cms orelse return;
+    var window: u64 = 0;
+    for (concept_tok.text) |c| {
+        const h1 = ghost_state.wyhash(window & 0xFFFF, @as(u64, c));
+        const h2 = ghost_state.wyhash(window & 0xFFFFFFFF, @as(u64, c));
+        const idx1 = getLobeIndices(h1);
+        const idx2 = getLobeIndices(h2);
+        inline for (idx1) |i| cms[i] = std.math.add(u16, cms[i], weight) catch std.math.maxInt(u16);
+        inline for (idx2) |i| cms[i] = std.math.add(u16, cms[i], weight) catch std.math.maxInt(u16);
+        window = std.math.rotl(u64, window, 7) ^ @as(u64, c);
+    }
+
+    sys.printOut("[ETCH] "); sys.printOut(concept_tok.text); sys.printOut("\n");
+}
+
+fn executeVoid(lex: *Lexer) void {
+    const concept_tok = lex.next();
+
+    if (concept_tok.tag != .string_literal) {
+        sigilErr(concept_tok.line, concept_tok.col, "VOID expects quoted string", "");
+        return;
+    }
+
+    if (!canExecute()) return;
+    
+    // Update ID Vector
+    const concept_vec = generateWordVec(concept_tok.text);
+    current_id_vector ^= concept_vec;
+
+    const cms = dense_cms orelse return;
+    var window: u64 = 0;
+    for (concept_tok.text) |c| {
+        const h1 = ghost_state.wyhash(window & 0xFFFF, @as(u64, c));
+        const h2 = ghost_state.wyhash(window & 0xFFFFFFFF, @as(u64, c));
+        const idx1 = getLobeIndices(h1);
+        const idx2 = getLobeIndices(h2);
+        
+        // Use 0xFFFF as a tombstone marker for VOID instructions
+        inline for (idx1) |i| cms[i] = 0xFFFF;
+        inline for (idx2) |i| cms[i] = 0xFFFF;
+        
+        window = std.math.rotl(u64, window, 7) ^ @as(u64, c);
+    }
+
+    sys.printOut("[VOID] "); sys.printOut(concept_tok.text); sys.printOut("\n");
+}
+
+/// CMS probe indices for the Lobe's 67M-entry address space.
+fn getLobeIndices(h: u64) [4]u32 {
+    const s: u32 = ghost_state.LOBE_CMS_ENTRIES / 4;
+    return .{
+        @as(u32, @truncate(h & 0xFFFFFFFF)) % s,
+        (@as(u32, @truncate(h >> 32)) % s) + s,
+        (@as(u32, @truncate(ghost_state.wyhash(h, 0x12345678))) % s) + (s * 2),
+        (@as(u32, @truncate(ghost_state.wyhash(h, 0x87654321))) % s) + (s * 3),
+    };
+}
+
+fn finalizeSigil(allocator: std.mem.Allocator) !void {
+    const path = current_sigil_path orelse return;
+    const cms = dense_cms orelse return;
+    const h = try sys.openForWrite(allocator, path);
+    defer sys.closeFile(h);
+
+
+    // 1. Write VSA Identity Header (128 bytes)
+    const id_bytes: [128]u8 = @bitCast(current_id_vector);
+    try sys.writeAll(h, &id_bytes);
+
+    // 2. Generate Sparse Deltas
+    var output_deltas = std.ArrayListUnmanaged(SparseDelta).empty;
+    const alloc = arena_alloc.allocator();
+    for (cms, 0..) |val, i| {
+        if (val > 0) {
+            const index = @as(u32, @intCast(i));
+            var delta: i16 = 0;
+            if (val == 0xFFFF) {
+                // VOID marker
+                delta = -32768;
+            } else {
+                delta = @as(i16, @intCast(@min(val, 32767)));
+            }
+            try output_deltas.append(alloc, SparseDelta{ .index = index, .delta = delta });
+        }
+    }
+
+    // 3. Write Sparse Array bounds
+    try sys.writeAll(h, std.mem.sliceAsBytes(output_deltas.items));
+
+    sys.printOut("[SIGIL] Saved sparse cartridge: "); sys.printOut(path);
+    sys.printOut(" (");
+    var buf: [32]u8 = undefined;
+    const bytes_saved = output_deltas.items.len * @sizeOf(SparseDelta);
+    sys.printOut(std.fmt.bufPrint(&buf, "{d}", .{bytes_saved + 128}) catch "?");
+    sys.printOut(" bytes)\n");
+}
+
+pub fn main() !void {
+    arena_alloc = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_alloc.deinit();
+    vars = std.StringHashMap(u16).init(arena_alloc.allocator());
+
+    // Allocate the 128MB dense CMS buffer (zero-initialized)
+    const cms_raw = sys.allocSectorAligned(ghost_state.LOBE_CMS_BYTES) orelse {
+        sys.printOut("[SIGIL] FATAL: Failed to allocate 128 MiB CMS buffer.\n");
+        return;
+    };
+    defer sys.freeSectorAligned(cms_raw);
+    // Reinterpret as u16 array
+    dense_cms = @as([*]u16, @ptrCast(@alignCast(cms_raw.ptr)))[0..ghost_state.LOBE_CMS_ENTRIES];
+    // Zero-init
+    @memset(cms_raw, 0);
+
+    const args = try sys.getArgs(arena_alloc.allocator());
+    if (args.len < 2) {
+        sys.printOut("Usage: sigil_core <script.sgl>\n");
+        return;
+    }
+
+    const script_path = args[1];
+    const fh = try sys.openForRead(arena_alloc.allocator(), script_path);
+    defer sys.closeFile(fh);
+
+
+    const size = try sys.getFileSize(fh);
+    const buffer = try arena_alloc.allocator().alloc(u8, size);
+    _ = try sys.readAll(fh, buffer);
+
+    var lex = Lexer{ .buffer = buffer };
+    while (true) {
+        const tok = lex.next();
+        if (tok.tag == .eof) break;
+        switch (tok.tag) {
+            .keyword_bind => executeBind(&lex),
+            .keyword_etch => executeEtch(&lex),
+            .keyword_void => executeVoid(&lex),
+            .keyword_let => {
+                _ = lex.next(); // var
+                _ = lex.next(); // =
+                _ = lex.next(); // val
+            },
+            .brace_close => { if (loom_depth > 0) loom_depth -= 1; },
+            else => {},
+        }
+    }
+
+    try finalizeSigil(arena_alloc.allocator());
+
+    sys.printOut("\nSigil compilation complete (128 MiB dense cartridge format).\n");
+}
+const std = @import("std");
+const builtin = @import("builtin");
+const sys = @import("sys.zig");
+const ghost_state = @import("ghost_state.zig");
+const vsa = @import("vsa_core.zig");
+const vsa_vulkan = @import("vsa_vulkan.zig");
+const compute_api = @import("compute_api.zig");
+
+const VERSION = "V28";
+
+var active_compute: ?*const compute_api.ComputeApi = null;
+var global_lattice: ?*ghost_state.UnifiedLattice = null;
+var global_mapped: ?sys.MappedFile = null;
+var using_cpu_fallback: bool = false;
+var loaded_plugins = std.ArrayListUnmanaged(sys.NativeLibrary).empty;
+
+// Signal handler (Platform agnostic through sys layer or direct if needed)
+fn ctrlHandler(ctrl_type: u32) void {
+    if (ctrl_type == 0) { // SIGINT/Interrupt
+        sys.printOut("\n[SIGNAL] Interrupt detected. Releasing Silicon...\n");
+        if (active_compute) |_| vsa_vulkan.GHOST_COMPUTE_PLUGIN.deinit();
+        if (global_mapped) |*m| m.flush();
+        for (loaded_plugins.items) |*lib| {
+            if (lib.lookup(*const fn () void, "cleanup")) |cleanup| cleanup();
+            lib.close();
+        }
+        sys.exit(0);
+    }
+}
+
+// ── Stream State: Independent Temporal Rotor per corpus file ──
+const StreamState = struct {
+    lexical_rotor: u64,
+    semantic_rotor: u64,
+    concept: vsa.HyperVector,
+    syntax: vsa.HyperVector,
+    phrase: vsa.HyperVector,
+    sentence_pool: vsa.HyperVector,
+    spell_vector: vsa.HyperVector,
+    file_data: []const u8,
+    cursor: usize,
+    name: []const u8,
+    done: bool,
+
+    pub fn init(data: []const u8, name: []const u8) StreamState {
+        return .{
+            .lexical_rotor = ghost_state.FNV_OFFSET_BASIS,
+            .semantic_rotor = ghost_state.FNV_OFFSET_BASIS,
+            .concept = @splat(0),
+            .syntax = @splat(0),
+            .phrase = @splat(0),
+            .sentence_pool = @splat(0),
+            .spell_vector = @splat(0),
+            .file_data = data,
+            .cursor = 0,
+            .name = name,
+            .done = false,
+        };
+    }
+
+    pub fn advance(self: *StreamState) ?u8 {
+        if (self.cursor >= self.file_data.len) {
+            self.done = true;
+            return null;
+        }
+        const byte = self.file_data[self.cursor];
+        self.cursor += 1;
+
+        // Update rotors (fast path - no boredom tracking)
+        self.lexical_rotor = (self.lexical_rotor ^ @as(u64, byte)) *% ghost_state.FNV_PRIME;
+        self.semantic_rotor = (self.semantic_rotor ^ @as(u64, byte)) *% ghost_state.FNV_PRIME;
+        
+        // Universal Boundary Check: ASCII whitespace/punctuation + anything > 127 (Unicode start)
+        const is_boundary = (byte <= ' ' or byte == '.' or byte == ';' or byte == '=' or byte > 127);
+        if (is_boundary) self.semantic_rotor = ghost_state.FNV_OFFSET_BASIS;
+
+        return byte;
+    }
+
+    /// Pulls the next full Rune (UTF-8 multi-byte sequence) from the stream.
+    pub fn nextRune(self: *StreamState) ?u32 {
+        if (self.cursor >= self.file_data.len) {
+            self.done = true;
+            return null;
+        }
+
+        const first_byte = self.file_data[self.cursor];
+        const len = std.unicode.utf8ByteSequenceLength(first_byte) catch 1;
+        
+        if (self.cursor + len > self.file_data.len) {
+            self.done = true;
+            return null;
+        }
+
+        const rune_bytes = self.file_data[self.cursor .. self.cursor + len];
+        const rune = if (len == 1) @as(u32, first_byte) else std.unicode.utf8Decode(rune_bytes) catch @as(u32, first_byte);
+        
+        self.cursor += len;
+        
+        // Update rotors with the full Rune hash
+        const rune_hash = ghost_state.wyhash(ghost_state.FNV_OFFSET_BASIS, rune);
+        self.lexical_rotor = (self.lexical_rotor ^ rune_hash) *% ghost_state.FNV_PRIME;
+        
+        // Semantic rotor reset: uses a broader set of boundaries including Unicode whitespace
+        const is_boundary = (rune <= 32 or rune == '.' or rune == ';' or rune == '=' or rune == 0x3000); 
+        if (is_boundary) {
+            self.semantic_rotor = ghost_state.FNV_OFFSET_BASIS;
+        } else {
+            self.semantic_rotor = (self.semantic_rotor ^ rune_hash) *% ghost_state.FNV_PRIME;
+        }
+
+        return rune;
+    }
+
+    pub fn progress(self: *const StreamState) f64 {
+        if (self.file_data.len == 0) return 100.0;
+        return @as(f64, @floatFromInt(self.cursor)) / @as(f64, @floatFromInt(self.file_data.len)) * 100.0;
+    }
+};
+
+// ── Multi-Stream Greedy Pool Batcher (V28: Unified Stream Pool) ──
+// Replaces the old static-partition MultiStreamBatcher.
+//
+// Architecture:
+//   - No more chunk_size = max_batch / streams.len
+//   - fillBatch() is greedy: pulls runes from ANY active stream until the
+//     unified buffer is full or all streams are exhausted.
+//   - A parallel rotor_index[] slice records the stream origin of each rune.
+//   - The final batch_len is clamped to a multiple of 64 for wavefront alignment.
+//
+// GPU Saturation effect:
+//   - If 3 of 4 streams finish early, Stream 4 immediately fills 100% of the
+//     buffer on the next dispatch, using all available GPU cores.
+const MAX_STREAMS = 64;
+// Wavefront size: AMD Wave64=64, Nvidia Wave32=32. We align to 64 to cover both.
+const WAVEFRONT_ALIGN = 64;
+
+const GreedyBatcher = struct {
+    streams: []StreamState,
+    active_count: usize,
+    /// Greedy-packed rune bytes. May contain bytes from any stream, contiguous.
+    batch_bytes: [4096]u8,
+    /// Parallel stream-ID per slot. batch_index[i] == which stream produced batch_bytes[i].
+    batch_index: [4096]u32,
+    batch_len: usize,
+
+    pub fn init(streams: []StreamState) GreedyBatcher {
+        return .{
+            .streams = streams,
+            .active_count = streams.len,
+            .batch_bytes = [_]u8{0} ** 4096,
+            .batch_index = [_]u32{0} ** 4096,
+            .batch_len = 0,
+        };
+    }
+
+    /// Greedy fill: iterates streams round-robin pulling one rune per stream
+    /// per round, filling the unified buffer until max_batch is reached or all
+    /// streams are exhausted. Wavefront-aligns the final count to WAVEFRONT_ALIGN.
+    pub fn fillBatch(self: *GreedyBatcher, max_batch: u32) usize {
+        // Clamp max_batch to our buffer size
+        const cap: usize = @min(max_batch, self.batch_bytes.len);
+        var pos: usize = 0;
+        var any_active = true;
+
+        // Round-robin pull: one rune per stream per pass.
+        // This distributes load evenly when multiple streams are alive, and
+        // automatically saturates to one stream when others are exhausted.
+        while (pos < cap and any_active) {
+            any_active = false;
+            for (self.streams, 0..) |*s, si| {
+                if (pos >= cap) break;
+                if (s.done) continue;
+                // Pull one rune from this stream
+                const rune = s.nextRune() orelse continue;
+                self.batch_bytes[pos] = @as(u8, @truncate(rune));
+                self.batch_index[pos] = @as(u32, @intCast(si));
+                pos += 1;
+                any_active = true;
+            }
+        }
+
+        // ── Wavefront Alignment ──
+        // Truncate to the largest multiple of WAVEFRONT_ALIGN ≤ pos.
+        // This eliminates masked-out threads on the silicon level (Wave64/Wave32).
+        if (pos > 0) {
+            pos = (pos / WAVEFRONT_ALIGN) * WAVEFRONT_ALIGN;
+            // If we got fewer than one wavefront of data, keep it as-is
+            // (final tail of training — we don't want to discard it).
+            if (pos == 0) pos = @min(WAVEFRONT_ALIGN, self.batch_len);
+        }
+
+        self.batch_len = pos;
+
+        // Update active_count so callers can track stream death
+        self.active_count = 0;
+        for (self.streams) |s| {
+            if (!s.done) self.active_count += 1;
+        }
+
+        return self.batch_len;
+    }
+
+    pub fn allDone(self: *const GreedyBatcher) bool {
+        for (self.streams) |s| {
+            if (!s.done) return false;
+        }
+        return true;
+    }
+
+    pub fn totalSize(self: *const GreedyBatcher) usize {
+        var total: usize = 0;
+        for (self.streams) |s| total += s.file_data.len;
+        return total;
+    }
+
+    /// Returns a snapshot of per-stream rotor pairs for the current batch.
+    /// Format: [stream0_lex, stream0_sem, stream1_lex, stream1_sem, ...]
+    /// This is uploaded to the GPU once per dispatch so each wavefront can
+    /// resolve its context via batch_index[] without re-reading the CPU state.
+    pub fn buildRotorSnapshot(self: *const GreedyBatcher, out: []u64) void {
+        for (self.streams, 0..) |s, i| {
+            if (i * 2 + 1 >= out.len) break;
+            out[i * 2]     = s.lexical_rotor;
+            out[i * 2 + 1] = s.semantic_rotor;
+        }
+    }
+};
+
+pub fn main() void {
+    main_wrapped() catch |err| {
+        sys.print("\n[FATAL ERROR] {any}\n", .{err});
+        if (active_compute) |_| vsa_vulkan.GHOST_COMPUTE_PLUGIN.deinit();
+        sys.exit(1);
+    };
+}
+
+fn main_wrapped() !void {
+    const allocator = std.heap.page_allocator;
+
+    // ── 1. Parse Args ──
+    const args = try sys.getArgs(allocator);
+    if (args.len < 2) {
+        sys.printOut("Usage: ohl_trainer <corpus_path> [--max|--high|--standard|--background]\n");
+        sys.exit(1);
+    }
+    const corpus_path = args[1];
+
+    var tier: vsa_vulkan.OperationalTier = .standard;
+    var plugins_on: bool = false;
+    for (args[2..]) |arg| {
+        if (std.mem.eql(u8, arg, "--max")) tier = .max
+        else if (std.mem.eql(u8, arg, "--high")) tier = .high
+        else if (std.mem.eql(u8, arg, "--standard")) tier = .standard
+        else if (std.mem.eql(u8, arg, "--background")) tier = .background
+        else if (std.mem.eql(u8, arg, "--plugins")) plugins_on = true;
+    }
+
+    const cpu_cores = std.Thread.getCpuCount() catch 4;
+
+    if (plugins_on) {
+        sys.printOut("[PLUGINS] Scanning for native optimizations...\n");
+        const plugin_files = try sys.findNativePlugins(allocator);
+        for (plugin_files) |fpath| {
+            var lib = sys.NativeLibrary.open(fpath) catch {
+                sys.print("[WARN] Failed to load plugin: {s}\n", .{fpath});
+                continue;
+            };
+            if (lib.lookup(*const fn () void, "init")) |init_fn| {
+                init_fn();
+                try loaded_plugins.append(allocator, lib);
+                sys.print("[LOADED] {s}\n", .{fpath});
+            } else {
+                lib.close();
+            }
+        }
+    }
+
+    const batch_size = @intFromEnum(tier);
+    // Constrain batch to 4096 (our buffer cap) and wavefront-align it
+    const aligned_batch_size: u32 = @min(batch_size, 4096);
+    const num_streams: usize = switch (tier) {
+        .max      => @min(MAX_STREAMS, cpu_cores * 2),
+        .high     => cpu_cores,
+        .standard => @min(cpu_cores, 4),
+        .background => 1,
+    };
+    const sleep_ms: u32 = switch (tier) {
+        .background => 15,
+        else => 0,
+    };
+
+    sys.print("\nGhost Trainer {s}: Sovereign Trinity Engine (V28 Greedy Saturation)\n", .{VERSION});
+    sys.printOut("========================================================\n\n");
+    sys.print("[TIER] {s} | batch={d} (wavefront-aligned) | streams={d} | cpu_cores={d}\n\n", .{ @tagName(tier), aligned_batch_size, num_streams, cpu_cores });
+
+    // ── 2. Map the 1GB Unified Lattice ──
+    sys.printOut("[CORTEX] Mapping 1GB Unified Lattice...\n");
+    var mapped = try sys.createMappedFile(allocator, "state/unified_lattice.bin", ghost_state.UNIFIED_SIZE_BYTES);
+    global_mapped = mapped;
+    var lattice = @as(*ghost_state.UnifiedLattice, @ptrCast(@alignCast(mapped.data.ptr)));
+
+    // ── 3. Initialize Compute Provider ──
+    sys.printOut("[COMPUTE] Initializing Sovereign Compute Provider...\n");
+    const compute_or_err = vsa_vulkan.GHOST_COMPUTE_PLUGIN.init(allocator) catch null;
+    var meaning_matrix: vsa.MeaningMatrix = undefined;
+
+    if (compute_or_err) |compute| {
+        active_compute = compute;
+        compute.setTier(@intFromEnum(tier));
+        const matrix_data = compute.getMatrixData();
+        const tags_data = compute.getTagsData();
+        meaning_matrix = vsa.MeaningMatrix{
+            .data = matrix_data.ptr[0..matrix_data.len],
+            .tags = tags_data.ptr[0..tags_data.len]
+        };
+        sys.print("[COMPUTE] {s} initialized on device.\n", .{compute.name});
+
+        sys.printOut("[CORTEX] Transferring lattice to Silicon...\n");
+        const compute_lattice = compute.getLatticeData();
+        const mapped_u16 = @as([*]const u16, @ptrCast(@alignCast(mapped.data.ptr)));
+        const total_u16 = ghost_state.UNIFIED_SIZE_BYTES / 2;
+        @memcpy(compute_lattice[0..total_u16], mapped_u16[0..total_u16]);
+    } else {
+        using_cpu_fallback = true;
+        sys.printOut("[COMPUTE] *** GPU init FAILED. Falling back to CPU-only VSA. ***\n");
+        const cpu_buf = sys.allocSectorAligned(1024 * 1024 * 2) orelse return error.OutOfMemory;
+        meaning_matrix = vsa.MeaningMatrix{
+            .data = @as([*]u16, @ptrCast(@alignCast(cpu_buf.ptr)))[0..(1024 * 1024)],
+            .tags = null,
+        };
+    }
+
+    // ── 4. Load Existing Meaning Matrix ──
+    if (sys.openForRead(allocator, "state/semantic_monolith.bin")) |h| {
+        _ = try sys.readAll(h, @as([]u8, @ptrCast(meaning_matrix.data)));
+        sys.closeFile(h);
+    } else |_| {}
+
+    // ── 5. Load Corpus Files ──
+    const corpus_handle = try sys.openForRead(allocator, corpus_path);
+    const corpus_size = try sys.getFileSize(corpus_handle);
+    var corpus_buf = try allocator.alloc(u8, corpus_size);
+    const bytes_read = try sys.readAll(corpus_handle, corpus_buf);
+    sys.closeFile(corpus_handle);
+    const primary_corpus = corpus_buf[0..bytes_read];
+
+    sys.print("[CORPUS] Primary: {d} bytes ({d:.1} MB)\n", .{ primary_corpus.len, @as(f64, @floatFromInt(primary_corpus.len)) / 1048576.0 });
+
+    var stream_data: [MAX_STREAMS][]const u8 = [_][]const u8{&[_]u8{}} ** MAX_STREAMS;
+    var stream_names: [MAX_STREAMS][]const u8 = [_][]const u8{"primary"} ** MAX_STREAMS;
+    stream_data[0] = primary_corpus;
+    stream_names[0] = corpus_path;
+
+    if (num_streams > 1) {
+        const extra_files: [7][]const u8 = .{ 
+            "platforms/windows/x86_64/corpus/shakespeare.txt", 
+            "platforms/windows/x86_64/corpus/The GCIDE.txt", 
+            "platforms/windows/x86_64/corpus/Moby dick.txt",
+            "platforms/windows/x86_64/corpus/wikitext_train.txt", 
+            "platforms/windows/x86_64/corpus/a tale of two cities.txt",
+            "platforms/windows/x86_64/corpus/The Adventures of Huckleberry Finn.txt", 
+            "platforms/windows/x86_64/corpus/wikitext_test.txt"
+        };
+        var loaded: usize = 1;
+        for (extra_files) |fpath| {
+            if (loaded >= num_streams) break;
+            if (sys.openForRead(allocator, fpath)) |h| {
+                const sz = sys.getFileSize(h) catch 0;
+                if (sz > 0) {
+                    var buf = try allocator.alloc(u8, sz);
+                    const n = sys.readAll(h, buf) catch 0;
+                    sys.closeFile(h);
+                    if (n > 0) {
+                        stream_data[loaded] = buf[0..n];
+                        stream_names[loaded] = fpath;
+                        loaded += 1;
+                        sys.print("[CORPUS] Stream {d}: {s} ({d:.1} MB)\n", .{ loaded, fpath, @as(f64, @floatFromInt(n)) / 1048576.0 });
+                    }
+                }
+            } else |_| {}
+        }
+        while (loaded < num_streams) {
+            stream_data[loaded] = primary_corpus;
+            stream_names[loaded] = "primary (mirror)";
+            loaded += 1;
+        }
+    }
+
+    // ── 6. Hard-Lock Universal Sigils ──
+    sys.printOut("[SIGIL] Locking Universal identities (Latin + CJK Base)...\n");
+    for (0..128) |c| meaning_matrix.hardLockSigil(@as(u64, @truncate(vsa.generate(@intCast(c))[0])), @intCast(c));
+    const extra_locks: [4]u32 = .{ 0x4E00, 0x4E01, 0x4E02, 0x4E03 };
+    for (extra_locks) |r| meaning_matrix.hardLockUniversalSigil(ghost_state.wyhash(0, r), r);
+    sys.printOut("[SIGIL] Done.\n");
+
+    // ── 7. Initialize Greedy Stream Pool ──
+    var streams: [MAX_STREAMS]StreamState = undefined;
+    for (0..num_streams) |si| streams[si] = StreamState.init(stream_data[si], stream_names[si]);
+    var batcher = GreedyBatcher.init(streams[0..num_streams]);
+    // Pre-allocated rotor snapshot buffer: 2 u64s per stream (lex + sem)
+    var rotor_snapshot: [MAX_STREAMS * 2]u64 = [_]u64{0} ** (MAX_STREAMS * 2);
+
+    // ── 8. Greedy Training Loop ──
+    sys.printOut("\n[TRAIN] Starting V28 Greedy Saturation training pass...\n");
+    sys.print("[TRAIN] Buffer: 4096 slots | Wavefront align: {d} | Active streams: {d}\n",
+        .{ WAVEFRONT_ALIGN, num_streams });
+    const start_time = sys.getMilliTick();
+    var last_report_time = start_time;
+    var last_report_bytes: usize = 0;
+    var solstice_position: usize = 0;
+    var total_bytes_processed: usize = 0;
+    var dispatch_count: usize = 0;
+
+    while (!batcher.allDone()) {
+        // ── V28: Build per-stream rotor snapshot BEFORE greedy fill ──
+        // The snapshot captures each stream's current rotating context.
+        // After fillBatch() advances cursors, rotors will be in the NEXT state.
+        // We send the STARTING state to the GPU so it can reconstruct context.
+        batcher.buildRotorSnapshot(rotor_snapshot[0 .. num_streams * 2]);
+
+        // ── V28 Greedy Fill: fills from any active stream, wavefront-aligned ──
+        const filled = batcher.fillBatch(aligned_batch_size);
+        if (filled == 0) break;
+
+        if (active_compute) |compute| {
+            // etch() signature V28: (total_batch, num_streams, rotors, chars, rotor_indices)
+            try compute.etch(
+                @intCast(filled),
+                @intCast(num_streams),
+                rotor_snapshot[0 .. num_streams * 2],
+                batcher.batch_bytes[0..filled],
+                batcher.batch_index[0..filled],
+            );
+        } else {
+            sys.printOut("[WARN] CPU Fallback active — no GPU etch this batch.\n");
+        }
+
+        total_bytes_processed += filled;
+        dispatch_count += 1;
+        if (sleep_ms > 0) sys.sleep(sleep_ms);
+
+        const now = sys.getMilliTick();
+        if (now - last_report_time >= 2000) {
+            const elapsed_ms = now - start_time;
+            const total_throughput = if (elapsed_ms > 0) (total_bytes_processed * 1000 / elapsed_ms) else 0;
+            const chunk_bytes = total_bytes_processed - last_report_bytes;
+            const chunk_elapsed = now - last_report_time;
+            const instant_throughput = if (chunk_elapsed > 0) (chunk_bytes * 1000 / chunk_elapsed) else 0;
+            const occupancy = lattice.sampleOccupancy(0x1337);
+            const total_size = batcher.totalSize();
+            const overall_pct = if (total_size > 0) @as(f64, @floatFromInt(total_bytes_processed)) / @as(f64, @floatFromInt(total_size)) * 100.0 else 0;
+
+            // V28: Report active stream count for saturation visibility
+            sys.print("[TRAIN] {d:.1}% | {d} KB/s inst | {d} KB/s avg | {d:.1}% occ | active={d}/{d} | buf={d}/{d}\n",
+                .{ overall_pct, instant_throughput / 1024, total_throughput / 1024,
+                   @as(f64, @floatFromInt(occupancy)) / 100.0,
+                   batcher.active_count, num_streams,
+                   filled, aligned_batch_size });
+
+            for (batcher.streams) |s| {
+                const status: []const u8 = if (s.done) "[DONE]" else "[ OK ]";
+                sys.print("  {s} {s}: {d:.1}% ({d:.1} MB / {d:.1} MB)\n", .{
+                    status, s.name, s.progress(),
+                    @as(f64, @floatFromInt(s.cursor)) / 1048576.0,
+                    @as(f64, @floatFromInt(s.file_data.len)) / 1048576.0
+                });
+            }
+
+            last_report_time = now;
+            last_report_bytes = total_bytes_processed;
+        }
+
+        if (dispatch_count % 128 == 0) _ = lattice.chunkedSolsticeDecay(&solstice_position);
+    }
+
+    // ── 9. Final Report ──
+    const total_elapsed_ms = sys.getMilliTick() - start_time;
+    const final_throughput = if (total_elapsed_ms > 0) (total_bytes_processed * 1000 / total_elapsed_ms) else 0;
+    sys.print("\n  TRAINING COMPLETE | {s} | Bytes: {d} | Time: {d}ms | {d} KB/s\n",
+        .{ @tagName(tier), total_bytes_processed, total_elapsed_ms, final_throughput / 1024 });
+
+    // ── 10. Save State ──
+    if (active_compute) |compute| {
+        const compute_lattice = compute.getLatticeData();
+        @memcpy(@as([*]u16, @ptrCast(@alignCast(mapped.data.ptr))), compute_lattice);
+    }
+    mapped.flush();
+    mapped.unmap();
+
+    if (sys.openForWrite(allocator, "state/semantic_monolith.bin")) |h| {
+        _ = try sys.writeAll(h, std.mem.sliceAsBytes(meaning_matrix.data));
+        sys.closeFile(h);
+    } else |_| {}
+
+    if (active_compute) |_| vsa_vulkan.GHOST_COMPUTE_PLUGIN.deinit();
+}

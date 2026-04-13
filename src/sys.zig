@@ -16,13 +16,18 @@ pub const SECTOR_SIZE = os_layer.SECTOR_SIZE;
 // Common Interface
 pub const printOut = os_layer.printOut;
 pub const readStdin = os_layer.readStdin;
+pub const pollStdin = os_layer.pollStdin;
 pub const openForRead = os_layer.openForRead;
 pub const openForWrite = os_layer.openForWrite;
+pub const makePath = os_layer.makePath;
 pub const closeFile = os_layer.closeFile;
 pub const getFileSize = os_layer.getFileSize;
 pub const readAll = os_layer.readAll;
 pub const writeAll = os_layer.writeAll;
 pub const createMappedFile = os_layer.createMappedFile;
+pub fn flushMappedMemory(mapped_file: *const MappedFile) void {
+    mapped_file.flush();
+}
 pub const allocSectorAligned = os_layer.allocSectorAligned;
 pub const freeSectorAligned = os_layer.freeSectorAligned;
 pub const getMilliTick = os_layer.getMilliTick;
@@ -30,20 +35,20 @@ pub const sleep = os_layer.sleep;
 pub const exit = os_layer.exit;
 pub const getArgs = os_layer.getArgs;
 pub const isTrainerActive = os_layer.isTrainerActive;
+pub const acquireTrainerLock = os_layer.acquireTrainerLock;
 pub const findPluginFiles = os_layer.findPluginFiles;
-
-// Dynamic Library Support (Optional depending on platform)
-pub const NativeLibrary = if (@hasDecl(os_layer, "NativeLibrary")) os_layer.NativeLibrary else struct {
-    pub fn open(_: []const u8) !@This() { return error.Unsupported; }
-    pub fn lookup(_: @This(), _: type, _: [:0]const u8) ?*anyopaque { return null; }
-    pub fn close(_: @This()) void {}
-};
-
-pub const findNativePlugins = if (@hasDecl(os_layer, "findNativePlugins")) os_layer.findNativePlugins else struct {
+pub const findCorpusFiles = if (@hasDecl(os_layer, "findCorpusFiles")) os_layer.findCorpusFiles else struct {
     pub fn f(_: std.mem.Allocator) ![][]const u8 {
         return &[_][]const u8{};
     }
 }.f;
+
+// Surveillance & Connectivity
+pub const createNamedPipe: ?*const fn ([]const u8) anyerror!FileHandle = if (@hasDecl(os_layer, "createNamedPipe")) &os_layer.createNamedPipe else null;
+pub const connectNamedPipe: ?*const fn (FileHandle) anyerror!void = if (@hasDecl(os_layer, "connectNamedPipe")) &os_layer.connectNamedPipe else null;
+pub const disconnectNamedPipe: ?*const fn (FileHandle) void = if (@hasDecl(os_layer, "disconnectNamedPipe")) &os_layer.disconnectNamedPipe else null;
+pub const openDirectory: ?*const fn (std.mem.Allocator, []const u8) anyerror!FileHandle = if (@hasDecl(os_layer, "openDirectory")) &os_layer.openDirectory else null;
+pub const watchDirectory: ?*const fn (FileHandle, []u8) anyerror!usize = if (@hasDecl(os_layer, "watchDirectory")) &os_layer.watchDirectory else null;
 
 pub const getSiloRoot = if (@hasDecl(os_layer, "getSiloRoot")) os_layer.getSiloRoot else struct {
     pub fn f(allocator: std.mem.Allocator) ![]const u8 {

@@ -9,9 +9,9 @@ layout(std430, binding = 5) buffer Lattice {
     uint data[];  // Packed u32 (2 x u16 per uint)
 } lattice;
 
-// ── 2. Batch Starting Rotors (1 pair PER STREAM, not per workgroup) ──
-layout(std430, binding = 1) readonly buffer StartingRotors {
-    uint64_t rotors[]; // [stream0_lex, stream0_sem, stream1_lex, stream1_sem, ...]
+// ── 2. Input Batch Per-Rune Rotors ──
+layout(std430, binding = 1) readonly buffer BatchRotors {
+    uint64_t rotors[]; // [lex0, sem0, lex1, sem1, ...] one pair per rune
 } batch_rotors;
 
 // ── 3. Batch Chars (greedy-packed unified buffer) ──
@@ -33,12 +33,23 @@ layout(std430, binding = 4) buffer Tags {
 layout(push_constant) uniform Constants {
     uint batch_size;
     uint num_streams;
+    uint slot_count;       // dynamic matrix_slots
+    uint lattice_quarter;  // dynamic: gpu_lattice_size / 8 (replaces hardcoded UNIFIED_QUARTER)
 } params;
 
-shared uint temporal_cache[1024];
+// ── 6. Engine Config Metadata (Binding 10) ──
+layout(std430, binding = 10) readonly buffer Config {
+    uint rotor_stride;
+    uint rotor_offset;
+    uint batch_size;
+} engine_config;
 
-const uint64_t FNV_PRIME  = 1099511628211ul;
-const uint UNIFIED_QUARTER = 134217728u;  // 536870912 / 4
+layout(std430, binding = 11) readonly buffer LockMask {
+    uint words[];
+} lock_mask;
+
+// No temporal cache needed anymore because rotors are calculated per-rune by the CPU.
+
 const uint64_t LEAKY_MASK = 0xEFEFEFEFEFEFEFEFul;
 
 const uint64_t DOMAIN_SYNTAX    = 0x9E3779B97F4A7C15ul;
@@ -69,7 +80,7 @@ uint64_t wyhash(uint64_t state, uint64_t in_val) {
 }
 
 void getProbes(uint64_t h, out uint probes[4]) {
-    uint s = UNIFIED_QUARTER;
+    uint s = params.lattice_quarter;
     probes[0] = uint(h & 0xFFFFFFFFul) % s;
     probes[1] = (uint(h >> 32u) % s) + s;
     uint64_t h2 = wyhash(h, 0x12345678ul);
@@ -114,9 +125,9 @@ void etchProbe(uint packed_idx, uint is_high, uint64_t h) {
     }
 }
 
-void etchDomain(uint64_t rotor, uint char_byte, uint64_t domain) {
+void etchDomain(uint64_t rotor, uint rune, uint64_t domain) {
     uint64_t leaky_domain = domain & LEAKY_MASK;
-    uint64_t h = wyhash(rotor ^ leaky_domain, uint64_t(char_byte));
+    uint64_t h = wyhash(rotor ^ leaky_domain, uint64_t(rune));
 
     uint probes[4];
     getProbes(h, probes);
@@ -129,54 +140,28 @@ void etchDomain(uint64_t rotor, uint char_byte, uint64_t domain) {
     }
 }
 
+bool isLockedRuneSlot(uint64_t rotor) {
+    uint slot = uint(rotor & uint64_t(params.slot_count - 1u));
+    uint word_idx = slot >> 5u;
+    uint bit_idx = slot & 31u;
+    return bitfieldExtract(lock_mask.words[word_idx], int(bit_idx), 1) == 1;
+}
+
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint wg_size = gl_WorkGroupSize.x;
     uint global_idx = gl_WorkGroupID.x * wg_size + tid;
 
-    uint my_stream = 0u;
-    uint my_char   = 0u;
-
-    if (global_idx < params.batch_size) {
-        my_stream = rotor_index.stream_ids[global_idx];
-        my_char   = batch_chars.target_chars[global_idx];
-    }
-
-    temporal_cache[tid] = (global_idx < params.batch_size) ? my_char : 0u;
-    barrier();
-
-    // Blelloch XOR prefix scan
-    for (uint d = 1u; d < wg_size; d *= 2u) {
-        uint partner = tid + d;
-        if ((tid & (d * 2u - 1u)) == (d * 2u - 1u) && partner < wg_size) {
-            temporal_cache[partner] ^= temporal_cache[tid];
-        }
-        barrier();
-    }
-    if (tid == wg_size - 1u) temporal_cache[tid] = 0u;
-    barrier();
-    for (uint d = wg_size / 2u; d >= 1u; d /= 2u) {
-        if ((tid & (d * 2u - 1u)) == (d * 2u - 1u)) {
-            uint left = temporal_cache[tid - d];
-            temporal_cache[tid - d] = temporal_cache[tid];
-            temporal_cache[tid] ^= left;
-        }
-        barrier();
-    }
-
-    if (global_idx < params.batch_size) {
-        uint aggregated_xor = temporal_cache[tid];
-
-        // ── V28: Sovereign per-rune rotor lookup ──
-        uint stream_rotor_base = my_stream * 2u;
-        uint64_t base_lex = batch_rotors.rotors[stream_rotor_base];
-        uint64_t current_lex = (base_lex ^ uint64_t(aggregated_xor)) * FNV_PRIME;
-
+    if (global_idx < engine_config.batch_size) {
+        uint my_char = batch_chars.target_chars[global_idx];
+        
+        uint64_t current_lex = batch_rotors.rotors[global_idx * engine_config.rotor_stride + engine_config.rotor_offset];
+        if (isLockedRuneSlot(current_lex)) return;
         etchDomain(current_lex, my_char, DOMAIN_SYNTAX);
         etchDomain(current_lex, my_char, DOMAIN_CONCEPT);
 
-        uint64_t base_sem = batch_rotors.rotors[stream_rotor_base + 1u];
-        uint64_t current_sem = (base_sem ^ uint64_t(aggregated_xor)) * FNV_PRIME;
+        uint64_t current_sem = batch_rotors.rotors[global_idx * engine_config.rotor_stride + engine_config.rotor_offset + 1u];
+        if (isLockedRuneSlot(current_sem)) return;
         etchDomain(current_sem, my_char, DOMAIN_INTUITION);
     }
 }
