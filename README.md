@@ -9,7 +9,7 @@ Ghost Engine currently builds and installs these executables from `build.zig`:
 - `ghost_sovereign` - interactive inference runtime
 - `ohl_trainer` - corpus-driven trainer
 - `probe_inference` - inference probe utility
-- `ghost_shell` - local HTTP/WebSocket dashboard
+- `ghost_shell` - local HTTP/WebSocket dashboard with a `POST /api/sigil` bridge
 - `sigil_core` - Sigil compiler
 
 `build.zig` also exposes these named steps:
@@ -92,6 +92,7 @@ If no corpus files are present, the trainer falls back to a synthetic benchmark 
 ```
 
 `ghost_sovereign` maps the state files, executes `boot.sigil` from the repo root if it exists, verifies lattice checksums, and enters the REPL.
+The same Sigil VM also powers the live `POST /api/sigil` bridge in the embedded shell.
 
 ### Background daemon mode
 
@@ -107,11 +108,25 @@ Daemon mode starts the named-pipe bridge used by the surveillance layer while ke
 .\platforms\windows\x86_64\bin\ghost_shell.exe
 ```
 
-`ghost_shell` serves a local dashboard on `http://127.0.0.1:8080` and exposes the current stats, corpus, state, probe, chat, and training control endpoints wired into `src/shell.zig`.
+`ghost_shell` serves a local dashboard on `http://127.0.0.1:8080` and exposes the current stats, corpus, state, probe, chat, training control, and Sigil bridge endpoints wired into `src/shell.zig`.
+
+The live bridge accepts raw Sigil text or JSON with a `script` or `sigil` field:
+
+```text
+POST /api/sigil
+```
 
 ## Sigil Control Plane
 
 The repo-root `boot.sigil` file is the current startup control plane for `ghost_sovereign`. The runtime executes it through the Sigil VM at boot. If `boot.sigil` is missing, the runtime falls back to `LOOM VULKAN_INIT`.
+
+For live control-plane work, use the embedded shell bridge:
+
+```text
+POST /api/sigil
+```
+
+That route accepts raw Sigil text or JSON with a `script` or `sigil` field.
 
 To compile a Sigil source file into bytecode manually:
 

@@ -1,19 +1,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const sigil_runtime = @import("sigil_runtime.zig");
 
 /// 1024-bit HyperVector represented as 16x 64-bit integers.
 /// Optimized for native SIMD registers (AVX, NEON).
 /// V31: Detection-only parity checksum in the last slot (not error-correcting).
 pub const HyperVector = @Vector(16, u64);
 
-pub const Boundary = enum(u32) { 
-    none = 0, 
-    word = 1, 
-    phrase = 2, 
-    paragraph = 3, 
-    soul = 4 
-};
+pub const Boundary = enum(u32) { none = 0, word = 1, phrase = 2, paragraph = 3, soul = 4 };
 
 /// V30: Syntactic Boundary Detection (The "Bracket-Aware" Engine)
 /// Automatically identifies context shifts based on structural runes.
@@ -46,8 +39,8 @@ pub fn isHealthy(v: HyperVector) bool {
 }
 
 // ── Role-Filler Binding Constants (Orthogonal Identities) ──
-pub const ROLE_SUBJECT   = generate(0x1234_5678_9ABC_DEF0);
-pub const ROLE_OBJECT    = generate(0x0FED_CBA9_8765_4321);
+pub const ROLE_SUBJECT = generate(0x1234_5678_9ABC_DEF0);
+pub const ROLE_OBJECT = generate(0x0FED_CBA9_8765_4321);
 pub const ROLE_PREDICATE = generate(0x5555_5555_AAAA_AAAA);
 
 // ── Orthogonal Namespace Masks ──
@@ -60,7 +53,7 @@ pub fn generate(seed: u64) HyperVector {
     var s = seed ^ 0x60bee2bee120fc15;
     const c1 = 0xa3b195354a39b70d;
     const c2 = 0x123456789abcdef0;
-    
+
     // Unrolled for maximum pipeline saturation (first 15 slots)
     inline for (0..15) |i| {
         s = (s ^ (s >> 33)) *% c1;
@@ -74,25 +67,27 @@ pub fn generate(seed: u64) HyperVector {
 }
 
 /// Bitwise Binding (XOR) - 100% Symmetrical
-pub inline fn bind(a: HyperVector, b: HyperVector) HyperVector { 
-    var res = a ^ b; 
+pub inline fn bind(a: HyperVector, b: HyperVector) HyperVector {
+    var res = a ^ b;
     res[15] = generateParity(res);
-    return res; 
+    return res;
 }
 
 /// Bitwise Bundling (Majority Rule)
 /// Implementation: (a & b) | (b & c) | (c & a)
-pub inline fn bundle(a: HyperVector, b: HyperVector, c: HyperVector) HyperVector { 
-    var res = (a & b) | (b & c) | (c & a); 
+pub inline fn bundle(a: HyperVector, b: HyperVector, c: HyperVector) HyperVector {
+    var res = (a & b) | (b & c) | (c & a);
     res[15] = generateParity(res);
-    return res; 
+    return res;
 }
 
 /// Circular Permutation (Shift logic)
 pub inline fn permute(v: HyperVector) HyperVector {
     var result: HyperVector = undefined;
     // Architecture optimization: use rotl if available natively
-    inline for (0..15) |i| { result[i] = std.math.rotl(u64, v[i], 19); }
+    inline for (0..15) |i| {
+        result[i] = std.math.rotl(u64, v[i], 19);
+    }
     result[15] = generateParity(result);
     return result;
 }
@@ -101,7 +96,9 @@ pub inline fn permute(v: HyperVector) HyperVector {
 pub inline fn rotate(v: HyperVector, comptime n: comptime_int) HyperVector {
     var result: HyperVector = undefined;
     // Note: Rotate only the first 15 slots to preserve parity slot integrity
-    inline for (0..15) |i| { result[i] = v[(i + n) % 15]; }
+    inline for (0..15) |i| {
+        result[i] = v[(i + n) % 15];
+    }
     result[15] = generateParity(result);
     return result;
 }
@@ -109,7 +106,9 @@ pub inline fn rotate(v: HyperVector, comptime n: comptime_int) HyperVector {
 /// Collapse 1024-bit HyperVector to a 64-bit hash via XOR folding
 pub inline fn collapse(v: HyperVector) u64 {
     var acc: u64 = v[0];
-    inline for (1..16) |i| { acc ^= v[i]; }
+    inline for (1..16) |i| {
+        acc ^= v[i];
+    }
     return acc;
 }
 
@@ -188,7 +187,7 @@ pub const HyperRotor = struct {
     /// Performance: 16 popcount + 32 comparisons = ~48 ALU ops.  Zero branches.
     pub fn projectSpatialSignature(self: HyperRotor) u32 {
         var result: u32 = 0;
-        inline for (0..16) |word_idx| {
+        inline for (0..15) |word_idx| {
             const word = self.state[word_idx];
 
             // Lower 32 bits → projection bit at index (word_idx * 2)
@@ -312,7 +311,9 @@ pub inline fn resonanceScore(expectation: HyperVector, reality: HyperVector) u16
 pub inline fn calculateResonance(expectation: HyperVector, reality: HyperVector) u16 {
     const diff = expectation ^ reality;
     var dist: u32 = 0;
-    inline for (0..16) |i| { dist += @popCount(diff[i]); }
+    inline for (0..16) |i| {
+        dist += @popCount(diff[i]);
+    }
     return @as(u16, @intCast(1024 -| dist));
 }
 
@@ -320,7 +321,9 @@ pub inline fn calculateResonance(expectation: HyperVector, reality: HyperVector)
 pub inline fn hammingDistance(a: HyperVector, b: HyperVector) u16 {
     const diff = a ^ b;
     var dist: u32 = 0;
-    inline for (0..16) |i| { dist += @popCount(diff[i]); }
+    inline for (0..16) |i| {
+        dist += @popCount(diff[i]);
+    }
     return @as(u16, @intCast(dist));
 }
 
@@ -341,7 +344,7 @@ pub const MeaningMatrix = struct {
         while (i < 64) : (i += 1) {
             const chunk: @Vector(16, u32) = acc[i * 16 ..][0..16].*;
             const mask = @as(@Vector(16, u32), @select(u32, chunk > threshold, powers, @as(@Vector(16, u32), @splat(0))));
-            
+
             // Sum the bits into two bytes
             const mask_arr: [16]u32 = mask;
             const low = @reduce(.Add, @as(@Vector(8, u32), mask_arr[0..8].*));
@@ -376,9 +379,16 @@ pub const MeaningMatrix = struct {
 
     /// The Gravity Rule: Microscopic addition toward a concept neighborhood.
     /// Vectorized for AVX-2/AVX-512 (1024-bit saturation via @Vector).
-    pub fn applyGravity(self: *MeaningMatrix, word_hash: u64, sentence_pool: HyperVector) u64 {
+    pub fn applyGravity(
+        self: *MeaningMatrix,
+        word_hash: u64,
+        sentence_pool: HyperVector,
+        hash_locked: bool,
+        slot_lock_mask: u32,
+    ) GravityResult {
         var slot_idx: ?u32 = null;
-        if (sigil_runtime.isHashLocked(word_hash)) return 0;
+        var inserted_new_slot = false;
+        if (hash_locked) return .{};
         if (self.tags) |tags| {
             const num_slots = @as(u32, @intCast(tags.len));
             const addr = computeSudhAddress(@as(u32, @truncate(word_hash)), word_hash, num_slots);
@@ -386,16 +396,25 @@ pub const MeaningMatrix = struct {
             while (p < SUDH_CPU_PROBES) : (p += 1) {
                 const slot = addr.probe(p, num_slots);
                 if (slot >= num_slots) break;
-                if (sigil_runtime.isSlotLocked(slot)) return 0;
-                if (tags[slot] == word_hash) { slot_idx = slot; break; }
-                if (tags[slot] == 0) { tags[slot] = word_hash; slot_idx = slot; break; }
+                const probe_mask = @as(u32, 1) << @as(u5, @intCast(p));
+                if ((slot_lock_mask & probe_mask) != 0) return .{};
+                if (tags[slot] == word_hash) {
+                    slot_idx = slot;
+                    break;
+                }
+                if (tags[slot] == 0) {
+                    tags[slot] = word_hash;
+                    slot_idx = slot;
+                    inserted_new_slot = true;
+                    break;
+                }
             }
         }
-        const sid = slot_idx orelse return 0;
-        
+        const sid = slot_idx orelse return .{};
+
         const acc_ptr = @as([*]u32, @ptrCast(@alignCast(&self.data[sid * 1024])));
         const pool_bytes: [128]u8 = @bitCast(sentence_pool);
-        
+
         // Process in 512-bit chunks (16x u32) for AVX-512 or 2x 256-bit AVX-2 saturation.
         // SIMD bit extraction: use vector shift-right + AND instead of 16 scalar extractions.
         const shift_lut: @Vector(8, u32) = .{ 0, 1, 2, 3, 4, 5, 6, 7 };
@@ -428,12 +447,23 @@ pub const MeaningMatrix = struct {
             total_drift += 16;
         }
 
-        return total_drift;
+        return .{
+            .drift = total_drift,
+            .slot = sid,
+            .inserted_new_slot = inserted_new_slot,
+        };
     }
 
     /// Bound gravity: XOR binds data to an agent mask before etching.
-    pub fn applyBoundGravity(self: *MeaningMatrix, word_hash: u64, data: HyperVector, mask: HyperVector) u64 {
-        return self.applyGravity(word_hash, data ^ mask);
+    pub fn applyBoundGravity(
+        self: *MeaningMatrix,
+        word_hash: u64,
+        data: HyperVector,
+        mask: HyperVector,
+        hash_locked: bool,
+        slot_lock_mask: u32,
+    ) GravityResult {
+        return self.applyGravity(word_hash, data ^ mask, hash_locked, slot_lock_mask);
     }
 
     /// Absolute Sigil Locking: Hardcoding a symbol into the matrix.
@@ -451,8 +481,15 @@ pub const MeaningMatrix = struct {
             while (p < SUDH_CPU_PROBES) : (p += 1) {
                 const slot = addr.probe(p, num_slots);
                 if (slot >= num_slots) break;
-                if (tags[slot] == hash) { slot_idx = slot; break; }
-                if (tags[slot] == 0) { tags[slot] = hash; slot_idx = slot; break; }
+                if (tags[slot] == hash) {
+                    slot_idx = slot;
+                    break;
+                }
+                if (tags[slot] == 0) {
+                    tags[slot] = hash;
+                    slot_idx = slot;
+                    break;
+                }
             }
         }
         const sid = slot_idx orelse return;
@@ -565,15 +602,30 @@ pub const PagedPanopticon = struct {
             const d2 = hammingDistance(query, self.concepts[i + 2]);
             const d3 = hammingDistance(query, self.concepts[i + 3]);
 
-            if (d0 < best_dist) { best_dist = d0; best_idx = i; }
-            if (d1 < best_dist) { best_dist = d1; best_idx = i + 1; }
-            if (d2 < best_dist) { best_dist = d2; best_idx = i + 2; }
-            if (d3 < best_dist) { best_dist = d3; best_idx = i + 3; }
+            if (d0 < best_dist) {
+                best_dist = d0;
+                best_idx = i;
+            }
+            if (d1 < best_dist) {
+                best_dist = d1;
+                best_idx = i + 1;
+            }
+            if (d2 < best_dist) {
+                best_dist = d2;
+                best_idx = i + 2;
+            }
+            if (d3 < best_dist) {
+                best_dist = d3;
+                best_idx = i + 3;
+            }
         }
 
         while (i < self.concepts_write) : (i += 1) {
             const d = hammingDistance(query, self.concepts[i]);
-            if (d < best_dist) { best_dist = d; best_idx = i; }
+            if (d < best_dist) {
+                best_dist = d;
+                best_idx = i;
+            }
         }
 
         return .{ .index = best_idx, .distance = best_dist, .offset = self.concept_offsets[best_idx] };
@@ -662,7 +714,6 @@ pub const FlatGraph = struct {
     }
 
     /// Attempt to add `candidate` as a neighbor of `node`.
-
     /// Full version with real HyperVectors for all existing neighbors.
     /// This is the production path called from applyGravity().
     ///
@@ -821,8 +872,10 @@ pub const FlatGraph = struct {
 /// Split-half consistency check: independently measures Hamming drift in the
 /// lower and upper 32-bit halves of each u64 lane, then gates on dual thresholds.
 pub fn dualDriftCheck(current: HyperVector, primary: HyperVector, manager_limit: u64, critic_limit: u64) struct { passed: bool, manager_drift: u16, critic_drift: u16 } {
-    const manager_drift = hammingDistance(current ^ @as(HyperVector, @splat(@as(u64, 0x00000000FFFFFFFF))), primary ^ @as(HyperVector, @splat(@as(u64, 0x00000000FFFFFFFF))));
-    const critic_drift = hammingDistance(current ^ @as(HyperVector, @splat(@as(u64, 0xFFFFFFFF00000000))), primary ^ @as(HyperVector, @splat(@as(u64, 0xFFFFFFFF00000000))));
+    const lo_mask: HyperVector = @splat(@as(u64, 0x00000000FFFFFFFF));
+    const hi_mask: HyperVector = @splat(@as(u64, 0xFFFFFFFF00000000));
+    const manager_drift = hammingDistance(current & lo_mask, primary & lo_mask);
+    const critic_drift = hammingDistance(current & hi_mask, primary & hi_mask);
 
     return .{
         .passed = (manager_drift <= manager_limit) and (critic_drift <= critic_limit),
@@ -920,7 +973,7 @@ pub const HnswIndex = struct {
         }
         const remaining = @as(u32, self.neighbor_counts[node_id]) -| offset;
         const count = @min(remaining, M);
-        return self.neighbors[base + offset..][0..count];
+        return self.neighbors[base + offset ..][0..count];
     }
 
     fn distanceTo(self: *const HnswIndex, node_id: u32, query: HyperVector) u16 {
@@ -1145,3 +1198,8 @@ pub const HnswIndex = struct {
         return .{ .index = best_id, .distance = best_dist };
     }
 };
+    pub const GravityResult = struct {
+        drift: u64 = 0,
+        slot: ?u32 = null,
+        inserted_new_slot: bool = false,
+    };

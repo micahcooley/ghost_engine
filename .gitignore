@@ -37,3 +37,29 @@ cimport.zig
 trainer.log
 ghost_config.json
 **/web/node_modules/
+
+# Root hygiene: no transient artifacts in the repository root
+/*.log
+/*.json
+/*.out
+/*.exe
+/*.pdb
+/*.obj
+
+# Artifact sinks stay local-only
+/logs/*
+!/logs/.gitkeep
+/scratch/*.log
+/scratch/*.json
+/scratch/*.out
+/scratch/*.exe
+/scratch/*.pdb
+/scratch/*.obj
+/scratch/*.csv
+/scratch/*.err
+/scratch/*stdout.txt
+/scratch/*stderr.txt
+
+# Explicit config/state exceptions
+!/build.zig.zon
+!/.vscode/settings.json

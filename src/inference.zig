@@ -12,7 +12,6 @@ const sigil_runtime = @import("sigil_runtime.zig");
 ///
 /// V30: Now decoupled from the training ring buffer, utilizing dedicated
 /// inference lanes owned by the Vulkan engine.
-
 pub const BEAM_NUM_LANES: u32 = config.BEAM_NUM_LANES;
 pub const BEAM_ROLLOUT_DEPTH: u32 = config.BEAM_ROLLOUT_DEPTH;
 pub const BeamSearchPool = struct {
@@ -66,7 +65,7 @@ pub const BeamSearchPool = struct {
             if (active_count == 0) break;
 
             // V30: Use Wide-Net decoupled dispatch
-            const energies = try self.vulkan.dispatchResonanceBatched(active_count, rotor_pairs[0..active_count * 2]);
+            const energies = try self.vulkan.dispatchResonanceBatched(active_count, rotor_pairs[0 .. active_count * 2]);
 
             var lane_idx: u32 = 0;
             for (0..num_lanes) |i| {
@@ -133,13 +132,10 @@ pub const BeamSearchPool = struct {
     /// Bonus for terminal states landing on saturated (energy-capped) lattice positions.
     fn saturationBonus(self: *const BeamSearchPool, soul: *const ghost_state.GhostSoul) u32 {
         // V33: Dynamic Friction — cut off the reward if we are repeating ourselves.
-        // If drift is below BOREDOM_DRIFT_HIGH (100), the boredom penalty (-30) 
+        // If drift is below BOREDOM_DRIFT_HIGH (100), the boredom penalty (-30)
         // would normally be overridden by this bonus (+64). We force the bonus
         // to 0 to ensure the engine pivots.
-        if (soul.anchor_idx >= 2) {
-            const a = soul.anchor_idx -% 1;
-            const b = soul.anchor_idx -% 2;
-            const drift = vsa.hammingDistance(soul.anchor_buffer[a], soul.anchor_buffer[b]);
+        if (soul.recentAnchorDrift()) |drift| {
             if (drift < config.BOREDOM_DRIFT_HIGH) return 0;
         }
 

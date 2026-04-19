@@ -14,6 +14,7 @@ pub const FRAME_COUNT = 3;
 pub const INF_LANE_COUNT = 5; // Parallel inference streams for Monte Carlo
 pub const ROTOR_STRIDE = 18; // 16x u64 spatial + 2x u64 (lexical, semantic)
 const FENCE_TIMEOUT_NS: u64 = 2_000_000_000;
+const SHUTDOWN_FENCE_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
 const VALIDATION_LAYER_NAME: [*:0]const u8 = "VK_LAYER_KHRONOS_validation";
 const DEBUG_UTILS_EXTENSION_NAME: [*:0]const u8 = "VK_EXT_debug_utils";
 
@@ -89,6 +90,28 @@ const InstanceBootstrap = struct {
 fn fixedCStringEquals(buf: []const u8, expected: []const u8) bool {
     const end = std.mem.indexOfScalar(u8, buf, 0) orelse buf.len;
     return std.mem.eql(u8, buf[0..end], expected);
+}
+
+fn beginGpuSubmit(self: *VulkanEngine) void {
+    _ = self.active_gpu_submits.fetchAdd(1, .acq_rel);
+}
+
+fn endGpuSubmit(self: *VulkanEngine) void {
+    _ = self.active_gpu_submits.fetchSub(1, .release);
+}
+
+pub fn getActiveGpuSubmitCount(self: *const VulkanEngine) u32 {
+    return self.active_gpu_submits.load(.acquire);
+}
+
+pub fn waitForGpuWorkersDrained(self: *VulkanEngine) void {
+    while (getActiveGpuSubmitCount(self) != 0) {
+        sys.sleep(1);
+    }
+}
+
+fn waitForAllHardwareInterruptsWithTimeout(self: *VulkanEngine, timeout_ns: u64) !void {
+    for (0..FRAME_COUNT) |i| try self.waitForHardwareInterruptWithTimeout(i, timeout_ns);
 }
 
 fn hasInstanceLayer(ctx: *vl.VulkanCtx, allocator: std.mem.Allocator, layer_name: []const u8) !bool {
@@ -222,6 +245,7 @@ pub const VulkanEngine = struct {
     timeline_value: u64 = 0,
     dispatch_mutex: Mutex = .{},
     frame_idx: u32 = 0,
+    active_gpu_submits: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     fences: [FRAME_COUNT]vk.VkFence = [_]vk.VkFence{null} ** FRAME_COUNT,
     frame_generations: [FRAME_COUNT]u64 = [_]u64{0} ** FRAME_COUNT,
@@ -925,6 +949,22 @@ pub const VulkanEngine = struct {
     pub fn deinit(self: *VulkanEngine) void {
         self.allocator.free(self.result_buffer);
 
+        waitForGpuWorkersDrained(self);
+        waitForAllHardwareInterruptsWithTimeout(self, SHUTDOWN_FENCE_TIMEOUT_NS) catch |err| {
+            sys.print("[WARN] Final hardware drain before deinit failed: {any}\n", .{err});
+        };
+        for (0..INF_LANE_COUNT) |i| {
+            self.waitForInferenceInterrupt(i) catch |err| {
+                sys.print("[WARN] Final inference drain before deinit failed on lane {d}: {any}\n", .{ i, err });
+            };
+        }
+        if (self.dev != null and self.vk_ctx.vkDeviceWaitIdle != null) {
+            const idle_res = self.vk_ctx.vkDeviceWaitIdle.?(self.dev);
+            if (idle_res != vk.VK_SUCCESS) {
+                sys.print("[WARN] vkDeviceWaitIdle failed during deinit: {d}\n", .{idle_res});
+            }
+        }
+
         if (self.has_dedicated_transfer) {
             for (0..FRAME_COUNT) |i| {
                 if (self.transfer_fences[i] != null) self.vk_ctx.vkDestroyFence.?(self.dev, self.transfer_fences[i], null);
@@ -977,6 +1017,9 @@ pub const VulkanEngine = struct {
     }
 
     pub fn dispatchBatch(self: *VulkanEngine, batch_size: u32) ![]u32 {
+        beginGpuSubmit(self);
+        defer endGpuSubmit(self);
+
         self.dispatch_mutex.lock();
         defer self.dispatch_mutex.unlock();
 
@@ -1019,6 +1062,9 @@ pub const VulkanEngine = struct {
     }
 
     pub fn dispatchResonance(self: *VulkanEngine, lexical_rotor: u64, semantic_rotor: u64) ![]u32 {
+        beginGpuSubmit(self);
+        defer endGpuSubmit(self);
+
         self.dispatch_mutex.lock();
         defer self.dispatch_mutex.unlock();
 
@@ -1063,6 +1109,9 @@ pub const VulkanEngine = struct {
     }
 
     pub fn dispatchResonanceBatched(self: *VulkanEngine, num_lanes: u32, rotor_pairs: []const u64) ![]u32 {
+        beginGpuSubmit(self);
+        defer endGpuSubmit(self);
+
         self.dispatch_mutex.lock();
         defer self.dispatch_mutex.unlock();
 
@@ -1105,6 +1154,9 @@ pub const VulkanEngine = struct {
     }
 
     pub fn dispatchEtch(self: *VulkanEngine, batch_size: u32) !void {
+        beginGpuSubmit(self);
+        defer endGpuSubmit(self);
+
         self.dispatch_mutex.lock();
         defer self.dispatch_mutex.unlock();
         self.refreshLockMaskFromControl();
@@ -1135,6 +1187,9 @@ pub const VulkanEngine = struct {
     }
 
     pub fn dispatchMergedEtch(self: *VulkanEngine, batch_size: u32, num_streams: u32) !void {
+        beginGpuSubmit(self);
+        defer endGpuSubmit(self);
+
         self.dispatch_mutex.lock();
         defer self.dispatch_mutex.unlock();
         self.refreshLockMaskFromControl();
@@ -1177,6 +1232,9 @@ pub const VulkanEngine = struct {
     }
 
     pub fn dispatchPrune(self: *VulkanEngine) !void {
+        beginGpuSubmit(self);
+        defer endGpuSubmit(self);
+
         self.dispatch_mutex.lock();
         defer self.dispatch_mutex.unlock();
 
@@ -1205,6 +1263,9 @@ pub const VulkanEngine = struct {
     }
 
     pub fn dispatchRecursiveLookahead(self: *VulkanEngine, num_rotors: u32, depth: u32) !u64 {
+        beginGpuSubmit(self);
+        defer endGpuSubmit(self);
+
         self.dispatch_mutex.lock();
         defer self.dispatch_mutex.unlock();
 
@@ -1297,17 +1358,13 @@ pub const VulkanEngine = struct {
         const mask = self.mapped_lock_mask orelse return;
         @memset(std.mem.sliceAsBytes(mask[0..self.lock_mask_words]), 0);
         const control = sigil_runtime.getActiveControl() orelse return;
-        var it = control.locked_slots.iterator();
-        while (it.next()) |entry| {
-            const slot = entry.key_ptr.*;
-            if (slot >= self.matrix_slots) continue;
-            const word_index: usize = slot / 32;
-            const bit_index: u5 = @intCast(slot % 32);
-            mask[word_index] |= (@as(u32, 1) << bit_index);
-        }
+        control.fillLockedSlotMask(mask[0..self.lock_mask_words], self.matrix_slots);
     }
 
     pub fn etch(self: *VulkanEngine, total_batch: u32, num_streams: u32, rotors: []const u64, chars: []const u32, indices: []const u32) !void {
+        beginGpuSubmit(self);
+        defer endGpuSubmit(self);
+
         self.dispatch_mutex.lock();
         defer self.dispatch_mutex.unlock();
 
@@ -1352,11 +1409,11 @@ pub const VulkanEngine = struct {
         self.advanceFrameSlot();
     }
 
-    fn transferLatticeToHost(self: *VulkanEngine, host_lattice: []u16) !void {
+    fn transferLatticeToHostWithTimeout(self: *VulkanEngine, host_lattice: []u16, timeout_ns: u64) !void {
         const copy_bytes = @min(self.gpu_lattice_size, host_lattice.len * @sizeOf(u16));
         if (copy_bytes == 0) return;
 
-        for (0..FRAME_COUNT) |i| try self.waitForHardwareInterrupt(i);
+        for (0..FRAME_COUNT) |i| try self.waitForHardwareInterruptWithTimeout(i, timeout_ns);
 
         var staging_buffer: vk.VkBuffer = null;
         var staging_memory: vk.VkDeviceMemory = null;
@@ -1370,7 +1427,7 @@ pub const VulkanEngine = struct {
         defer self.destroyBuffer(&staging_buffer, &staging_memory, staging_ptr);
 
         const f = self.frame_idx;
-        try self.recycleHardwareFence(f);
+        try self.recycleHardwareFenceWithTimeout(f, timeout_ns);
 
         var beginInfo = std.mem.zeroes(vk.VkCommandBufferBeginInfo);
         beginInfo.sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -1387,7 +1444,7 @@ pub const VulkanEngine = struct {
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &self.command_buffers[f];
         try check(self.vk_ctx.vkQueueSubmit.?(self.queue, 1, &submitInfo, self.fences[f]));
-        try self.waitForHardwareInterrupt(f);
+        try self.waitForHardwareInterruptWithTimeout(f, timeout_ns);
 
         const src: [*]const u16 = @ptrCast(@alignCast(staging_ptr));
         const word_count = copy_bytes / @sizeOf(u16);
@@ -1397,11 +1454,12 @@ pub const VulkanEngine = struct {
 
     pub fn transferLattice(self: *VulkanEngine) !void {
         const host_lattice = self.host_lattice orelse return error.HostLatticeNotBound;
-        try self.transferLatticeToHost(host_lattice);
+        try self.transferLatticeToHostWithTimeout(host_lattice, FENCE_TIMEOUT_NS);
     }
 
     pub fn syncDeviceToHost(self: *VulkanEngine, host_matrix: []u32, host_tags: []u64, host_lattice: []u16) !void {
-        for (0..FRAME_COUNT) |i| try self.waitForHardwareInterrupt(i);
+        waitForGpuWorkersDrained(self);
+        try waitForAllHardwareInterruptsWithTimeout(self, SHUTDOWN_FENCE_TIMEOUT_NS);
         if (self.mapped_matrix) |src| {
             const len = @min(host_matrix.len, self.matrix_slots * 1024);
             @memcpy(host_matrix[0..len], src[0..len]);
@@ -1413,7 +1471,7 @@ pub const VulkanEngine = struct {
         self.host_matrix = host_matrix;
         self.host_tags = host_tags;
         self.host_lattice = host_lattice;
-        try self.transferLatticeToHost(host_lattice);
+        try self.transferLatticeToHostWithTimeout(host_lattice, SHUTDOWN_FENCE_TIMEOUT_NS);
     }
 
     pub fn ensureSigilCapacity(self: *VulkanEngine, needed: usize) !void {
@@ -1452,24 +1510,33 @@ pub const VulkanEngine = struct {
     /// the GPU PCIe interrupt fires, signaling the frame/batch is complete.
     /// This wait does not reset the fence; callers that plan to reuse the slot
     /// must explicitly recycle it first.
-    pub fn waitForHardwareInterrupt(self: *VulkanEngine, f_idx: usize) !void {
+    fn waitForHardwareInterruptWithTimeout(self: *VulkanEngine, f_idx: usize, timeout_ns: u64) !void {
         const wait_res = self.vk_ctx.vkWaitForFences.?(
             self.dev,
             1,
             &self.fences[f_idx],
             vk.VK_TRUE,
-            FENCE_TIMEOUT_NS,
+            timeout_ns,
         );
         
         if (wait_res != vk.VK_SUCCESS) {
             sys.print("[FATAL] Vulkan Driver failed to sync PCIe interrupt on frame {d}: {d}\n", .{ f_idx, wait_res });
             return error.HardwareSyncFailed;
         }
+    }
 
+    pub fn waitForHardwareInterrupt(self: *VulkanEngine, f_idx: usize) !void {
+        try self.waitForHardwareInterruptWithTimeout(f_idx, FENCE_TIMEOUT_NS);
     }
 
     fn recycleHardwareFence(self: *VulkanEngine, f_idx: usize) !void {
         try self.waitForHardwareInterrupt(f_idx);
+        const reset_res = self.vk_ctx.vkResetFences.?(self.dev, 1, &self.fences[f_idx]);
+        if (reset_res != vk.VK_SUCCESS) return error.FenceResetFailed;
+    }
+
+    fn recycleHardwareFenceWithTimeout(self: *VulkanEngine, f_idx: usize, timeout_ns: u64) !void {
+        try self.waitForHardwareInterruptWithTimeout(f_idx, timeout_ns);
         const reset_res = self.vk_ctx.vkResetFences.?(self.dev, 1, &self.fences[f_idx]);
         if (reset_res != vk.VK_SUCCESS) return error.FenceResetFailed;
     }

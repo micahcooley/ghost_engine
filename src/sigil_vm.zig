@@ -14,6 +14,11 @@ pub const Context = struct {
     lattice: ?*ghost_state.UnifiedLattice = null,
 };
 
+const EtchLockState = struct {
+    hash_locked: bool,
+    slot_lock_mask: u32,
+};
+
 pub fn executeFile(ctx: *Context, path: []const u8) !void {
     const handle = try sys.openForRead(ctx.allocator, path);
     defer sys.closeFile(handle);
@@ -60,16 +65,17 @@ fn execMood(ctx: *Context, program: *const sigil_core.Program, inst: sigil_core.
         .string => {
             const mood_name = program.strings[inst.string_index];
             ctx.control.applyMoodName(mood_name);
+            const snapshot = ctx.control.snapshot();
             sys.print("[SIGIL VM] MOOD {s} => saturation={d} boredom=({d},{d})\n", .{
                 mood_name,
-                ctx.control.saturation_bonus,
-                ctx.control.boredom_penalty_high,
-                ctx.control.boredom_penalty_low,
+                snapshot.saturation_bonus,
+                snapshot.boredom_penalty_high,
+                snapshot.boredom_penalty_low,
             });
         },
         .integer => {
             const tuned = @as(u32, @intCast(@max(inst.a, 0)));
-            ctx.control.saturation_bonus = tuned;
+            ctx.control.setSaturationBonus(tuned);
             sys.print("[SIGIL VM] MOOD saturation bonus set to {d}\n", .{tuned});
         },
         else => {},
@@ -80,14 +86,28 @@ fn execLoom(ctx: *Context, inst: sigil_core.Instruction) void {
     const command = @as(sigil_core.LoomCommand, @enumFromInt(@as(u8, @intCast(@max(inst.a, 0)))));
     switch (command) {
         .vulkan_init => {
-            ctx.control.enable_vulkan = true;
-            ctx.control.force_cpu_only = false;
+            ctx.control.setComputeMode(true, false);
             sys.printOut("[SIGIL VM] LOOM VULKAN_INIT\n");
         },
         .cpu_only => {
-            ctx.control.enable_vulkan = false;
-            ctx.control.force_cpu_only = true;
+            ctx.control.setComputeMode(false, true);
             sys.printOut("[SIGIL VM] LOOM CPU_ONLY\n");
+        },
+        .tier_1 => {
+            ctx.control.setLoomTier(1, 64 * 1024 * 1024);
+            sys.printOut("[SIGIL VM] LOOM TIER_1 => cache cap 64MiB\n");
+        },
+        .tier_2 => {
+            ctx.control.setLoomTier(2, 128 * 1024 * 1024);
+            sys.printOut("[SIGIL VM] LOOM TIER_2 => cache cap 128MiB\n");
+        },
+        .tier_3 => {
+            ctx.control.setLoomTier(3, 256 * 1024 * 1024);
+            sys.printOut("[SIGIL VM] LOOM TIER_3 => cache cap 256MiB\n");
+        },
+        .tier_4 => {
+            ctx.control.setLoomTier(4, 512 * 1024 * 1024);
+            sys.printOut("[SIGIL VM] LOOM TIER_4 => cache cap 512MiB\n");
         },
         .none => {
             sys.printOut("[SIGIL VM] LOOM command ignored\n");
@@ -120,7 +140,7 @@ fn execScan(ctx: *Context, program: *const sigil_core.Program, inst: sigil_core.
             config.SEMANTIC_SIZE_BYTES,
             config.TAG_SIZE_BYTES,
         });
-        ctx.control.last_scan = .{ .hash = 0, .energy = @intCast(config.TOTAL_STATE_BYTES / 1024 / 1024) };
+        ctx.control.setLastScan(.{ .hash = 0, .energy = @intCast(config.TOTAL_STATE_BYTES / 1024 / 1024) });
         return;
     }
 
@@ -131,7 +151,7 @@ fn execScan(ctx: *Context, program: *const sigil_core.Program, inst: sigil_core.
             vsa.calculateResonance(vec, soul.concept)
         else
             vsa.calculateResonance(vec, @splat(@as(u64, 0)));
-        ctx.control.last_scan = .{ .hash = hash, .energy = energy };
+        ctx.control.setLastScan(.{ .hash = hash, .energy = energy });
         sys.print("[SIGIL VM] SCAN {s} => hash=0x{x} energy={d}\n", .{ target, hash, energy });
     }
 }
@@ -155,11 +175,51 @@ fn execEtch(ctx: *Context, program: *const sigil_core.Program, inst: sigil_core.
         const hash = semanticHash(payload);
         var remaining: usize = @intCast(@min(@max(inst.a, 1), 32));
         const vec = generateWordVec(payload);
+        const slot_usage_hint = if (meaning.tags) |tags|
+            countUsedTags(tags)
+        else
+            null;
+        const lock_state = if (meaning.tags) |tags|
+            computeEtchLockState(ctx.control, hash, @as(u32, @intCast(tags.len)))
+        else
+            EtchLockState{
+                .hash_locked = ctx.control.isHashLocked(hash),
+                .slot_lock_mask = 0,
+            };
+        var total_drift: u64 = 0;
+        var inserted_new_slot = false;
         while (remaining > 0) : (remaining -= 1) {
-            _ = meaning.applyGravity(hash, vec);
+            const result = meaning.applyGravity(hash, vec, lock_state.hash_locked, lock_state.slot_lock_mask);
+            total_drift += result.drift;
+            inserted_new_slot = inserted_new_slot or result.inserted_new_slot;
         }
+        const expectation = meaning.collapseToBinary(hash);
+        const energy: u16 = if (ctx.soul) |soul|
+            vsa.calculateResonance(expectation, soul.concept)
+        else
+            vsa.calculateResonance(expectation, vec);
+        ctx.control.recordEtch(hash, energy, total_drift, inserted_new_slot, slot_usage_hint);
         sys.print("[SIGIL VM] ETCH {s} weight={d}\n", .{ payload, inst.a });
     }
+}
+
+fn computeEtchLockState(control: *sigil_runtime.ControlPlane, word_hash: u64, num_slots: u32) EtchLockState {
+    var state = EtchLockState{
+        .hash_locked = control.isHashLocked(word_hash),
+        .slot_lock_mask = 0,
+    };
+    if (state.hash_locked or num_slots == 0) return state;
+
+    const addr = vsa.computeSudhAddress(@as(u32, @truncate(word_hash)), word_hash, num_slots);
+    var p: u32 = 0;
+    while (p < vsa.SUDH_CPU_PROBES) : (p += 1) {
+        const slot = addr.probe(p, num_slots);
+        if (slot >= num_slots) break;
+        if (control.isSlotLocked(slot)) {
+            state.slot_lock_mask |= @as(u32, 1) << @as(u5, @intCast(p));
+        }
+    }
+    return state;
 }
 
 fn execVoid(ctx: *Context, program: *const sigil_core.Program, inst: sigil_core.Instruction) void {
@@ -180,4 +240,12 @@ fn generateWordVec(word: []const u8) vsa.HyperVector {
     var result: vsa.HyperVector = @splat(0);
     for (word) |c| result ^= vsa.generate(c);
     return result;
+}
+
+fn countUsedTags(tags: []const u64) usize {
+    var used: usize = 0;
+    for (tags) |tag| {
+        if (tag != 0) used += 1;
+    }
+    return used;
 }

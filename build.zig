@@ -11,7 +11,7 @@ fn addCoreOptions(
     const is_x86_64 = arch == .x86_64;
 
     var core_options = b.addOptions();
-    core_options.addOption([]const u8, "ghost_version", "V31");
+    core_options.addOption([]const u8, "ghost_version", "V32");
     core_options.addOption([]const u8, "project_root", b.pathFromRoot("."));
     core_options.addOption([]const u8, "platform_subdir", b.fmt(
         "platforms/{s}/{s}",
@@ -57,6 +57,38 @@ pub fn build(b: *std.Build) void {
         }
     }.add;
 
+    const addGhostExecutable = struct {
+        fn add(
+            builder: *std.Build,
+            exe_name: []const u8,
+            root: []const u8,
+            exe_target: std.Build.ResolvedTarget,
+            exe_optimize: std.builtin.OptimizeMode,
+            core_module: *std.Build.Module,
+            options: *std.Build.Step.Options,
+            os: std.Target.Os,
+            sdk_opt: ?[]const u8,
+            add_vulkan_includes: *const fn (*std.Build.Module, std.Target.Os, ?[]const u8, *std.Build) void,
+        ) *std.Build.Step.Compile {
+            const exe = builder.addExecutable(.{
+                .name = exe_name,
+                .root_module = builder.createModule(.{
+                    .root_source_file = builder.path(root),
+                    .target = exe_target,
+                    .optimize = exe_optimize,
+                }),
+            });
+            exe.root_module.addImport("ghost_core", core_module);
+            exe.root_module.addOptions("build_options", options);
+            exe.root_module.linkSystemLibrary("c", .{});
+            add_vulkan_includes(exe.root_module, os, sdk_opt, builder);
+            if (std.mem.eql(u8, exe_name, "ghost_sovereign") and os.tag == .windows) {
+                exe.root_module.linkSystemLibrary("ws2_32", .{});
+            }
+            return exe;
+        }
+    }.add;
+
     // ── 3. Shader SPIR-V (Pre-compiled, embedded via @embedFile) ──
     const shader_names = [_][]const u8{ "resonance_query", "genesis_etch", "thermal_prune", "recursive_lookahead", "lattice_etch" };
     for (shader_names) |name| {
@@ -69,51 +101,44 @@ pub fn build(b: *std.Build) void {
         name: []const u8,
         root: []const u8,
     };
+    const monolith = addGhostExecutable(
+        b,
+        "ghost_sovereign",
+        "src/main.zig",
+        target,
+        optimize,
+        ghost_core,
+        core_options,
+        target.result.os,
+        vulkan_sdk,
+        addVulkanIncludes,
+    );
+    b.installArtifact(monolith);
+
     const exes = [_]ExeConfig{
-        .{ .name = "ghost_sovereign", .root = "src/main.zig" },
         .{ .name = "ohl_trainer", .root = "src/trainer.zig" },
         .{ .name = "probe_inference", .root = "src/probe_inference.zig" },
         .{ .name = "sigil_core", .root = "src/sigil_core.zig" },
     };
 
     for (exes) |cfg| {
-        const exe = b.addExecutable(.{
-            .name = cfg.name,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(cfg.root),
-                .target = target,
-                .optimize = optimize,
-            }),
-        });
-        exe.root_module.addImport("ghost_core", ghost_core);
-        exe.root_module.addOptions("build_options", core_options);
-        exe.root_module.linkSystemLibrary("c", .{});
-        addVulkanIncludes(exe.root_module, target.result.os, vulkan_sdk, b);
-
-        if (std.mem.eql(u8, cfg.name, "ghost_sovereign") and target.result.os.tag == .windows) {
-            exe.root_module.linkSystemLibrary("ws2_32", .{});
-        }
-
+        const exe = addGhostExecutable(
+            b,
+            cfg.name,
+            cfg.root,
+            target,
+            optimize,
+            ghost_core,
+            core_options,
+            target.result.os,
+            vulkan_sdk,
+            addVulkanIncludes,
+        );
         b.installArtifact(exe);
     }
 
     // ── 8. Run Step ──
-    const ghost_exe = b.addExecutable(.{
-        .name = "ghost_sovereign",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    ghost_exe.root_module.addImport("ghost_core", ghost_core);
-    ghost_exe.root_module.addOptions("build_options", core_options);
-    ghost_exe.root_module.linkSystemLibrary("c", .{});
-    addVulkanIncludes(ghost_exe.root_module, target.result.os, vulkan_sdk, b);
-    if (target.result.os.tag == .windows) {
-        ghost_exe.root_module.linkSystemLibrary("ws2_32", .{});
-    }
-    const run_cmd = b.addRunArtifact(ghost_exe);
+    const run_cmd = b.addRunArtifact(monolith);
     run_cmd.step.dependOn(b.getInstallStep());
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);

@@ -29,6 +29,10 @@ pub const LoomCommand = enum(u8) {
     none,
     vulkan_init,
     cpu_only,
+    tier_1,
+    tier_2,
+    tier_3,
+    tier_4,
 };
 
 pub const Instruction = extern struct {
@@ -463,6 +467,10 @@ pub fn serializeProgram(allocator: std.mem.Allocator, program: *const Program) !
 fn parseLoomCommand(text: []const u8) LoomCommand {
     if (std.ascii.eqlIgnoreCase(text, "VULKAN_INIT")) return .vulkan_init;
     if (std.ascii.eqlIgnoreCase(text, "CPU_ONLY")) return .cpu_only;
+    if (std.ascii.eqlIgnoreCase(text, "TIER_1")) return .tier_1;
+    if (std.ascii.eqlIgnoreCase(text, "TIER_2")) return .tier_2;
+    if (std.ascii.eqlIgnoreCase(text, "TIER_3")) return .tier_3;
+    if (std.ascii.eqlIgnoreCase(text, "TIER_4")) return .tier_4;
     return .none;
 }
 

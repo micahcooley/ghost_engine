@@ -18,6 +18,7 @@ pub const printOut = os_layer.printOut;
 pub const readStdin = os_layer.readStdin;
 pub const pollStdin = os_layer.pollStdin;
 pub const openForRead = os_layer.openForRead;
+pub const openForReadWrite = os_layer.openForReadWrite;
 pub const openForWrite = os_layer.openForWrite;
 pub const makePath = os_layer.makePath;
 pub const closeFile = os_layer.closeFile;
@@ -25,8 +26,10 @@ pub const getFileSize = os_layer.getFileSize;
 pub const readAll = os_layer.readAll;
 pub const writeAll = os_layer.writeAll;
 pub const createMappedFile = os_layer.createMappedFile;
-pub fn flushMappedMemory(mapped_file: *const MappedFile) void {
-    mapped_file.flush();
+pub const directRead = os_layer.directRead;
+pub const directWrite = os_layer.directWrite;
+pub fn flushMappedMemory(mapped_file: *const MappedFile) !void {
+    try mapped_file.flush();
 }
 pub const allocSectorAligned = os_layer.allocSectorAligned;
 pub const freeSectorAligned = os_layer.freeSectorAligned;

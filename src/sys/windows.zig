@@ -315,31 +315,38 @@ pub const MappedFile = struct {
     map_handle: FileHandle,
     data: []u8,
 
-    pub fn flush(self: *const MappedFile) void {
+    pub fn flush(self: *const MappedFile) !void {
         // V31: Direct DMA flush. Bypasses standard OS buffering.
-        _ = FlushViewOfFile(self.data.ptr, 0);
-        _ = FlushFileBuffers(self.file_handle);
+        if (FlushViewOfFile(self.data.ptr, 0) == 0) return error.FlushViewFailed;
+        if (FlushFileBuffers(self.file_handle) == 0) return error.FlushFileBuffersFailed;
     }
 
     pub fn unmap(self: *MappedFile) void {
         _ = UnmapViewOfFile(self.data.ptr);
         _ = CloseHandle(self.map_handle);
         _ = CloseHandle(self.file_handle);
+        self.* = .{
+            .file_handle = INVALID_HANDLE,
+            .map_handle = INVALID_HANDLE,
+            .data = &[_]u8{},
+        };
     }
 };
 
 /// V31: DirectStorage-style DMA. 
 /// Loads data directly from NVMe into a sector-aligned buffer.
 pub fn directRead(handle: FileHandle, offset: u64, buffer: []u8) !void {
-    var overlapped = std.mem.zeroes(std.os.windows.OVERLAPPED);
-    overlapped.u.s.Offset = @intCast(offset & 0xFFFFFFFF);
-    overlapped.u.s.OffsetHigh = @intCast(offset >> 32);
-
+    _ = SetFilePointerEx(handle, @intCast(offset), null, 0);
     var read_bytes: u32 = 0;
-    if (ReadFile(handle, buffer.ptr, @intCast(buffer.len), &read_bytes, @ptrCast(&overlapped)) == 0) {
-        const err = GetLastError();
-        if (err != 997) return error.DirectReadFailed; // 997 = ERROR_IO_PENDING
-    }
+    if (ReadFile(handle, buffer.ptr, @intCast(buffer.len), &read_bytes, null) == 0) return error.DirectReadFailed;
+    if (read_bytes != buffer.len) return error.DirectReadFailed;
+}
+
+pub fn directWrite(handle: FileHandle, offset: u64, buffer: []const u8) !void {
+    _ = SetFilePointerEx(handle, @intCast(offset), null, 0);
+    var written_bytes: u32 = 0;
+    if (WriteFile(handle, buffer.ptr, @intCast(buffer.len), &written_bytes, null) == 0) return error.DirectWriteFailed;
+    if (written_bytes != buffer.len) return error.DirectWriteFailed;
 }
 
 pub fn getMilliTick() u64 {
@@ -411,6 +418,15 @@ pub fn openForRead(allocator: std.mem.Allocator, path: []const u8) !FileHandle {
     defer allocator.free(anchored);
     const h = CreateFileW(utf8ToW(anchored, &wbuf), 0x80000000, FILE_SHARE_READ | FILE_SHARE_WRITE, null, 3, 0x80, null);
     if (h == INVALID_HANDLE) return error.FileNotFound;
+    return h;
+}
+
+pub fn openForReadWrite(allocator: std.mem.Allocator, path: []const u8) !FileHandle {
+    var wbuf: [1024]u16 = undefined;
+    const anchored = try getAnchorPath(allocator, path);
+    defer allocator.free(anchored);
+    const h = CreateFileW(utf8ToW(anchored, &wbuf), 0xC0000000, FILE_SHARE_READ | FILE_SHARE_WRITE, null, 3, 0x80, null);
+    if (h == INVALID_HANDLE) return error.OpenFailed;
     return h;
 }
 

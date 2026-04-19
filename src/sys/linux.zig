@@ -34,6 +34,11 @@ pub fn directRead(handle: FileHandle, offset: u64, buffer: []u8) !void {
     if (n < 0) return error.DirectReadFailed;
 }
 
+pub fn directWrite(handle: FileHandle, offset: u64, buffer: []const u8) !void {
+    const n = linux.pwrite(handle, buffer.ptr, buffer.len, offset);
+    if (n < 0) return error.DirectWriteFailed;
+}
+
 pub fn getMilliTick() u64 {
     var ts: linux.timespec = undefined;
     _ = linux.clock_gettime(linux.CLOCK.MONOTONIC, &ts);
@@ -95,6 +100,14 @@ pub fn openForRead(allocator: std.mem.Allocator, path: []const u8) !FileHandle {
     defer allocator.free(anchored);
     const fd = linux.open(anchored.ptr, linux.O.RDONLY, 0);
     if (fd < 0) return error.FileNotFound;
+    return @intCast(fd);
+}
+
+pub fn openForReadWrite(allocator: std.mem.Allocator, path: []const u8) !FileHandle {
+    const anchored = try getAnchorPath(allocator, path);
+    defer allocator.free(anchored);
+    const fd = linux.open(anchored.ptr, linux.O.RDWR, 0);
+    if (fd < 0) return error.OpenFailed;
     return @intCast(fd);
 }
 

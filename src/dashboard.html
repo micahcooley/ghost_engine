@@ -456,7 +456,7 @@
 <body>
   <header>
     <div class="brand">Ghost <span>Operator Console</span></div>
-    <div class="pill mono" id="version-pill">V31</div>
+    <div class="pill mono" id="version-pill">V32</div>
     <div class="spacer"></div>
     <div class="pill mono" id="status-pill">Offline</div>
   </header>
@@ -948,7 +948,7 @@
         const arch = data.architecture || {};
         const files = data.files || {};
         const defaults = data.defaults || {};
-        el("version-pill").textContent = arch.version || "V31";
+        el("version-pill").textContent = arch.version || "V32";
         el("runtime-compute").textContent = arch.computeMode || "-";
         el("runtime-device").textContent = arch.device || "-";
         el("runtime-slots").textContent = `${arch.gpuMatrixSlots || 0} GPU / ${arch.semanticSlots || 0} mapped`;

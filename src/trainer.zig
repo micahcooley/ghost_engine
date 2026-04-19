@@ -297,7 +297,7 @@ pub const GreedyBatcher = struct {
 
         const configured_limit = self.max_active_streams.load(.acquire);
         const active_limit: u32 = if (configured_limit == 0) stream_count else @min(configured_limit, stream_count);
-        const start_idx = self.current_stream_idx.fetchAdd(1, .monotonic);
+        const start_idx = self.current_stream_idx.load(.monotonic);
         var considered_active: u32 = 0;
 
         while (total_packed < max_runes) {
@@ -329,6 +329,9 @@ pub const GreedyBatcher = struct {
         num_streams_out.* = considered_active;
         self.last_packed_batch.store(total_packed, .monotonic);
         self.last_active_streams.store(considered_active, .monotonic);
+        if (total_packed > 0) {
+            _ = self.current_stream_idx.fetchAdd(1, .monotonic);
+        }
         _ = self.total_processed.fetchAdd(total_packed, .monotonic);
         return total_packed;
     }
@@ -735,9 +738,15 @@ pub const OhlTrainer = struct {
             }
         }
 
-        if (self.lattice_file) |f| sys.flushMappedMemory(f);
-        if (self.meaning_file) |f| sys.flushMappedMemory(f);
-        if (self.tags_file) |f| sys.flushMappedMemory(f);
+        if (self.lattice_file) |f| {
+            sys.flushMappedMemory(f) catch |err| sys.print("[WARN] Lattice checkpoint flush failed: {any}\n", .{err});
+        }
+        if (self.meaning_file) |f| {
+            sys.flushMappedMemory(f) catch |err| sys.print("[WARN] Meaning checkpoint flush failed: {any}\n", .{err});
+        }
+        if (self.tags_file) |f| {
+            sys.flushMappedMemory(f) catch |err| sys.print("[WARN] Tags checkpoint flush failed: {any}\n", .{err});
+        }
 
         sys.print("[FLEET] Crystallization Checkpoint OK (V33 Graph Refined)\n", .{});
     }
@@ -745,12 +754,14 @@ pub const OhlTrainer = struct {
     fn gpuWorker(self: *OhlTrainer, engine: *vsa_vulkan.VulkanEngine, stats: *GpuRuntimeStats) void {
         sys.print("[GPU-{d}] Worker Online: {s}\n", .{ engine.device_index, engine.device_name });
 
-        while (self.is_running.load(.acquire)) {
+        while (true) {
             if (self.is_paused.load(.acquire)) {
+                if (!self.is_running.load(.acquire)) break;
                 _ = stats.idle_loops.fetchAdd(1, .monotonic);
                 sys.sleep(self.idle_sleep_ms.load(.acquire));
                 continue;
             }
+            if (!self.is_running.load(.acquire)) break;
 
             const tier = @as(vsa_vulkan.OperationalTier, @enumFromInt(self.current_tier.load(.acquire)));
             const tier_batch = tier.getBatchSize(engine.max_workgroup_invocations);
@@ -783,6 +794,8 @@ pub const OhlTrainer = struct {
             _ = stats.dispatched_batches.fetchAdd(1, .monotonic);
             _ = stats.busy_time_ms.fetchAdd(dispatch_elapsed, .monotonic);
             stats.last_dispatch_ms.store(dispatch_elapsed, .monotonic);
+
+            if (!self.is_running.load(.acquire)) break;
         }
 
         sys.print("[GPU-{d}] Worker Offline.\n", .{engine.device_index});

@@ -6,6 +6,8 @@ const ghost_state = core.ghost_state;
 const vsa_vulkan = core.vsa_vulkan;
 const engine = core.engine;
 const config = core.config;
+const sigil_runtime = core.sigil_runtime;
+const sigil_vm = core.sigil_vm;
 const trainer = @import("trainer.zig");
 
 const builtin = @import("builtin");
@@ -13,10 +15,12 @@ const WINAPI = if (builtin.os.tag == .windows) std.builtin.CallingConvention.win
 extern "kernel32" fn SetConsoleCtrlHandler(handler: ?*const fn (u32) callconv(WINAPI) i32, add: i32) callconv(WINAPI) i32;
 extern "ws2_32" fn WSAStartup(wVersionRequired: u16, lpWSAData: *anyopaque) callconv(WINAPI) i32;
 extern "ws2_32" fn WSACleanup() callconv(WINAPI) i32;
+extern "ws2_32" fn WSAGetLastError() callconv(WINAPI) i32;
 extern "ws2_32" fn socket(af: i32, type_: i32, protocol: i32) callconv(WINAPI) usize;
 extern "ws2_32" fn bind(s: usize, name: *const anyopaque, namelen: i32) callconv(WINAPI) i32;
 extern "ws2_32" fn listen(s: usize, backlog: i32) callconv(WINAPI) i32;
 extern "ws2_32" fn accept(s: usize, addr: ?*anyopaque, addrlen: ?*i32) callconv(WINAPI) usize;
+extern "ws2_32" fn ioctlsocket(s: usize, cmd: u32, argp: *u32) callconv(WINAPI) i32;
 extern "ws2_32" fn recv(s: usize, buf: [*]u8, len: i32, flags: i32) callconv(WINAPI) i32;
 extern "ws2_32" fn send(s: usize, buf: [*]const u8, len: i32, flags: i32) callconv(WINAPI) i32;
 extern "ws2_32" fn closesocket(s: usize) callconv(WINAPI) i32;
@@ -25,6 +29,8 @@ const AF_INET = 2;
 const SOCK_STREAM = 1;
 const IPPROTO_TCP = 6;
 const INVALID_SOCKET = ~@as(usize, 0);
+const FIONBIO: u32 = 0x8004667E;
+const WSAEWOULDBLOCK = 10035;
 const DASHBOARD_HTML = @embedFile("dashboard.html");
 const DEFAULT_CHECKPOINT_INTERVAL_MS: u32 = 60_000;
 const DEFAULT_IDLE_SLEEP_MS: u32 = 10;
@@ -34,7 +40,11 @@ const DEFAULT_HOT_CELLS: usize = 8;
 const CHAT_QUEUE_CAPACITY = 32;
 const CHAT_PROMPT_CAPACITY = 2048;
 const CHAT_CHUNK_CAPACITY = 128;
-const CHAT_RESPONSE_CHUNKS = 32;
+const CHAT_STREAM_QUEUE_CAPACITY = 64;
+const SHUTDOWN_DRAIN_TIMEOUT_MS: u32 = 3_000;
+const SHUTDOWN_POLL_MS: u32 = 10;
+const CHAT_STREAM_POLL_MS: u32 = 1;
+const WS_WRITE_BUFFER_CAPACITY = 1024;
 const FALLBACK_CORPORA = [_][]const u8{
     "tiny_shakespeare.txt",
     "mixed_sovereign.txt",
@@ -43,6 +53,7 @@ const FALLBACK_CORPORA = [_][]const u8{
 comptime {
     if (!std.math.isPowerOfTwo(CHAT_QUEUE_CAPACITY)) @compileError("CHAT_QUEUE_CAPACITY must be a power of two");
     if ((CHAT_PROMPT_CAPACITY & (CHAT_PROMPT_CAPACITY - 1)) != 0) @compileError("CHAT_PROMPT_CAPACITY must be a power of two");
+    if (!std.math.isPowerOfTwo(CHAT_STREAM_QUEUE_CAPACITY)) @compileError("CHAT_STREAM_QUEUE_CAPACITY must be a power of two");
 }
 
 const sockaddr_in = extern struct {
@@ -76,50 +87,93 @@ const TrainRequest = struct {
     idle_sleep_ms: u32,
 };
 
-const ChatResponse = struct {
-    kind: enum(u8) { ok, failed },
-    chunk_count: u16,
-    chunk_lens: [CHAT_RESPONSE_CHUNKS]u16,
-    chunks: [CHAT_RESPONSE_CHUNKS][CHAT_CHUNK_CAPACITY]u8,
-    error_len: u16,
-    error_buf: [CHAT_CHUNK_CAPACITY]u8,
-    truncated: bool,
+const ChatStreamFrameKind = enum(u8) {
+    partial,
+    err,
+};
 
-    fn clear(self: *ChatResponse) void {
-        self.* = std.mem.zeroes(ChatResponse);
+const ChatStreamFrame = struct {
+    kind: ChatStreamFrameKind = .partial,
+    text_len: u16 = 0,
+    text: [CHAT_CHUNK_CAPACITY]u8 = [_]u8{0} ** CHAT_CHUNK_CAPACITY,
+
+    fn set(self: *ChatStreamFrame, kind: ChatStreamFrameKind, chunk: []const u8) void {
+        self.kind = kind;
+        const len = @min(chunk.len, self.text.len);
+        @memcpy(self.text[0..len], chunk[0..len]);
+        self.text_len = @intCast(len);
+        if (len < self.text.len) @memset(self.text[len..], 0);
     }
 
-    fn pushChunk(self: *ChatResponse, chunk: []const u8) bool {
-        if (chunk.len == 0) return true;
-        if (self.chunk_count >= CHAT_RESPONSE_CHUNKS or chunk.len > CHAT_CHUNK_CAPACITY) {
-            self.truncated = true;
+    fn textSlice(self: *const ChatStreamFrame) []const u8 {
+        return self.text[0..self.text_len];
+    }
+};
+
+const ChatStreamQueue = struct {
+    write_index: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    read_index: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    dropped_frames: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    frames: [CHAT_STREAM_QUEUE_CAPACITY]ChatStreamFrame = [_]ChatStreamFrame{.{}} ** CHAT_STREAM_QUEUE_CAPACITY,
+
+    fn tryPush(self: *ChatStreamQueue, kind: ChatStreamFrameKind, chunk: []const u8) bool {
+        const write = self.write_index.load(.acquire);
+        const read = self.read_index.load(.acquire);
+        if (write - read >= self.frames.len) {
+            self.dropped_frames.store(true, .release);
             return false;
         }
 
-        const idx: usize = self.chunk_count;
-        self.chunk_lens[idx] = @intCast(chunk.len);
-        @memcpy(self.chunks[idx][0..chunk.len], chunk);
-        self.chunk_count += 1;
+        const idx = write & (self.frames.len - 1);
+        self.frames[idx].set(kind, chunk);
+        self.write_index.store(write + 1, .release);
         return true;
     }
 
-    fn setError(self: *ChatResponse, message: []const u8) void {
-        self.clear();
-        self.kind = .failed;
-        const len = @min(message.len, self.error_buf.len);
-        @memcpy(self.error_buf[0..len], message[0..len]);
-        self.error_len = @intCast(len);
-        self.truncated = len < message.len;
+    fn pop(self: *ChatStreamQueue) ?ChatStreamFrame {
+        const read = self.read_index.load(.acquire);
+        const write = self.write_index.load(.acquire);
+        if (read == write) return null;
+
+        const idx = read & (self.frames.len - 1);
+        const frame = self.frames[idx];
+        self.read_index.store(read + 1, .release);
+        return frame;
     }
 
-    fn errorText(self: *const ChatResponse) []const u8 {
-        return self.error_buf[0..self.error_len];
+    fn hasDroppedFrames(self: *const ChatStreamQueue) bool {
+        return self.dropped_frames.load(.acquire);
     }
 };
 
 const ChatExchange = struct {
-    ready: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
-    response: ChatResponse = std.mem.zeroes(ChatResponse),
+    status: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    stream: ChatStreamQueue = .{},
+    error_len: u16 = 0,
+    error_buf: [CHAT_CHUNK_CAPACITY]u8 = [_]u8{0} ** CHAT_CHUNK_CAPACITY,
+
+    fn fail(self: *ChatExchange, message: []const u8) void {
+        const len = @min(message.len, self.error_buf.len);
+        @memcpy(self.error_buf[0..len], message[0..len]);
+        self.error_len = @intCast(len);
+        self.status.store(2, .release);
+    }
+
+    fn finish(self: *ChatExchange) void {
+        self.status.store(1, .release);
+    }
+
+    fn isComplete(self: *const ChatExchange) bool {
+        return self.status.load(.acquire) != 0;
+    }
+
+    fn failed(self: *const ChatExchange) bool {
+        return self.status.load(.acquire) == 2;
+    }
+
+    fn errorText(self: *const ChatExchange) []const u8 {
+        return self.error_buf[0..self.error_len];
+    }
 };
 
 const ChatRequest = struct {
@@ -132,6 +186,7 @@ const RawChatRequestQueue = core.sync.LockFreeQueue(ChatRequest, CHAT_QUEUE_CAPA
 
 const ChatRequestQueue = struct {
     inner: RawChatRequestQueue = .{},
+    pending: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     fn push(self: *ChatRequestQueue, exchange: *ChatExchange, prompt: []const u8) !void {
         if (prompt.len > CHAT_PROMPT_CAPACITY) return error.PromptTooLong;
@@ -146,10 +201,13 @@ const ChatRequestQueue = struct {
             error.QueueFull => return error.ChatQueueFull,
             error.QueueStopped => return error.ChatQueueStopped,
         };
+        _ = self.pending.fetchAdd(1, .acq_rel);
     }
 
     fn pop(self: *ChatRequestQueue) ?ChatRequest {
-        return self.inner.pop();
+        const request = self.inner.pop() orelse return null;
+        _ = self.pending.fetchSub(1, .acq_rel);
+        return request;
     }
 
     fn shutdown(self: *ChatRequestQueue) void {
@@ -158,6 +216,10 @@ const ChatRequestQueue = struct {
 
     fn isShutdown(self: *const ChatRequestQueue) bool {
         return self.inner.isShutdown();
+    }
+
+    fn pendingCount(self: *const ChatRequestQueue) usize {
+        return self.pending.load(.acquire);
     }
 };
 
@@ -173,6 +235,11 @@ const Lock = struct {
     fn unlock(self: *Lock) void {
         self.state.store(0, .release);
     }
+};
+
+const TrackedSocket = struct {
+    sock: usize,
+    closed: bool = false,
 };
 
 const TrainingSession = struct {
@@ -229,6 +296,7 @@ const TrainingSession = struct {
 
 var global_allocator: std.mem.Allocator = undefined;
 var global_io: std.Io = undefined;
+var global_io_ready = std.atomic.Value(bool).init(false);
 var stop_flag = std.atomic.Value(bool).init(false);
 var train_lock: Lock = .{};
 var global_training: ?*TrainingSession = null;
@@ -243,6 +311,10 @@ var global_tags: ?[]u64 = null;
 var global_last_stop_reason = std.atomic.Value(u32).init(@intFromEnum(trainer.StopReason.none));
 var global_last_checkpoint_ms = std.atomic.Value(u64).init(0);
 var global_chat_queue: ChatRequestQueue = .{};
+var global_active_chat_exchanges = std.atomic.Value(usize).init(0);
+var global_socket_registry_lock: Lock = .{};
+var global_active_sockets: std.ArrayListUnmanaged(TrackedSocket) = .empty;
+var global_background_workers = std.atomic.Value(usize).init(0);
 var global_ema_average = std.atomic.Value(u32).init(850 << 8);
 var global_ema_deviation = std.atomic.Value(u32).init(25 << 8);
 var global_runtime_lock: Lock = .{};
@@ -252,10 +324,10 @@ pub const EmbeddedInit = struct {
     io: std.Io,
     soul: *ghost_state.GhostSoul,
     live_engine: *engine.SingularityEngine,
-    lattice_file: sys.MappedFile,
+    lattice_file: ?sys.MappedFile = null,
     meaning_file: sys.MappedFile,
     tags_file: sys.MappedFile,
-    lattice_words: []u16,
+    lattice_words: ?[]u16 = null,
     meaning_words: []u32,
     tags_words: []u64,
     port: u16 = 8080,
@@ -276,26 +348,161 @@ fn ctrlHandler(ctrl_type: u32) callconv(WINAPI) i32 {
     return 1;
 }
 
+fn closeSocketNow(sock: usize) void {
+    if (sock == INVALID_SOCKET) return;
+    _ = closesocket(sock);
+}
+
+fn registerActiveSocket(sock: usize) bool {
+    global_socket_registry_lock.lock();
+    defer global_socket_registry_lock.unlock();
+    global_active_sockets.append(global_allocator, .{ .sock = sock }) catch return false;
+    return true;
+}
+
+fn closeTrackedSocket(sock: usize) void {
+    global_socket_registry_lock.lock();
+    defer global_socket_registry_lock.unlock();
+
+    for (global_active_sockets.items) |*entry| {
+        if (entry.sock != sock) continue;
+        if (entry.closed) return;
+        entry.closed = true;
+        closeSocketNow(sock);
+        return;
+    }
+
+    closeSocketNow(sock);
+}
+
+fn unregisterActiveSocket(sock: usize) void {
+    global_socket_registry_lock.lock();
+    defer global_socket_registry_lock.unlock();
+
+    for (global_active_sockets.items, 0..) |entry, i| {
+        if (entry.sock != sock) continue;
+        _ = global_active_sockets.swapRemove(i);
+        return;
+    }
+}
+
+fn forceCloseActiveSockets() void {
+    global_socket_registry_lock.lock();
+    defer global_socket_registry_lock.unlock();
+
+    for (global_active_sockets.items) |*entry| {
+        if (entry.closed) continue;
+        entry.closed = true;
+        closeSocketNow(entry.sock);
+    }
+}
+
+fn failPendingChatRequests(message: []const u8) void {
+    while (global_chat_queue.pop()) |request| {
+        request.exchange.fail(message);
+    }
+}
+
+fn isChatDrainComplete() bool {
+    return global_chat_queue.pendingCount() == 0 and global_active_chat_exchanges.load(.acquire) == 0;
+}
+
+fn waitForChatDrain(timeout_ms: u32) void {
+    const started = sys.getMilliTick();
+    while (!isChatDrainComplete()) {
+        if (sys.getMilliTick() - started >= timeout_ms) break;
+        sys.sleep(SHUTDOWN_POLL_MS);
+    }
+}
+
 pub fn requestStop() bool {
     const first = stop_flag.cmpxchgStrong(false, true, .acq_rel, .acquire) == null;
-    global_chat_queue.shutdown();
+    if (first) {
+        global_chat_queue.shutdown();
+        waitForChatDrain(SHUTDOWN_DRAIN_TIMEOUT_MS);
+        if (!isChatDrainComplete()) {
+            failPendingChatRequests("Shutdown requested.");
+            forceCloseActiveSockets();
+        }
+    }
     _ = requestStopTraining();
     return first;
+}
+
+pub fn waitForBackgroundWorkers(timeout_ms: u32) bool {
+    const started = sys.getMilliTick();
+    while (global_background_workers.load(.acquire) != 0) {
+        if (sys.getMilliTick() - started >= timeout_ms) return false;
+        sys.sleep(SHUTDOWN_POLL_MS);
+    }
+    return true;
 }
 
 fn sendBytes(sock: usize, bytes: []const u8) void {
     if (bytes.len > 0) _ = send(sock, bytes.ptr, @intCast(bytes.len), 0);
 }
 
-fn sendResponse(sock: usize, status: []const u8, content_type: []const u8, body: []const u8) void {
+fn sendNonBlocking(sock: usize, bytes: []const u8, sent: *usize) !bool {
+    if (sent.* >= bytes.len) return true;
+
+    const n = send(sock, bytes[sent.*..].ptr, @intCast(bytes.len - sent.*), 0);
+    if (n > 0) {
+        sent.* += @intCast(n);
+        return sent.* >= bytes.len;
+    }
+
+    if (n == 0) return error.SocketClosed;
+    const err = WSAGetLastError();
+    if (err == WSAEWOULDBLOCK) return false;
+    return error.SocketWriteFailed;
+}
+
+const HttpJsonResult = struct {
+    status: std.http.Status,
+    body: []const u8,
+};
+
+const RequestHead = struct {
+    method: std.http.Method,
+    target: []const u8,
+};
+
+fn statusPhrase(status: std.http.Status) []const u8 {
+    return status.phrase() orelse "Unknown";
+}
+
+fn sendResponse(sock: usize, status: std.http.Status, content_type: []const u8, body: []const u8) void {
     var buf: [1024]u8 = undefined;
     const header = std.fmt.bufPrint(
         &buf,
-        "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Sec-WebSocket-Key, Sec-WebSocket-Version\r\nConnection: close\r\n\r\n",
-        .{ status, content_type, body.len },
+        "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Sec-WebSocket-Key, Sec-WebSocket-Version\r\nConnection: close\r\n\r\n",
+        .{ @intFromEnum(status), statusPhrase(status), content_type, body.len },
     ) catch return;
     sendBytes(sock, header);
     sendBytes(sock, body);
+}
+
+fn sendJsonResponse(sock: usize, status: std.http.Status, body: []const u8) void {
+    sendResponse(sock, status, "application/json", body);
+}
+
+fn sendJsonError(sock: usize, status: std.http.Status, message: []const u8) void {
+    var buf: [192]u8 = undefined;
+    const body = std.fmt.bufPrint(&buf, "{{\"error\":\"{s}\"}}", .{message}) catch "{\"error\":\"Response formatting failed\"}";
+    sendJsonResponse(sock, status, body);
+}
+
+fn parseRequestHead(req: []const u8) ?RequestHead {
+    const line_end = std.mem.indexOf(u8, req, "\r\n") orelse return null;
+    const line = req[0..line_end];
+    const first_space = std.mem.indexOfScalar(u8, line, ' ') orelse return null;
+    const remainder = line[first_space + 1 ..];
+    const second_space_rel = std.mem.indexOfScalar(u8, remainder, ' ') orelse return null;
+    const method = std.meta.stringToEnum(std.http.Method, line[0..first_space]) orelse return null;
+    return .{
+        .method = method,
+        .target = remainder[0..second_space_rel],
+    };
 }
 
 fn trimName(buf: []const u8) []const u8 {
@@ -581,19 +788,33 @@ fn loadStreams(
     return list.toOwnedSlice(allocator);
 }
 
-fn requestStopTraining() bool {
+fn activeTrainingSessionLocked() ?*TrainingSession {
+    const session = global_training orelse return null;
+    if (!session.trainer.is_running.load(.acquire)) return null;
+    return session;
+}
+
+fn requestStopTraining() HttpJsonResult {
     train_lock.lock();
     defer train_lock.unlock();
-    if (global_training) |session| {
-        session.trainer.requestStop(.manual);
-        return true;
-    }
-    return false;
+    const session = activeTrainingSessionLocked() orelse return .{
+        .status = .conflict,
+        .body = "{\"error\":\"Training is not active\"}",
+    };
+    session.trainer.requestStop(.manual);
+    return .{
+        .status = .ok,
+        .body = "{\"status\":\"stopping\"}",
+    };
 }
 
 fn trainingThread(session: *TrainingSession) void {
+    _ = global_background_workers.fetchAdd(1, .acq_rel);
+    defer _ = global_background_workers.fetchSub(1, .acq_rel);
     session.trainer.start() catch |err| sys.print("[TRAIN] {any}\n", .{err});
-    session.trainer.checkpoint() catch |err| sys.print("[CHECKPOINT] {any}\n", .{err});
+    if (!stop_flag.load(.acquire) and session.trainer.getStopReason() != .manual) {
+        session.trainer.checkpoint() catch |err| sys.print("[CHECKPOINT] {any}\n", .{err});
+    }
     global_last_stop_reason.store(@intFromEnum(session.trainer.getStopReason()), .release);
     global_last_checkpoint_ms.store(session.trainer.getLastCheckpointMs(), .release);
     train_lock.lock();
@@ -602,51 +823,120 @@ fn trainingThread(session: *TrainingSession) void {
     session.deinit();
 }
 
-fn startTraining(req: TrainRequest) ![]const u8 {
+fn startTraining(req: TrainRequest) HttpJsonResult {
     train_lock.lock();
     defer train_lock.unlock();
-    if (global_training != null) return "{\"status\":\"already_running\"}";
-    const session = try TrainingSession.init(global_allocator, req);
+    if (global_training != null) return .{
+        .status = .conflict,
+        .body = "{\"error\":\"Training is already active\"}",
+    };
+
+    const session = TrainingSession.init(global_allocator, req) catch |err| return switch (err) {
+        error.TrainingRequiresGpu => .{
+            .status = .bad_request,
+            .body = "{\"error\":\"Training requires a GPU\"}",
+        },
+        error.NoCorpusSelected => .{
+            .status = .bad_request,
+            .body = "{\"error\":\"No corpus selected\"}",
+        },
+        error.NoGpuSelected => .{
+            .status = .bad_request,
+            .body = "{\"error\":\"No valid GPU selected\"}",
+        },
+        error.OutOfMemory => .{
+            .status = .internal_server_error,
+            .body = "{\"error\":\"Failed to allocate training session\"}",
+        },
+        else => .{
+            .status = .internal_server_error,
+            .body = "{\"error\":\"Failed to start training\"}",
+        },
+    };
+
     global_training = session;
-    const thread = try std.Thread.spawn(.{ .allocator = global_allocator }, trainingThread, .{session});
+    const thread = std.Thread.spawn(.{ .allocator = global_allocator }, trainingThread, .{session}) catch {
+        global_training = null;
+        session.deinit();
+        return .{
+            .status = .internal_server_error,
+            .body = "{\"error\":\"Failed to launch training thread\"}",
+        };
+    };
     thread.detach();
-    return "{\"status\":\"started\"}";
+    return .{
+        .status = .ok,
+        .body = "{\"status\":\"started\"}",
+    };
 }
 
-fn pauseTraining() bool {
+fn pauseTraining() HttpJsonResult {
     train_lock.lock();
     defer train_lock.unlock();
-    if (global_training) |session| {
-        trainer.OhlTrainer.pause(&session.trainer);
-        return true;
+    const session = activeTrainingSessionLocked() orelse return .{
+        .status = .conflict,
+        .body = "{\"error\":\"Training is not active\"}",
+    };
+    if (session.trainer.is_paused.load(.acquire)) {
+        return .{
+            .status = .conflict,
+            .body = "{\"error\":\"Training is already paused\"}",
+        };
     }
-    return false;
+    trainer.OhlTrainer.pause(&session.trainer);
+    return .{
+        .status = .ok,
+        .body = "{\"status\":\"paused\"}",
+    };
 }
 
-fn resumeTraining() bool {
+fn resumeTraining() HttpJsonResult {
     train_lock.lock();
     defer train_lock.unlock();
-    if (global_training) |session| {
-        session.trainer.resumeTraining();
-        return true;
+    const session = activeTrainingSessionLocked() orelse return .{
+        .status = .conflict,
+        .body = "{\"error\":\"Training is not active\"}",
+    };
+    if (!session.trainer.is_paused.load(.acquire)) {
+        return .{
+            .status = .conflict,
+            .body = "{\"error\":\"Training is not paused\"}",
+        };
     }
-    return false;
+    session.trainer.resumeTraining();
+    return .{
+        .status = .ok,
+        .body = "{\"status\":\"resumed\"}",
+    };
 }
 
-fn requestCheckpointNow() bool {
+fn requestCheckpointNow() HttpJsonResult {
     train_lock.lock();
     defer train_lock.unlock();
-    if (global_training) |session| {
-        trainer.OhlTrainer.requestCheckpoint(&session.trainer);
-        return true;
+    const session = activeTrainingSessionLocked() orelse return .{
+        .status = .conflict,
+        .body = "{\"error\":\"Training is not active\"}",
+    };
+    if (session.trainer.checkpoint_in_progress.load(.acquire)) {
+        return .{
+            .status = .conflict,
+            .body = "{\"error\":\"Checkpoint already in progress\"}",
+        };
     }
-    return false;
+    trainer.OhlTrainer.requestCheckpoint(&session.trainer);
+    return .{
+        .status = .ok,
+        .body = "{\"status\":\"queued\"}",
+    };
 }
 
-fn applyControlUpdate(body: []const u8) ![]const u8 {
+fn applyControlUpdate(body: []const u8) HttpJsonResult {
     train_lock.lock();
     defer train_lock.unlock();
-    const session = global_training orelse return "{\"status\":\"idle\"}";
+    const session = activeTrainingSessionLocked() orelse return .{
+        .status = .conflict,
+        .body = "{\"error\":\"Training is not active\"}",
+    };
     var tier_buf: [64]u8 = undefined;
     const tier_value = if (jsonString(body, "tier", &tier_buf)) |tier_text| tierValueFromText(tier_text) else session.trainer.getCurrentTier();
     session.trainer.applyOptions(.{
@@ -660,7 +950,117 @@ fn applyControlUpdate(body: []const u8) ![]const u8 {
         .idle_sleep_ms = jsonU32(body, "idleSleepMs", DEFAULT_IDLE_SLEEP_MS),
         .selected_gpu_ids = &.{},
     });
-    return "{\"status\":\"updated\"}";
+    return .{
+        .status = .ok,
+        .body = "{\"status\":\"updated\"}",
+    };
+}
+
+fn parseSigilScriptBody(body: []const u8, scratch: []u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, body, " \r\n\t");
+    if (trimmed.len == 0) return error.EmptyBody;
+    if (trimmed[0] != '{') return trimmed;
+
+    const script = jsonLooseString(trimmed, "script", scratch) orelse jsonLooseString(trimmed, "sigil", scratch) orelse return error.InvalidJson;
+    const cleaned = std.mem.trim(u8, script, " \r\n\t");
+    if (cleaned.len == 0) return error.EmptyBody;
+    return cleaned;
+}
+
+fn jsonLooseString(body: []const u8, key: []const u8, out: []u8) ?[]const u8 {
+    var pat_buf: [96]u8 = undefined;
+    const key_pat = std.fmt.bufPrint(&pat_buf, "\"{s}\"", .{key}) catch return null;
+    const idx = std.mem.indexOf(u8, body, key_pat) orelse return null;
+    var pos = idx + key_pat.len;
+    while (pos < body.len and (body[pos] == ' ' or body[pos] == '\r' or body[pos] == '\n' or body[pos] == '\t')) : (pos += 1) {}
+    if (pos >= body.len or body[pos] != ':') return null;
+    pos += 1;
+    while (pos < body.len and (body[pos] == ' ' or body[pos] == '\r' or body[pos] == '\n' or body[pos] == '\t')) : (pos += 1) {}
+    if (pos >= body.len or body[pos] != '"') return null;
+    return decodeJsonString(body[pos + 1 ..], out);
+}
+
+fn controlMoodName(snapshot: sigil_runtime.ControlSnapshot) []const u8 {
+    if (snapshot.saturation_bonus == 96 and snapshot.boredom_penalty_high == 8 and snapshot.boredom_penalty_low == 4) return "aggressive";
+    if (snapshot.saturation_bonus == 80 and snapshot.boredom_penalty_high == 16 and snapshot.boredom_penalty_low == 8) return "focused";
+    if (snapshot.saturation_bonus == 40 and snapshot.boredom_penalty_high == 40 and snapshot.boredom_penalty_low == 20) return "calm";
+    if (snapshot.saturation_bonus == config.SATURATION_BONUS and
+        snapshot.boredom_penalty_high == config.BOREDOM_PENALTY_HIGH and
+        snapshot.boredom_penalty_low == config.BOREDOM_PENALTY_LOW) return "default";
+    return "custom";
+}
+
+fn buildSigilStateJson(allocator: std.mem.Allocator, snapshot: sigil_runtime.ControlSnapshot) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(allocator);
+
+    try appendPrint(&list, allocator, "{{\"status\":\"ok\",\"control\":{{\"mood\":\"{s}\",\"saturationBonus\":{d},\"boredomPenaltyHigh\":{d},\"boredomPenaltyLow\":{d},\"enableVulkan\":{s},\"forceCpuOnly\":{s},\"lastScan\":{{\"hash\":{d},\"energy\":{d}}},\"lockedSlots\":{d},\"lockedHashes\":{d},\"bindings\":{d}}}}}", .{
+        controlMoodName(snapshot),
+        snapshot.saturation_bonus,
+        snapshot.boredom_penalty_high,
+        snapshot.boredom_penalty_low,
+        if (snapshot.enable_vulkan) "true" else "false",
+        if (snapshot.force_cpu_only) "true" else "false",
+        snapshot.last_scan.hash,
+        snapshot.last_scan.energy,
+        snapshot.locked_slot_count,
+        snapshot.locked_hash_count,
+        snapshot.binding_count,
+    });
+    return list.toOwnedSlice(allocator);
+}
+
+fn handleSigilRequest(sock: usize, allocator: std.mem.Allocator, body: []const u8) void {
+    const control = sigil_runtime.getActiveControl() orelse {
+        sendJsonError(sock, .service_unavailable, "Sigil control plane unavailable");
+        return;
+    };
+    const live = global_engine orelse {
+        sendJsonError(sock, .service_unavailable, "Engine unavailable");
+        return;
+    };
+
+    const script_buf = allocator.alloc(u8, body.len) catch {
+        sendJsonError(sock, .internal_server_error, "Failed to allocate Sigil buffer");
+        return;
+    };
+    defer allocator.free(script_buf);
+
+    const script = parseSigilScriptBody(body, script_buf) catch |err| {
+        switch (err) {
+            error.EmptyBody => sendJsonError(sock, .bad_request, "Sigil body is empty"),
+            error.InvalidJson => sendJsonError(sock, .bad_request, "Expected raw Sigil text or JSON with a script field"),
+        }
+        return;
+    };
+
+    const snapshot = blk: {
+        lockInference();
+        defer unlockInference();
+
+        var vm_ctx = sigil_vm.Context{
+            .allocator = allocator,
+            .control = control,
+            .meaning = live.meaning,
+            .soul = live.soul,
+            .lattice = live.lattice,
+        };
+        sigil_vm.executeSource(&vm_ctx, script) catch |err| {
+            switch (err) {
+                error.ParseFailed => sendJsonError(sock, .bad_request, "Invalid Sigil script"),
+                else => sendJsonError(sock, .internal_server_error, "Sigil execution failed"),
+            }
+            return;
+        };
+        break :blk control.snapshot();
+    };
+
+    const json = buildSigilStateJson(allocator, snapshot) catch {
+        sendJsonError(sock, .internal_server_error, "Failed to serialize control plane");
+        return;
+    };
+    defer allocator.free(json);
+    sendJsonResponse(sock, .ok, json);
 }
 
 fn isTrainingActive() bool {
@@ -797,6 +1197,7 @@ fn buildStatsJson(allocator: std.mem.Allocator) ![]u8 {
     const ema_dev = @as(f64, @floatFromInt(global_ema_deviation.load(.acquire))) / 256.0;
     const last_stop = @as(trainer.StopReason, @enumFromInt(global_last_stop_reason.load(.acquire)));
     const last_checkpoint = global_last_checkpoint_ms.load(.acquire);
+    const control_snapshot = if (sigil_runtime.getActiveControl()) |control| control.snapshot() else null;
 
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(allocator);
@@ -808,6 +1209,19 @@ fn buildStatsJson(allocator: std.mem.Allocator) ![]u8 {
         ema_avg,
         ema_dev,
     });
+    if (control_snapshot) |snapshot| {
+        try appendPrint(&list, allocator, "\"sigilEtches\":{d},\"sigilTotalDrift\":{d},\"sigilLastHash\":{d},\"sigilLastEnergy\":{d},\"sigilEmaAverage\":{d:.2},\"sigilEmaDeviation\":{d:.2},\"sigilSlotUsage\":{d},", .{
+            snapshot.etch.total_etches,
+            snapshot.etch.total_drift,
+            snapshot.etch.last_hash,
+            snapshot.etch.last_energy,
+            @as(f64, @floatFromInt(snapshot.etch.ema_average)) / 256.0,
+            @as(f64, @floatFromInt(snapshot.etch.ema_deviation)) / 256.0,
+            snapshot.etch.slot_usage,
+        });
+    } else {
+        try list.appendSlice(allocator, "\"sigilEtches\":0,\"sigilTotalDrift\":0,\"sigilLastHash\":0,\"sigilLastEnergy\":0,\"sigilEmaAverage\":0,\"sigilEmaDeviation\":0,\"sigilSlotUsage\":0,");
+    }
 
     train_lock.lock();
     defer train_lock.unlock();
@@ -1052,28 +1466,67 @@ fn recvWsText(sock: usize, out: []u8) ?[]u8 {
     return out[0..len];
 }
 
-fn sendWsJson(sock: usize, typ: []const u8, text: ?[]const u8) void {
-    var payload: std.ArrayList(u8) = .empty;
-    defer payload.deinit(global_allocator);
-    payload.appendSlice(global_allocator, "{\"type\":\"") catch return;
-    appendEscaped(&payload, global_allocator, typ) catch return;
-    payload.append(global_allocator, '"') catch return;
-    if (text) |value| {
-        payload.appendSlice(global_allocator, ",\"text\":\"") catch return;
-        appendEscaped(&payload, global_allocator, value) catch return;
-        payload.append(global_allocator, '"') catch return;
+const WsWriteBuffer = struct {
+    data: [WS_WRITE_BUFFER_CAPACITY]u8 = [_]u8{0} ** WS_WRITE_BUFFER_CAPACITY,
+    len: usize = 0,
+    sent: usize = 0,
+
+    fn reset(self: *WsWriteBuffer) void {
+        self.len = 0;
+        self.sent = 0;
     }
-    payload.append(global_allocator, '}') catch return;
-    var hdr: [4]u8 = undefined;
-    if (payload.items.len < 126) {
-        hdr[0] = 0x81;
-        hdr[1] = @intCast(payload.items.len);
-        sendBytes(sock, hdr[0..2]);
-    } else {
-        hdr = .{ 0x81, 126, @intCast((payload.items.len >> 8) & 0xFF), @intCast(payload.items.len & 0xFF) };
-        sendBytes(sock, &hdr);
+
+    fn queueJson(self: *WsWriteBuffer, typ: []const u8, content: ?[]const u8) !void {
+        self.reset();
+
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(global_allocator);
+
+        try payload.appendSlice(global_allocator, "{\"type\":\"");
+        try appendEscaped(&payload, global_allocator, typ);
+        try payload.append(global_allocator, '"');
+        if (content) |value| {
+            try payload.appendSlice(global_allocator, ",\"content\":\"");
+            try appendEscaped(&payload, global_allocator, value);
+            try payload.append(global_allocator, '"');
+        }
+        try payload.append(global_allocator, '}');
+
+        const payload_len = payload.items.len;
+
+        if (payload_len < 126) {
+            self.data[0] = 0x81;
+            self.data[1] = @intCast(payload_len);
+            @memcpy(self.data[2 .. 2 + payload_len], payload.items[0..payload_len]);
+            self.len = 2 + payload_len;
+            return;
+        }
+        if (payload_len > WS_WRITE_BUFFER_CAPACITY - 4) return error.FrameTooLarge;
+
+        self.data[0] = 0x81;
+        self.data[1] = 126;
+        self.data[2] = @intCast((payload_len >> 8) & 0xFF);
+        self.data[3] = @intCast(payload_len & 0xFF);
+        @memcpy(self.data[4 .. 4 + payload_len], payload.items[0..payload_len]);
+        self.len = 4 + payload_len;
     }
-    sendBytes(sock, payload.items);
+
+    fn flush(self: *WsWriteBuffer, sock: usize) !bool {
+        if (self.sent >= self.len) return true;
+        const done = try sendNonBlocking(sock, self.data[0..self.len], &self.sent);
+        if (done) self.reset();
+        return done;
+    }
+};
+
+fn sendWsJson(sock: usize, typ: []const u8, content: ?[]const u8) void {
+    var writer = WsWriteBuffer{};
+    writer.queueJson(typ, content) catch return;
+    while (true) {
+        const done = writer.flush(sock) catch return;
+        if (done) return;
+        sys.sleep(CHAT_STREAM_POLL_MS);
+    }
 }
 
 fn absorbPrompt(soul: *ghost_state.GhostSoul, text: []const u8) !void {
@@ -1092,13 +1545,21 @@ fn resetChatEngine(live: *engine.SingularityEngine) void {
     live.is_live = isTrainingActive();
 }
 
-fn renderChatResponse(live: *engine.SingularityEngine, prompt: []const u8, response: *ChatResponse) !void {
-    response.clear();
+fn streamChatChunk(exchange: *ChatExchange, kind: ChatStreamFrameKind, chunk: []const u8) void {
+    _ = exchange.stream.tryPush(kind, chunk);
+}
+
+fn renderChatResponse(live: *engine.SingularityEngine, prompt: []const u8, exchange: *ChatExchange) !void {
+    if (stop_flag.load(.acquire)) {
+        exchange.fail("Shutdown requested.");
+        return;
+    }
     if (config.force_cpu_inference) {
         var chunk_buf: [CHAT_CHUNK_CAPACITY]u8 = undefined;
         const clipped = prompt[0..@min(prompt.len, 48)];
         const text = std.fmt.bufPrint(&chunk_buf, "CPU bypass ok: {s}", .{clipped}) catch "CPU bypass ok";
-        _ = response.pushChunk(text);
+        streamChatChunk(exchange, .partial, text);
+        exchange.finish();
         return;
     }
 
@@ -1112,6 +1573,10 @@ fn renderChatResponse(live: *engine.SingularityEngine, prompt: []const u8, respo
     var chunk_len: usize = 0;
 
     for (0..200) |_| {
+        if (stop_flag.load(.acquire)) {
+            exchange.fail("Shutdown requested.");
+            return;
+        }
         lockInference();
         const maybe_cp = live.resolveText1D();
         unlockInference();
@@ -1123,7 +1588,7 @@ fn renderChatResponse(live: *engine.SingularityEngine, prompt: []const u8, respo
         if (n == 0) continue;
 
         if (chunk_len + n > chunk.len) {
-            if (!response.pushChunk(chunk[0..chunk_len])) break;
+            streamChatChunk(exchange, .partial, chunk[0..chunk_len]);
             chunk_len = 0;
         }
 
@@ -1131,30 +1596,20 @@ fn renderChatResponse(live: *engine.SingularityEngine, prompt: []const u8, respo
         chunk_len += n;
 
         if (chunk_len >= 48 or cp == ' ' or cp == '\n') {
-            if (!response.pushChunk(chunk[0..chunk_len])) break;
+            streamChatChunk(exchange, .partial, chunk[0..chunk_len]);
             chunk_len = 0;
         }
 
         std.Thread.yield() catch {};
     }
 
-    if (chunk_len > 0) _ = response.pushChunk(chunk[0..chunk_len]);
-}
-
-fn waitForExchange(exchange: *ChatExchange) void {
-    var spins: u32 = 0;
-    while (exchange.ready.load(.acquire) == 0) {
-        if (spins < 256) {
-            spins += 1;
-            std.atomic.spinLoopHint();
-        } else {
-            spins = 0;
-            std.Thread.yield() catch {};
-        }
-    }
+    if (chunk_len > 0) streamChatChunk(exchange, .partial, chunk[0..chunk_len]);
+    exchange.finish();
 }
 
 fn inferenceActorThread() void {
+    _ = global_background_workers.fetchAdd(1, .acq_rel);
+    defer _ = global_background_workers.fetchSub(1, .acq_rel);
     while (true) {
         const request = global_chat_queue.pop() orelse {
             if (global_chat_queue.isShutdown()) break;
@@ -1163,42 +1618,79 @@ fn inferenceActorThread() void {
         };
         const exchange = request.exchange;
 
+        if (stop_flag.load(.acquire)) {
+            exchange.fail("Shutdown requested.");
+            continue;
+        }
+
         const live = global_engine;
         if (live) |engine_ref| {
-            renderChatResponse(engine_ref, request.prompt[0..request.prompt_len], &exchange.response) catch |err| {
+            renderChatResponse(engine_ref, request.prompt[0..request.prompt_len], exchange) catch |err| {
                 var message_buf: [CHAT_CHUNK_CAPACITY]u8 = undefined;
                 const message = std.fmt.bufPrint(&message_buf, "Inference failed: {any}", .{err}) catch "Inference failed.";
-                exchange.response.setError(message);
+                exchange.fail(message);
             };
             global_ema_average.store(engine_ref.ema.average, .release);
             global_ema_deviation.store(engine_ref.ema.deviation, .release);
         } else {
-            exchange.response.setError("Engine unavailable.");
+            exchange.fail("Engine unavailable.");
         }
-        exchange.ready.store(1, .release);
     }
 }
 
-fn sendChatResponse(sock: usize, response: *const ChatResponse) void {
-    switch (response.kind) {
-        .ok => {
-            var i: usize = 0;
-            while (i < response.chunk_count) : (i += 1) {
-                const len = response.chunk_lens[i];
-                sendWsJson(sock, "output", response.chunks[i][0..len]);
+fn drainChatExchange(sock: usize, exchange: *ChatExchange) bool {
+    var writer = WsWriteBuffer{};
+    var reported_drop = false;
+    var sent_failure = false;
+    var sent_done = false;
+
+    while (true) {
+        if (writer.len != 0) {
+            const flushed = writer.flush(sock) catch return false;
+            if (!flushed) {
+                sys.sleep(CHAT_STREAM_POLL_MS);
+                continue;
             }
-            if (response.truncated) sendWsJson(sock, "error", "Chat response truncated.");
-            sendWsJson(sock, "done", null);
-        },
-        .failed => {
-            sendWsJson(sock, "error", response.errorText());
-            sendWsJson(sock, "done", null);
-        },
+        }
+
+        if (exchange.stream.pop()) |frame| {
+            const frame_type = switch (frame.kind) {
+                .partial => "partial",
+                .err => "error",
+            };
+            writer.queueJson(frame_type, frame.textSlice()) catch return false;
+            continue;
+        }
+
+        if (!reported_drop and exchange.stream.hasDroppedFrames()) {
+            reported_drop = true;
+            writer.queueJson("error", "Partial frames dropped because the client could not keep up.") catch return false;
+            continue;
+        }
+
+        if (exchange.isComplete()) {
+            if (exchange.failed() and !sent_failure) {
+                sent_failure = true;
+                writer.queueJson("error", exchange.errorText()) catch return false;
+                continue;
+            }
+            if (sent_done) return true;
+            sent_done = true;
+            writer.queueJson("done", null) catch return false;
+            while (true) {
+                const done = writer.flush(sock) catch return false;
+                if (done) return true;
+                sys.sleep(CHAT_STREAM_POLL_MS);
+            }
+        }
+
+        sys.sleep(CHAT_STREAM_POLL_MS);
     }
 }
 
 fn chatThread(sock: usize) void {
-    defer _ = closesocket(sock);
+    defer unregisterActiveSocket(sock);
+    defer closeTrackedSocket(sock);
     sendWsJson(sock, "connected", "Ghost link established.");
     var frame: [4096]u8 = undefined;
     while (!stop_flag.load(.acquire)) {
@@ -1209,104 +1701,195 @@ fn chatThread(sock: usize) void {
         var text_buf: [2048]u8 = undefined;
         const prompt = jsonString(msg, "text", &text_buf) orelse continue;
         var exchange = ChatExchange{};
+        _ = global_active_chat_exchanges.fetchAdd(1, .acq_rel);
         global_chat_queue.push(&exchange, prompt) catch |err| {
+            _ = global_active_chat_exchanges.fetchSub(1, .acq_rel);
             var err_buf: [CHAT_CHUNK_CAPACITY]u8 = undefined;
             const message = std.fmt.bufPrint(&err_buf, "Prompt rejected: {any}", .{err}) catch "Prompt rejected.";
             sendWsJson(sock, "error", message);
             continue;
         };
 
-        waitForExchange(&exchange);
-        sendChatResponse(sock, &exchange.response);
+        setSocketNonBlocking(sock) catch {
+            _ = global_active_chat_exchanges.fetchSub(1, .acq_rel);
+            sendWsJson(sock, "error", "Failed to enable streaming mode.");
+            break;
+        };
+        const stream_ok = drainChatExchange(sock, &exchange);
+        setSocketBlocking(sock) catch {};
+        _ = global_active_chat_exchanges.fetchSub(1, .acq_rel);
+        if (!stream_ok) break;
     }
 }
 
-fn serve(allocator: std.mem.Allocator, port: u16) !void {
+fn initServerSocket(port: u16) !usize {
     var wsadata: [512]u8 = undefined;
     _ = WSAStartup(0x0202, &wsadata);
-    defer _ = WSACleanup();
     const server = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (server == INVALID_SOCKET) return error.SocketCreateFailed;
-    defer _ = closesocket(server);
+    if (server == INVALID_SOCKET) {
+        _ = WSACleanup();
+        return error.SocketCreateFailed;
+    }
+    var nonblocking: u32 = 1;
+    if (ioctlsocket(server, FIONBIO, &nonblocking) != 0) {
+        closeSocketNow(server);
+        _ = WSACleanup();
+        return error.SocketConfigureFailed;
+    }
     const addr = sockaddr_in{ .sin_family = AF_INET, .sin_port = std.mem.nativeToBig(u16, port), .sin_addr = std.mem.nativeToBig(u32, 0x7F000001) };
-    if (bind(server, @ptrCast(&addr), @sizeOf(sockaddr_in)) != 0) return error.BindFailed;
-    if (listen(server, 1024) != 0) return error.ListenFailed;
+    if (bind(server, @ptrCast(&addr), @sizeOf(sockaddr_in)) != 0) {
+        closeSocketNow(server);
+        _ = WSACleanup();
+        return error.BindFailed;
+    }
+    if (listen(server, 1024) != 0) {
+        closeSocketNow(server);
+        _ = WSACleanup();
+        return error.ListenFailed;
+    }
+    return server;
+}
+
+fn setSocketBlocking(sock: usize) !void {
+    var blocking: u32 = 0;
+    if (ioctlsocket(sock, FIONBIO, &blocking) != 0) return error.SocketConfigureFailed;
+}
+
+fn setSocketNonBlocking(sock: usize) !void {
+    var nonblocking: u32 = 1;
+    if (ioctlsocket(sock, FIONBIO, &nonblocking) != 0) return error.SocketConfigureFailed;
+}
+
+fn serveLoop(allocator: std.mem.Allocator, server: usize) !void {
     sys.printOut("[HTTP] Honest Operator Console at http://127.0.0.1:8080\n");
 
     while (!stop_flag.load(.acquire)) {
         const client = accept(server, null, null);
-        if (client == INVALID_SOCKET) continue;
+        if (client == INVALID_SOCKET) {
+            const err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK) {
+                sys.sleep(SHUTDOWN_POLL_MS);
+                continue;
+            }
+            sys.print("[HTTP] Accept error: {d}\n", .{err});
+            break;
+        }
+        if (stop_flag.load(.acquire)) {
+            closeSocketNow(client);
+            continue;
+        }
+        setSocketBlocking(client) catch |err| {
+            sys.print("[HTTP] Failed to reset client socket to blocking mode: {any}\n", .{err});
+            closeSocketNow(client);
+            continue;
+        };
         var req_buf: [16384]u8 = undefined;
         const n = recv(client, &req_buf, req_buf.len, 0);
         if (n <= 0) {
-            _ = closesocket(client);
+            closeSocketNow(client);
             continue;
         }
         const req = req_buf[0..@intCast(n)];
         const body = if (std.mem.indexOf(u8, req, "\r\n\r\n")) |idx| req[idx + 4 ..] else req[0..0];
-
-        if (std.mem.startsWith(u8, req, "OPTIONS ")) {
-            sendResponse(client, "204 No Content", "text/plain", "");
-        } else if (std.mem.startsWith(u8, req, "GET /?channel=chat ") and std.mem.indexOf(u8, req, "Upgrade: websocket") != null and wsHandshake(client, req)) {
-            const t = try std.Thread.spawn(.{ .allocator = allocator }, chatThread, .{client});
-            t.detach();
+        const head = parseRequestHead(req) orelse {
+            sendJsonError(client, .bad_request, "Malformed HTTP request");
+            closeSocketNow(client);
             continue;
-        } else if (std.mem.startsWith(u8, req, "GET /api/stats")) {
+        };
+
+        if (head.method == .OPTIONS) {
+            sendResponse(client, .no_content, "text/plain", "");
+        } else if (head.method == .GET and std.mem.eql(u8, head.target, "/?channel=chat")) {
+            if (std.mem.indexOf(u8, req, "Upgrade: websocket") == null) {
+                sendJsonError(client, .bad_request, "WebSocket upgrade required");
+            } else if (!wsHandshake(client, req)) {
+                sendJsonError(client, .bad_request, "WebSocket handshake failed");
+            } else {
+                if (!registerActiveSocket(client)) {
+                    closeSocketNow(client);
+                    continue;
+                }
+                const t = std.Thread.spawn(.{ .allocator = allocator }, chatThread, .{client}) catch |err| {
+                    unregisterActiveSocket(client);
+                    closeSocketNow(client);
+                    return err;
+                };
+                t.detach();
+                continue;
+            }
+        } else if (head.method == .GET and std.mem.eql(u8, head.target, "/")) {
+            sendResponse(client, .ok, "text/html; charset=utf-8", DASHBOARD_HTML);
+        } else if (head.method == .GET and std.mem.eql(u8, head.target, "/api/stats")) {
             const json = try buildStatsJson(allocator);
             defer allocator.free(json);
-            sendResponse(client, "200 OK", "application/json", json);
-        } else if (std.mem.startsWith(u8, req, "GET /api/corpora")) {
+            sendJsonResponse(client, .ok, json);
+        } else if (head.method == .GET and std.mem.eql(u8, head.target, "/api/corpora")) {
             const json = try buildCorporaJson(allocator);
             defer allocator.free(json);
-            sendResponse(client, "200 OK", "application/json", json);
-        } else if (std.mem.startsWith(u8, req, "GET /api/state")) {
+            sendJsonResponse(client, .ok, json);
+        } else if (head.method == .GET and std.mem.eql(u8, head.target, "/api/state")) {
             const json = try buildStateJson(allocator);
             defer allocator.free(json);
-            sendResponse(client, "200 OK", "application/json", json);
-        } else if (std.mem.startsWith(u8, req, "GET /api/probe")) {
+            sendJsonResponse(client, .ok, json);
+        } else if (head.method == .GET and std.mem.eql(u8, head.target, "/api/probe")) {
             const json = try buildProbeJson(allocator);
             defer allocator.free(json);
-            sendResponse(client, "200 OK", "application/json", json);
-        } else if (std.mem.startsWith(u8, req, "POST /api/train")) {
+            sendJsonResponse(client, .ok, json);
+        } else if (head.method == .POST and std.mem.eql(u8, head.target, "/api/train")) {
             const req_train = parseTrainRequest(allocator, body) catch |err| {
-                var tmp: [160]u8 = undefined;
-                const resp = std.fmt.bufPrint(&tmp, "{{\"status\":\"error\",\"error\":\"{any}\"}}", .{err}) catch "{\"status\":\"error\"}";
-                sendResponse(client, "200 OK", "application/json", resp);
-                _ = closesocket(client);
+                switch (err) {
+                    error.OutOfMemory => sendJsonError(client, .internal_server_error, "Failed to parse training request"),
+                    else => sendJsonError(client, .bad_request, "Invalid training request body"),
+                }
+                closeSocketNow(client);
                 continue;
             };
             defer freeTrainRequest(allocator, req_train);
-            const resp = startTraining(req_train) catch |err| blk: {
-                var tmp: [160]u8 = undefined;
-                break :blk std.fmt.bufPrint(&tmp, "{{\"status\":\"error\",\"error\":\"{any}\"}}", .{err}) catch "{\"status\":\"error\"}";
-            };
-            sendResponse(client, "200 OK", "application/json", resp);
-        } else if (std.mem.startsWith(u8, req, "POST /api/stoptrain")) {
-            sendResponse(client, "200 OK", "application/json", if (requestStopTraining()) "{\"status\":\"stopping\"}" else "{\"status\":\"idle\"}");
-        } else if (std.mem.startsWith(u8, req, "POST /api/pause")) {
-            sendResponse(client, "200 OK", "application/json", if (pauseTraining()) "{\"status\":\"paused\"}" else "{\"status\":\"idle\"}");
-        } else if (std.mem.startsWith(u8, req, "POST /api/resume")) {
-            sendResponse(client, "200 OK", "application/json", if (resumeTraining()) "{\"status\":\"resumed\"}" else "{\"status\":\"idle\"}");
-        } else if (std.mem.startsWith(u8, req, "POST /api/checkpoint")) {
-            sendResponse(client, "200 OK", "application/json", if (requestCheckpointNow()) "{\"status\":\"queued\"}" else "{\"status\":\"idle\"}");
-        } else if (std.mem.startsWith(u8, req, "POST /api/control")) {
-            const resp = applyControlUpdate(body) catch |err| blk: {
-                var tmp: [160]u8 = undefined;
-                break :blk std.fmt.bufPrint(&tmp, "{{\"status\":\"error\",\"error\":\"{any}\"}}", .{err}) catch "{\"status\":\"error\"}";
-            };
-            sendResponse(client, "200 OK", "application/json", resp);
+            const resp = startTraining(req_train);
+            sendJsonResponse(client, resp.status, resp.body);
+        } else if (head.method == .POST and std.mem.eql(u8, head.target, "/api/stoptrain")) {
+            const resp = requestStopTraining();
+            sendJsonResponse(client, resp.status, resp.body);
+        } else if (head.method == .POST and std.mem.eql(u8, head.target, "/api/pause")) {
+            const resp = pauseTraining();
+            sendJsonResponse(client, resp.status, resp.body);
+        } else if (head.method == .POST and std.mem.eql(u8, head.target, "/api/resume")) {
+            const resp = resumeTraining();
+            sendJsonResponse(client, resp.status, resp.body);
+        } else if (head.method == .POST and std.mem.eql(u8, head.target, "/api/checkpoint")) {
+            const resp = requestCheckpointNow();
+            sendJsonResponse(client, resp.status, resp.body);
+        } else if (head.method == .POST and std.mem.eql(u8, head.target, "/api/control")) {
+            const resp = applyControlUpdate(body);
+            sendJsonResponse(client, resp.status, resp.body);
+        } else if (head.method == .POST and std.mem.eql(u8, head.target, "/api/sigil")) {
+            handleSigilRequest(client, allocator, body);
         } else {
-            sendResponse(client, "200 OK", "text/html; charset=utf-8", DASHBOARD_HTML);
+            sendJsonError(client, .not_found, "Route not found");
         }
-        _ = closesocket(client);
+        closeSocketNow(client);
     }
+}
+
+fn serveThread(allocator: std.mem.Allocator, server: usize, port: u16) void {
+    defer closeSocketNow(server);
+    defer _ = WSACleanup();
+
+    serveLoop(allocator, server) catch |err| {
+        sys.print("[FATAL] Embedded shell failed while serving port {d}: {any}\n", .{ port, err });
+        _ = requestStop();
+    };
 }
 
 pub fn startEmbedded(init: EmbeddedInit) !void {
     global_allocator = init.allocator;
     global_io = init.io;
+    global_io_ready.store(true, .release);
     stop_flag.store(false, .release);
     global_chat_queue = .{};
+    global_active_chat_exchanges.store(0, .release);
+    global_active_sockets = .empty;
+    global_background_workers.store(0, .release);
     global_soul = init.soul;
     global_engine = init.live_engine;
     global_lattice_file = init.lattice_file;
@@ -1318,10 +1901,12 @@ pub fn startEmbedded(init: EmbeddedInit) !void {
     global_ema_average.store(init.live_engine.ema.average, .release);
     global_ema_deviation.store(init.live_engine.ema.deviation, .release);
 
+    const server_socket = try initServerSocket(init.port);
+
     const inference_actor = try std.Thread.spawn(.{ .allocator = global_allocator }, inferenceActorThread, .{});
     inference_actor.detach();
 
-    const server = try std.Thread.spawn(.{ .allocator = global_allocator }, serve, .{ global_allocator, init.port });
+    const server = try std.Thread.spawn(.{ .allocator = global_allocator }, serveThread, .{ global_allocator, server_socket, init.port });
     server.detach();
     sys.printOut("◈ Ghost Shell Online ◈\n");
 }

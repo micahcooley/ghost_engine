@@ -24,9 +24,9 @@ pub const ResonanceEMA = struct {
         const diff = if (s > self.average) s - self.average else self.average - s;
 
         // EMA update: (val * (1-alpha) + sample * alpha)
-        const a = @as(u32, 1) << self.alpha_shift;
-        self.average = (self.average * (a - 1) + s) >> self.alpha_shift;
-        self.deviation = (self.deviation * (a - 1) + diff) >> self.alpha_shift;
+        const a = @as(u64, 1) << self.alpha_shift;
+        self.average = @intCast((@as(u64, self.average) * (a - 1) + @as(u64, s)) >> self.alpha_shift);
+        self.deviation = @intCast((@as(u64, self.deviation) * (a - 1) + @as(u64, diff)) >> self.alpha_shift);
     }
 
     pub fn getSurpriseThreshold(self: ResonanceEMA) u16 {
@@ -61,6 +61,7 @@ pub const SoulSnapshot = struct {
     fractal_state: vsa.HyperVector,
     spell_vector: vsa.HyperVector,
     sentence_pool: vsa.HyperVector,
+    anchor_count: u64,
     last_energy: u16,
     last_boundary: vsa.Boundary,
 };
@@ -76,6 +77,7 @@ pub fn saveSoul(soul: *const ghost_state.GhostSoul) SoulSnapshot {
         .fractal_state = soul.fractal_state,
         .spell_vector = soul.spell_vector,
         .sentence_pool = soul.sentence_pool,
+        .anchor_count = soul.anchor_count,
         .last_energy = soul.last_energy,
         .last_boundary = soul.last_boundary,
     };
@@ -91,12 +93,14 @@ pub fn restoreSoul(soul: *ghost_state.GhostSoul, snap: SoulSnapshot) void {
     soul.fractal_state = snap.fractal_state;
     soul.spell_vector = snap.spell_vector;
     soul.sentence_pool = snap.sentence_pool;
+    soul.anchor_count = snap.anchor_count;
     soul.last_energy = snap.last_energy;
     soul.last_boundary = snap.last_boundary;
 }
 
 pub const SingularityEngine = struct {
     lattice: *ghost_state.UnifiedLattice,
+    lattice_provider: ?*ghost_state.LatticeProvider = null,
     meaning: *vsa.MeaningMatrix,
     soul: *ghost_state.GhostSoul,
     canvas: ghost_state.MesoLattice,
@@ -107,6 +111,25 @@ pub const SingularityEngine = struct {
     allocator: std.mem.Allocator,
     rune_counter: u64 = 0,
     ema: ResonanceEMA = .{},
+
+    pub fn setLatticeProvider(self: *SingularityEngine, provider: *ghost_state.LatticeProvider) void {
+        self.lattice_provider = provider;
+    }
+
+    pub fn setCacheCap(self: *SingularityEngine, bytes: u64) !void {
+        if (self.lattice_provider) |provider| {
+            try provider.setCacheCap(bytes);
+        }
+    }
+
+    pub fn acquireLatticeWords(self: *SingularityEngine, word_index: usize, word_count: usize, writable: bool) !ghost_state.LatticeLease {
+        if (self.lattice_provider) |provider| {
+            return provider.acquireWords(word_index, word_count, writable);
+        }
+
+        var fallback = ghost_state.LatticeProvider.initMapped(self.lattice);
+        return fallback.acquireWords(word_index, word_count, writable);
+    }
 
     pub fn measureNoise(self: *SingularityEngine, candidate_vec: vsa.HyperVector, position: u32) u16 {
         const pos_hash = ghost_state.wyhash(self.soul.active_context_hash, @as(u64, position));
@@ -132,9 +155,12 @@ pub const SingularityEngine = struct {
         const position = self.canvas.cursor;
         var top_chars: [REASON_TOP_K]u32 = [_]u32{' '} ** REASON_TOP_K;
         var top_energies: [REASON_TOP_K]u32 = [_]u32{0} ** REASON_TOP_K;
-        const prev1 = self.inventory[(self.inv_cursor + 127) % 128];
-        const prev2 = self.inventory[(self.inv_cursor + 126) % 128];
-        const prev3 = self.inventory[(self.inv_cursor + 125) % 128];
+        const base_cursor = self.inv_cursor % self.inventory.len;
+        // inv_cursor always points at the next write slot, so these are the three
+        // most recently committed bytes before we append the chosen rune below.
+        const prev1 = self.inventory[(base_cursor + self.inventory.len - 1) % self.inventory.len];
+        const prev2 = self.inventory[(base_cursor + self.inventory.len - 2) % self.inventory.len];
+        const prev3 = self.inventory[(base_cursor + self.inventory.len - 3) % self.inventory.len];
 
         var gpu_success: bool = false;
         if (!config.force_cpu_inference and self.vulkan != null) {
@@ -177,6 +203,7 @@ pub const SingularityEngine = struct {
 
         const primary_concept = self.soul.concept;
         var reason_best_char: u32 = top_chars[0];
+        var chosen_energy: u32 = top_energies[0];
 
         // Beam search rollout (when Vulkan is available)
         if (!config.force_cpu_inference and self.vulkan != null) {
@@ -184,28 +211,26 @@ pub const SingularityEngine = struct {
             const beam = mc.BeamSearchPool.init(self.allocator, vulkan, self.meaning);
             const winner_idx = beam.resolve(self.soul, &top_chars, &top_energies) catch 0;
             reason_best_char = top_chars[winner_idx];
+            chosen_energy = top_energies[winner_idx];
         } else {
             // Fallback: shallow dual-drift reasoning (no GPU)
             var reason_best_score: u32 = 0;
             var frustration: u64 = 0;
 
-            var candidate_encoded = [_][4]u8{[_]u8{0} ** 4} ** REASON_TOP_K;
-            var candidate_lens = [_]u8{0} ** REASON_TOP_K;
             var candidate_vecs = [_]vsa.HyperVector{@as(vsa.HyperVector, @splat(0))} ** REASON_TOP_K;
             for (top_chars, 0..) |candidate, ki| {
-                candidate_lens[ki] = @as(u8, @intCast(std.unicode.utf8Encode(@intCast(candidate), &candidate_encoded[ki]) catch 0));
                 candidate_vecs[ki] = vsa.generate(candidate);
             }
 
             while (true) {
                 for (top_chars, 0..) |candidate, ki| {
-                    if (top_energies[ki] == 0 or candidate_lens[ki] == 0) continue;
+                    if (top_energies[ki] == 0) continue;
                     const snapshot = saveSoul(self.soul);
 
-                    const len = candidate_lens[ki];
-                    for (candidate_encoded[ki][0..len]) |b| {
-                        self.soul.simulateAbsorb(candidate_vecs[ki], b, null) catch break;
-                    }
+                    self.soul.simulateAbsorb(candidate_vecs[ki], candidate, null) catch {
+                        restoreSoul(self.soul, snapshot);
+                        continue;
+                    };
 
                     // Integer-only sigmoid approximation for frustration-based leniency
                     // leniency = (200 * (f * f)) / ((f * f) + 25)
@@ -222,6 +247,7 @@ pub const SingularityEngine = struct {
                     if (future_energy > reason_best_score) {
                         reason_best_score = future_energy;
                         reason_best_char = candidate;
+                        chosen_energy = top_energies[ki];
                     }
                 }
                 if (reason_best_score > 0 or frustration >= 15) break;
@@ -266,19 +292,19 @@ pub const SingularityEngine = struct {
         // Encode and push to inventory
         var utf8_fin: [4]u8 = undefined;
         const len_fin = std.unicode.utf8Encode(@intCast(chosen), &utf8_fin) catch 1;
-        for (utf8_fin[0..len_fin]) |b| {
-            self.inventory[self.inv_cursor % 128] = b;
-            self.inv_cursor += 1;
+        for (utf8_fin[0..len_fin], 0..) |b, offset| {
+            self.inventory[(base_cursor + offset) % self.inventory.len] = b;
         }
+        self.inv_cursor = (base_cursor + len_fin) % self.inventory.len;
 
         // V32: Update the noise floor EMA with the chosen rune's resonance
-        self.ema.update(@intCast(top_energies[0]));
+        self.ema.update(@intCast(chosen_energy));
 
         // Aggressive Uncertainty Detection: V32 "Digital Oracle"
         // Triggered via dynamic threshold derived from Hamming drift statistics
         const search_threshold = self.ema.getSearchThreshold();
-        if (top_energies[0] < search_threshold and self.rune_counter > 20) {
-            sys.print("\n[MONOLITH] Resonance dropped to {d} (Threshold: {d}). State depletion detected.\n", .{ top_energies[0], search_threshold });
+        if (chosen_energy < search_threshold and self.rune_counter > 20) {
+            sys.print("\n[MONOLITH] Resonance dropped to {d} (Threshold: {d}). State depletion detected.\n", .{ chosen_energy, search_threshold });
             return 0x10FFFF; // Ghost Sigil for "Search Required"
         }
 
