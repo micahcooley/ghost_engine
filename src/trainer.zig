@@ -6,8 +6,17 @@ const ghost_state = core.ghost_state;
 const vsa = core.vsa;
 const vsa_vulkan = core.vsa_vulkan;
 const config = core.config;
+const shards = core.shards;
+const sigil_runtime = core.sigil_runtime;
 
 const STREAM_BUFFER_CAPACITY = 64 * 1024;
+const CPU_SUDH_PROBE_LIMIT: u32 = 32;
+const CPU_LATTICE_LEAKY_MASK: u64 = 0xEFEFEFEFEFEFEFEF;
+const CPU_DOMAIN_SYNTAX: u64 = 0x9E3779B97F4A7C15;
+const CPU_DOMAIN_CONCEPT: u64 = 0xC7115792D0E47B43;
+const CPU_DOMAIN_INTUITION: u64 = 0x6C62272E07BB0142;
+const CPU_MATRIX_LOCK_STRIPES: usize = 1024;
+const CPU_LATTICE_LOCK_STRIPES: usize = 4096;
 
 pub const CorpusWeight = struct {
     name: []const u8,
@@ -35,6 +44,19 @@ pub const StopReason = enum(u32) {
     slot_usage = 5,
     failed = 6,
 };
+
+fn resolveSelectedShardPaths(allocator: std.mem.Allocator) !shards.Paths {
+    const project_id = std.process.getEnvVarOwned(allocator, "GHOST_PROJECT_SHARD") catch null;
+    defer if (project_id) |value| allocator.free(value);
+
+    var metadata = if (project_id) |value|
+        try shards.resolveProjectMetadata(allocator, value)
+    else
+        try shards.resolveCoreMetadata(allocator);
+    defer metadata.deinit();
+
+    return shards.resolvePaths(allocator, metadata.metadata);
+}
 
 pub const StreamState = struct {
     const Source = enum {
@@ -348,9 +370,151 @@ pub const GpuRuntimeStats = struct {
     last_dispatch_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
+const EtchLockState = struct {
+    hash_locked: bool,
+    slot_lock_mask: u32,
+};
+
+fn computeEtchLockState(word_hash: u64, num_slots: u32) EtchLockState {
+    const control = sigil_runtime.getActiveControl() orelse return .{
+        .hash_locked = false,
+        .slot_lock_mask = 0,
+    };
+
+    var state = EtchLockState{
+        .hash_locked = control.isHashLocked(word_hash),
+        .slot_lock_mask = 0,
+    };
+    if (state.hash_locked or num_slots == 0) return state;
+
+    const addr = vsa.computeSudhAddress(@as(u32, @truncate(word_hash)), word_hash, num_slots);
+    var p: u32 = 0;
+    while (p < vsa.SUDH_CPU_PROBES) : (p += 1) {
+        const slot = addr.probe(p, num_slots);
+        if (slot >= num_slots) break;
+        if (control.isSlotLocked(slot)) {
+            state.slot_lock_mask |= @as(u32, 1) << @as(u5, @intCast(p));
+        }
+    }
+    return state;
+}
+
+fn isLockedRuneSlot(rotor: u64, slot_count: u32) bool {
+    const control = sigil_runtime.getActiveControl() orelse return false;
+    if (slot_count == 0) return false;
+    const slot = @as(u32, @truncate(rotor & @as(u64, slot_count - 1)));
+    return control.isSlotLocked(slot);
+}
+
+fn isLockedMatrixSlot(slot: u32) bool {
+    const control = sigil_runtime.getActiveControl() orelse return false;
+    return control.isSlotLocked(slot);
+}
+
+fn initMutexArray(allocator: std.mem.Allocator, count: usize) ![]core.sync.Mutex {
+    const locks = try allocator.alloc(core.sync.Mutex, count);
+    for (locks) |*lock| lock.* = .{};
+    return locks;
+}
+
+fn latticeWyhash(state: u64, in_val: u64) u64 {
+    const x = state ^ 0x60bee2bee120fc15;
+    const y = in_val ^ 0xa3b195354a39b70d;
+    const product = @as(u128, x) * @as(u128, y);
+    const lo = @as(u64, @truncate(product));
+    const hi = @as(u64, @truncate(product >> 64));
+    return lo ^ hi;
+}
+
+fn fillLatticeProbes(out: *[4]u32, lattice_quarter: u32, h: u64) void {
+    out[0] = @as(u32, @truncate(h)) % lattice_quarter;
+    out[1] = @as(u32, @truncate(h >> 32)) % lattice_quarter + lattice_quarter;
+    const h2 = latticeWyhash(h, 0x12345678);
+    out[2] = @as(u32, @truncate(h2)) % lattice_quarter + lattice_quarter * 2;
+    const h3 = latticeWyhash(h, 0x87654321);
+    out[3] = @as(u32, @truncate(h3)) % lattice_quarter + lattice_quarter * 3;
+}
+
+fn etchLatticeProbe(lattice: []u16, entry_idx: u32, h: u64) void {
+    const idx: usize = @intCast(entry_idx);
+    const current = lattice[idx];
+    if (current == 0) {
+        lattice[idx] = 1;
+        return;
+    }
+
+    const rng = latticeWyhash(h, entry_idx);
+    if (rng % @as(u64, current) == 0 and current < std.math.maxInt(u16)) {
+        lattice[idx] = current + 1;
+    }
+}
+
+fn etchLatticeDomain(lattice: []u16, lattice_quarter: u32, rotor: u64, rune: u32, domain: u64) void {
+    const leaky_domain = domain & CPU_LATTICE_LEAKY_MASK;
+    const h = latticeWyhash(rotor ^ leaky_domain, rune);
+
+    var probes: [4]u32 = undefined;
+    fillLatticeProbes(&probes, lattice_quarter, h);
+    for (probes) |entry_idx| etchLatticeProbe(lattice, entry_idx, h);
+}
+
+fn projectSpatialSignatureFromWords(words: []const u64) u32 {
+    var result: u32 = 0;
+    for (0..16) |i| {
+        const word = words[i];
+        if (@popCount(@as(u32, @truncate(word))) > 16) {
+            result |= @as(u32, 1) << @as(u5, @intCast(i * 2));
+        }
+        if (@popCount(@as(u32, @truncate(word >> 32))) > 16) {
+            result |= @as(u32, 1) << @as(u5, @intCast(i * 2 + 1));
+        }
+    }
+    return result;
+}
+
+fn findMeaningSlot(tags: []u64, spatial_sig: u32, uniform_hash: u64, collision_stalls: *std.atomic.Value(u64), dropped_runes: *std.atomic.Value(u64)) ?u32 {
+    const slot_count: u32 = @intCast(tags.len);
+    const wide = @as(u64, spatial_sig) * @as(u64, slot_count);
+    const base_slot = @as(u32, @truncate(wide >> 32)) & ~@as(u32, vsa.SUDH_NEIGHBORHOOD_SIZE - 1);
+    const raw_stride = @as(u32, @truncate(uniform_hash >> 32));
+    const stride = @max(raw_stride | 1, vsa.SUDH_NEIGHBORHOOD_SIZE + 1) | 1;
+    const slot_mask = slot_count - 1;
+
+    var p: u32 = 0;
+    while (p < CPU_SUDH_PROBE_LIMIT) : (p += 1) {
+        const slot = (base_slot +% p *% stride) & slot_mask;
+        const existing = tags[slot];
+        if (existing == uniform_hash) return slot;
+        if (existing == 0) {
+            tags[slot] = uniform_hash;
+            return slot;
+        }
+        _ = collision_stalls.fetchAdd(1, .monotonic);
+    }
+
+    _ = dropped_runes.fetchAdd(1, .monotonic);
+    return null;
+}
+
+fn etchMeaningSlot(meaning: *vsa.MeaningMatrix, slot_idx: u32, target_char: u32) void {
+    const base_idx = slot_idx * 1024;
+    const concept = vsa.generate(target_char);
+    const bytes: [128]u8 = @bitCast(concept);
+
+    for (0..1024) |bit_index| {
+        const bit = (bytes[bit_index / 8] >> @as(u3, @intCast(bit_index % 8))) & 1;
+        const target_idx = base_idx + @as(u32, @intCast(bit_index));
+        if (bit != 0) {
+            meaning.data[target_idx] +%= 1;
+        } else {
+            meaning.data[target_idx] +%= 0xFFFF_FFFF;
+        }
+    }
+}
+
 pub const OhlTrainer = struct {
     allocator: std.mem.Allocator,
-    fleet: *vsa_vulkan.MultiGPU,
+    fleet: ?*vsa_vulkan.MultiGPU,
     batcher: *GreedyBatcher,
     engines: []*vsa_vulkan.VulkanEngine,
     gpu_stats: []GpuRuntimeStats,
@@ -369,6 +533,10 @@ pub const OhlTrainer = struct {
     stop_after_slot_usage_bp: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     idle_sleep_ms: std.atomic.Value(u32) = std.atomic.Value(u32).init(10),
     stop_reason: std.atomic.Value(u32) = std.atomic.Value(u32).init(@intFromEnum(StopReason.none)),
+    cpu_dropped_runes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    cpu_collision_stalls: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    cpu_matrix_locks: []core.sync.Mutex = &.{},
+    cpu_lattice_locks: []core.sync.Mutex = &.{},
 
     // Global mapped files for checkpointing (synced from main.zig or newly mapped)
     mapped_lattice: ?[]u16 = null,
@@ -378,42 +546,56 @@ pub const OhlTrainer = struct {
     meaning_file: ?*const sys.MappedFile = null,
     tags_file: ?*const sys.MappedFile = null,
 
-    pub fn init(allocator: std.mem.Allocator, fleet: *vsa_vulkan.MultiGPU, batcher: *GreedyBatcher, options: TrainerOptions) !OhlTrainer {
+    pub fn init(allocator: std.mem.Allocator, fleet: ?*vsa_vulkan.MultiGPU, batcher: *GreedyBatcher, options: TrainerOptions) !OhlTrainer {
         var selected_count: usize = 0;
-        if (options.selected_gpu_ids.len == 0) {
-            selected_count = fleet.engines.len;
-        } else {
-            for (fleet.engines) |engine| {
-                for (options.selected_gpu_ids) |wanted| {
-                    if (wanted == engine.device_index) {
-                        selected_count += 1;
-                        break;
+        if (fleet) |fleet_ref| {
+            if (options.selected_gpu_ids.len == 0) {
+                selected_count = fleet_ref.engines.len;
+            } else {
+                for (fleet_ref.engines) |engine| {
+                    for (options.selected_gpu_ids) |wanted| {
+                        if (wanted == engine.device_index) {
+                            selected_count += 1;
+                            break;
+                        }
                     }
                 }
             }
+        } else if (options.selected_gpu_ids.len != 0) {
+            return error.NoGpuSelected;
         }
-        if (selected_count == 0) return error.NoGpuSelected;
+
+        const cpu_fallback = selected_count == 0;
+        const worker_count = if (cpu_fallback) @max(@as(usize, 1), std.Thread.getCpuCount() catch 1) else selected_count;
 
         const selected = try allocator.alloc(*vsa_vulkan.VulkanEngine, selected_count);
         errdefer allocator.free(selected);
-        const gpu_stats = try allocator.alloc(GpuRuntimeStats, selected_count);
+        const gpu_stats = try allocator.alloc(GpuRuntimeStats, worker_count);
         errdefer allocator.free(gpu_stats);
+        const cpu_matrix_locks = if (cpu_fallback) try initMutexArray(allocator, CPU_MATRIX_LOCK_STRIPES) else try allocator.alloc(core.sync.Mutex, 0);
+        errdefer allocator.free(cpu_matrix_locks);
+        const cpu_lattice_locks = if (cpu_fallback) try initMutexArray(allocator, CPU_LATTICE_LOCK_STRIPES) else try allocator.alloc(core.sync.Mutex, 0);
+        errdefer allocator.free(cpu_lattice_locks);
 
         var out_idx: usize = 0;
-        for (fleet.engines) |*engine| {
-            if (options.selected_gpu_ids.len != 0) {
-                var keep = false;
-                for (options.selected_gpu_ids) |wanted| {
-                    if (wanted == engine.device_index) {
-                        keep = true;
-                        break;
+        if (fleet) |fleet_ref| {
+            for (fleet_ref.engines) |*engine| {
+                if (options.selected_gpu_ids.len != 0) {
+                    var keep = false;
+                    for (options.selected_gpu_ids) |wanted| {
+                        if (wanted == engine.device_index) {
+                            keep = true;
+                            break;
+                        }
                     }
+                    if (!keep) continue;
                 }
-                if (!keep) continue;
+                selected[out_idx] = engine;
+                gpu_stats[out_idx] = .{ .device_index = engine.device_index };
+                out_idx += 1;
             }
-            selected[out_idx] = engine;
-            gpu_stats[out_idx] = .{ .device_index = engine.device_index };
-            out_idx += 1;
+        } else {
+            gpu_stats[0] = .{ .device_index = 0 };
         }
 
         var self = OhlTrainer{
@@ -422,7 +604,9 @@ pub const OhlTrainer = struct {
             .batcher = batcher,
             .engines = selected,
             .gpu_stats = gpu_stats,
-            .threads = try allocator.alloc(std.Thread, selected_count),
+            .threads = try allocator.alloc(std.Thread, worker_count),
+            .cpu_matrix_locks = cpu_matrix_locks,
+            .cpu_lattice_locks = cpu_lattice_locks,
         };
         self.applyOptions(options);
         return self;
@@ -432,6 +616,8 @@ pub const OhlTrainer = struct {
         self.allocator.free(self.threads);
         self.allocator.free(self.gpu_stats);
         self.allocator.free(self.engines);
+        if (self.cpu_matrix_locks.len > 0) self.allocator.free(self.cpu_matrix_locks);
+        if (self.cpu_lattice_locks.len > 0) self.allocator.free(self.cpu_lattice_locks);
     }
 
     pub fn applyOptions(self: *OhlTrainer, options: TrainerOptions) void {
@@ -456,9 +642,16 @@ pub const OhlTrainer = struct {
         self.start_time = @intCast(sys.getMilliTick());
         self.last_checkpoint_ms.store(@intCast(self.start_time), .release);
 
-        for (self.engines, 0..) |engine, i| {
-            self.gpu_stats[i].device_index = engine.device_index;
-            self.threads[i] = try std.Thread.spawn(.{ .allocator = self.allocator }, gpuWorker, .{ self, engine, &self.gpu_stats[i] });
+        if (self.engines.len == 0) {
+            for (self.threads, 0..) |*thread, i| {
+                self.gpu_stats[i].device_index = @intCast(i);
+                thread.* = try std.Thread.spawn(.{ .allocator = self.allocator }, cpuWorker, .{ self, @as(u32, @intCast(i)), &self.gpu_stats[i] });
+            }
+        } else {
+            for (self.engines, 0..) |engine, i| {
+                self.gpu_stats[i].device_index = engine.device_index;
+                self.threads[i] = try std.Thread.spawn(.{ .allocator = self.allocator }, gpuWorker, .{ self, engine, &self.gpu_stats[i] });
+            }
         }
 
         while (self.is_running.load(.acquire)) {
@@ -563,6 +756,7 @@ pub const OhlTrainer = struct {
         for (self.engines) |engine| {
             if (engine.mapped_diag) |d| dropped += d.dropped_runes;
         }
+        dropped += @intCast(@min(self.cpu_dropped_runes.load(.monotonic), @as(u64, std.math.maxInt(u32) - dropped)));
         return dropped;
     }
 
@@ -571,6 +765,7 @@ pub const OhlTrainer = struct {
         for (self.engines) |engine| {
             if (engine.mapped_diag) |d| stalls += d.collision_stalls;
         }
+        stalls += @intCast(@min(self.cpu_collision_stalls.load(.monotonic), @as(u64, std.math.maxInt(u32) - stalls)));
         return stalls;
     }
 
@@ -800,12 +995,167 @@ pub const OhlTrainer = struct {
 
         sys.print("[GPU-{d}] Worker Offline.\n", .{engine.device_index});
     }
+
+    fn claimMeaningSlot(self: *OhlTrainer, tags: []u64, spatial_sig: u32, uniform_hash: u64) ?u32 {
+        const slot_count: u32 = @intCast(tags.len);
+        const wide = @as(u64, spatial_sig) * @as(u64, slot_count);
+        const base_slot = @as(u32, @truncate(wide >> 32)) & ~@as(u32, vsa.SUDH_NEIGHBORHOOD_SIZE - 1);
+        const raw_stride = @as(u32, @truncate(uniform_hash >> 32));
+        const stride = @max(raw_stride | 1, vsa.SUDH_NEIGHBORHOOD_SIZE + 1) | 1;
+        const slot_mask = slot_count - 1;
+
+        var p: u32 = 0;
+        while (p < CPU_SUDH_PROBE_LIMIT) : (p += 1) {
+            const slot = (base_slot +% p *% stride) & slot_mask;
+            const lock = &self.cpu_matrix_locks[@as(usize, slot) & (self.cpu_matrix_locks.len - 1)];
+            lock.lock();
+            const existing = tags[slot];
+            if (existing == uniform_hash) return slot;
+            if (existing == 0) {
+                tags[slot] = uniform_hash;
+                return slot;
+            }
+            lock.unlock();
+            _ = self.cpu_collision_stalls.fetchAdd(1, .monotonic);
+        }
+
+        _ = self.cpu_dropped_runes.fetchAdd(1, .monotonic);
+        return null;
+    }
+
+    fn releaseMeaningSlot(self: *OhlTrainer, slot: u32) void {
+        const lock = &self.cpu_matrix_locks[@as(usize, slot) & (self.cpu_matrix_locks.len - 1)];
+        lock.unlock();
+    }
+
+    fn etchLatticeProbeLocked(self: *OhlTrainer, lattice: []u16, entry_idx: u32, h: u64) void {
+        const lock = &self.cpu_lattice_locks[@as(usize, entry_idx) & (self.cpu_lattice_locks.len - 1)];
+        lock.lock();
+        defer lock.unlock();
+        etchLatticeProbe(lattice, entry_idx, h);
+    }
+
+    fn etchLatticeDomainLocked(self: *OhlTrainer, lattice: []u16, lattice_quarter: u32, rotor: u64, rune: u32, domain: u64) void {
+        const leaky_domain = domain & CPU_LATTICE_LEAKY_MASK;
+        const h = latticeWyhash(rotor ^ leaky_domain, rune);
+
+        var probes: [4]u32 = undefined;
+        fillLatticeProbes(&probes, lattice_quarter, h);
+        for (probes) |entry_idx| self.etchLatticeProbeLocked(lattice, entry_idx, h);
+    }
+
+    fn cpuWorker(self: *OhlTrainer, worker_id: u32, stats: *GpuRuntimeStats) void {
+        sys.print("[CPU-{d}] Worker Online: host fallback trainer\n", .{worker_id});
+
+        const max_batch = config.MAX_STREAMS;
+        const chars = self.allocator.alloc(u32, max_batch) catch {
+            self.requestStop(.failed);
+            return;
+        };
+        defer self.allocator.free(chars);
+        const rotors = self.allocator.alloc(u64, max_batch * 18) catch {
+            self.requestStop(.failed);
+            self.allocator.free(chars);
+            return;
+        };
+        defer self.allocator.free(rotors);
+        const indices = self.allocator.alloc(u32, max_batch) catch {
+            self.requestStop(.failed);
+            self.allocator.free(chars);
+            self.allocator.free(rotors);
+            return;
+        };
+        defer self.allocator.free(indices);
+
+        const host_lattice = self.mapped_lattice orelse {
+            self.requestStop(.failed);
+            return;
+        };
+        const host_meaning = self.mapped_meaning orelse {
+            self.requestStop(.failed);
+            return;
+        };
+        const host_tags = self.mapped_tags orelse {
+            self.requestStop(.failed);
+            return;
+        };
+        var meaning = vsa.MeaningMatrix{
+            .data = host_meaning[0..config.SEMANTIC_ENTRIES],
+            .tags = host_tags[0..config.TAG_ENTRIES],
+        };
+        const lattice_quarter: u32 = @intCast(host_lattice.len / 4);
+        const slot_count: u32 = @intCast(host_tags.len);
+
+        while (true) {
+            if (self.is_paused.load(.acquire)) {
+                if (!self.is_running.load(.acquire)) break;
+                _ = stats.idle_loops.fetchAdd(1, .monotonic);
+                sys.sleep(self.idle_sleep_ms.load(.acquire));
+                continue;
+            }
+            if (!self.is_running.load(.acquire)) break;
+
+            const tier = @as(vsa_vulkan.OperationalTier, @enumFromInt(self.current_tier.load(.acquire)));
+            const tier_batch = tier.getBatchSize(config.BATCH_SIZE);
+            const override_batch = self.batch_size_override.load(.acquire);
+            const batch_size = @min(if (override_batch > 0) override_batch else tier_batch, config.MAX_STREAMS);
+            stats.target_batch_size.store(batch_size, .monotonic);
+
+            var num_streams: u32 = 0;
+            const num_packed = self.batcher.pack(batch_size, chars[0..batch_size], rotors[0..(batch_size * 18)], indices[0..batch_size], &num_streams);
+            stats.last_batch_size.store(num_packed, .monotonic);
+
+            if (num_packed == 0) {
+                _ = stats.idle_loops.fetchAdd(1, .monotonic);
+                sys.sleep(self.idle_sleep_ms.load(.acquire));
+                continue;
+            }
+
+            const dispatch_start = sys.getMilliTick();
+            for (0..num_packed) |i| {
+                const base = i * 18;
+                const rune = chars[i];
+                const lexical = rotors[base + 16];
+                const semantic = rotors[base + 17];
+                const spatial_sig = projectSpatialSignatureFromWords(rotors[base .. base + 16]);
+
+                if (!isLockedRuneSlot(lexical, slot_count)) {
+                    self.etchLatticeDomainLocked(host_lattice, lattice_quarter, lexical, rune, CPU_DOMAIN_SYNTAX);
+                    self.etchLatticeDomainLocked(host_lattice, lattice_quarter, lexical, rune, CPU_DOMAIN_CONCEPT);
+                }
+                if (!isLockedRuneSlot(semantic, slot_count)) {
+                    self.etchLatticeDomainLocked(host_lattice, lattice_quarter, semantic, rune, CPU_DOMAIN_INTUITION);
+                }
+
+                const lexical_lock = computeEtchLockState(lexical, slot_count);
+                if (!lexical_lock.hash_locked) {
+                    if (self.claimMeaningSlot(meaning.tags.?, spatial_sig, lexical)) |slot_idx| {
+                        defer self.releaseMeaningSlot(slot_idx);
+                        if (!isLockedMatrixSlot(slot_idx)) etchMeaningSlot(&meaning, slot_idx, rune);
+                    }
+                }
+
+                const semantic_lock = computeEtchLockState(semantic, slot_count);
+                if (!semantic_lock.hash_locked) {
+                    if (self.claimMeaningSlot(meaning.tags.?, spatial_sig, semantic)) |slot_idx| {
+                        defer self.releaseMeaningSlot(slot_idx);
+                        if (!isLockedMatrixSlot(slot_idx)) etchMeaningSlot(&meaning, slot_idx, rune);
+                    }
+                }
+            }
+
+            const dispatch_elapsed = sys.getMilliTick() - dispatch_start;
+            _ = stats.processed_runes.fetchAdd(num_packed, .monotonic);
+            stats.last_dispatch_ms.store(dispatch_elapsed, .monotonic);
+            _ = stats.busy_time_ms.fetchAdd(dispatch_elapsed, .monotonic);
+            _ = stats.dispatched_batches.fetchAdd(1, .monotonic);
+        }
+
+        sys.print("[CPU-{d}] Worker Offline.\n", .{worker_id});
+    }
 };
 
-fn main_wrapped(init: std.process.Init) !void {
-    const allocator = init.gpa;
-    _ = init.io;
-
+fn main_wrapped(allocator: std.mem.Allocator) !void {
     sys.print("\nGhost Trainer {s}: Sovereign Fleet\n", .{@import("ghost_core").VERSION});
 
     if (!sys.acquireTrainerLock()) {
@@ -813,23 +1163,30 @@ fn main_wrapped(init: std.process.Init) !void {
         sys.exit(1);
     }
 
-    var fleet = try vsa_vulkan.MultiGPU.init(allocator, init.io);
-    defer fleet.deinit();
+    var fleet = vsa_vulkan.MultiGPU.init(allocator) catch |err| blk: {
+        sys.print("[TRAINER] Vulkan fleet unavailable ({any}). Falling back to CPU-only training.\n", .{err});
+        break :blk null;
+    };
+    defer if (fleet) |*fleet_ref| fleet_ref.deinit();
 
-    const lattice_abs_path = try config.getPath(allocator, config.LATTICE_REL_PATH);
-    const semantic_abs_path = try config.getPath(allocator, config.SEMANTIC_REL_PATH);
-    const tag_abs_path = try config.getPath(allocator, config.TAG_REL_PATH);
+    var shard_paths = try resolveSelectedShardPaths(allocator);
+    defer shard_paths.deinit();
 
-    const m_lattice = try sys.createMappedFile(allocator, lattice_abs_path, config.UNIFIED_SIZE_BYTES);
-    const m_meaning = try sys.createMappedFile(allocator, semantic_abs_path, config.SEMANTIC_SIZE_BYTES);
-    const m_tags = try sys.createMappedFile(allocator, tag_abs_path, config.TAG_SIZE_BYTES);
+    var m_lattice = try sys.createMappedFile(allocator, shard_paths.lattice_abs_path, config.UNIFIED_SIZE_BYTES);
+    defer m_lattice.unmap();
+    var m_meaning = try sys.createMappedFile(allocator, shard_paths.semantic_abs_path, config.SEMANTIC_SIZE_BYTES);
+    defer m_meaning.unmap();
+    var m_tags = try sys.createMappedFile(allocator, shard_paths.tags_abs_path, config.TAG_SIZE_BYTES);
+    defer m_tags.unmap();
 
     const host_lattice = @as([*]u16, @ptrCast(@alignCast(m_lattice.data.ptr)))[0 .. m_lattice.data.len / @sizeOf(u16)];
     const host_meaning = @as([*]u32, @ptrCast(@alignCast(m_meaning.data.ptr)))[0..config.SEMANTIC_ENTRIES];
     const host_tags = @as([*]u64, @ptrCast(@alignCast(m_tags.data.ptr)))[0..config.TAG_ENTRIES];
 
-    for (fleet.engines) |*engine| {
-        engine.bindHostState(host_meaning, host_tags, host_lattice);
+    if (fleet) |*fleet_ref| {
+        for (fleet_ref.engines) |*engine| {
+            engine.bindHostState(host_meaning, host_tags, host_lattice);
+        }
     }
 
     const corpus_files = sys.findCorpusFiles(allocator) catch try allocator.alloc([]const u8, 0);
@@ -839,6 +1196,7 @@ fn main_wrapped(init: std.process.Init) !void {
     }
 
     var streams = try allocator.alloc(StreamState, @max(corpus_files.len, 1));
+    defer allocator.free(streams);
     var active_streams: usize = 0;
     if (corpus_files.len > 0) {
         for (corpus_files) |path| {
@@ -865,7 +1223,7 @@ fn main_wrapped(init: std.process.Init) !void {
 
     var batcher = try GreedyBatcher.init(allocator, streams[0..active_streams]);
     defer batcher.deinit();
-    var trainer = try OhlTrainer.init(allocator, &fleet, &batcher, .{});
+    var trainer = try OhlTrainer.init(allocator, if (fleet) |*fleet_ref| fleet_ref else null, &batcher, .{});
     defer trainer.deinit();
 
     trainer.mapped_lattice = host_lattice;
@@ -879,8 +1237,11 @@ fn main_wrapped(init: std.process.Init) !void {
     try trainer.start();
 }
 
-pub fn main(init: std.process.Init) void {
-    main_wrapped(init) catch |err| {
+pub fn main() void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    main_wrapped(gpa.allocator()) catch |err| {
         sys.print("\n[FATAL ERROR] {any}\n", .{err});
         std.process.exit(1);
     };

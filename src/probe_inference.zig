@@ -5,29 +5,49 @@ const vsa = core.vsa;
 const ghost_state = core.ghost_state;
 const vsa_vulkan = core.vsa_vulkan;
 const mc = core.inference;
+const config = core.config;
+const shards = core.shards;
 
-pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
-    _ = init.io;
+fn resolveSelectedShardPaths(allocator: std.mem.Allocator) !shards.Paths {
+    const project_id = std.process.getEnvVarOwned(allocator, "GHOST_PROJECT_SHARD") catch null;
+    defer if (project_id) |value| allocator.free(value);
+
+    var metadata = if (project_id) |value|
+        try shards.resolveProjectMetadata(allocator, value)
+    else
+        try shards.resolveCoreMetadata(allocator);
+    defer metadata.deinit();
+
+    return shards.resolvePaths(allocator, metadata.metadata);
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
     const silo_root = try sys.getSiloRoot(allocator);
     sys.print("Silo Root: {s}\n", .{silo_root});
 
-    const vk_engine = try vsa_vulkan.initRuntime(allocator, init.io);
+    const vk_engine = try vsa_vulkan.initRuntime(allocator);
     defer vsa_vulkan.deinitRuntime();
 
-    // Upload CPU-trained data to GPU buffers
-    const mapped_meaning = try sys.createMappedFile(allocator, "state/semantic_monolith.bin", @sizeOf(u32) * 512 * 1024 * 1024);
+    var shard_paths = try resolveSelectedShardPaths(allocator);
+    defer shard_paths.deinit();
+
+    // Upload the selected committed shard's semantic monolith into GPU buffers.
+    const mapped_meaning = try sys.createMappedFile(allocator, shard_paths.semantic_abs_path, config.SEMANTIC_SIZE_BYTES);
+    defer {
+        var mapped = mapped_meaning;
+        mapped.unmap();
+    }
     const gpu_matrix = vk_engine.getMatrixData();
     const src_ptr: [*]const u32 = @ptrCast(@alignCast(mapped_meaning.data.ptr));
     const src_len = mapped_meaning.data.len / 4;
     const copy_len = @min(gpu_matrix.len, src_len);
     @memcpy(gpu_matrix[0..copy_len], src_ptr[0..copy_len]);
 
-    var meaning_matrix = vsa.MeaningMatrix{
-        .data = gpu_matrix,
-        .tags = null
-    };
+    var meaning_matrix = vsa.MeaningMatrix{ .data = gpu_matrix, .tags = null };
 
     var soul = try allocator.create(ghost_state.GhostSoul);
     soul.* = try ghost_state.GhostSoul.init(allocator);
@@ -60,16 +80,24 @@ pub fn main(init: std.process.Init) !void {
         // Debug: show top-3 candidates
         if (i < 5) {
             sys.print("\n  [MC-{d}] top3: '{c}'({d}) '{c}'({d}) '{c}'({d})", .{
-                i, @as(u8, @intCast(top_chars[0])), top_energies[0],
-                @as(u8, @intCast(top_chars[1])), top_energies[1],
-                @as(u8, @intCast(top_chars[2])), top_energies[2],
+                i,                               @as(u8, @intCast(top_chars[0])), top_energies[0],
+                @as(u8, @intCast(top_chars[1])), top_energies[1],                 @as(u8, @intCast(top_chars[2])),
+                top_energies[2],
             });
         }
 
         // Beam search picks the winner
-        const winner_idx = beam.resolve(soul, &top_chars, &top_energies) catch 0;
-        const chosen = top_chars[winner_idx];
-        sys.print("\n  -> chosen: '{c}' (lane {d})\n", .{@as(u8, @intCast(chosen)), winner_idx});
+        const decision = beam.resolveWithContract(soul, &top_chars, &top_energies, .{}) catch {
+            sys.print("\n  -> unresolved: internal_error\n", .{});
+            break;
+        };
+        if (decision.stop_reason != .none) {
+            sys.print("\n  -> unresolved: {s}\n", .{@tagName(decision.stop_reason)});
+            break;
+        }
+        const winner_idx = decision.branch_index orelse 0;
+        const chosen = decision.output;
+        sys.print("\n  -> chosen: '{c}' (lane {d})\n", .{ @as(u8, @intCast(chosen)), winner_idx });
         _ = try soul.absorb(vsa.generate(@intCast(chosen)), @intCast(chosen), null);
         if (chosen == '.' or chosen == '\n') break;
     }

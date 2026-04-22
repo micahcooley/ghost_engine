@@ -1,6 +1,24 @@
 const std = @import("std");
 const config = @import("config.zig");
 
+pub const ReasoningMode = enum(u8) {
+    proof,
+    exploratory,
+};
+
+pub fn reasoningModeName(mode: ReasoningMode) []const u8 {
+    return switch (mode) {
+        .proof => "proof",
+        .exploratory => "exploratory",
+    };
+}
+
+pub fn parseReasoningMode(text: []const u8) ?ReasoningMode {
+    if (std.ascii.eqlIgnoreCase(text, "proof")) return .proof;
+    if (std.ascii.eqlIgnoreCase(text, "exploratory")) return .exploratory;
+    return null;
+}
+
 pub const ScanSnapshot = struct {
     hash: u64 = 0,
     energy: u32 = 0,
@@ -32,6 +50,7 @@ const Mutex = struct {
 };
 
 pub const ControlSnapshot = struct {
+    reasoning_mode: ReasoningMode,
     saturation_bonus: u32,
     boredom_penalty_high: u32,
     boredom_penalty_low: u32,
@@ -46,9 +65,43 @@ pub const ControlSnapshot = struct {
     etch: EtchTelemetry,
 };
 
+pub const BindingSnapshot = struct {
+    label: []u8,
+    rune: u32,
+};
+
+pub const CapturedControlState = struct {
+    allocator: std.mem.Allocator,
+    snapshot: ControlSnapshot,
+    locked_slots: []u32,
+    locked_hashes: []u64,
+    bindings: []BindingSnapshot,
+
+    pub fn deinit(self: *CapturedControlState) void {
+        for (self.bindings) |binding| self.allocator.free(binding.label);
+        self.allocator.free(self.bindings);
+        self.allocator.free(self.locked_hashes);
+        self.allocator.free(self.locked_slots);
+        self.* = undefined;
+    }
+};
+
+fn lessThanU32(_: void, lhs: u32, rhs: u32) bool {
+    return lhs < rhs;
+}
+
+fn lessThanU64(_: void, lhs: u64, rhs: u64) bool {
+    return lhs < rhs;
+}
+
+fn lessThanBinding(_: void, lhs: BindingSnapshot, rhs: BindingSnapshot) bool {
+    return std.mem.order(u8, lhs.label, rhs.label) == .lt;
+}
+
 pub const ControlPlane = struct {
     allocator: std.mem.Allocator,
     mutex: Mutex = .{},
+    reasoning_mode: ReasoningMode = .proof,
     saturation_bonus: u32 = config.SATURATION_BONUS,
     boredom_penalty_high: u32 = config.BOREDOM_PENALTY_HIGH,
     boredom_penalty_low: u32 = config.BOREDOM_PENALTY_LOW,
@@ -117,6 +170,12 @@ pub const ControlPlane = struct {
         self.saturation_bonus = tuned;
     }
 
+    pub fn setReasoningMode(self: *ControlPlane, mode: ReasoningMode) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.reasoning_mode = mode;
+    }
+
     pub fn setComputeMode(self: *ControlPlane, enable_vulkan: bool, force_cpu_only: bool) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -141,6 +200,7 @@ pub const ControlPlane = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return .{
+            .reasoning_mode = self.reasoning_mode,
             .saturation_bonus = self.saturation_bonus,
             .boredom_penalty_high = self.boredom_penalty_high,
             .boredom_penalty_low = self.boredom_penalty_low,
@@ -154,6 +214,105 @@ pub const ControlPlane = struct {
             .binding_count = self.bindings.count(),
             .etch = self.etch,
         };
+    }
+
+    pub fn captureState(self: *ControlPlane, allocator: std.mem.Allocator) !CapturedControlState {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var captured = CapturedControlState{
+            .allocator = allocator,
+            .snapshot = .{
+                .reasoning_mode = self.reasoning_mode,
+                .saturation_bonus = self.saturation_bonus,
+                .boredom_penalty_high = self.boredom_penalty_high,
+                .boredom_penalty_low = self.boredom_penalty_low,
+                .enable_vulkan = self.enable_vulkan,
+                .force_cpu_only = self.force_cpu_only,
+                .loom_tier = self.loom_tier,
+                .lattice_cache_cap_bytes = self.lattice_cache_cap_bytes,
+                .last_scan = self.last_scan,
+                .locked_slot_count = self.locked_slots.count(),
+                .locked_hash_count = self.locked_hashes.count(),
+                .binding_count = self.bindings.count(),
+                .etch = self.etch,
+            },
+            .locked_slots = try allocator.alloc(u32, self.locked_slots.count()),
+            .locked_hashes = try allocator.alloc(u64, self.locked_hashes.count()),
+            .bindings = try allocator.alloc(BindingSnapshot, self.bindings.count()),
+        };
+        for (captured.bindings) |*binding| {
+            binding.* = .{ .label = &.{}, .rune = 0 };
+        }
+        errdefer {
+            for (captured.bindings[0..captured.snapshot.binding_count]) |binding| allocator.free(binding.label);
+            allocator.free(captured.bindings);
+            allocator.free(captured.locked_hashes);
+            allocator.free(captured.locked_slots);
+        }
+
+        var slot_index: usize = 0;
+        var slot_it = self.locked_slots.iterator();
+        while (slot_it.next()) |entry| : (slot_index += 1) {
+            captured.locked_slots[slot_index] = entry.key_ptr.*;
+        }
+
+        var hash_index: usize = 0;
+        var hash_it = self.locked_hashes.iterator();
+        while (hash_it.next()) |entry| : (hash_index += 1) {
+            captured.locked_hashes[hash_index] = entry.key_ptr.*;
+        }
+
+        var binding_index: usize = 0;
+        var binding_it = self.bindings.iterator();
+        while (binding_it.next()) |entry| : (binding_index += 1) {
+            captured.bindings[binding_index] = .{
+                .label = try allocator.dupe(u8, entry.key_ptr.*),
+                .rune = entry.value_ptr.*,
+            };
+        }
+
+        std.sort.heap(u32, captured.locked_slots, {}, lessThanU32);
+        std.sort.heap(u64, captured.locked_hashes, {}, lessThanU64);
+        std.sort.heap(BindingSnapshot, captured.bindings, {}, lessThanBinding);
+        return captured;
+    }
+
+    pub fn restoreState(self: *ControlPlane, captured: *const CapturedControlState) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.reasoning_mode = captured.snapshot.reasoning_mode;
+        self.saturation_bonus = captured.snapshot.saturation_bonus;
+        self.boredom_penalty_high = captured.snapshot.boredom_penalty_high;
+        self.boredom_penalty_low = captured.snapshot.boredom_penalty_low;
+        self.enable_vulkan = captured.snapshot.enable_vulkan;
+        self.force_cpu_only = captured.snapshot.force_cpu_only;
+        self.loom_tier = captured.snapshot.loom_tier;
+        self.lattice_cache_cap_bytes = captured.snapshot.lattice_cache_cap_bytes;
+        self.last_scan = captured.snapshot.last_scan;
+        self.etch = captured.snapshot.etch;
+
+        self.locked_slots.clearRetainingCapacity();
+        self.locked_hashes.clearRetainingCapacity();
+
+        var binding_it = self.bindings.iterator();
+        while (binding_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.bindings.clearRetainingCapacity();
+
+        for (captured.locked_slots) |slot| {
+            try self.locked_slots.put(slot, {});
+        }
+        for (captured.locked_hashes) |hash| {
+            try self.locked_hashes.put(hash, {});
+        }
+        for (captured.bindings) |binding| {
+            const owned = try self.allocator.dupe(u8, binding.label);
+            errdefer self.allocator.free(owned);
+            try self.bindings.put(owned, binding.rune);
+        }
     }
 
     pub fn recordEtch(

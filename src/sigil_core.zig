@@ -29,6 +29,8 @@ pub const LoomCommand = enum(u8) {
     none,
     vulkan_init,
     cpu_only,
+    proof,
+    exploratory,
     tier_1,
     tier_2,
     tier_3,
@@ -211,14 +213,14 @@ const Parser = struct {
         return .{
             .allocator = allocator,
             .tokens = tokens,
-            .instructions = .empty,
-            .strings = .empty,
+            .instructions = std.ArrayList(Instruction).init(allocator),
+            .strings = std.ArrayList([]const u8).init(allocator),
         };
     }
 
     fn deinit(self: *Parser) void {
-        self.instructions.deinit(self.allocator);
-        self.strings.deinit(self.allocator);
+        self.instructions.deinit();
+        self.strings.deinit();
     }
 
     fn current(self: *Parser) Atom {
@@ -241,12 +243,12 @@ const Parser = struct {
 
     fn appendString(self: *Parser, text: []const u8) anyerror!u32 {
         const owned = try self.allocator.dupe(u8, text);
-        try self.strings.append(self.allocator, owned);
+        try self.strings.append(owned);
         return @intCast(self.strings.items.len - 1);
     }
 
     fn emit(self: *Parser, opcode: Opcode, mode: OperandMode, a: i64, b: i64, string_index: u32) anyerror!usize {
-        try self.instructions.append(self.allocator, .{
+        try self.instructions.append(.{
             .opcode = opcode,
             .mode = mode,
             .a = a,
@@ -422,12 +424,12 @@ const Parser = struct {
 
 pub fn compileScript(allocator: std.mem.Allocator, source: []const u8) !Program {
     var lexer = Lexer{ .buffer = source };
-    var tokens: std.ArrayList(Atom) = .empty;
-    defer tokens.deinit(allocator);
+    var tokens = std.ArrayList(Atom).init(allocator);
+    defer tokens.deinit();
 
     while (true) {
         const token = lexer.next();
-        try tokens.append(allocator, token);
+        try tokens.append(token);
         if (token.tag == .eof) break;
     }
 
@@ -437,36 +439,38 @@ pub fn compileScript(allocator: std.mem.Allocator, source: []const u8) !Program 
 
     return .{
         .allocator = allocator,
-        .instructions = try parser.instructions.toOwnedSlice(allocator),
-        .strings = try parser.strings.toOwnedSlice(allocator),
+        .instructions = try parser.instructions.toOwnedSlice(),
+        .strings = try parser.strings.toOwnedSlice(),
     };
 }
 
 pub fn serializeProgram(allocator: std.mem.Allocator, program: *const Program) ![]u8 {
-    var output: std.ArrayList(u8) = .empty;
-    errdefer output.deinit(allocator);
+    var output = std.ArrayList(u8).init(allocator);
+    errdefer output.deinit();
 
-    try output.appendSlice(allocator, "SVM1");
+    try output.appendSlice("SVM1");
 
     var counts: [2]u32 = .{
         @intCast(program.instructions.len),
         @intCast(program.strings.len),
     };
-    try output.appendSlice(allocator, std.mem.asBytes(&counts));
-    try output.appendSlice(allocator, std.mem.sliceAsBytes(program.instructions));
+    try output.appendSlice(std.mem.asBytes(&counts));
+    try output.appendSlice(std.mem.sliceAsBytes(program.instructions));
 
     for (program.strings) |item| {
         const len: u32 = @intCast(item.len);
-        try output.appendSlice(allocator, std.mem.asBytes(&len));
-        try output.appendSlice(allocator, item);
+        try output.appendSlice(std.mem.asBytes(&len));
+        try output.appendSlice(item);
     }
 
-    return output.toOwnedSlice(allocator);
+    return output.toOwnedSlice();
 }
 
 fn parseLoomCommand(text: []const u8) LoomCommand {
     if (std.ascii.eqlIgnoreCase(text, "VULKAN_INIT")) return .vulkan_init;
     if (std.ascii.eqlIgnoreCase(text, "CPU_ONLY")) return .cpu_only;
+    if (std.ascii.eqlIgnoreCase(text, "PROOF")) return .proof;
+    if (std.ascii.eqlIgnoreCase(text, "EXPLORATORY")) return .exploratory;
     if (std.ascii.eqlIgnoreCase(text, "TIER_1")) return .tier_1;
     if (std.ascii.eqlIgnoreCase(text, "TIER_2")) return .tier_2;
     if (std.ascii.eqlIgnoreCase(text, "TIER_3")) return .tier_3;

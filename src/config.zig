@@ -3,7 +3,6 @@ const build_options = @import("build_options");
 
 /// ── Sovereign Configuration: The Comptime Spine ──
 /// Derived memory algebra for bit-perfect hardware alignment.
-
 pub const TEST_MODE = build_options.test_mode;
 pub const PLATFORM_SUBDIR = build_options.platform_subdir;
 pub const STATE_SUBDIR = if (TEST_MODE) "state/test" else PLATFORM_SUBDIR ++ "/state";
@@ -17,19 +16,20 @@ pub const SEMANTIC_SLOTS: usize = if (TEST_MODE) 16_384 else 524_288;
 
 // --- Lattice Algebra ---
 pub const UNIFIED_ENTRIES: usize = if (TEST_MODE) 33_554_432 else 536_870_912;
-pub const UNIFIED_SIZE_BYTES: usize = UNIFIED_ENTRIES * @sizeOf(u16); 
+pub const UNIFIED_SIZE_BYTES: usize = UNIFIED_ENTRIES * @sizeOf(u16);
 
 // --- Semantic Algebra ---
 // Accumulators: Slots * 1024 * u32 (1GB if slots=256K)
 pub const SEMANTIC_ENTRIES: usize = SEMANTIC_SLOTS * 1024;
-pub const SEMANTIC_SIZE_BYTES: usize = SEMANTIC_ENTRIES * @sizeOf(u32); 
+pub const SEMANTIC_SIZE_BYTES: usize = SEMANTIC_ENTRIES * @sizeOf(u32);
 
 // Tags: Slots * u64 (2MB if slots=256K)
 pub const TAG_ENTRIES: usize = SEMANTIC_SLOTS;
-pub const TAG_SIZE_BYTES: usize = TAG_ENTRIES * @sizeOf(u64); 
+pub const TAG_SIZE_BYTES: usize = TAG_ENTRIES * @sizeOf(u64);
 
 // --- Derived Totals ---
 pub const TOTAL_STATE_BYTES: usize = UNIFIED_SIZE_BYTES + SEMANTIC_SIZE_BYTES + TAG_SIZE_BYTES;
+pub const DEFAULT_SCRATCHPAD_BYTES: usize = if (TEST_MODE) 1 * 1024 * 1024 else 32 * 1024 * 1024;
 
 // --- Operational Logic ---
 pub const SURPRISE_THRESHOLD: u16 = 850; // Resonance > 850 = Already known (skip etching)
@@ -48,6 +48,9 @@ pub const MAX_STREAMS: u32 = 20480; // Max concurrent training streams per GPU f
 pub const BEAM_NUM_LANES: u32 = 5;
 pub const BEAM_ROLLOUT_DEPTH: u32 = 10;
 pub const force_cpu_inference: bool = false; // Re-engage GPU inference while interrogating the live Vulkan path.
+pub const LAYER3_CONFIDENCE_FLOOR_MIN: u32 = 0;
+pub const LAYER3_MAX_STEPS: u32 = BEAM_ROLLOUT_DEPTH;
+pub const LAYER3_MAX_BRANCHES: u32 = BEAM_NUM_LANES;
 pub const SATURATION_BONUS: u32 = 64;
 pub const SATURATION_LOCK_THRESHOLD: u32 = 32; // Minimum locked cells for saturation bonus
 pub const SATURATION_SAMPLE_SIZE: u32 = 64; // Cells to sample per slot for saturation check
@@ -83,9 +86,27 @@ pub fn getPath(allocator: std.mem.Allocator, sub_path: []const u8) ![]u8 {
     return std.fs.path.join(allocator, &.{ build_options.project_root, sub_path });
 }
 
-pub const LATTICE_REL_PATH = STATE_SUBDIR ++ "/unified_lattice.bin";
-pub const SEMANTIC_REL_PATH = STATE_SUBDIR ++ "/semantic_monolith.bin";
-pub const TAG_REL_PATH = STATE_SUBDIR ++ "/semantic_tags.bin";
+pub const LATTICE_FILE_NAME = "unified_lattice.bin";
+pub const SEMANTIC_FILE_NAME = "semantic_monolith.bin";
+pub const TAG_FILE_NAME = "semantic_tags.bin";
+pub const SIGIL_CONTROL_FILE_NAME = "control.bin";
+pub const ABSTRACTION_CATALOG_FILE_NAME = "catalog.gabs";
+pub const ABSTRACTION_STAGED_FILE_NAME = "staged.gabs";
+pub const ABSTRACTION_SLOT_FILE_NAME = "abstractions.gabs";
+pub const PATCH_CANDIDATE_REL_DIR_NAME = "patch_candidates";
+pub const PATCH_CANDIDATE_STAGED_FILE_NAME = "staged.json";
+pub const SHARD_ROOT_REL_DIR = STATE_SUBDIR ++ "/shards";
+pub const CORE_SHARD_REL_DIR = SHARD_ROOT_REL_DIR ++ "/core/core";
+pub const PROJECT_SHARD_REL_DIR = SHARD_ROOT_REL_DIR ++ "/projects";
+pub const ABSTRACTIONS_REL_DIR_NAME = "abstractions";
+pub const SIGIL_STATE_REL_DIR = CORE_SHARD_REL_DIR ++ "/sigil";
+pub const SIGIL_SCRATCH_REL_DIR = SIGIL_STATE_REL_DIR ++ "/scratch";
+pub const SIGIL_COMMITTED_REL_DIR = SIGIL_STATE_REL_DIR ++ "/committed";
+pub const SIGIL_SNAPSHOT_REL_DIR = SIGIL_STATE_REL_DIR ++ "/snapshot";
+
+pub const LATTICE_REL_PATH = CORE_SHARD_REL_DIR ++ "/" ++ LATTICE_FILE_NAME;
+pub const SEMANTIC_REL_PATH = CORE_SHARD_REL_DIR ++ "/" ++ SEMANTIC_FILE_NAME;
+pub const TAG_REL_PATH = CORE_SHARD_REL_DIR ++ "/" ++ TAG_FILE_NAME;
 
 // --- Integration Test Constants ---
 pub const TEST_LATTICE_SIZE: usize = 1 * 1024 * 1024; // 1 MiB

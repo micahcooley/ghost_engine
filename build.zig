@@ -24,6 +24,8 @@ fn addCoreOptions(
 }
 
 pub fn build(b: *std.Build) void {
+    // Linux is the primary documented target. `zig build` uses the host target
+    // by default, or an explicit target such as `-Dtarget=x86_64-linux`.
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const core_options = addCoreOptions(b, target, false);
@@ -32,7 +34,7 @@ pub fn build(b: *std.Build) void {
     // NOTE: We do NOT link against vulkan-1.dll at build time.
     // The DLL is loaded dynamically at runtime via LoadLibraryA.
     // If the DLL is missing (no GPU driver), the engine falls back to CPU mode.
-    const vulkan_sdk = b.graph.environ_map.get("VULKAN_SDK");
+    const vulkan_sdk = b.graph.env_map.get("VULKAN_SDK");
 
     // ── 2. Sovereign Core Module ──
     const ghost_core = b.createModule(.{
@@ -43,6 +45,9 @@ pub fn build(b: *std.Build) void {
         if (vulkan_sdk) |sdk| {
             ghost_core.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "Include" }) });
         }
+    } else if (target.result.os.tag == .linux) {
+        ghost_core.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
+        ghost_core.addSystemIncludePath(.{ .cwd_relative = "/usr/include/x86_64-linux-gnu" });
     }
 
     // Helper: add Vulkan include path to any module that imports ghost_core
@@ -53,6 +58,9 @@ pub fn build(b: *std.Build) void {
                 if (sdk_opt) |sdk| {
                     mod.addIncludePath(.{ .cwd_relative = builder.pathJoin(&.{ sdk, "Include" }) });
                 }
+            } else if (os.tag == .linux) {
+                mod.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
+                mod.addSystemIncludePath(.{ .cwd_relative = "/usr/include/x86_64-linux-gnu" });
             }
         }
     }.add;
@@ -81,6 +89,9 @@ pub fn build(b: *std.Build) void {
             exe.root_module.addImport("ghost_core", core_module);
             exe.root_module.addOptions("build_options", options);
             exe.root_module.linkSystemLibrary("c", .{});
+            if (os.tag == .linux) {
+                exe.root_module.linkSystemLibrary("dl", .{});
+            }
             add_vulkan_includes(exe.root_module, os, sdk_opt, builder);
             if (std.mem.eql(u8, exe_name, "ghost_sovereign") and os.tag == .windows) {
                 exe.root_module.linkSystemLibrary("ws2_32", .{});
@@ -90,7 +101,16 @@ pub fn build(b: *std.Build) void {
     }.add;
 
     // ── 3. Shader SPIR-V (Pre-compiled, embedded via @embedFile) ──
-    const shader_names = [_][]const u8{ "resonance_query", "genesis_etch", "thermal_prune", "recursive_lookahead", "lattice_etch" };
+    const shader_names = [_][]const u8{
+        "resonance_query",
+        "genesis_etch",
+        "thermal_prune",
+        "recursive_lookahead",
+        "lattice_etch",
+        "candidate_score",
+        "neighborhood_score",
+        "contradiction_filter",
+    };
     for (shader_names) |name| {
         const spv_path = b.pathJoin(&.{ "src", "shaders", b.fmt("{s}.spv", .{name}) });
         _ = b.path(spv_path);
@@ -119,6 +139,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "ohl_trainer", .root = "src/trainer.zig" },
         .{ .name = "probe_inference", .root = "src/probe_inference.zig" },
         .{ .name = "sigil_core", .root = "src/sigil_core.zig" },
+        .{ .name = "ghost_code_intel", .root = "src/code_intel_cli.zig" },
+        .{ .name = "ghost_patch_candidates", .root = "src/patch_candidates_cli.zig" },
+        .{ .name = "ghost_task_intent", .root = "src/task_intent_cli.zig" },
     };
 
     for (exes) |cfg| {
@@ -143,6 +166,23 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
+    const bench_exe = addGhostExecutable(
+        b,
+        "ghost_bench_serious_workflows",
+        "src/bench_serious_workflows.zig",
+        target,
+        optimize,
+        ghost_core,
+        core_options,
+        target.result.os,
+        vulkan_sdk,
+        addVulkanIncludes,
+    );
+    const run_bench = b.addRunArtifact(bench_exe);
+    run_bench.step.dependOn(b.getInstallStep());
+    const bench_step = b.step("bench-serious-workflows", "Run the serious workflow benchmark suite");
+    bench_step.dependOn(&run_bench.step);
+
     // ── 9. Unit & Integration Tests ──
     const main_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -160,9 +200,15 @@ pub fn build(b: *std.Build) void {
         if (vulkan_sdk) |sdk| {
             ghost_core_test.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "Include" }) });
         }
+    } else if (target.result.os.tag == .linux) {
+        ghost_core_test.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
+        ghost_core_test.addSystemIncludePath(.{ .cwd_relative = "/usr/include/x86_64-linux-gnu" });
     }
     main_tests.root_module.addOptions("build_options", test_core_options);
     main_tests.root_module.linkSystemLibrary("c", .{});
+    if (target.result.os.tag == .linux) {
+        main_tests.root_module.linkSystemLibrary("dl", .{});
+    }
     addVulkanIncludes(main_tests.root_module, target.result.os, vulkan_sdk, b);
 
     const run_main_tests = b.addRunArtifact(main_tests);
@@ -176,18 +222,30 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         }),
+        .test_runner = .{
+            .path = b.path("src/parity_test_runner.zig"),
+            .mode = .simple,
+        },
     });
     parity_test.root_module.addImport("ghost_core", ghost_core);
     parity_test.root_module.addOptions("build_options", core_options);
     parity_test.root_module.linkSystemLibrary("c", .{});
+    if (target.result.os.tag == .linux) {
+        parity_test.root_module.addLibraryPath(.{ .cwd_relative = "/lib/x86_64-linux-gnu" });
+        parity_test.root_module.addLibraryPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
+        parity_test.root_module.linkSystemLibrary("dl", .{});
+        parity_test.root_module.linkSystemLibrary("vulkan", .{});
+    }
     addVulkanIncludes(parity_test.root_module, target.result.os, vulkan_sdk, b);
 
     const run_parity_test = b.addRunArtifact(parity_test);
+    run_parity_test.stdio = .inherit;
+    run_parity_test.has_side_effects = true;
     const parity_step = b.step("test-parity", "Run Vulkan GPU <-> CPU Parity Tests");
     parity_step.dependOn(&run_parity_test.step);
 
     // ── 11. Release Packaging ──
-    // Creates a clean distributable folder with exe, empty state/, empty corpus/
+    // Creates a clean distributable folder with the selected target layout.
     const release_step = b.step("release", "Build and package a distributable release");
     const release_exe = b.addExecutable(.{
         .name = "ghost_sovereign",
@@ -200,6 +258,9 @@ pub fn build(b: *std.Build) void {
     release_exe.root_module.addImport("ghost_core", ghost_core);
     release_exe.root_module.addOptions("build_options", core_options);
     release_exe.root_module.linkSystemLibrary("c", .{});
+    if (target.result.os.tag == .linux) {
+        release_exe.root_module.linkSystemLibrary("dl", .{});
+    }
     addVulkanIncludes(release_exe.root_module, target.result.os, vulkan_sdk, b);
     if (target.result.os.tag == .windows) {
         release_exe.root_module.linkSystemLibrary("ws2_32", .{});
@@ -223,6 +284,9 @@ pub fn build(b: *std.Build) void {
     });
     unicode_probe.root_module.addImport("ghost_core", ghost_core);
     unicode_probe.root_module.linkSystemLibrary("c", .{});
+    if (target.result.os.tag == .linux) {
+        unicode_probe.root_module.linkSystemLibrary("dl", .{});
+    }
     const run_unicode_probe = b.addRunArtifact(unicode_probe);
     const unicode_step = b.step("probe-unicode", "Run Unicode Resonance Probe");
     unicode_step.dependOn(&run_unicode_probe.step);
@@ -237,8 +301,12 @@ pub fn build(b: *std.Build) void {
         }),
     });
     seed_exe.root_module.addImport("ghost_core", ghost_core);
+    seed_exe.root_module.linkSystemLibrary("c", .{});
+    if (target.result.os.tag == .linux) {
+        seed_exe.root_module.linkSystemLibrary("dl", .{});
+    }
     const run_seed = b.addRunArtifact(seed_exe);
-    const seed_step = b.step("seed", "Initialize the 2GB state files (Lattice & Meaning Matrix)");
+    const seed_step = b.step("seed", "Initialize the seeded platform state files (lattice, semantic monolith, tags)");
     seed_step.dependOn(&run_seed.step);
 
     const corpus_exe = b.addExecutable(.{
@@ -250,6 +318,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
     corpus_exe.root_module.addImport("ghost_core", ghost_core);
+    corpus_exe.root_module.linkSystemLibrary("c", .{});
+    if (target.result.os.tag == .linux) {
+        corpus_exe.root_module.linkSystemLibrary("dl", .{});
+    }
     const run_corpus = b.addRunArtifact(corpus_exe);
     const corpus_step = b.step("corpus", "Generate the mixed_sovereign.txt test corpus");
     corpus_step.dependOn(&run_corpus.step);

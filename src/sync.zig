@@ -16,8 +16,7 @@ pub const Mutex = struct {
                     _ = windows.ntdll.RtlWaitOnAddress(&self.state.raw, &@as(u32, 1), 4, null);
                 },
                 .linux => {
-                    const linux = std.os.linux;
-                    _ = linux.futex_4arg(&self.state.raw, .{ .cmd = .WAIT, .private = true }, 1, null);
+                    std.Thread.Futex.wait(&self.state, 1);
                 },
                 else => std.Thread.yield() catch {},
             }
@@ -32,8 +31,7 @@ pub const Mutex = struct {
                 windows.ntdll.RtlWakeAddressSingle(&self.state.raw);
             },
             .linux => {
-                const linux = std.os.linux;
-                _ = linux.futex_3arg(&self.state.raw, .{ .cmd = .WAKE, .private = true }, 1);
+                std.Thread.Futex.wake(&self.state, 1);
             },
             else => {},
         }
@@ -53,8 +51,7 @@ pub const Condition = struct {
                 _ = windows.ntdll.RtlWaitOnAddress(&self.state.raw, &current, 4, null);
             },
             .linux => {
-                const linux = std.os.linux;
-                _ = linux.futex_4arg(&self.state.raw, .{ .cmd = .WAIT, .private = true }, current, null);
+                std.Thread.Futex.wait(&self.state, current);
             },
             else => std.Thread.yield() catch {},
         }
@@ -69,8 +66,7 @@ pub const Condition = struct {
                 windows.ntdll.RtlWakeAddressSingle(&self.state.raw);
             },
             .linux => {
-                const linux = std.os.linux;
-                _ = linux.futex_3arg(&self.state.raw, .{ .cmd = .WAKE, .private = true }, 1);
+                std.Thread.Futex.wake(&self.state, 1);
             },
             else => {},
         }
@@ -84,8 +80,7 @@ pub const Condition = struct {
                 windows.ntdll.RtlWakeAddressAll(&self.state.raw);
             },
             .linux => {
-                const linux = std.os.linux;
-                _ = linux.futex_3arg(&self.state.raw, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
+                std.Thread.Futex.wake(&self.state, std.math.maxInt(u32));
             },
             else => {},
         }

@@ -1,93 +1,271 @@
 # Ghost Engine Architecture
 
-A bare-metal Vector Symbolic Architecture (VSA) engine with Vulkan GPU compute acceleration, multi-GPU fleet training, and distributed consensus.
+This file describes implemented behavior only. Deferred work lives in [docs/ARCHITECTURE_PHASE1.md](docs/ARCHITECTURE_PHASE1.md).
 
-## Domain Term Mapping
+## Current Top Level
 
-| Ghost Term | CS / Math Term | Description |
-|---|---|---|
-| Rune | Unicode Codepoint | A single UTF-32 character. The atomic unit of input. |
-| HyperVector | 1024-bit VSA Vector | `@Vector(16, u64)`. A pseudo-random bipolar vector in hyperspace. |
-| generate(seed) | VSA Identity Vector | Deterministic hash (splitmix64 variant) mapping any u64 to a 1024-bit vector. |
-| bind(a, b) | VSA Binding (XOR) | `a ^ b`. Produces a vector dissimilar to both inputs. Symmetric, invertible. |
-| bundle(a, b, c) | VSA Bundling (Majority Rule) | `(a & b) \| (b & c) \| (c & a)`. Superposes 3 vectors into 1. Lossy compression. |
-| permute(v) | VSA Permutation | Circular bit-shift by 19 on each lane. Produces a near-orthogonal vector. |
-| Resonance | Hamming Similarity | `1024 - popcount(a ^ b)`. Range [0, 1024]. 1024 = identical, 512 = random, 0 = inverse. |
-| Rotor | Rolling Hash State | A u64 FNV-1a derivative that evolves per-rune. Acts as a context-dependent address. |
-| MeaningMatrix | Hash-Table of Accumulators | Open-addressed (double-hash) table. Each slot holds 1024 x u32 counters. Collapse via thresholding produces a 1024-bit binary vector. |
-| collapseToBinary(hash) | VSA Memory Read | Probes the MeaningMatrix by hash, reads 1024 u32 accumulators, thresholds each to a single bit, producing a 1024-bit HyperVector. |
-| applyGravity | VSA Memory Write (Hebbian) | For each of 1024 bit positions: if bit=1, increment counter; if bit=0, decrement. Saturating arithmetic. |
-| Myelination | Weight Locking (MSB) | When a u32 counter reaches 10,000, the MSB (0x80000000) is set. The weight becomes permanent. |
-| Unified Lattice | Memory-Mapped u16 Array | 1 GB file (`unified_lattice.bin`). 512M x u16 counters. Secondary storage for GPU etched patterns. |
-| GhostSoul | Multi-Scale Context State | Four HyperVector registers (syntax, phrase, concept, global) with cascade etching on boundary detection. |
-| Boundary | Syntactic Delimiter | Enum: word (space), phrase (punctuation), paragraph (brace), soul (low energy). Triggers context cascade. |
-| PagedPanopticon | Paged Text Buffer | 64 pages x 16M u32 = 4 GB literal recall. Stores every rune seen. Concept anchors stored separately for O(n) nearest-neighbor search. |
-| MesoLattice | Cursor State | Tracks the current position in the generation stream. |
-| Monte Carlo Engine | Tree Search | 5-lane parallel rollout over top-K candidates. Each lane simulates 10 steps of greedy character selection. Winner chosen by terminal resonance score. |
-| Koryphaios | Coherence Gate | A 2-threshold Hamming distance check (manager + critic) that gates candidate acceptance during reasoning. Prevents context drift. |
-| OperationalTier | GPU Batch Size Heuristic | Enum from `god` (16x base) to `background` (base/8). Derived from `maxComputeWorkGroupInvocations`. |
-| BMP Space | Precomputed Identity Table | 65,536 HyperVectors generated at init. Hierarchical search via 256 centroids (each bundling 256 vectors). |
-| GreedyBatcher | Multi-Stream Scheduler | Atomic-cursor round-robin over corpus file streams. Packs runes into GPU dispatch buffers. |
-| ClusterNode | Gossip Protocol | UDP broadcast for myelin lock events + heartbeat. TCP fallback for hash-mismatch slot sync. 16-byte fixed packets. |
-
-## Data Flow
-
-```
-Input Text
-    |
-    v
-[Rune Iterator] -- UTF-8 decode --> codepoints
-    |
-    v
-[GhostSoul.absorb(rune)]
-    |-- generate(codepoint) -> HyperVector
-    |-- Update rotors (FNV-1a rolling hash)
-    |-- Bundle into syntax/phrase/concept/global registers
-    |-- Detect boundary -> cascade etch across levels
-    |-- Push to Panopticon (literal recall)
-    |
-    v
-[SingularityEngine.resolveText1D()]
-    |-- Query resonance (GPU or CPU hierarchical search)
-    |      CPU: 256 centroid sweep -> top-8 chunks -> 2048 candidates
-    |      GPU: Vulkan compute shader -> 256 energy values
-    |-- Top-K selection
-    |-- Reasoning (Monte Carlo GPU rollout or Koryphaios CPU fallback)
-    |-- Oracle audit (1/10000 runes: GPU vs CPU energy comparison)
-    |
-    v
-Output Rune
-```
-
-## GPU Pipeline
-
-Five SPIR-V compute shaders, embedded in the binary:
-
-| Shader | Purpose |
+| Path | Current role |
 |---|---|
-| `genesis_etch` | Batch Hebbian update: writes to MeaningMatrix accumulators |
-| `lattice_etch` | 4-probe hashing with greedy saturation into the Unified Lattice |
-| `resonance_query` | Hamming distance sweep: computes energy per candidate character |
-| `recursive_lookahead` | Monte Carlo tree search with shared-memory reduction |
-| `thermal_prune` | Bit-shift decay on lattice counters |
+| `build.zig` | Build graph, installed executables, benchmark step |
+| `src/main.zig` | Linux-first runtime entrypoint, shard mount, boot Sigil, shell startup |
+| `src/trainer.zig` | Corpus trainer with Vulkan workers or CPU fallback |
+| `src/shell.zig` | OS switch for the embedded shell |
+| `src/shell_linux.zig` | Primary embedded HTTP and WebSocket shell |
+| `src/shell_windows.zig` | Secondary compatibility shell path |
+| `src/sigil_core.zig` | Sigil compiler |
+| `src/sigil_vm.zig` | Sigil VM execution over committed or scratch meaning surfaces |
+| `src/sigil_runtime.zig` | Runtime control-plane state |
+| `src/sigil_snapshot.zig` | Scratch, commit, snapshot, discard, and revert control flow |
+| `src/abstractions.zig` | Explicit abstraction distillation, reuse, merge, prune, lineage, and provenance |
+| `src/code_intel.zig` | Deterministic code-intel pilot with native and symbolic indexing |
+| `src/task_intent.zig` | Narrow natural-language grounding into supported code-intel or patch flows |
+| `src/patch_candidates.zig` | Explore-to-proof patch planning, verification, and minimality selection |
+| `src/execution.zig` | Bounded verification harness for build, test, and runtime steps |
+| `src/technical_drafts.zig` | Deterministic human-readable rendering over bounded traces |
+| `src/bench_serious_workflows.zig` | Serious-workflow benchmark runner and report writer |
+| `src/panic_dump.zig` | Deterministic panic dump recorder |
+| `src/vsa_vulkan.zig` | Vulkan runtime and bounded GPU helper dispatch |
+| `src/shaders/` | Compute shader sources and checked-in `.spv` binaries |
+| `tools/seed_lattice.zig` | Seeds committed shard state |
 
-The training path uses `dispatchMergedEtch` which records lattice + meaning matrix compute into a single command buffer with a pipeline barrier between them.
+## Installed Binaries
 
-## Memory Layout
+`build.zig` installs:
 
-| Artifact | Size | Format |
-|---|---|---|
-| `unified_lattice.bin` | 1 GB | 512M x u16 (memory-mapped) |
-| `semantic_monolith.bin` | 2 GB | 512M x u32 (accumulators) |
-| `semantic_tags.bin` | 8 MB | 1M x u64 (hash keys) |
+- `ghost_sovereign`
+- `ohl_trainer`
+- `probe_inference`
+- `sigil_core`
+- `ghost_code_intel`
+- `ghost_patch_candidates`
+- `ghost_task_intent`
 
-GPU buffers are sized dynamically based on detected VRAM (60% meaning matrix, 30% lattice, 10% overhead), with power-of-2 slot counts for deterministic double-hashing.
+The serious-workflow benchmark runner is built and exposed through the `zig build bench-serious-workflows` step. It is not an installed runtime binary.
 
-## Build
+## Layer Model
 
-```bash
-zig build -Doptimize=ReleaseFast     # Build all executables
-zig build release                      # Package distributable
-zig build test                         # Run unit tests
-zig build test-parity                  # GPU vs CPU parity verification
-```
+Layer 1 is implemented as shard-aware state.
+
+- core committed shard: `platforms/linux/x86_64/state/shards/core/core/`
+- project committed shards: `platforms/linux/x86_64/state/shards/projects/<id>/`
+- scratch behavior: a temporary overlay bound to the currently mounted committed shard
+
+Each committed shard owns:
+
+- `unified_lattice.bin`
+- `semantic_monolith.bin`
+- `semantic_tags.bin`
+- `sigil/scratch/`
+- `sigil/committed/`
+- `sigil/snapshot/`
+- `abstractions/`
+- `code_intel/`
+- `patch_candidates/`
+
+Layer 2a is implemented as bounded GPU helpers only.
+
+- candidate scoring
+- neighborhood scoring
+- contradiction filtering
+
+Layer 2b is CPU-first and authoritative.
+
+- bounded hypothesis expansion
+- contradiction pruning
+- branch-cap enforcement
+- final selection
+
+Layer 3 is a tiny honesty gate.
+
+- it decides whether bounded search resolved cleanly
+- it can stop on low confidence, contradiction, budget, or internal error
+- it is not a separate reasoning engine
+
+Proof policy is the default. Exploratory policy exists as an explicit alternate budget in code and is used inside the patch-candidate handoff flow, but it is not a hype-first best-effort mode.
+
+## Runtime And Shell
+
+`ghost_sovereign`:
+
+- mounts the selected committed shard
+- verifies lattice checksums on startup
+- creates a shard-local scratch overlay
+- executes `boot.sigil`, or falls back to `LOOM VULKAN_INIT`
+- enables Vulkan only when Sigil allows it and runtime init succeeds
+- flushes and crystallizes mapped state on clean shutdown
+
+Current runtime flags:
+
+- `--project-shard=<id>`
+- `--scratchpad-bytes=<n>`
+- `--reasoning-mode=proof|exploratory`
+- `--daemon`
+- `--no-shell`
+
+The Linux shell surface is:
+
+- `GET /api/stats`
+- `GET /api/corpora`
+- `GET /api/state`
+- `GET /api/probe`
+- `POST /api/train`
+- `POST /api/stoptrain`
+- `POST /api/pause`
+- `POST /api/resume`
+- `POST /api/checkpoint`
+- `POST /api/control`
+- `POST /api/sigil`
+- `GET /?channel=chat`
+
+## Sigil, Scratch, And Replay
+
+`POST /api/sigil` accepts:
+
+- Sigil VM source
+- exact snapshot-control commands
+- explicit abstraction commands
+- explicit patch-staging commands
+
+Implemented control commands:
+
+- `begin scratch`
+- `discard`
+- `commit`
+- `snapshot`
+- `revert`
+- `rollback`
+
+Behavior:
+
+- `begin scratch` writes a shard-local scratch baseline
+- `discard` restores that baseline and clears staged abstraction and patch output
+- `commit` applies scratch data to permanent mappings, applies staged abstractions, clears staged patch batches, and writes the committed snapshot
+- `snapshot` writes a full shard-local snapshot only when scratch is inactive
+- `revert` restores the saved snapshot only when scratch is inactive
+
+Snapshot replay covers Sigil state and abstraction lineage state for the mounted shard. Scratch is session-local and intentionally discardable.
+
+## Code Intel
+
+`ghost_code_intel` is implemented as a deterministic pilot.
+
+- query kinds: `impact`, `breaks-if`, `contradicts`
+- output is bounded and honesty-gated
+- results persist under the selected shard in `code_intel/last_result.json`
+- ambiguous targets return `unresolved`
+- the tool does not claim full-language semantic understanding
+
+Current indexed surfaces:
+
+- Zig source
+- bounded native source and headers: `.c`, `.cc`, `.cpp`, `.cxx`, `.h`, `.hh`, `.hpp`, `.hxx`
+- `.comp` and `.sigil`
+- symbolic files such as markdown, text, config, markup, and DSL-like sources
+
+Trace output uses the repository's current layer names:
+
+- `layer1`: deterministic repo index size
+- `layer2a`: target-resolution candidates
+- `layer2b`: query hypotheses, abstraction traces, and symbolic groundings
+- `layer3`: honesty status and confidence
+
+Support graph output is part of the JSON result. It includes:
+
+- `permission`: final output permission (`supported` or `unresolved`)
+- `minimumMet`: whether the minimum support threshold for final permission was met
+- `flowMode`: current reasoning flow name
+- `unresolvedReason`: why support permission was denied when unresolved
+
+## Task Intent
+
+`ghost_task_intent` and the `--intent=` options on `ghost_code_intel` and `ghost_patch_candidates` provide narrow task-intent grounding.
+
+Implemented grounding scope:
+
+- action matching for build, implement, refactor, explain, verify, compare, and plan
+- explicit target extraction from files, functions, modules, shards, concepts, symbols, quoted strings, and path-like tokens
+- bounded constraint capture such as determinism, Linux-first, no-new-deps, API stability, performance, and language hints
+- deterministic dispatch into `code_intel` or `patch_candidates`
+
+If the request does not ground into a supported flow, the parser returns `clarification_required` or `unresolved`.
+
+## Patch Candidates
+
+`ghost_patch_candidates` consumes bounded `code_intel` output and produces proof-backed patch scaffolds.
+
+Implemented behavior:
+
+- initial analysis runs in exploratory mode
+- generated candidates are clustered and trimmed into a proof queue
+- proof mode verifies queued candidates through the bounded execution harness
+- surviving verified candidates are ranked again under proof policy
+- the selected winner prefers smaller verified scope through the minimality model `bounded_refactor_minimality_v1`
+- if no candidate survives verification or proof selection, final output is `unresolved`
+
+Patch output includes:
+
+- staged or CLI JSON with candidate hunks and per-candidate verification traces
+- `handoff` telemetry for exploration and proof phases
+- `supportGraph` with `flowMode` set to `explore_then_proof`
+
+## Abstractions, Provenance, And Trust
+
+Abstractions are explicit. They are not inferred implicitly from arbitrary runtime behavior.
+
+Implemented commands:
+
+- `/commit_abstractions ...`
+- `/reuse_abstractions ...`
+- `/merge_abstractions ...`
+- `/prune_abstractions ...`
+- `/stage_patch_candidates ...`
+
+Current trust and provenance behavior:
+
+- abstraction records carry lineage ids, lineage versions, trust class, decay state, and bounded provenance entries
+- cross-shard reuse is available while mounted on a project shard
+- merge can refuse on incompatible records or provenance/trust violations
+- promotion requires a strictly higher-trust destination
+- snapshot write and restore paths include abstraction catalog state and reuse state for the mounted shard
+
+## Execution Harness
+
+`src/execution.zig` implements the verifier used by patch candidates and the serious-workflow benchmark.
+
+Current guarantees:
+
+- workspace-root confinement
+- allowlisted shell tools only for shell steps
+- bounded `zig build` and `zig run` surfaces only
+- capped output capture
+- bounded timeouts
+- explicit failure signals such as `disallowed_command`, `timed_out`, `nonzero_exit`, and `invariant_failed`
+
+The harness is Linux-first and is deliberately narrower than a general shell agent.
+
+## Benchmarks
+
+The serious-workflow suite measures implemented workflow behavior, not open-ended chat performance.
+
+Latest Linux report in this workspace:
+
+- 15 total cases, 15 passed
+- patch compile-pass rate: 85% (12/14)
+- test-pass rate: 75% (9/12)
+- runtime-pass rate: 0% (0/0) because no positive runtime-verified patch fixture exists yet
+- latency per verified result: 6940 ms
+- cold start / warm start: 40 ms / 56 ms
+- cold cache changed files / warm cache changed files: 11 / 0
+
+## Panic Dumps
+
+Panic dump support is implemented.
+
+- the runtime installs `panic_dump.panicCall` as the panic hook
+- Linux dumps are written to `/tmp/ghost-dd-panic.bin`
+- the binary format is deterministic and versioned
+- dumps include the last bounded reasoning trace and scratch references when present
+
+## Deferred
+
+Future work belongs in [docs/ARCHITECTURE_PHASE1.md](docs/ARCHITECTURE_PHASE1.md), not here.

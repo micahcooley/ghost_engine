@@ -1,0 +1,15 @@
+GABS1
+concept compute_guard
+examples 2
+threshold 2
+retained_tokens 2
+retained_patterns 2
+average_resonance 700
+min_resonance 700
+consensus_hash 42
+valid 1
+vector 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+source region:src/api/service.zig:1-10
+pattern compute
+pattern hydrate
+end

@@ -1,146 +1,197 @@
 # Ghost Engine
 
-Deterministic local inference and training over memory-mapped state, with Vulkan compute when available and CPU fallback when it is not.
+Deterministic local inference and training over memory-mapped state, with optional Vulkan compute. The shipped stack is Linux-first, shard-aware, and bounded. Deferred work is tracked in [docs/ARCHITECTURE_PHASE1.md](docs/ARCHITECTURE_PHASE1.md); it is not current behavior.
 
-## What Ships Today
+## Current Stack
 
-Ghost Engine currently builds and installs these executables from `build.zig`:
+- Layer 1 is a shard-aware memory civilization: one mounted committed shard plus one shard-local scratch overlay.
+- `ghost_code_intel` builds a bounded semantic code graph for Zig-first repositories, with bounded native-code indexing and symbolic ingestion for docs, config, markup, and DSL-like files.
+- `ghost_patch_candidates` runs an explicit `explore_then_proof` flow: exploratory candidate generation, clustered handoff into proof mode, bounded build/test/runtime verification, then minimal verified survivor selection.
+- Support output is permissioned. Final `supported` results require both decision traces and evidence traces; otherwise the result is forced back to `unresolved`.
+- Abstractions, reuse, merge, prune, and replay are explicit shard-local workflows with recorded provenance and trust boundaries.
 
-- `ghost_sovereign` - interactive inference runtime
-- `ohl_trainer` - corpus-driven trainer
-- `probe_inference` - inference probe utility
-- `ghost_shell` - local HTTP/WebSocket dashboard with a `POST /api/sigil` bridge
-- `sigil_core` - Sigil compiler
+## What Ships
 
-`build.zig` also exposes these named steps:
+`build.zig` installs:
 
+- `ghost_sovereign`
+- `ohl_trainer`
+- `probe_inference`
+- `sigil_core`
+- `ghost_code_intel`
+- `ghost_patch_candidates`
+- `ghost_task_intent`
+
+Named build steps:
+
+- `zig build`
 - `zig build run`
-- `zig build release`
 - `zig build test`
 - `zig build test-parity`
-- `zig build probe-unicode`
+- `zig build release`
 - `zig build seed`
 - `zig build corpus`
+- `zig build bench-serious-workflows`
 
-## Windows Setup
+## Linux Build
 
-### 1. Bootstrap Zig
+Dependencies:
 
-```powershell
-.\platforms\windows\sylor_forge.ps1
+- Zig
+- `shaderc` for `glslc` when rebuilding shaders
+- `libvulkan-dev` for Linux Vulkan builds and parity tests
+
+```bash
+sudo apt install shaderc libvulkan-dev
+zig build seed
+zig build -Doptimize=ReleaseFast
 ```
 
-The forge installs Zig into `platforms/windows/.toolchain/zig`. It does not download the Vulkan SDK.
+`zig build seed` seeds the selected committed shard. By default that is the core shard. Set `GHOST_PROJECT_SHARD=<id>` first if you want to seed a project shard instead.
 
-### 2. Seed the mapped state
+Windows codepaths remain in the tree for compatibility and parity coverage, but the current setup, runtime, and workflow docs are Linux-first.
 
-```powershell
-.\tools\seed_lattice.ps1
+## Runtime
+
+Run the main runtime:
+
+```bash
+./zig-out/bin/ghost_sovereign
 ```
 
-This creates the current Windows runtime state under `platforms/windows/x86_64/state/`:
+Useful flags:
+
+- `--project-shard=<id>` mounts a project shard instead of the core shard
+- `--scratchpad-bytes=<n>` sizes the shard-local scratch overlay
+- `--reasoning-mode=proof|exploratory` selects the control-plane reasoning mode at runtime
+- `--daemon` starts the surveillance bridge thread and keeps the runtime alive
+- `--no-shell` disables the embedded shell
+
+At startup `ghost_sovereign`:
+
+- mounts the selected committed shard
+- verifies lattice checksums
+- creates a shard-local scratch overlay
+- installs panic dump hooks
+- executes `boot.sigil` from the repo root compiled into `build_options.project_root`
+- falls back to `LOOM VULKAN_INIT` when `boot.sigil` is missing
+
+When enabled, the embedded shell listens on `http://127.0.0.1:8080`.
+
+Current shell surface:
+
+- `GET /api/stats`
+- `GET /api/corpora`
+- `GET /api/state`
+- `GET /api/probe`
+- `POST /api/train`
+- `POST /api/stoptrain`
+- `POST /api/pause`
+- `POST /api/resume`
+- `POST /api/checkpoint`
+- `POST /api/control`
+- `POST /api/sigil`
+- `GET /?channel=chat`
+
+## State Layout
+
+Layer 1 is implemented as shard-aware committed state plus scratch:
+
+- core committed shard: `platforms/linux/x86_64/state/shards/core/core/`
+- project committed shard: `platforms/linux/x86_64/state/shards/projects/<id>/`
+- scratch behavior: overlay attached to the mounted committed shard, not a separate committed shard
+
+Each committed shard owns:
 
 - `unified_lattice.bin`
 - `semantic_monolith.bin`
 - `semantic_tags.bin`
+- `sigil/`
+- `abstractions/`
+- `code_intel/`
+- `patch_candidates/`
 
-### 3. Build from the repo root
+Scratch and snapshot behavior is real and shard-local through `POST /api/sigil`:
 
-```powershell
-$env:PATH = "$(Get-Location)\platforms\windows\.toolchain\zig;" + $env:PATH
-zig build -Doptimize=ReleaseFast
+- `begin scratch`: clears the overlay, captures a shard-local baseline, and starts a discardable session
+- `discard`: drops staged overlay data, restores the saved scratch baseline, clears staged abstractions and staged patch batches, and ends the session
+- `commit`: applies the overlay into the mounted shard's permanent mappings, applies staged abstractions, clears staged patch batches, writes the committed snapshot, and ends the session
+- `snapshot`: writes a full shard-local snapshot when no scratch session is active
+- `revert` or `rollback`: restores the last snapshot when no scratch session is active
+
+`snapshot` and `revert` are blocked while scratch is active.
+
+## Code Intel And Patch Flow
+
+`ghost_code_intel` is a deterministic pilot, not a general semantic understanding system.
+
+Supported query kinds:
+
+- `impact`
+- `breaks-if`
+- `contradicts`
+
+Current implemented scope:
+
+- Zig-first native indexing
+- bounded native-code support for `.c`, `.cc`, `.cpp`, `.cxx`, `.h`, `.hh`, `.hpp`, `.hxx`
+- symbolic ingestion for `.md`, `.txt`, `.rst`, `.toml`, `.yaml`, `.yml`, `.json`, `.ini`, `.cfg`, `.conf`, `.env`, `.xml`, `.html`, `.rules`, and `.dsl`
+- cross-symbol grounding from symbolic units into bounded code or runtime targets when deterministic support exists
+
+Persisted shard-local outputs:
+
+- `code_intel/last_query.txt`
+- `code_intel/last_result.json`
+- `code_intel/cache/index_v1.gcix`
+
+`ghost_patch_candidates` consumes the same bounded code-intel surfaces and adds:
+
+- proof-backed patch scaffolds
+- bounded execution verification
+- minimal-safe-refactor planning
+- explicit `explore_then_proof` handoff reporting
+- support graph output with permission metadata
+
+## Benchmark Snapshot
+
+Latest Linux serious-workflow report in this workspace:
+
+- suite status: 15/15 cases passed cleanly
+- verified supported patch results: 5
+- patch compile-pass rate: 85% (12/14 candidate build attempts)
+- test-pass rate: 75% (9/12 candidate test attempts)
+- runtime-pass rate: 0% (0/0 attempted runtime-verification steps)
+- latency per verified result: 6940 ms
+- cold start / warm start: 40 ms / 56 ms
+- cold cache changed files / warm cache changed files: 11 / 0
+
+The `runtime-pass rate` is `0/0` because the suite does not yet contain a positive runtime-verified patch fixture. It does not mean the execution harness is currently failing.
+
+Run the suite with:
+
+```bash
+zig build bench-serious-workflows
 ```
 
-If your Windows toolchain needs Vulkan headers from a local SDK install, set `VULKAN_SDK` yourself before building. The forge does not provision one.
+The runner writes fresh reports under `benchmarks/ghost_serious_workflows/results/`.
 
-### 4. Copy the binaries into the packaged runtime layout
+## Docs
 
-```powershell
-Copy-Item .\zig-out\bin\*.exe .\platforms\windows\x86_64\bin\ -Force
-```
+- [ARCHITECTURE.md](ARCHITECTURE.md): implemented stack overview
+- [GUIDE_ARCHITECTURE.md](GUIDE_ARCHITECTURE.md): short operator view
+- [docs/RUNTIME_SETUP.md](docs/RUNTIME_SETUP.md): build, runtime, shell, and shard setup
+- [docs/CODE_INTEL_AND_PATCHING.md](docs/CODE_INTEL_AND_PATCHING.md): code-intel, task-intent, patch generation, and support graph behavior
+- [docs/ABSTRACTIONS_PROVENANCE_REPLAY.md](docs/ABSTRACTIONS_PROVENANCE_REPLAY.md): abstractions, provenance, trust, reuse, merge, prune, snapshot, and replay behavior
+- [docs/SERIOUS_WORKFLOWS_AND_BENCHMARKS.md](docs/SERIOUS_WORKFLOWS_AND_BENCHMARKS.md): serious-workflow suite layout and current measured scope
+- [SIGIL_REFERENCE.md](SIGIL_REFERENCE.md): current Sigil and shell command surface
+- [docs/ARCHITECTURE_PHASE1.md](docs/ARCHITECTURE_PHASE1.md): intentionally deferred work only
 
-The Windows runtime layout expected by the packaged binaries is:
+## Limits
 
-- `platforms/windows/x86_64/bin/`
-- `platforms/windows/x86_64/corpus/`
-- `platforms/windows/x86_64/state/`
-
-## Training
-
-`ohl_trainer` does not take a corpus filepath on the command line. It scans the runtime `corpus/` directory for `.txt` files and trains on every file it finds.
-
-On the packaged Windows layout, put your text files here:
-
-```text
-platforms/windows/x86_64/corpus/
-```
-
-Then run:
-
-```powershell
-.\platforms\windows\x86_64\bin\ohl_trainer.exe
-```
-
-If no corpus files are present, the trainer falls back to a synthetic benchmark stream.
-
-## Runtime Modes
-
-### Interactive runtime
-
-```powershell
-.\platforms\windows\x86_64\bin\ghost_sovereign.exe
-```
-
-`ghost_sovereign` maps the state files, executes `boot.sigil` from the repo root if it exists, verifies lattice checksums, and enters the REPL.
-The same Sigil VM also powers the live `POST /api/sigil` bridge in the embedded shell.
-
-### Background daemon mode
-
-```powershell
-.\platforms\windows\x86_64\bin\ghost_sovereign.exe --daemon
-```
-
-Daemon mode starts the named-pipe bridge used by the surveillance layer while keeping the main runtime alive.
-
-### Local dashboard
-
-```powershell
-.\platforms\windows\x86_64\bin\ghost_shell.exe
-```
-
-`ghost_shell` serves a local dashboard on `http://127.0.0.1:8080` and exposes the current stats, corpus, state, probe, chat, training control, and Sigil bridge endpoints wired into `src/shell.zig`.
-
-The live bridge accepts raw Sigil text or JSON with a `script` or `sigil` field:
-
-```text
-POST /api/sigil
-```
-
-## Sigil Control Plane
-
-The repo-root `boot.sigil` file is the current startup control plane for `ghost_sovereign`. The runtime executes it through the Sigil VM at boot. If `boot.sigil` is missing, the runtime falls back to `LOOM VULKAN_INIT`.
-
-For live control-plane work, use the embedded shell bridge:
-
-```text
-POST /api/sigil
-```
-
-That route accepts raw Sigil text or JSON with a `script` or `sigil` field.
-
-To compile a Sigil source file into bytecode manually:
-
-```powershell
-.\zig-out\bin\sigil_core.exe .\boot.sigil
-```
-
-The runtime boot path currently executes `boot.sigil` source directly; it does not scan directories for scripts or plugins.
-
-## Determinism Constraints
-
-- Keep the core bitwise. Do not introduce floating point into the resonance path.
-- Keep CPU and Vulkan behavior aligned. `src/shaders/*.comp` must match the CPU logic.
-- Treat the mapped state files as live engine state, not disposable cache.
+- Layer 2a is bounded GPU assistance only. Layer 2b stays CPU-first and authoritative.
+- Exploratory reasoning exists in code, but the runtime remains honesty-gated and does not ship a hype-first "best guess" mode.
+- Symbolic ingestion is bounded structural grounding. It is not universal semantic understanding of arbitrary repositories.
+- If a feature is staged, scaffolded, or bounded, the docs call that out directly.
 
 ## License
 

@@ -1,0 +1,1 @@
+impact src/api/service.zig:compute --reasoning-mode=proof

@@ -1,29 +1,70 @@
-# Ghost Engine Architectural Guide: The Sovereign Monolith
+# Ghost Engine Architecture Guide
 
-This guide outlines the structural philosophy of Ghost Engine V27.
+This is the short operator view of the shipped stack. Deferred work lives in [docs/ARCHITECTURE_PHASE1.md](docs/ARCHITECTURE_PHASE1.md).
 
-## 1. The Ternary State-Space Model (TSSM)
-Unlike traditional neural networks, the Ghost Engine does not use weights in the classical sense. It utilizes a **Meaning Matrix**—a sparse, recurrent lattice where 1024-bit HyperVectors resonate to form semantic boundaries.
+## Runtime Shape
 
-## 2. Hardware-Native System Layer
-The engine bypasses standard OS file buffering to achieve maximum NVMe throughput.
-*   **Sector Alignment**: All I/O is performed in 4096-byte blocks to match hardware physical sectors.
-*   **Mapped Memory Consistency**: The ~2.1 GB semantic state is mapped into process memory via platform-native APIs (`CreateFileMapping`/`MapViewOfFile` on Windows, `mmap` on Linux/macOS). This allows multiple processes (Trainer, Core, Bridge) to access the same intelligence simultaneously.
+- `ghost_sovereign` is the main Linux-first runtime
+- `ohl_trainer` consumes corpus text and etches state
+- `sigil_core` compiles Sigil source
+- `probe_inference` is a probe utility
+- `ghost_code_intel` is the deterministic code-intel pilot
+- `ghost_patch_candidates` stages proof-backed patch candidates
+- `ghost_task_intent` grounds bounded natural-language requests into supported flows
 
-## 3. Unified Source Structure
-All source code lives at the project root:
-*   **`src/`**: Core modules (`vsa_core`, `ghost_state`, `engine`, `trainer`, `vsa_vulkan`, `sigil_core`)
-*   **`src/shaders/`**: Vulkan SPIR-V compute shaders
-*   **`src/sys/`**: Platform abstraction layer (`windows.zig`, `linux.zig`)
-*   **`build.zig`**: Single build definition for all targets
-*   **`platforms/windows/x86_64/`**: Runtime only (binaries, state, corpus)
+The runtime mounts one committed shard, creates one shard-local scratch overlay, runs `boot.sigil`, and then starts the REPL and optional embedded shell.
 
-## 4. The No-Float Philosophy
-All calculations are performed using bitwise logic (XOR, POPCNT, Majority Rule). This eliminates rounding errors, overflows, and the non-deterministic nature of floating-point arithmetic, resulting in a perfectly stable, recurrent fractal state.
+## Shards
 
-## 5. Silicon Fragility: Memory & Alignment
-Ghost Engine is optimized for **zero-copy hardware saturation**. This makes several components extremely sensitive:
-*   **Memory Mapping (The Cortex)**: The ~2.1 GB semantic state is memory-mapped via native APIs (`MapViewOfFile`/`mmap`). **Fragility**: Any change to `src/config.zig` that alters the `TOTAL_STATE_BYTES` or shifts the offsets of `UnifiedLattice` and `MeaningMatrix` will render the existing `state/*.bin` files incompatible or cause immediate segfaults.
-*   **Bit-Perfect Parity**: The CPU code in `src/vsa_core.zig` and the Vulkan SPIR-V kernels in `src/shaders/` MUST be 100% identical in their bitwise behavior. **Fragility**: If the GPU implementation of `Majority Rule` or `POPCNT` differs from the CPU version, the engine will "split," where the Trainer and Inference engine effectively live in different realities.
-*   **Sector Alignment**: All I/O is performed in **4096-byte blocks** to match hardware sectors. **Fragility**: Breaking this alignment in `src/sys/` will lead to fatal I/O errors and state corruption.
+Implemented Layer 1 behavior:
 
+- core shard: default committed state
+- project shard: selected with `--project-shard=<id>` or `GHOST_PROJECT_SHARD=<id>`
+- scratch behavior: temporary overlay attached to the mounted shard
+
+Scratch is local to the mounted shard. It is not a separate committed runtime target.
+
+## Reasoning
+
+- Layer 2a is optional Vulkan acceleration for bounded helper work only
+- Layer 2b is CPU-first and authoritative for branch-heavy reasoning
+- Layer 3 is a small honesty gate at the output boundary
+
+Proof policy is the default. Exploratory policy exists in code and is used inside patch-candidate exploration, but final permission stays honesty-gated.
+
+## Code Intel And Patching
+
+- `ghost_code_intel` supports `impact`, `breaks-if`, and `contradicts`
+- native support is Zig-first with bounded C/C++ source and header indexing
+- symbolic ingestion covers docs, config, markup, and DSL-like files so symbolic concepts can ground into bounded code/runtime targets
+- `ghost_patch_candidates` runs `explore_then_proof`, verifies through the bounded execution harness, and prefers the smallest verified survivor
+- both tools emit support graphs with explicit `permission` and `minimumMet` fields
+
+## Shell And Sigil
+
+`POST /api/sigil` accepts:
+
+- Sigil VM source
+- `begin scratch`, `discard`, `commit`, `snapshot`, `revert`, `rollback`
+- `/commit_abstractions ...`
+- `/reuse_abstractions ...`
+- `/merge_abstractions ...`
+- `/prune_abstractions ...`
+- `/stage_patch_candidates ...`
+
+`begin scratch` captures a discard baseline. `commit` makes staged shard-local changes live. `discard` throws staged work away. `snapshot` and `revert` operate only when scratch is inactive.
+
+## Operational Extras
+
+- panic dumps are implemented and deterministic on Linux at `/tmp/ghost-dd-panic.bin`
+- code-intel results persist under the selected shard in `code_intel/`
+- patch batches persist under the selected shard in `patch_candidates/`
+- abstraction lineage, reuse, merge, and prune state persist under the selected shard in `abstractions/`
+
+## Current Limits
+
+- Linux is the primary documented environment
+- the shipped boot path uses one startup script: `boot.sigil`
+- there is no active binary plugin system
+- the code-intel pilot is bounded and deterministic, not full semantic understanding
+- runtime verification exists in the harness, but the benchmark suite does not yet contain a positive runtime-verified patch fixture

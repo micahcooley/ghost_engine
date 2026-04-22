@@ -3,13 +3,60 @@ const config = @import("config.zig");
 const sigil_core = @import("sigil_core.zig");
 const sigil_runtime = @import("sigil_runtime.zig");
 const ghost_state = @import("ghost_state.zig");
+const scratchpad = @import("scratchpad.zig");
 const sys = @import("sys.zig");
 const vsa = @import("vsa_core.zig");
+
+pub const MeaningSurface = union(enum) {
+    permanent: *vsa.MeaningMatrix,
+    scratchpad: *scratchpad.OverlayMeaningMatrix,
+
+    pub fn collapseToBinary(self: *const MeaningSurface, hash: u64) vsa.HyperVector {
+        return switch (self.*) {
+            .permanent => |meaning| meaning.collapseToBinary(hash),
+            .scratchpad => |meaning| meaning.collapseToBinary(hash),
+        };
+    }
+
+    pub fn applyGravity(
+        self: *MeaningSurface,
+        word_hash: u64,
+        data: vsa.HyperVector,
+        hash_locked: bool,
+        slot_lock_mask: u32,
+    ) vsa.GravityResult {
+        return switch (self.*) {
+            .permanent => |meaning| meaning.applyGravity(word_hash, data, hash_locked, slot_lock_mask),
+            .scratchpad => |meaning| meaning.applyGravity(word_hash, data, hash_locked, slot_lock_mask),
+        };
+    }
+
+    pub fn hardLockUniversalSigil(self: *MeaningSurface, hash: u64, rune: u32) void {
+        switch (self.*) {
+            .permanent => |meaning| meaning.hardLockUniversalSigil(hash, rune),
+            .scratchpad => |meaning| meaning.hardLockUniversalSigil(hash, rune),
+        }
+    }
+
+    pub fn slotUsageHint(self: *const MeaningSurface) ?usize {
+        return switch (self.*) {
+            .permanent => |meaning| if (meaning.tags) |tags| countUsedTags(tags) else null,
+            .scratchpad => |meaning| meaning.slotUsageHint(),
+        };
+    }
+
+    pub fn slotCount(self: *const MeaningSurface) ?u32 {
+        return switch (self.*) {
+            .permanent => |meaning| if (meaning.tags) |tags| @as(u32, @intCast(tags.len)) else null,
+            .scratchpad => |meaning| if (meaning.scratch.tags) |tags| @as(u32, @intCast(tags.len)) else null,
+        };
+    }
+};
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
     control: *sigil_runtime.ControlPlane,
-    meaning: ?*vsa.MeaningMatrix = null,
+    meaning: ?*MeaningSurface = null,
     soul: ?*ghost_state.GhostSoul = null,
     lattice: ?*ghost_state.UnifiedLattice = null,
 };
@@ -93,6 +140,14 @@ fn execLoom(ctx: *Context, inst: sigil_core.Instruction) void {
             ctx.control.setComputeMode(false, true);
             sys.printOut("[SIGIL VM] LOOM CPU_ONLY\n");
         },
+        .proof => {
+            ctx.control.setReasoningMode(.proof);
+            sys.printOut("[SIGIL VM] LOOM PROOF\n");
+        },
+        .exploratory => {
+            ctx.control.setReasoningMode(.exploratory);
+            sys.printOut("[SIGIL VM] LOOM EXPLORATORY\n");
+        },
         .tier_1 => {
             ctx.control.setLoomTier(1, 64 * 1024 * 1024);
             sys.printOut("[SIGIL VM] LOOM TIER_1 => cache cap 64MiB\n");
@@ -175,12 +230,9 @@ fn execEtch(ctx: *Context, program: *const sigil_core.Program, inst: sigil_core.
         const hash = semanticHash(payload);
         var remaining: usize = @intCast(@min(@max(inst.a, 1), 32));
         const vec = generateWordVec(payload);
-        const slot_usage_hint = if (meaning.tags) |tags|
-            countUsedTags(tags)
-        else
-            null;
-        const lock_state = if (meaning.tags) |tags|
-            computeEtchLockState(ctx.control, hash, @as(u32, @intCast(tags.len)))
+        const slot_usage_hint = meaning.slotUsageHint();
+        const lock_state = if (meaning.slotCount()) |slot_count|
+            computeEtchLockState(ctx.control, hash, slot_count)
         else
             EtchLockState{
                 .hash_locked = ctx.control.isHashLocked(hash),

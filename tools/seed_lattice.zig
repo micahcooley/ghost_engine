@@ -2,33 +2,53 @@ const std = @import("std");
 const core = @import("ghost_core");
 const sys = core.sys;
 const config = core.config;
+const shards = core.shards;
 
-pub fn main_wrapped(init: std.process.Init) !void {
-    const allocator = init.gpa;
+fn resolveSelectedShardPaths(allocator: std.mem.Allocator) !shards.Paths {
+    const project_id = std.process.getEnvVarOwned(allocator, "GHOST_PROJECT_SHARD") catch null;
+    defer if (project_id) |value| allocator.free(value);
 
+    var metadata = if (project_id) |value|
+        try shards.resolveProjectMetadata(allocator, value)
+    else
+        try shards.resolveCoreMetadata(allocator);
+    defer metadata.deinit();
+
+    return shards.resolvePaths(allocator, metadata.metadata);
+}
+
+pub fn main_wrapped(allocator: std.mem.Allocator) !void {
     const lattice_size: usize = config.UNIFIED_SIZE_BYTES;
     const monolith_size: usize = config.SEMANTIC_SIZE_BYTES;
     const tags_size: usize = config.TAG_SIZE_BYTES;
+    const total_size: usize = lattice_size + monolith_size + tags_size;
 
-    const lattice_abs_path = try config.getPath(allocator, config.LATTICE_REL_PATH);
-    const semantic_abs_path = try config.getPath(allocator, config.SEMANTIC_REL_PATH);
-    const tag_abs_path = try config.getPath(allocator, config.TAG_REL_PATH);
-    defer allocator.free(lattice_abs_path);
-    defer allocator.free(semantic_abs_path);
-    defer allocator.free(tag_abs_path);
+    var shard_paths = try resolveSelectedShardPaths(allocator);
+    defer shard_paths.deinit();
 
-    std.debug.print("Ghost Engine: State Seeding (~2.1 GB)\n", .{});
+    std.debug.print(
+        "Ghost Engine: State Seeding ({})\n  {s}: {}\n  {s}: {}\n  {s}: {}\n",
+        .{
+            std.fmt.fmtIntSizeBin(total_size),
+            shard_paths.lattice_abs_path,
+            std.fmt.fmtIntSizeBin(lattice_size),
+            shard_paths.semantic_abs_path,
+            std.fmt.fmtIntSizeBin(monolith_size),
+            shard_paths.tags_abs_path,
+            std.fmt.fmtIntSizeBin(tags_size),
+        },
+    );
 
-    // Ensure state directory exists using sys.makePath
-    if (std.fs.path.dirname(lattice_abs_path)) |dir_path| {
+    // Seed the selected target's state directory under platforms/<os>/<arch>/state.
+    if (std.fs.path.dirname(shard_paths.lattice_abs_path)) |dir_path| {
         sys.makePath(allocator, dir_path) catch |err| {
             if (err != error.DirectoryCreationFailed) return err;
         };
     }
 
-    try initializeFile(allocator, lattice_abs_path, lattice_size);
-    try initializeFile(allocator, semantic_abs_path, monolith_size);
-    try initializeFile(allocator, tag_abs_path, tags_size);
+    try initializeFile(allocator, shard_paths.lattice_abs_path, lattice_size);
+    try initializeFile(allocator, shard_paths.semantic_abs_path, monolith_size);
+    try initializeFile(allocator, shard_paths.tags_abs_path, tags_size);
 
     std.debug.print("\nState Seeding Complete.\n", .{});
     std.debug.print("The Ghost is ready to begin ingestion.\n", .{});
@@ -39,8 +59,9 @@ fn initializeFile(allocator: std.mem.Allocator, path: []const u8, size: usize) !
     const f_check = sys.openForRead(allocator, path) catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print("  Creating {s}... ", .{path});
-            const mapped = try sys.createMappedFile(allocator, path, size);
-            sys.flushMappedMemory(&mapped);
+            var mapped = try sys.createMappedFile(allocator, path, size);
+            defer mapped.unmap();
+            try sys.flushMappedMemory(&mapped);
             std.debug.print("done.\n", .{});
             return;
         }
@@ -50,8 +71,11 @@ fn initializeFile(allocator: std.mem.Allocator, path: []const u8, size: usize) !
     std.debug.print("  {s} already exists.\n", .{path});
 }
 
-pub fn main(init: std.process.Init) void {
-    main_wrapped(init) catch |err| {
+pub fn main() void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    main_wrapped(gpa.allocator()) catch |err| {
         std.debug.print("\n[FATAL ERROR] {any}\n", .{err});
         std.process.exit(1);
     };

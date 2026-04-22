@@ -5,10 +5,16 @@ const vsa = core.vsa;
 const ghost_state = core.ghost_state;
 const vsa_vulkan = core.vsa_vulkan;
 const engine_logic = core.engine;
+const mc = core.inference;
 const config = core.config;
+const shards = core.shards;
+const scratchpad = core.scratchpad;
 const sigil_runtime = core.sigil_runtime;
 const sigil_vm = core.sigil_vm;
+const panic_dump = core.panic_dump;
 const shell = @import("shell.zig");
+
+pub const panic = std.debug.FullPanic(panic_dump.panicCall);
 
 const builtin = @import("builtin");
 const WINAPI = if (builtin.os.tag == .windows) std.builtin.CallingConvention.winapi else .C;
@@ -20,10 +26,9 @@ extern "kernel32" fn GetFileAttributesW(lpFileName: [*:0]const u16) callconv(WIN
 var global_vk_engine: ?*vsa_vulkan.VulkanEngine = null;
 var global_shutdown_requested = std.atomic.Value(bool).init(false);
 
-var global_paged_lattice: ?ghost_state.PagedLatticeProvider = null;
+var global_state_shard: ?shards.MountedStateShard = null;
 var global_lattice_provider: ?ghost_state.LatticeProvider = null;
-var global_mapped_meaning: ?sys.MappedFile = null;
-var global_mapped_tags: ?sys.MappedFile = null;
+var global_scratchpad: ?scratchpad.ScratchpadLayer = null;
 var global_lattice_path: ?[]const u8 = null;
 var global_host_lattice_words: ?[]u16 = null;
 var global_meaning_data: ?[]u32 = null;
@@ -35,6 +40,10 @@ const TYPEAHEAD_CAPACITY = 8;
 const LaunchConfig = struct {
     daemon_mode: bool = false,
     shell_enabled: bool = true,
+    scratchpad_bytes: usize = config.DEFAULT_SCRATCHPAD_BYTES,
+    project_shard: ?[]const u8 = null,
+    reasoning_mode: sigil_runtime.ReasoningMode = .proof,
+    invalid_reasoning_mode: ?[]const u8 = null,
 };
 
 const TypeAheadBuffer = struct {
@@ -80,15 +89,42 @@ fn isStopCommand(line: []const u8) bool {
 }
 
 fn parseLaunchConfig(args: []const []const u8) LaunchConfig {
-    var launch = LaunchConfig{};
+    var launch = LaunchConfig{
+        .scratchpad_bytes = scratchpadBytesFromEnv() orelse config.DEFAULT_SCRATCHPAD_BYTES,
+    };
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--daemon")) {
             launch.daemon_mode = true;
         } else if (std.mem.eql(u8, arg, "--no-shell")) {
             launch.shell_enabled = false;
+        } else if (std.mem.startsWith(u8, arg, "--scratchpad-bytes=")) {
+            if (parseOptionalUsize(arg["--scratchpad-bytes=".len..])) |bytes| {
+                launch.scratchpad_bytes = scratchpad.ScratchpadLayer.normalizeCapacity(bytes);
+            }
+        } else if (std.mem.startsWith(u8, arg, "--project-shard=")) {
+            const shard_id = arg["--project-shard=".len..];
+            if (shard_id.len > 0) launch.project_shard = shard_id;
+        } else if (std.mem.startsWith(u8, arg, "--reasoning-mode=")) {
+            const mode_text = arg["--reasoning-mode=".len..];
+            if (sigil_runtime.parseReasoningMode(mode_text)) |mode| {
+                launch.reasoning_mode = mode;
+            } else if (mode_text.len > 0) {
+                launch.invalid_reasoning_mode = mode_text;
+            }
         }
     }
     return launch;
+}
+
+fn parseOptionalUsize(text: []const u8) ?usize {
+    return std.fmt.parseUnsigned(usize, text, 10) catch null;
+}
+
+fn scratchpadBytesFromEnv() ?usize {
+    const value = std.process.getEnvVarOwned(std.heap.page_allocator, "GHOST_SCRATCHPAD_BYTES") catch return null;
+    defer std.heap.page_allocator.free(value);
+    const parsed = parseOptionalUsize(value) orelse return null;
+    return scratchpad.ScratchpadLayer.normalizeCapacity(parsed);
 }
 
 fn requestShutdown() bool {
@@ -178,8 +214,8 @@ fn crystallizeStateAndExit() noreturn {
             if (global_tags_data) |host_tags| {
                 @memcpy(host_tags, vk.getTagsData()[0..host_tags.len]);
             }
-            if (global_paged_lattice) |*paged| {
-                if (syncSliceToPagedLattice(vk.getLatticeData(), paged)) |_| {
+            if (global_state_shard) |*state_shard| {
+                if (syncSliceToPagedLattice(vk.getLatticeData(), &state_shard.paged_lattice)) |_| {
                     var provider = lattice_provider.?;
                     if (finalizeChecksumsSafely(&provider)) |_| {
                         provider.flush() catch |err| {
@@ -224,21 +260,31 @@ fn crystallizeStateAndExit() noreturn {
                 sys.print("[WARNING] Lattice pager flush failed: {any}\n", .{err});
             };
         }
-        if (global_mapped_meaning) |*m| {
+        if (global_state_shard) |*state_shard| {
             sys.printOut("[TEARDOWN] Flushing and Unmapping Meaning Matrix...\n");
-            sys.flushMappedMemory(m) catch |err| {
+            sys.flushMappedMemory(&state_shard.semantic_file) catch |err| {
                 sys.print("[WARNING] Meaning Matrix flush failed: {any}\n", .{err});
             };
-            m.unmap();
-        }
-        if (global_mapped_tags) |*m| {
             sys.printOut("[TEARDOWN] Flushing and Unmapping Tags...\n");
-            sys.flushMappedMemory(m) catch |err| {
+            sys.flushMappedMemory(&state_shard.tags_file) catch |err| {
                 sys.print("[WARNING] Tags flush failed: {any}\n", .{err});
             };
-            m.unmap();
+            state_shard.deinit();
+            global_state_shard = null;
         }
         sys.printOut("[TEARDOWN] Persisted state flushed.\n");
+    }
+
+    if (global_scratchpad) |*scratch| {
+        panic_dump.unregisterScratchpad();
+        scratch.deinit();
+        global_scratchpad = null;
+        sys.printOut("[TEARDOWN] Scratchpad released.\n");
+    }
+
+    if (global_state_shard) |*state_shard| {
+        state_shard.deinit();
+        global_state_shard = null;
     }
 
     if (!crystal_integrity_ok) {
@@ -266,10 +312,11 @@ fn executeBootSigil(
     meaning: *vsa.MeaningMatrix,
     soul: *ghost_state.GhostSoul,
 ) !void {
+    var meaning_surface = sigil_vm.MeaningSurface{ .permanent = meaning };
     var vm_ctx = sigil_vm.Context{
         .allocator = allocator,
         .control = control,
-        .meaning = meaning,
+        .meaning = &meaning_surface,
         .soul = soul,
     };
 
@@ -285,32 +332,47 @@ fn executeBootSigil(
     };
 }
 
-pub fn main_wrapped(init: std.process.Init) !void {
+pub fn main_wrapped(allocator: std.mem.Allocator) !void {
     if (builtin.os.tag == .windows) {
         _ = SetConsoleCtrlHandler(ctrlHandler, 1);
     }
 
-    const allocator = init.gpa;
-    _ = init.io;
-
     sys.printOut("[MONOLITH] Mapping Cortex...\n");
 
-    const lattice_abs_path = try config.getPath(allocator, config.LATTICE_REL_PATH);
-    const semantic_abs_path = try config.getPath(allocator, config.SEMANTIC_REL_PATH);
-    const tag_abs_path = try config.getPath(allocator, config.TAG_REL_PATH);
-    defer allocator.free(lattice_abs_path);
-    defer allocator.free(semantic_abs_path);
-    defer allocator.free(tag_abs_path);
-
-    var paged_lattice = ghost_state.PagedLatticeProvider.init(allocator, lattice_abs_path, config.IDEAL_LATTICE_SIZE) catch |err| {
-        sys.print("\n[FATAL] Failed to initialize paged Unified Lattice: {any}\n", .{err});
-        sys.print("[HINT] Ensure you have run .\\tools\\seed_lattice.ps1 to create the 1GB state files.\n", .{});
+    const args = try sys.getArgs(allocator);
+    const launch = parseLaunchConfig(args);
+    if (launch.invalid_reasoning_mode) |mode_text| {
+        sys.print("\n[FATAL] Unsupported reasoning mode '{s}'. Use proof or exploratory.\n", .{mode_text});
         sys.exit(1);
-    };
-    errdefer paged_lattice.deinit();
-    var lattice_provider = ghost_state.LatticeProvider.initPaged(&paged_lattice);
+    }
+    const env_project_shard = std.process.getEnvVarOwned(allocator, "GHOST_PROJECT_SHARD") catch null;
+    defer if (env_project_shard) |value| allocator.free(value);
+    const selected_project_shard = launch.project_shard orelse env_project_shard;
 
-    sys.printOut("[CHECKSUM] Verifying Lattice Integrity (16 Blocks / 64MB each)...\n");
+    global_state_shard = blk: {
+        const mounted = if (selected_project_shard) |project_shard_id|
+            shards.MountedStateShard.mountProject(allocator, project_shard_id, config.IDEAL_LATTICE_SIZE)
+        else
+            shards.MountedStateShard.mountCore(allocator, config.IDEAL_LATTICE_SIZE);
+        break :blk mounted catch |err| {
+            sys.print("\n[FATAL] Failed to initialize paged Unified Lattice: {any}\n", .{err});
+            sys.print(
+                "[HINT] Seed shard state under {s} before launch.\n",
+                .{if (selected_project_shard) |_| config.PROJECT_SHARD_REL_DIR else config.CORE_SHARD_REL_DIR},
+            );
+            sys.exit(1);
+        };
+    };
+    errdefer {
+        global_state_shard.?.deinit();
+        global_state_shard = null;
+    }
+    var lattice_provider = global_state_shard.?.latticeProvider();
+
+    sys.print(
+        "[CHECKSUM] Verifying Lattice Integrity ({d} blocks / {} each)...\n",
+        .{ config.CHECKSUM_BLOCK_COUNT, std.fmt.fmtIntSizeBin(config.CHECKSUM_BLOCK_SIZE) },
+    );
     var corrupted_blocks: u32 = 0;
     inline for (0..ghost_state.UnifiedLattice.BLOCK_COUNT) |block_idx| {
         if (!(lattice_provider.verifyBlock(block_idx) catch |err| {
@@ -333,43 +395,42 @@ pub fn main_wrapped(init: std.process.Init) !void {
     lattice_provider.flush() catch |err| {
         sys.print("[WARN] Initial lattice flush failed: {any}\n", .{err});
     };
-    const mapped_meaning = sys.createMappedFile(allocator, semantic_abs_path, config.SEMANTIC_SIZE_BYTES) catch |err| {
-        sys.print("\n[FATAL] Failed to map Semantic Monolith: {any}\n", .{err});
-        sys.exit(1);
-    };
-    const mapped_tags = sys.createMappedFile(allocator, tag_abs_path, config.TAG_SIZE_BYTES) catch |err| {
-        sys.print("\n[FATAL] Failed to map Semantic Tags: {any}\n", .{err});
-        sys.exit(1);
-    };
-
-    var meaning_matrix = vsa.MeaningMatrix{ .data = @as([*]u32, @ptrCast(@alignCast(mapped_meaning.data.ptr)))[0..(config.SEMANTIC_ENTRIES)], .tags = @as([*]u64, @ptrCast(@alignCast(mapped_tags.data.ptr)))[0..config.TAG_ENTRIES] };
+    const meaning_matrix = &global_state_shard.?.meaning_matrix;
 
     var soul = try ghost_state.GhostSoul.init(allocator);
     defer soul.deinit();
-    soul.meaning_matrix = &meaning_matrix;
+    soul.meaning_matrix = meaning_matrix;
+
+    const state_scratchpad = try scratchpad.ScratchpadLayer.init(allocator, .{
+        .requested_bytes = launch.scratchpad_bytes,
+        .file_prefix = global_state_shard.?.paths.scratch_file_prefix,
+        .owner_id = global_state_shard.?.paths.metadata.id,
+    }, meaning_matrix);
+    global_scratchpad = state_scratchpad;
+    panic_dump.registerScratchpad(&global_scratchpad.?);
 
     var sigil_control = sigil_runtime.ControlPlane.init(allocator);
     defer sigil_control.deinit();
     sigil_runtime.setActive(&sigil_control);
     defer sigil_runtime.setActive(null);
+    sigil_control.setReasoningMode(launch.reasoning_mode);
+    sys.print("[REASONING] Launch mode: {s}\n", .{sigil_runtime.reasoningModeName(launch.reasoning_mode)});
 
-    try executeBootSigil(allocator, &sigil_control, &meaning_matrix, &soul);
-    try paged_lattice.setCacheCap(selectedLatticeCacheCap(&sigil_control));
+    try executeBootSigil(allocator, &sigil_control, meaning_matrix, &soul);
+    sys.print("[REASONING] Active mode: {s}\n", .{sigil_runtime.reasoningModeName(sigil_control.snapshot().reasoning_mode)});
+    try global_state_shard.?.paged_lattice.setCacheCap(selectedLatticeCacheCap(&sigil_control));
 
-    global_paged_lattice = paged_lattice;
-    global_lattice_provider = ghost_state.LatticeProvider.initPaged(&global_paged_lattice.?);
-    global_mapped_meaning = mapped_meaning;
-    global_mapped_tags = mapped_tags;
-    global_lattice_path = try allocator.dupe(u8, lattice_abs_path);
+    global_lattice_provider = ghost_state.LatticeProvider.initPaged(&global_state_shard.?.paged_lattice);
+    global_lattice_path = try allocator.dupe(u8, global_state_shard.?.paths.lattice_abs_path);
     global_meaning_data = meaning_matrix.data;
     global_tags_data = meaning_matrix.tags;
     global_host_lattice_words = null;
 
     if (!sigil_control.force_cpu_only and sigil_control.enable_vulkan) {
         sys.printOut("[VULKAN] Initializing Sovereign Compute...\n");
-        if (vsa_vulkan.initRuntime(allocator, init.io)) |vk| {
+        if (vsa_vulkan.initRuntime(allocator)) |vk| {
             global_vk_engine = vk;
-            try syncPagedLatticeToSlice(&global_paged_lattice.?, vk.getLatticeData());
+            try syncPagedLatticeToSlice(&global_state_shard.?.paged_lattice, vk.getLatticeData());
             global_host_lattice_words = vk.getLatticeData();
             vk.bindHostState(meaning_matrix.data, meaning_matrix.tags.?, global_host_lattice_words.?);
             sys.printOut("[COMPUTE] Ghost-Vulkan-Native active.\n");
@@ -384,7 +445,7 @@ pub fn main_wrapped(init: std.process.Init) !void {
 
     var shell_engine = engine_logic.SingularityEngine{
         .lattice = undefined,
-        .meaning = &meaning_matrix,
+        .meaning = meaning_matrix,
         .soul = &soul,
         .canvas = try ghost_state.MesoLattice.initText(allocator),
         .is_live = false,
@@ -394,12 +455,9 @@ pub fn main_wrapped(init: std.process.Init) !void {
     shell_engine.setLatticeProvider(&global_lattice_provider.?);
     try shell_engine.setCacheCap(selectedLatticeCacheCap(&sigil_control));
 
-    const args = try sys.getArgs(allocator);
-    const launch = parseLaunchConfig(args);
-
     if (launch.daemon_mode) {
         const surveil = try allocator.create(core.surveillance.SovereignSurveillance);
-        surveil.* = core.surveillance.SovereignSurveillance.init(allocator, &soul, &meaning_matrix, undefined, &state_queue);
+        surveil.* = core.surveillance.SovereignSurveillance.init(allocator, &soul, meaning_matrix, undefined, &state_queue);
 
         // The bridge outlives this stack frame, so it must own heap-backed state.
         const bridge_thread = try std.Thread.spawn(.{ .allocator = allocator }, core.surveillance.SovereignSurveillance.startBridge, .{surveil});
@@ -409,12 +467,13 @@ pub fn main_wrapped(init: std.process.Init) !void {
     if (launch.shell_enabled) {
         shell.startEmbedded(.{
             .allocator = allocator,
-            .io = init.io,
             .soul = &soul,
             .live_engine = &shell_engine,
+            .state_paths = &global_state_shard.?.paths,
             .lattice_file = null,
-            .meaning_file = mapped_meaning,
-            .tags_file = mapped_tags,
+            .meaning_file = global_state_shard.?.semantic_file,
+            .tags_file = global_state_shard.?.tags_file,
+            .scratchpad = &global_scratchpad.?,
             .lattice_words = global_host_lattice_words,
             .meaning_words = global_meaning_data.?,
             .tags_words = global_tags_data.?,
@@ -472,7 +531,7 @@ pub fn main_wrapped(init: std.process.Init) !void {
         const generation_start_concept = soul.concept;
         var engine = engine_logic.SingularityEngine{
             .lattice = undefined,
-            .meaning = &meaning_matrix,
+            .meaning = meaning_matrix,
             .soul = &soul,
             .canvas = try ghost_state.MesoLattice.initText(loop_allocator),
             .is_live = sys.isTrainerActive(loop_allocator),
@@ -507,7 +566,9 @@ pub fn main_wrapped(init: std.process.Init) !void {
                 }
             }
 
-            const chosen = engine.resolveTopology() orelse break;
+            const decision = engine.resolveTopology() orelse break;
+            if (decision.stop_reason != .none) break;
+            const chosen = decision.output;
             var utf8_buf: [4]u8 = undefined;
             const len = std.unicode.utf8Encode(@intCast(chosen), &utf8_buf) catch 1;
             sys.printOut(utf8_buf[0..len]);
@@ -530,7 +591,7 @@ test "Sovereign Pipeline: Golden Run" {
 
     sys.printOut("\n[TEST] Initializing Golden Pipeline...\n");
 
-    // 1. Initialize an empty 10MB memory-mapped lattice for testing
+    // 1. Initialize an empty 1 MiB memory-mapped lattice for testing
     const test_lattice_path = "state/test_lattice.bin";
     const mapped_lattice = try sys.createMappedFile(allocator, test_lattice_path, config.TEST_LATTICE_SIZE);
     var m = mapped_lattice;
@@ -571,9 +632,12 @@ test "Sovereign Pipeline: Golden Run" {
     sys.printOut("[TEST] Golden Run: SUCCESS\n");
 }
 
-pub fn main(init: std.process.Init) void {
-    main_wrapped(init) catch |err| {
-        sys.print("\n[MONOLITH] Panic: {any}\n", .{err});
+pub fn main() void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    main_wrapped(gpa.allocator()) catch |err| {
+        panic_dump.write(std.io.getStdErr().writer(), err) catch {};
         std.process.exit(1);
     };
 }

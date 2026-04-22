@@ -1,61 +1,93 @@
 # Sigil Reference
 
-This file is the quick source-backed reference for the Sigil compiler and VM in this repository.
+This file documents the current source-backed shell and Sigil surface. It does not describe deferred ideas.
 
-## Runtime Keywords
+## VM Keywords
 
-| Token | Kind | Notes |
-|---|---|---|
-| `MOOD` | User keyword | Accepts a string, identifier, or integer. Named moods retune saturation and boredom penalties. Integer form sets the saturation bonus directly. |
-| `LOOM` | User keyword | Accepts an identifier. `VULKAN_INIT` enables Vulkan if available. `CPU_ONLY` disables Vulkan for the session. Unknown values compile to `none` and are ignored at runtime. |
-| `LOCK` | User keyword | Accepts a number for a slot index or a string/identifier for a symbolic hash lock. |
-| `SCAN` | User keyword | Accepts a string or identifier target. `system_memory` reports mapped state sizing. |
-| `BIND` | User keyword | Accepts a rune number, optional `TO`, then a string or identifier label. |
-| `ETCH` | User keyword | Accepts a string or identifier payload, plus an optional weight literal or number. The VM clamps the weight to `1..32`. |
-| `VOID` | User keyword | Accepts a string or identifier payload and hard-locks it to zero. |
-| `TEST` | User keyword | Accepts a literal condition, then a `{ ... }` block. |
+| Token | Notes |
+|---|---|
+| `MOOD` | Accepts a string, identifier, or integer |
+| `LOOM` | Accepts a compute-mode command |
+| `LOCK` | Accepts a numeric slot or symbolic label |
+| `SCAN` | Accepts a string or identifier target |
+| `BIND` | Accepts a rune value and label |
+| `ETCH` | Accepts a label plus an optional weight |
+| `VOID` | Hard-locks a label to zero |
+| `TEST` | Executes a `{ ... }` block when the literal condition is true |
+
+## Snapshot Control Commands
+
+These are recognized by `POST /api/sigil` before VM execution:
+
+| Command | Behavior |
+|---|---|
+| `begin scratch` | Starts a shard-local scratch session and writes a discard baseline |
+| `discard` | Restores the scratch baseline, clears staged abstractions and patch batches, ends the session |
+| `commit` | Applies scratch changes to permanent state, applies staged abstractions, clears staged patch batches, writes the committed snapshot |
+| `snapshot` | Writes a full shard-local snapshot when scratch is inactive |
+| `revert` | Restores the last snapshot when scratch is inactive |
+| `rollback` | Alias for `revert` |
+
+`snapshot`, `revert`, and `rollback` are rejected while a scratch session is active.
+
+## Shell Workflow Commands
+
+These are shell commands, not Sigil VM keywords. When sent through `POST /api/sigil`, the current Linux shell requires an active scratch session before staging them.
+
+| Command | Current behavior |
+|---|---|
+| `/commit_abstractions ...` | Distills and stages abstraction output under the selected shard |
+| `/reuse_abstractions ...` | Stages cross-shard reuse decisions for project shards |
+| `/merge_abstractions ...` | Stages compatible abstraction merges and provenance-preserving promotions |
+| `/prune_abstractions ...` | Stages decay-state updates or bounded collection of prunable concepts |
+| `/stage_patch_candidates ...` | Stages proof-backed patch candidates under the selected shard |
+
+Current staging rules:
+
+- staged abstraction output becomes live only on `commit`
+- staged patch batches are scratch-only and are cleared by `discard` or `commit`
+- `revert` restores the last committed snapshot for the mounted shard when scratch is inactive
+- merge and promote paths can be refused by provenance or trust rules
 
 ## Internal Opcodes
 
-| Opcode | Role | Notes |
-|---|---|---|
-| `halt` | Internal | Emitted automatically at the end of each compiled program. |
-| `jmp_if_false` | Internal | Emitted by `TEST` to skip the block when the condition is false. |
+- `halt`
+- `jmp_if_false`
 
 ## Operand Modes
 
-The compiler currently emits these operand modes:
+- `none`
+- `string`
+- `integer`
+- `rune_and_string`
+- `loom_command`
+- `immediate_bool`
 
-| Mode | Meaning |
-|---|---|
-| `none` | No operand payload. |
-| `string` | String table reference. |
-| `integer` | Signed integer payload. |
-| `rune_and_string` | Rune value plus a string table reference. |
-| `loom_command` | Encoded `LOOM` command. |
-| `immediate_bool` | Immediate boolean used by `TEST`. |
+## `LOOM` Commands
 
-## Supported `LOOM` Commands
+- `VULKAN_INIT`
+- `CPU_ONLY`
+- `TIER_1`
+- `TIER_2`
+- `TIER_3`
+- `TIER_4`
 
-| Command | Effect |
-|---|---|
-| `VULKAN_INIT` | Enables Vulkan if it is available. |
-| `CPU_ONLY` | Forces the session into CPU-only mode. |
+Unknown `LOOM` values compile to `none` and are ignored by the VM.
 
-## Syntax Notes
+## Syntax
 
-- Strings use double quotes.
-- Integers can be decimal or hex.
-- Comments can start with `//` or `#`.
-- `ETCH` weights can be written as a plain number or `@weight`.
-- `TEST` uses braces for its block body.
+- strings use double quotes
+- integers can be decimal or hex
+- comments can start with `//` or `#`
+- `ETCH` weights can be written as a plain number or `@weight`
+- `TEST` uses braces for its block
 
 ## Live Execution
 
-The embedded shell accepts live Sigil through:
+The embedded shell executes through:
 
 ```text
 POST /api/sigil
 ```
 
-That route accepts either raw Sigil text or JSON with a `script` or `sigil` field.
+The request body can be raw text or JSON with a `script` or `sigil` field.

@@ -26,11 +26,19 @@ pub const getFileSize = os_layer.getFileSize;
 pub const readAll = os_layer.readAll;
 pub const writeAll = os_layer.writeAll;
 pub const createMappedFile = os_layer.createMappedFile;
+pub const createTemporaryMappedFile = if (@hasDecl(os_layer, "createTemporaryMappedFile")) os_layer.createTemporaryMappedFile else struct {
+    pub fn f(_: std.mem.Allocator, _: []const u8, _: usize) !MappedFile {
+        return error.UnsupportedPlatform;
+    }
+}.f;
 pub const directRead = os_layer.directRead;
 pub const directWrite = os_layer.directWrite;
 pub fn flushMappedMemory(mapped_file: *const MappedFile) !void {
     try mapped_file.flush();
 }
+pub const flushMappedSlice = if (@hasDecl(os_layer, "flushSlice")) os_layer.flushSlice else struct {
+    pub fn f(_: []const u8) !void {}
+}.f;
 pub const allocSectorAligned = os_layer.allocSectorAligned;
 pub const freeSectorAligned = os_layer.freeSectorAligned;
 pub const getMilliTick = os_layer.getMilliTick;

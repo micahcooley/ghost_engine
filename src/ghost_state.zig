@@ -154,7 +154,7 @@ pub const BlockCache = struct {
     }
 
     fn allocateSlotLocked(self: *BlockCache) !usize {
-        const buffer = try self.allocator.alignedAlloc(u8, .fromByteUnits(@alignOf(u64)), self.page_size);
+        const buffer = try self.allocator.alignedAlloc(u8, @alignOf(u64), self.page_size);
         const slot_index = self.slots.items.len;
         try self.slots.append(self.allocator, .{
             .buffer = buffer,

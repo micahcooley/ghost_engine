@@ -1,14 +1,32 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const vsa = @import("vsa_core.zig");
 const ghost_state = @import("ghost_state.zig");
 const vsa_vulkan = @import("vsa_vulkan.zig");
+const layer2a_gpu = @import("layer2a_gpu.zig");
 const vl = @import("vulkan_loader.zig");
 const vk = vl.vk;
 
-const GoldenPayload = struct {
+const GoldenPayload = extern struct {
     lexical: u64 = 0xDEADBEEFCAFEBABE,
     semantic: u64 = 0x8BADF00D0D15EA5E,
     rune: u32 = 'X',
+};
+
+const WindowsParityGolden = extern struct {
+    payload: GoldenPayload,
+    rotor_state: [16]u64,
+    lexical_slot: u32,
+    semantic_slot: u32,
+    lexical_vector: [16]u64,
+    semantic_vector: [16]u64,
+    lexical_tag: u64,
+    semantic_tag: u64,
+    resonance: u16,
+    manager_drift: u16,
+    critic_drift: u16,
+    drift_passed: u8,
+    _padding: [5]u8 = [_]u8{0} ** 5,
 };
 
 fn makeGoldenSoul(allocator: std.mem.Allocator, payload: GoldenPayload) !ghost_state.GhostSoul {
@@ -121,8 +139,52 @@ fn vkCheck(result: vk.VkResult) !void {
     if (result != vk.VK_SUCCESS) return error.VulkanError;
 }
 
+const PhaseTrace = struct {
+    test_name: []const u8,
+    total_timer: std.time.Timer,
+    phase_timer: std.time.Timer,
+    phase_index: usize = 0,
+
+    fn init(test_name: []const u8) !PhaseTrace {
+        std.debug.print("[PARITY] {s} begin\n", .{test_name});
+        return .{
+            .test_name = test_name,
+            .total_timer = try std.time.Timer.start(),
+            .phase_timer = try std.time.Timer.start(),
+        };
+    }
+
+    fn begin(self: *PhaseTrace, phase_name: []const u8) void {
+        self.phase_index += 1;
+        self.phase_timer.reset();
+        std.debug.print("[PARITY] {s} phase {d}: {s}\n", .{
+            self.test_name,
+            self.phase_index,
+            phase_name,
+        });
+    }
+
+    fn end(self: *PhaseTrace, phase_name: []const u8) void {
+        std.debug.print("[PARITY] {s} phase {d} done: {s} ({})\n", .{
+            self.test_name,
+            self.phase_index,
+            phase_name,
+            std.fmt.fmtDuration(self.phase_timer.read()),
+        });
+    }
+
+    fn finish(self: *PhaseTrace) void {
+        std.debug.print("[PARITY] {s} complete ({})\n", .{
+            self.test_name,
+            std.fmt.fmtDuration(self.total_timer.read()),
+        });
+    }
+};
+
 fn dispatchSingleEtch(engine: *vsa_vulkan.VulkanEngine, rotors: []const u64, chars: []const u32, indices: []const u32) !void {
     const frame = engine.frame_idx;
+    var total_timer = try std.time.Timer.start();
+    var record_timer = try std.time.Timer.start();
 
     @memcpy(engine.mapped_rotors[frame].?[0..rotors.len], rotors);
     @memcpy(engine.mapped_chars[frame].?[0..chars.len], chars);
@@ -160,51 +222,168 @@ fn dispatchSingleEtch(engine: *vsa_vulkan.VulkanEngine, rotors: []const u64, cha
     engine.vk_ctx.vkCmdDispatch.?(engine.command_buffers[frame], num_workgroups, 1, 1);
 
     try vkCheck(engine.vk_ctx.vkEndCommandBuffer.?(engine.command_buffers[frame]));
+    const record_ns = record_timer.read();
 
     var submit_info = std.mem.zeroes(vk.VkSubmitInfo);
     submit_info.sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit_info.commandBufferCount = 1;
     submit_info.pCommandBuffers = &engine.command_buffers[frame];
+    var submit_timer = try std.time.Timer.start();
     try vkCheck(engine.vk_ctx.vkQueueSubmit.?(engine.queue, 1, &submit_info, engine.fences[frame]));
+    const submit_ns = submit_timer.read();
 
+    var wait_timer = try std.time.Timer.start();
     try engine.waitForHardwareInterrupt(frame);
+    const wait_ns = wait_timer.read();
     engine.frame_idx = (engine.frame_idx + 1) % vsa_vulkan.FRAME_COUNT;
 
+    std.debug.print(
+        "[PARITY] single-rune gpu frame {d}: record={} submit={} wait={} total={}\n",
+        .{
+            frame,
+            std.fmt.fmtDuration(record_ns),
+            std.fmt.fmtDuration(submit_ns),
+            std.fmt.fmtDuration(wait_ns),
+            std.fmt.fmtDuration(total_timer.read()),
+        },
+    );
+
     _ = wg_size;
+}
+
+fn readGoldenFixture(allocator: std.mem.Allocator) !?WindowsParityGolden {
+    const env_name = "GHOST_WINDOWS_PARITY_GOLDEN";
+    const path = std.process.getEnvVarOwned(allocator, env_name) catch return null;
+    defer allocator.free(path);
+
+    const file = std.fs.openFileAbsolute(path, .{}) catch |abs_err| blk: {
+        if (abs_err != error.FileNotFound) return abs_err;
+        break :blk try std.fs.cwd().openFile(path, .{});
+    };
+    defer file.close();
+
+    const bytes = try file.readToEndAlloc(allocator, @sizeOf(WindowsParityGolden) + 1);
+    defer allocator.free(bytes);
+    if (bytes.len != @sizeOf(WindowsParityGolden)) return error.InvalidGoldenFixture;
+    return std.mem.bytesToValue(WindowsParityGolden, bytes[0..@sizeOf(WindowsParityGolden)]);
+}
+
+fn makeSnapshot(
+    payload: GoldenPayload,
+    soul: ghost_state.GhostSoul,
+    lexical_slot: u32,
+    semantic_slot: u32,
+    lexical_vector: [16]u64,
+    semantic_vector: [16]u64,
+    lexical_tag: u64,
+    semantic_tag: u64,
+) WindowsParityGolden {
+    const lexical_hv: vsa.HyperVector = @bitCast(lexical_vector);
+    const semantic_hv: vsa.HyperVector = @bitCast(semantic_vector);
+    const rotor_state: [16]u64 = @bitCast(soul.spatial_rotor.state);
+    const resonance = vsa.calculateResonance(lexical_hv, semantic_hv);
+    const drift = vsa.dualDriftCheck(lexical_hv, semantic_hv, 512, 512);
+    return .{
+        .payload = payload,
+        .rotor_state = rotor_state,
+        .lexical_slot = lexical_slot,
+        .semantic_slot = semantic_slot,
+        .lexical_vector = lexical_vector,
+        .semantic_vector = semantic_vector,
+        .lexical_tag = lexical_tag,
+        .semantic_tag = semantic_tag,
+        .resonance = resonance,
+        .manager_drift = drift.manager_drift,
+        .critic_drift = drift.critic_drift,
+        .drift_passed = @intFromBool(drift.passed),
+    };
+}
+
+fn expectGoldenParity(expected: WindowsParityGolden, actual: WindowsParityGolden) !void {
+    try std.testing.expectEqual(expected.payload.lexical, actual.payload.lexical);
+    try std.testing.expectEqual(expected.payload.semantic, actual.payload.semantic);
+    try std.testing.expectEqual(expected.payload.rune, actual.payload.rune);
+    try std.testing.expectEqualSlices(u64, expected.rotor_state[0..], actual.rotor_state[0..]);
+    try std.testing.expectEqual(expected.lexical_slot, actual.lexical_slot);
+    try std.testing.expectEqual(expected.semantic_slot, actual.semantic_slot);
+    try std.testing.expectEqualSlices(u64, expected.lexical_vector[0..], actual.lexical_vector[0..]);
+    try std.testing.expectEqualSlices(u64, expected.semantic_vector[0..], actual.semantic_vector[0..]);
+    try std.testing.expectEqual(expected.lexical_tag, actual.lexical_tag);
+    try std.testing.expectEqual(expected.semantic_tag, actual.semantic_tag);
+    try std.testing.expectEqual(expected.resonance, actual.resonance);
+    try std.testing.expectEqual(expected.manager_drift, actual.manager_drift);
+    try std.testing.expectEqual(expected.critic_drift, actual.critic_drift);
+    try std.testing.expectEqual(expected.drift_passed, actual.drift_passed);
+}
+
+fn resetLayer2aBuffers(engine: *vsa_vulkan.VulkanEngine) !void {
+    try engine.ensureSigilCapacity(64 * 1024 * 1024);
+    @memset(engine.getMatrixData(), 0);
+    @memset(engine.getTagsData(), 0);
+    @memset(engine.getLatticeData(), 0);
+    @memset(std.mem.sliceAsBytes(engine.getSigilDataMutable()), 0);
+    @memset(engine.getPanopticonEdgesMutable(), layer2a_gpu.GRAPH_EMPTY);
+}
+
+fn expectCandidateScoresEqual(expected: []const layer2a_gpu.CandidateScore, actual: []const layer2a_gpu.CandidateScore) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |lhs, rhs| {
+        try std.testing.expectEqualDeep(lhs, rhs);
+    }
+}
+
+fn expectNeighborhoodScoresEqual(expected: []const layer2a_gpu.NeighborhoodScore, actual: []const layer2a_gpu.NeighborhoodScore) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |lhs, rhs| {
+        try std.testing.expectEqualDeep(lhs, rhs);
+    }
 }
 
 test "single-rune CPU and GPU etch agree bit-for-bit" {
     const allocator = std.testing.allocator;
     const payload = GoldenPayload{};
+    var trace = try PhaseTrace.init("single-rune CPU and GPU etch agree bit-for-bit");
+    defer trace.finish();
 
-    const engine = try vsa_vulkan.initRuntime(allocator, std.testing.io);
+    trace.begin("init runtime");
+    const engine = try vsa_vulkan.initRuntime(allocator);
     defer vsa_vulkan.deinitRuntime();
+    trace.end("init runtime");
 
+    trace.begin("clear gpu buffers");
     const gpu_matrix = engine.getMatrixData();
     const gpu_tags = engine.getTagsData();
     const gpu_lattice = engine.getLatticeData();
     @memset(gpu_matrix, 0);
     @memset(gpu_tags, 0);
     @memset(gpu_lattice, 0);
+    trace.end("clear gpu buffers");
 
+    trace.begin("allocate cpu mirrors");
     const cpu_matrix = try allocator.alloc(u32, gpu_matrix.len);
     defer allocator.free(cpu_matrix);
     const cpu_tags = try allocator.alloc(u64, gpu_tags.len);
     defer allocator.free(cpu_tags);
     @memset(cpu_matrix, 0);
     @memset(cpu_tags, 0);
+    trace.end("allocate cpu mirrors");
 
     var cpu_meaning = vsa.MeaningMatrix{
         .data = cpu_matrix,
         .tags = cpu_tags,
     };
 
+    trace.begin("build golden soul");
     var soul = try makeGoldenSoul(allocator, payload);
     defer soul.deinit();
+    trace.end("build golden soul");
 
+    trace.begin("cpu etch reference");
     const lexical_slot = try cpuEtchSlotFull(&cpu_meaning, soul.spatial_rotor, payload.lexical, payload.rune);
     const semantic_slot = try cpuEtchSlotFull(&cpu_meaning, soul.spatial_rotor, payload.semantic, payload.rune);
+    trace.end("cpu etch reference");
 
+    trace.begin("prepare gpu dispatch");
     var rotors: [18]u64 = undefined;
     const spatial_state: [16]u64 = soul.spatial_rotor.state;
     @memcpy(rotors[0..16], spatial_state[0..16]);
@@ -215,9 +394,14 @@ test "single-rune CPU and GPU etch agree bit-for-bit" {
     const indices = [_]u32{0};
 
     engine.setTier(4);
+    trace.end("prepare gpu dispatch");
+
+    trace.begin("gpu etch dispatch");
     try dispatchSingleEtch(engine, rotors[0..], chars[0..], indices[0..]);
+    trace.end("gpu etch dispatch");
 
     // The matrix and tags buffers are host-visible and mapped.
+    trace.begin("compare cpu and gpu results");
     var gpu_meaning = vsa.MeaningMatrix{
         .data = gpu_matrix,
         .tags = gpu_tags,
@@ -233,4 +417,161 @@ test "single-rune CPU and GPU etch agree bit-for-bit" {
 
     try std.testing.expectEqual(cpu_tags[lexical_slot], gpu_tags[lexical_slot]);
     try std.testing.expectEqual(cpu_tags[semantic_slot], gpu_tags[semantic_slot]);
+
+    const local_snapshot = makeSnapshot(
+        payload,
+        soul,
+        lexical_slot,
+        semantic_slot,
+        cpu_lex_vector,
+        cpu_sem_vector,
+        cpu_tags[lexical_slot],
+        cpu_tags[semantic_slot],
+    );
+    try std.testing.expectEqual(
+        vsa.calculateResonance(cpu_lex_vector, cpu_sem_vector),
+        local_snapshot.resonance,
+    );
+    const drift = vsa.dualDriftCheck(cpu_lex_vector, cpu_sem_vector, 512, 512);
+    try std.testing.expectEqual(drift.manager_drift, local_snapshot.manager_drift);
+    try std.testing.expectEqual(drift.critic_drift, local_snapshot.critic_drift);
+    try std.testing.expectEqual(@intFromBool(drift.passed), local_snapshot.drift_passed);
+
+    if (builtin.os.tag == .linux) {
+        if (try readGoldenFixture(allocator)) |golden| {
+            std.debug.print("[PARITY] compare windows fixture\n", .{});
+            try expectGoldenParity(golden, local_snapshot);
+        }
+    }
+    trace.end("compare cpu and gpu results");
+}
+
+test "layer2a candidate scoring matches exact cpu reference" {
+    const allocator = std.testing.allocator;
+    var trace = try PhaseTrace.init("layer2a candidate scoring matches exact cpu reference");
+    defer trace.finish();
+
+    trace.begin("init runtime");
+    const engine = try vsa_vulkan.initRuntime(allocator);
+    defer vsa_vulkan.deinitRuntime();
+    trace.end("init runtime");
+
+    trace.begin("reset layer2a buffers");
+    try resetLayer2aBuffers(engine);
+    trace.end("reset layer2a buffers");
+
+    trace.begin("prepare candidate inputs");
+    const helper = layer2a_gpu.Layer2aGpu.init(engine);
+    const state = try layer2a_gpu.StateView.initFromVulkan(engine);
+    const chars = [_]u32{ 'a', 'b', '(', ')' };
+    var expected_storage: [layer2a_gpu.MAX_CANDIDATES]layer2a_gpu.CandidateScore = undefined;
+    var actual_storage: [layer2a_gpu.MAX_CANDIDATES]layer2a_gpu.CandidateScore = undefined;
+    trace.end("prepare candidate inputs");
+
+    trace.begin("candidate cpu reference");
+    const expected = try layer2a_gpu.scoreCandidatesReference(state, 0xDEADBEEFCAFEBABE, 0x8BADF00D0D15EA5E, &chars, expected_storage[0..chars.len]);
+    trace.end("candidate cpu reference");
+
+    trace.begin("candidate gpu dispatch");
+    const actual = try helper.scoreCandidates(0xDEADBEEFCAFEBABE, 0x8BADF00D0D15EA5E, &chars, actual_storage[0..chars.len]);
+    trace.end("candidate gpu dispatch");
+
+    trace.begin("candidate result compare");
+    try expectCandidateScoresEqual(expected, actual);
+    trace.end("candidate result compare");
+
+    var run_index: usize = 0;
+    while (run_index < 4) : (run_index += 1) {
+        trace.begin("candidate stability rerun");
+        const repeated = try helper.scoreCandidates(0xDEADBEEFCAFEBABE, 0x8BADF00D0D15EA5E, &chars, actual_storage[0..chars.len]);
+        try expectCandidateScoresEqual(actual, repeated);
+        trace.end("candidate stability rerun");
+    }
+}
+
+test "layer2a neighborhood scoring matches exact cpu reference" {
+    const allocator = std.testing.allocator;
+    var trace = try PhaseTrace.init("layer2a neighborhood scoring matches exact cpu reference");
+    defer trace.finish();
+
+    trace.begin("init runtime");
+    const engine = try vsa_vulkan.initRuntime(allocator);
+    defer vsa_vulkan.deinitRuntime();
+    trace.end("init runtime");
+
+    trace.begin("reset layer2a buffers");
+    try resetLayer2aBuffers(engine);
+    trace.end("reset layer2a buffers");
+
+    trace.begin("prepare neighborhood inputs");
+    const helper = layer2a_gpu.Layer2aGpu.init(engine);
+    const state = try layer2a_gpu.StateView.initFromVulkan(engine);
+    const chars = [_]u32{ 'x', 'y', '[', ']' };
+    var expected_storage: [layer2a_gpu.MAX_CANDIDATES]layer2a_gpu.NeighborhoodScore = undefined;
+    var actual_storage: [layer2a_gpu.MAX_CANDIDATES]layer2a_gpu.NeighborhoodScore = undefined;
+    trace.end("prepare neighborhood inputs");
+
+    trace.begin("neighborhood cpu reference");
+    const expected = try layer2a_gpu.scoreNeighborhoodsReference(state, 0x1111222233334444, 0x5555666677778888, &chars, expected_storage[0..chars.len]);
+    trace.end("neighborhood cpu reference");
+
+    trace.begin("neighborhood gpu dispatch");
+    const actual = try helper.scoreNeighborhoods(0x1111222233334444, 0x5555666677778888, &chars, actual_storage[0..chars.len]);
+    trace.end("neighborhood gpu dispatch");
+
+    trace.begin("neighborhood result compare");
+    try expectNeighborhoodScoresEqual(expected, actual);
+    trace.end("neighborhood result compare");
+
+    var run_index: usize = 0;
+    while (run_index < 4) : (run_index += 1) {
+        trace.begin("neighborhood stability rerun");
+        const repeated = try helper.scoreNeighborhoods(0x1111222233334444, 0x5555666677778888, &chars, actual_storage[0..chars.len]);
+        try expectNeighborhoodScoresEqual(actual, repeated);
+        trace.end("neighborhood stability rerun");
+    }
+}
+
+test "layer2a contradiction filtering matches exact cpu reference" {
+    const allocator = std.testing.allocator;
+    var trace = try PhaseTrace.init("layer2a contradiction filtering matches exact cpu reference");
+    defer trace.finish();
+
+    trace.begin("init runtime");
+    const engine = try vsa_vulkan.initRuntime(allocator);
+    defer vsa_vulkan.deinitRuntime();
+    trace.end("init runtime");
+
+    trace.begin("reset layer2a buffers");
+    try resetLayer2aBuffers(engine);
+    trace.end("reset layer2a buffers");
+
+    trace.begin("prepare contradiction inputs");
+    const helper = layer2a_gpu.Layer2aGpu.init(engine);
+    const candidates = [_]layer2a_gpu.CandidateScore{
+        .{ .char_code = 'x', .score = 700 },
+        .{ .char_code = 'y', .score = 700 },
+        .{ .char_code = 'z', .score = 12 },
+    };
+    trace.end("prepare contradiction inputs");
+
+    trace.begin("contradiction cpu reference");
+    const expected = layer2a_gpu.filterContradictionsReference(&candidates);
+    trace.end("contradiction cpu reference");
+
+    trace.begin("contradiction gpu dispatch");
+    const actual = try helper.filterContradictions(&candidates);
+    trace.end("contradiction gpu dispatch");
+
+    trace.begin("contradiction result compare");
+    try std.testing.expectEqualDeep(expected, actual);
+    trace.end("contradiction result compare");
+
+    var run_index: usize = 0;
+    while (run_index < 4) : (run_index += 1) {
+        trace.begin("contradiction stability rerun");
+        const repeated = try helper.filterContradictions(&candidates);
+        try std.testing.expectEqualDeep(actual, repeated);
+        trace.end("contradiction stability rerun");
+    }
 }

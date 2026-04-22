@@ -3,13 +3,14 @@ const sys = @import("sys.zig");
 const vsa = @import("vsa_core.zig");
 const ghost_state = @import("ghost_state.zig");
 const vsa_vulkan = @import("vsa_vulkan.zig");
+const layer2a_gpu = @import("layer2a_gpu.zig");
 const mc = @import("inference.zig");
+const panic_dump = @import("panic_dump.zig");
 const config = @import("config.zig");
+const sigil_runtime = @import("sigil_runtime.zig");
 
 pub const REASON_DEPTH: u32 = 8;
 pub const REASON_TOP_K: u32 = 3;
-pub const DUAL_DRIFT_MANAGER_THRESHOLD: u64 = 256;
-pub const DUAL_DRIFT_CRITIC_THRESHOLD: u64 = 5;
 
 /// V32: Resonance Self-Calibration (Fixed-Point Integer)
 /// Replaces non-deterministic floating-point EMA with bit-perfect integer math.
@@ -111,6 +112,23 @@ pub const SingularityEngine = struct {
     allocator: std.mem.Allocator,
     rune_counter: u64 = 0,
     ema: ResonanceEMA = .{},
+    last_layer2a_metrics: mc.Layer2aInstrumentation = .{},
+
+    fn layer3Config(self: *const SingularityEngine) mc.Layer3Config {
+        const reasoning_mode = if (sigil_runtime.getActiveControl()) |control|
+            control.snapshot().reasoning_mode
+        else
+            .proof;
+        return .{
+            .confidence_floor = .{
+                .min_score = @max(@as(u32, self.ema.getSearchThreshold()), config.LAYER3_CONFIDENCE_FLOOR_MIN),
+            },
+            .max_steps = config.LAYER3_MAX_STEPS,
+            .max_branches = config.LAYER3_MAX_BRANCHES,
+            .policy = mc.policyForMode(reasoning_mode),
+            .dump = panic_dump.dumpHook(),
+        };
+    }
 
     pub fn setLatticeProvider(self: *SingularityEngine, provider: *ghost_state.LatticeProvider) void {
         self.lattice_provider = provider;
@@ -137,7 +155,7 @@ pub const SingularityEngine = struct {
         return vsa.resonanceScore(candidate_vec, target_vec);
     }
 
-    pub fn resolveTopology(self: *SingularityEngine) ?u32 {
+    pub fn resolveTopology(self: *SingularityEngine) ?mc.Layer3Decision {
         switch (self.canvas.topology) {
             .text_1d => return self.resolveText1D(),
             .image_2d => {
@@ -151,8 +169,16 @@ pub const SingularityEngine = struct {
         }
     }
 
-    pub fn resolveText1D(self: *SingularityEngine) ?u32 {
+    pub fn resolveText1D(self: *SingularityEngine) mc.Layer3Decision {
         const position = self.canvas.cursor;
+        // Layer 3 is intentionally a tiny honesty gate at the output boundary.
+        // It is not a reasoning layer and it must never invent a "best effort" answer.
+        // `UNRESOLVED_OUTPUT` means the output is unsupported and must not be committed.
+        // Layer 2b below remains the only owner of bounded reasoning over the
+        // fixed top-K frontier. Optional Layer 2a GPU helpers may rank or filter
+        // compact candidate sets, but branch-heavy reasoning and final decisions
+        // stay on the CPU.
+        const layer3 = self.layer3Config();
         var top_chars: [REASON_TOP_K]u32 = [_]u32{' '} ** REASON_TOP_K;
         var top_energies: [REASON_TOP_K]u32 = [_]u32{0} ** REASON_TOP_K;
         const base_cursor = self.inv_cursor % self.inventory.len;
@@ -201,59 +227,31 @@ pub const SingularityEngine = struct {
             }
         }
 
-        const primary_concept = self.soul.concept;
         var reason_best_char: u32 = top_chars[0];
         var chosen_energy: u32 = top_energies[0];
+        var layer3_decision = mc.Layer3Decision{
+            .output = reason_best_char,
+            .confidence = chosen_energy,
+        };
 
-        // Beam search rollout (when Vulkan is available)
+        // CPU Layer 2b owns bounded hypothesis expansion, contradiction pruning,
+        // branch-cap enforcement, and final selection. When Vulkan is available,
+        // Layer 2a only accelerates compact scoring/filter sub-operations inside
+        // this same reasoning loop.
+        self.last_layer2a_metrics = .{};
+        var reasoning = mc.ReasoningContext.init(self.meaning, self.soul, layer3)
+            .withRecentBytes(.{ prev1, prev2, prev3 })
+            .withInstrumentation(&self.last_layer2a_metrics);
+        var layer2a_helper: ?layer2a_gpu.Layer2aGpu = null;
         if (!config.force_cpu_inference and self.vulkan != null) {
-            const vulkan = self.vulkan.?;
-            const beam = mc.BeamSearchPool.init(self.allocator, vulkan, self.meaning);
-            const winner_idx = beam.resolve(self.soul, &top_chars, &top_energies) catch 0;
-            reason_best_char = top_chars[winner_idx];
-            chosen_energy = top_energies[winner_idx];
-        } else {
-            // Fallback: shallow dual-drift reasoning (no GPU)
-            var reason_best_score: u32 = 0;
-            var frustration: u64 = 0;
-
-            var candidate_vecs = [_]vsa.HyperVector{@as(vsa.HyperVector, @splat(0))} ** REASON_TOP_K;
-            for (top_chars, 0..) |candidate, ki| {
-                candidate_vecs[ki] = vsa.generate(candidate);
-            }
-
-            while (true) {
-                for (top_chars, 0..) |candidate, ki| {
-                    if (top_energies[ki] == 0) continue;
-                    const snapshot = saveSoul(self.soul);
-
-                    self.soul.simulateAbsorb(candidate_vecs[ki], candidate, null) catch {
-                        restoreSoul(self.soul, snapshot);
-                        continue;
-                    };
-
-                    // Integer-only sigmoid approximation for frustration-based leniency
-                    // leniency = (200 * (f * f)) / ((f * f) + 25)
-                    const f2 = frustration * frustration;
-                    const sigmoid_leniency = (200 * f2) / (f2 + 25);
-                    const verdict = vsa.dualDriftCheck(self.soul.concept, primary_concept, DUAL_DRIFT_MANAGER_THRESHOLD, DUAL_DRIFT_CRITIC_THRESHOLD + sigmoid_leniency);
-                    if (!verdict.passed) {
-                        restoreSoul(self.soul, snapshot);
-                        continue;
-                    }
-
-                    const future_energy: u32 = top_energies[ki] + @as(u32, @intCast(@min(verdict.manager_drift / 4, 64)));
-                    restoreSoul(self.soul, snapshot);
-                    if (future_energy > reason_best_score) {
-                        reason_best_score = future_energy;
-                        reason_best_char = candidate;
-                        chosen_energy = top_energies[ki];
-                    }
-                }
-                if (reason_best_score > 0 or frustration >= 15) break;
-                frustration += 1;
-            }
+            layer2a_helper = layer2a_gpu.Layer2aGpu.init(self.vulkan.?);
+            reasoning = reasoning.withLayer2aGpu(&layer2a_helper.?);
         }
+        const decision = reasoning.resolve(&top_chars, &top_energies);
+        if (decision.stop_reason != .none) return decision;
+        layer3_decision = decision;
+        reason_best_char = decision.output;
+        chosen_energy = decision.confidence;
 
         const chosen: u32 = reason_best_char;
         const chosen_vec = vsa.generate(chosen);
@@ -263,7 +261,7 @@ pub const SingularityEngine = struct {
         self.rune_counter += 1;
         if (self.rune_counter % 10000 == 0 and gpu_success) {
             if (self.vulkan) |vulkan| {
-                const gpu_energies = vulkan.dispatchResonance(self.soul.lexical_rotor, self.soul.semantic_rotor) catch return chosen;
+                const gpu_energies = vulkan.dispatchResonance(self.soul.lexical_rotor, self.soul.semantic_rotor) catch return layer3_decision;
                 const gpu_energy = gpu_energies[@as(usize, @intCast(chosen))];
 
                 // Independent CPU computation
@@ -300,15 +298,10 @@ pub const SingularityEngine = struct {
         // V32: Update the noise floor EMA with the chosen rune's resonance
         self.ema.update(@intCast(chosen_energy));
 
-        // Aggressive Uncertainty Detection: V32 "Digital Oracle"
-        // Triggered via dynamic threshold derived from Hamming drift statistics
-        const search_threshold = self.ema.getSearchThreshold();
-        if (chosen_energy < search_threshold and self.rune_counter > 20) {
-            sys.print("\n[MONOLITH] Resonance dropped to {d} (Threshold: {d}). State depletion detected.\n", .{ chosen_energy, search_threshold });
-            return 0x10FFFF; // Ghost Sigil for "Search Required"
-        }
-
-        return chosen;
+        layer3_decision.output = chosen;
+        layer3_decision.confidence = chosen_energy;
+        layer3_decision.stop_reason = .none;
+        return layer3_decision;
     }
 
     /// VSA-based 2D relaxation: each cell converges toward its MeaningMatrix target
