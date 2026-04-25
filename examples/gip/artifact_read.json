@@ -1,0 +1,7 @@
+{
+  "gipVersion": "gip.v0.1",
+  "kind": "artifact.read",
+  "requestId": "example-002",
+  "workspace": "/home/user/project",
+  "path": "src/main.zig"
+}

@@ -1,0 +1,9 @@
+{
+  "gipVersion": "gip.v0.1",
+  "kind": "conversation.turn",
+  "message": "optimize the compute budget logic",
+  "reasoningLevel": "deep",
+  "contextArtifacts": [
+    "src/compute_budget.zig"
+  ]
+}

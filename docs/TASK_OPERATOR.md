@@ -74,7 +74,24 @@ All commands support stable rendering modes:
 
 `report` mode reuses existing technical drafts and replay reports. It is not a chat surface.
 
-## Response Mode UX
+## Reasoning Control UX
+
+Normal operator and chat usage exposes one reasoning control:
+
+```bash
+ghost_task_operator chat --message="explain this" --reasoning=quick
+ghost_task_operator chat --message="fix this bug" --reasoning=deep
+ghost_task_operator chat --message="verify and apply this" --reasoning=max
+```
+
+`--reasoning` means how hard Ghost should try:
+
+- `quick`: fast, minimal effort.
+- `balanced`: the default.
+- `deep`: more thorough and may verify when useful.
+- `max`: most thorough, but not always deep if deep adds no value.
+
+Internal response modes such as `draft_mode`, `fast_path`, `deep_path`, and `auto_path` are policy-selected implementation details, not normal user choices. Advanced/debug budget controls such as `--compute-tier` remain available only behind explicit advanced usage; when combined with `--reasoning`, the CLI requires `--advanced` so the override is deliberate and deterministic.
 
 Operator workflows stay on verifier-capable paths for proof, correctness, test, verify, and patch-capable actions. Draft/report rendering is a view over recorded artifacts and support traces; it does not turn an unverified draft into `verified_complete`.
 

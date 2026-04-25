@@ -1,0 +1,18 @@
+{
+  "gipVersion": "gip.v0.1",
+  "kind": "artifact.patch.propose",
+  "path": "examples/gip/patch_propose_bad_span.json",
+  "edits": [
+    {
+      "editId": "test-1",
+      "span": {
+        "startLine": 1000,
+        "startCol": 1,
+        "endLine": 1001,
+        "endCol": 1
+      },
+      "replacement": "out of bounds"
+    }
+  ],
+  "reason": "testing out of bounds span"
+}

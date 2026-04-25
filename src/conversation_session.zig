@@ -176,6 +176,7 @@ pub const TurnOptions = struct {
     context_artifacts: []const []const u8 = &.{},
     auto_proceed_low_risk: bool = true,
     compute_budget_request: compute_budget.Request = .{},
+    reasoning_level: response_engine.ReasoningLevel = .balanced,
 };
 
 pub fn turn(allocator: std.mem.Allocator, options: TurnOptions) !TurnResult {
@@ -230,9 +231,14 @@ pub fn turn(allocator: std.mem.Allocator, options: TurnOptions) !TurnResult {
     });
     defer gi.deinit();
 
-    var config = chooseResponseConfig(&session, &gi, normalized_message, options.compute_budget_request);
-    const deep_blocked_by_ambiguity = wantsDeep(normalized_message) and gi.ambiguity_sets.len > 0;
-    if (deep_blocked_by_ambiguity) config = response_engine.ResponseConfig.draftOnly();
+    var config = chooseResponseConfig(&session, &gi, normalized_message, options.compute_budget_request, options.reasoning_level);
+    const deep_blocked_by_ambiguity = wantsDeep(normalized_message) and (session.pending_ambiguities.len > 0 or gi.ambiguity_sets.len > 0);
+    if (deep_blocked_by_ambiguity) {
+        config = response_engine.ResponseConfig.draftOnly();
+        config.budget_request = options.compute_budget_request;
+        config.reasoning_level = options.reasoning_level;
+        config.explicit_user_draft_override = true;
+    }
 
     var response = try response_engine.execute(allocator, &gi, config);
     defer response.deinit();
@@ -243,7 +249,7 @@ pub fn turn(allocator: std.mem.Allocator, options: TurnOptions) !TurnResult {
     errdefer if (transition) |t| allocator.free(t.reason);
 
     try replaceCurrentIntent(&session, &response.grounded_intent, selected_mode, transition);
-    try replacePending(&session, &response.grounded_intent);
+    if (!deep_blocked_by_ambiguity) try replacePending(&session, &response.grounded_intent);
     try updateArtifactsFromIntent(&session, &response.grounded_intent);
     try replaceLastResult(&session, &response, selected_mode, deep_blocked_by_ambiguity);
 
@@ -459,33 +465,37 @@ fn summarizeResponse(allocator: std.mem.Allocator, result: *const response_engin
     }
 }
 
-fn chooseResponseConfig(session: *const Session, gi: *const intent_grounding.GroundedIntent, normalized: []const u8, budget_request: compute_budget.Request) response_engine.ResponseConfig {
+fn chooseResponseConfig(session: *const Session, gi: *const intent_grounding.GroundedIntent, normalized: []const u8, budget_request: compute_budget.Request, reasoning_level: response_engine.ReasoningLevel) response_engine.ResponseConfig {
     var config = response_engine.ResponseConfig.autoPath();
     config.budget_request = budget_request;
+    config.reasoning_level = reasoning_level;
     if (contains(normalized, "just give me a draft") or contains(normalized, "draft only")) {
         config = response_engine.ResponseConfig.draftOnly();
         config.budget_request = budget_request;
+        config.reasoning_level = reasoning_level;
+        config.explicit_user_draft_override = true;
+        return config;
+    }
+    if (session.pending_ambiguities.len > 0 and !selectsAmbiguity(normalized, session)) {
+        config = response_engine.ResponseConfig.draftOnly();
+        config.budget_request = budget_request;
+        config.reasoning_level = reasoning_level;
+        return config;
+    }
+    if (gi.ambiguity_sets.len > 0 and !selectsAmbiguity(normalized, session)) {
+        config = response_engine.ResponseConfig.draftOnly();
+        config.budget_request = budget_request;
+        config.reasoning_level = reasoning_level;
         return config;
     }
     if (wantsDeep(normalized)) {
         config = response_engine.ResponseConfig.deepOnly();
         config.user_requested_deep = true;
         config.budget_request = budget_request;
+        config.reasoning_level = reasoning_level;
         return config;
     }
     if (isQuestionOrPlanning(normalized)) {
-        config = response_engine.ResponseConfig.draftOnly();
-        config.budget_request = budget_request;
-        return config;
-    }
-    if (session.pending_ambiguities.len > 0 and !selectsAmbiguity(normalized, session)) {
-        config = response_engine.ResponseConfig.draftOnly();
-        config.budget_request = budget_request;
-        return config;
-    }
-    if (gi.ambiguity_sets.len > 0 and !selectsAmbiguity(normalized, session)) {
-        config = response_engine.ResponseConfig.draftOnly();
-        config.budget_request = budget_request;
         return config;
     }
     return config;

@@ -5,6 +5,7 @@ const sys = @import("sys.zig");
 pub const DEFAULT_TIMEOUT_MS: u32 = 4_000;
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 pub const MAX_TIMEOUT_MS: u32 = 15_000;
+const POST_EXIT_PIPE_DRAIN_GRACE_MS: u64 = 100;
 pub const MAX_ARG_COUNT: usize = 16;
 pub const MAX_ARG_BYTES: usize = 256;
 pub const MAX_EVIDENCE_BYTES: usize = 1024;
@@ -427,13 +428,17 @@ fn runCapturePosix(
 
     const started = sys.getMilliTick();
     var term: ?std.process.Child.Term = null;
+    var term_seen_ms: ?u64 = null;
     var timed_out = false;
     var output_limited = false;
 
     while (term == null or child.stdout != null or child.stderr != null) {
         if (term == null) {
             const wait_result = std.posix.waitpid(child.id, waitNoHang());
-            if (wait_result.pid == child.id) term = statusToTerm(wait_result.status);
+            if (wait_result.pid == child.id) {
+                term = statusToTerm(wait_result.status);
+                term_seen_ms = sys.getMilliTick();
+            }
         }
 
         if (term == null and sys.getMilliTick() - started >= timeout_ms) {
@@ -441,6 +446,7 @@ fn runCapturePosix(
             forceKillPosixChild(child.id);
             const wait_result = std.posix.waitpid(child.id, 0);
             term = statusToTerm(wait_result.status);
+            term_seen_ms = sys.getMilliTick();
         }
 
         var poll_fds: [2]std.posix.pollfd = undefined;
@@ -472,10 +478,20 @@ fn runCapturePosix(
         if (try drainPipe(&child.stdout, &stdout, max_output_bytes)) output_limited = true;
         if (try drainPipe(&child.stderr, &stderr, max_output_bytes)) output_limited = true;
 
+        if (term != null and (child.stdout != null or child.stderr != null)) {
+            const seen_ms = term_seen_ms orelse sys.getMilliTick();
+            term_seen_ms = seen_ms;
+            if (sys.getMilliTick() - seen_ms >= POST_EXIT_PIPE_DRAIN_GRACE_MS) {
+                forceKillPosixChild(child.id);
+                closeChildStreams(&child);
+            }
+        }
+
         if (output_limited and term == null) {
             forceKillPosixChild(child.id);
             const wait_result = std.posix.waitpid(child.id, 0);
             term = statusToTerm(wait_result.status);
+            term_seen_ms = sys.getMilliTick();
         }
     }
 

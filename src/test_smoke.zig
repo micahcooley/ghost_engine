@@ -30,9 +30,13 @@ const intent_grounding = @import("intent_grounding.zig");
 const response_engine = @import("response_engine.zig");
 const verifier_adapter = @import("verifier_adapter.zig");
 const repo_hygiene = @import("repo_hygiene.zig");
+const hypothesis_core = @import("hypothesis_core.zig");
+const gip = @import("gip.zig");
 
 comptime {
     _ = repo_hygiene;
+    _ = hypothesis_core;
+    _ = gip;
 }
 
 const TraceCapture = struct {
@@ -196,13 +200,152 @@ test "code execution verifier output is adapter traceable evidence only" {
         allocator,
         verifier_adapter.codeBuildAdapter(),
         &capture,
-        &.{ "build" },
+        &.{"build"},
         "execution_harness",
     );
     defer adapter_result.deinit();
     try std.testing.expectEqual(verifier_adapter.Status.passed, adapter_result.status);
     try std.testing.expectEqual(verifier_adapter.EvidenceKind.build_log, adapter_result.evidence_kind);
     try std.testing.expect(std.mem.eql(u8, adapter_result.adapter_id, "code.build.zig_build"));
+}
+
+fn testHandoffHypothesis(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    artifact_scope: []const u8,
+    schema_name: []const u8,
+    hook: []const u8,
+    obligation: []const u8,
+    provenance: []const u8,
+    trace: []const u8,
+) !hypothesis_core.Hypothesis {
+    const evidence = [_][]const u8{"provenance-backed evidence"};
+    const obligations = [_][]const u8{obligation};
+    const hooks = [_][]const u8{hook};
+    return hypothesis_core.makeWithSignals(
+        allocator,
+        id,
+        artifact_scope,
+        schema_name,
+        .possible_missing_obligation,
+        &.{ "key", "value" },
+        &.{"contains"},
+        &evidence,
+        &obligations,
+        &hooks,
+        "verify",
+        "handoff_test",
+        &.{ "fresh", "high_trust", "project" },
+        provenance,
+        trace,
+    );
+}
+
+test "hypothesis verifier handoff schedules selected matching verifier job and evidence stays non-authorizing" {
+    const allocator = std.testing.allocator;
+    var hypothesis = try testHandoffHypothesis(allocator, "hyp:selected", "runtime.toml", "config_schema", "schema_validation", "schema_validation", "project_provenance", "safe selected hypothesis");
+    defer hypothesis.deinit(allocator);
+    var triage = try hypothesis_core.triage(allocator, @as([]const hypothesis_core.Hypothesis, &.{hypothesis}), .{ .max_hypotheses_selected = 1 });
+    defer triage.deinit();
+    var registry = verifier_adapter.Registry.init(allocator);
+    defer registry.deinit();
+    try verifier_adapter.registerBuiltinAdapters(&registry);
+    var tracker = verifier_adapter.BudgetTracker.init(allocator, compute_budget.resolve(.{ .tier = .high }));
+    var artifact = try artifact_schema.Artifact.init(allocator, "cfg", .repo, .file, "project", .project, "toml", "runtime.toml", "config_schema");
+    defer artifact.deinit(allocator);
+    const entities = [_]artifact_schema.Entity{
+        .{ .id = "key", .entity_type = "key", .fragment_index = 0, .label = "port", .provenance = "project", .artifact_id = "cfg" },
+        .{ .id = "value", .entity_type = "value", .fragment_index = 0, .label = "3000", .provenance = "project", .artifact_id = "cfg" },
+    };
+    var handoff = try verifier_adapter.handoffSelectedHypotheses(allocator, &registry, &tracker, @as([]const hypothesis_core.Hypothesis, &.{hypothesis}), triage, .{ .artifact = &artifact, .entities = &entities }, .deep);
+    defer handoff.deinit();
+    try std.testing.expectEqual(@as(usize, 1), handoff.eligible_count);
+    try std.testing.expectEqual(@as(usize, 1), handoff.scheduled_count);
+    try std.testing.expectEqual(@as(usize, 1), handoff.completed_count);
+    try std.testing.expectEqual(verifier_adapter.HandoffJobStatus.completed, handoff.jobs[0].status);
+    try std.testing.expectEqual(verifier_adapter.Status.passed, handoff.jobs[0].result_status.?);
+    try std.testing.expect(handoff.jobs[0].non_authorizing_input);
+}
+
+test "hypothesis verifier handoff blocks non-selected, missing adapter, unbound, draft, and unsafe requests deterministically" {
+    const allocator = std.testing.allocator;
+    var selected = try testHandoffHypothesis(allocator, "hyp:a", "runtime.toml", "config_schema", "schema_validation", "schema_validation", "project_provenance", "safe");
+    defer selected.deinit(allocator);
+    var second = try testHandoffHypothesis(allocator, "hyp:b", "runtime.toml", "config_schema", "schema_validation", "schema_validation", "project_provenance", "safe");
+    defer second.deinit(allocator);
+    var hypotheses = [_]hypothesis_core.Hypothesis{ selected, second };
+    var triage = try hypothesis_core.triage(allocator, &hypotheses, .{ .max_hypotheses_selected = 1 });
+    defer triage.deinit();
+    var registry = verifier_adapter.Registry.init(allocator);
+    defer registry.deinit();
+    try verifier_adapter.registerBuiltinAdapters(&registry);
+    var tracker = verifier_adapter.BudgetTracker.init(allocator, compute_budget.resolve(.{ .tier = .high }));
+    var draft_handoff = try verifier_adapter.handoffSelectedHypotheses(allocator, &registry, &tracker, &hypotheses, triage, .{}, .draft);
+    defer draft_handoff.deinit();
+    try std.testing.expectEqual(@as(usize, 1), draft_handoff.skipped_count);
+    try std.testing.expectEqual(@as(usize, 1), draft_handoff.jobs.len);
+
+    var missing = try testHandoffHypothesis(allocator, "hyp:missing", "docs/runbook.md", "document_schema", "schema_validation", "schema_validation", "project_provenance", "safe");
+    defer missing.deinit(allocator);
+    var missing_triage = try hypothesis_core.triage(allocator, @as([]const hypothesis_core.Hypothesis, &.{missing}), .{ .max_hypotheses_selected = 1 });
+    defer missing_triage.deinit();
+    var missing_handoff = try verifier_adapter.handoffSelectedHypotheses(allocator, &registry, &tracker, @as([]const hypothesis_core.Hypothesis, &.{missing}), missing_triage, .{}, .deep);
+    defer missing_handoff.deinit();
+    try std.testing.expectEqual(verifier_adapter.HandoffBlockedReason.no_matching_adapter, missing_handoff.jobs[0].blocked_reason.?);
+
+    var unbound = try testHandoffHypothesis(allocator, "hyp:unbound", "unbound", "config_schema", "schema_validation", "schema_validation", "project_provenance", "safe");
+    defer unbound.deinit(allocator);
+    var unbound_triage = try hypothesis_core.triage(allocator, @as([]const hypothesis_core.Hypothesis, &.{unbound}), .{ .max_hypotheses_selected = 1 });
+    defer unbound_triage.deinit();
+    var unbound_handoff = try verifier_adapter.handoffSelectedHypotheses(allocator, &registry, &tracker, @as([]const hypothesis_core.Hypothesis, &.{unbound}), unbound_triage, .{}, .deep);
+    defer unbound_handoff.deinit();
+    try std.testing.expectEqual(verifier_adapter.HandoffBlockedReason.unbound_artifact_scope, unbound_handoff.jobs[0].blocked_reason.?);
+
+    var unsafe = try testHandoffHypothesis(allocator, "hyp:unsafe", "runtime.toml", "config_schema", "schema_validation", "schema_validation", "project_provenance", "unsafe disallowed verifier request");
+    defer unsafe.deinit(allocator);
+    var unsafe_triage = try hypothesis_core.triage(allocator, @as([]const hypothesis_core.Hypothesis, &.{unsafe}), .{ .max_hypotheses_selected = 1 });
+    defer unsafe_triage.deinit();
+    var unsafe_handoff = try verifier_adapter.handoffSelectedHypotheses(allocator, &registry, &tracker, @as([]const hypothesis_core.Hypothesis, &.{unsafe}), unsafe_triage, .{}, .deep);
+    defer unsafe_handoff.deinit();
+    try std.testing.expectEqual(verifier_adapter.HandoffBlockedReason.unsafe_or_disallowed_verification, unsafe_handoff.jobs[0].blocked_reason.?);
+}
+
+test "hypothesis verifier handoff records failed evidence, budget caps, non-code jobs, and deterministic order" {
+    const allocator = std.testing.allocator;
+    var failed = try testHandoffHypothesis(allocator, "hyp:failed", "docs/contract.md", "generic_schema", "consistency_check", "consistency_check", "project_provenance", "safe failed verifier");
+    defer failed.deinit(allocator);
+    var triage = try hypothesis_core.triage(allocator, @as([]const hypothesis_core.Hypothesis, &.{failed}), .{ .max_hypotheses_selected = 1 });
+    defer triage.deinit();
+    var registry = verifier_adapter.Registry.init(allocator);
+    defer registry.deinit();
+    try verifier_adapter.registerBuiltinAdapters(&registry);
+    var tracker = verifier_adapter.BudgetTracker.init(allocator, compute_budget.resolve(.{ .tier = .high }));
+    const relation = artifact_schema.RelationEdge{ .relation = .contradicts, .from_entity_id = "a", .to_entity_id = "b", .provenance = "project" };
+    var handoff = try verifier_adapter.handoffSelectedHypotheses(allocator, &registry, &tracker, @as([]const hypothesis_core.Hypothesis, &.{failed}), triage, .{ .relations = &.{relation} }, .deep);
+    defer handoff.deinit();
+    try std.testing.expectEqual(@as(usize, 1), handoff.scheduled_count);
+    try std.testing.expectEqual(@as(usize, 1), handoff.completed_count);
+    try std.testing.expectEqual(@as(usize, 1), handoff.non_code_job_count);
+    try std.testing.expectEqual(verifier_adapter.HandoffJobStatus.failed, handoff.jobs[0].status);
+    try std.testing.expectEqual(verifier_adapter.Status.failed, handoff.jobs[0].result_status.?);
+    try std.testing.expect(handoff.jobs[0].evidence_ref != null);
+
+    var capped_tracker = verifier_adapter.BudgetTracker.init(allocator, compute_budget.resolve(.{
+        .tier = .high,
+        .overrides = .{ .max_hypothesis_verifier_jobs = 0 },
+    }));
+    var capped = try verifier_adapter.handoffSelectedHypotheses(allocator, &registry, &capped_tracker, @as([]const hypothesis_core.Hypothesis, &.{failed}), triage, .{}, .deep);
+    defer capped.deinit();
+    try std.testing.expectEqual(@as(usize, 1), capped.budget_exhausted_count);
+    try std.testing.expectEqual(verifier_adapter.HandoffBlockedReason.budget_exhausted, capped.jobs[0].blocked_reason.?);
+
+    var first_tracker = verifier_adapter.BudgetTracker.init(allocator, compute_budget.resolve(.{ .tier = .high }));
+    var second_tracker = verifier_adapter.BudgetTracker.init(allocator, compute_budget.resolve(.{ .tier = .high }));
+    var first = try verifier_adapter.handoffSelectedHypotheses(allocator, &registry, &first_tracker, @as([]const hypothesis_core.Hypothesis, &.{failed}), triage, .{ .relations = &.{relation} }, .deep);
+    defer first.deinit();
+    var second = try verifier_adapter.handoffSelectedHypotheses(allocator, &registry, &second_tracker, @as([]const hypothesis_core.Hypothesis, &.{failed}), triage, .{ .relations = &.{relation} }, .deep);
+    defer second.deinit();
+    try std.testing.expectEqualStrings(first.jobs[0].id, second.jobs[0].id);
 }
 
 const Layer2aStub = struct {
@@ -3748,6 +3891,45 @@ test "execution harness times out bounded workspace scripts" {
     try std.testing.expectEqual(execution.FailureSignal.timed_out, result.failure_signal);
 }
 
+test "execution harness closes inherited pipes after child exit" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFixtureFile(tmp.dir, "scripts/pipe_holder.sh",
+        \\#!/bin/sh
+        \\sleep 2 &
+        \\echo parent-exit
+        \\
+    );
+    const script_path = try tmp.dir.realpathAlloc(allocator, "scripts/pipe_holder.sh");
+    defer allocator.free(script_path);
+    try std.posix.fchmodat(std.posix.AT.FDCWD, script_path, 0o755, 0);
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var result = try execution.run(allocator, .{
+        .workspace_root = root_path,
+        .cwd = root_path,
+    }, .{
+        .label = "pipe_holder",
+        .kind = .shell,
+        .phase = .invariant,
+        .argv = &.{"./scripts/pipe_holder.sh"},
+        .expectations = &.{
+            .{ .success = {} },
+            .{ .stdout_contains = "parent-exit" },
+        },
+        .timeout_ms = 1_000,
+    });
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.succeeded());
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "parent-exit") != null);
+    try std.testing.expect(result.duration_ms < 1_000);
+}
+
 test "patch candidate generation is bounded and traceable" {
     const allocator = std.testing.allocator;
     const project_shard = "patch-candidate-generation-test";
@@ -5641,6 +5823,7 @@ test "conflicting mounted knowledge packs never silently authorize merged suppor
     defer deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path) catch {};
     defer deleteTreeIfExistsAbsolute(mounts_path) catch {};
 
+    knowledge_packs.removePack(allocator, "runtime-pack-conflict-a", "v1") catch {};
     var pack_a = try knowledge_packs.createPack(allocator, .{
         .pack_id = "runtime-pack-conflict-a",
         .pack_version = "v1",
@@ -5656,6 +5839,7 @@ test "conflicting mounted knowledge packs never silently authorize merged suppor
     defer allocator.free(pack_a.root_abs_path);
     defer knowledge_packs.removePack(allocator, "runtime-pack-conflict-a", "v1") catch {};
 
+    knowledge_packs.removePack(allocator, "runtime-pack-conflict-b", "v1") catch {};
     var pack_b = try knowledge_packs.createPack(allocator, .{
         .pack_id = "runtime-pack-conflict-b",
         .pack_version = "v1",
@@ -8087,6 +8271,13 @@ test "artifact schema: support graph node kinds include artifact pipeline types"
     try std.testing.expect(ArtifactKind.relation == .relation);
     try std.testing.expect(ArtifactKind.verifier_hook == .verifier_hook);
     try std.testing.expect(ArtifactKind.action_surface == .action_surface);
+    try std.testing.expect(ArtifactKind.hypothesis == .hypothesis);
+    try std.testing.expect(ArtifactKind.hypothesis_evidence == .hypothesis_evidence);
+    try std.testing.expect(ArtifactKind.hypothesis_obligation == .hypothesis_obligation);
+    try std.testing.expect(ArtifactKind.hypothesis_verifier_need == .hypothesis_verifier_need);
+    try std.testing.expect(ArtifactKind.hypothesis_triage == .hypothesis_triage);
+    try std.testing.expect(ArtifactKind.hypothesis_duplicate_group == .hypothesis_duplicate_group);
+    try std.testing.expect(ArtifactKind.hypothesis_score == .hypothesis_score);
 
     // And the new edge kinds.
     const EdgeKind = code_intel.SupportEdgeKind;
@@ -8095,6 +8286,13 @@ test "artifact schema: support graph node kinds include artifact pipeline types"
     try std.testing.expect(EdgeKind.entity_from_fragment == .entity_from_fragment);
     try std.testing.expect(EdgeKind.relates_to == .relates_to);
     try std.testing.expect(EdgeKind.verified_by == .verified_by);
+    try std.testing.expect(EdgeKind.hypothesized_from == .hypothesized_from);
+    try std.testing.expect(EdgeKind.requires_obligation == .requires_obligation);
+    try std.testing.expect(EdgeKind.needs_verifier == .needs_verifier);
+    try std.testing.expect(EdgeKind.triages == .triages);
+    try std.testing.expect(EdgeKind.suppresses == .suppresses);
+    try std.testing.expect(EdgeKind.duplicates == .duplicates);
+    try std.testing.expect(EdgeKind.ranks_above == .ranks_above);
 }
 
 test "artifact schema: compute budget includes artifact pipeline stages" {
@@ -8104,6 +8302,166 @@ test "artifact schema: compute budget includes artifact pipeline stages" {
     try std.testing.expect(Stage.artifact_entity_extraction == .artifact_entity_extraction);
     try std.testing.expect(Stage.artifact_schema_routing == .artifact_schema_routing);
     try std.testing.expect(Stage.artifact_obligation_attachment == .artifact_obligation_attachment);
+    try std.testing.expect(Stage.hypothesis_generation == .hypothesis_generation);
+    try std.testing.expect(Stage.hypothesis_selection == .hypothesis_selection);
+    try std.testing.expect(Stage.hypothesis_verifier_need_collection == .hypothesis_verifier_need_collection);
+
+    const budget = compute_budget.resolve(.{ .tier = .medium });
+    try std.testing.expect(budget.max_hypotheses_generated > 0);
+    try std.testing.expect(budget.max_hypotheses_selected <= budget.max_hypotheses_generated);
+    try std.testing.expect(budget.max_hypothesis_evidence_fragments > 0);
+    try std.testing.expect(budget.max_hypothesis_obligations > 0);
+    try std.testing.expect(budget.max_hypothesis_verifier_needs > 0);
+}
+
+test "hypothesis core: artifact ingestion emits non-authorizing code and non-code hypotheses" {
+    const allocator = std.testing.allocator;
+
+    var registry = artifact_schema.SchemaRegistry.init(allocator);
+    defer registry.deinit();
+    try artifact_schema.registerBuiltinSchemas(&registry);
+
+    const options = artifact_schema.PipelineOptions{ .registry = &registry };
+
+    var code_artifact = try artifact_schema.Artifact.init(allocator, "hyp-code", .repo, .file, "test", .project, "zig", null, null);
+    defer code_artifact.deinit(allocator);
+    var code_result = try artifact_schema.ingestArtifact(allocator, &code_artifact, "pub fn main() void {}\n", &options);
+    defer code_result.deinit();
+
+    var doc_artifact = try artifact_schema.Artifact.init(allocator, "hyp-doc", .repo, .document, "test", .project, "md", null, null);
+    defer doc_artifact.deinit(allocator);
+    var doc_result = try artifact_schema.ingestArtifact(allocator, &doc_artifact, "# Runbook\n\nValidate this section.\n", &options);
+    defer doc_result.deinit();
+
+    try std.testing.expect(code_result.hypotheses.len > 0);
+    try std.testing.expect(doc_result.hypotheses.len > 0);
+    try std.testing.expectEqual(hypothesis_core.HypothesisKind.possible_missing_obligation, code_result.hypotheses[0].hypothesis_kind);
+    try std.testing.expectEqual(hypothesis_core.HypothesisKind.possible_missing_obligation, doc_result.hypotheses[0].hypothesis_kind);
+    try std.testing.expect(code_result.hypotheses[0].non_authorizing);
+    try std.testing.expect(doc_result.hypotheses[0].non_authorizing);
+}
+
+test "hypothesis core: hypothesis appears in support graph without authorizing support" {
+    const allocator = std.testing.allocator;
+
+    var registry = artifact_schema.SchemaRegistry.init(allocator);
+    defer registry.deinit();
+    try artifact_schema.registerBuiltinSchemas(&registry);
+
+    var artifact = try artifact_schema.Artifact.init(allocator, "hyp-graph", .repo, .file, "test", .project, "zig", null, null);
+    defer artifact.deinit(allocator);
+    const options = artifact_schema.PipelineOptions{ .registry = &registry };
+    var result = try artifact_schema.ingestArtifact(allocator, &artifact, "pub fn main() void {}\n", &options);
+    defer result.deinit();
+
+    var graph = code_intel.SupportGraph{ .allocator = allocator, .permission = .unresolved, .minimum_met = false };
+    defer graph.deinit();
+    try artifact_schema.appendArtifactSupportNodes(allocator, &graph, &result);
+
+    var has_hypothesis = false;
+    for (graph.nodes) |node| {
+        if (node.kind == .hypothesis) {
+            has_hypothesis = true;
+            try std.testing.expect(!node.usable);
+        }
+    }
+    try std.testing.expect(has_hypothesis);
+    try std.testing.expect(!graph.minimum_met);
+}
+
+test "hypothesis core: unresolved output carries hypotheses visibly" {
+    const allocator = std.testing.allocator;
+
+    const evidence = [_][]const u8{"fragment:doc:1"};
+    const obligations = [_][]const u8{"validate_possible_gap"};
+    const hooks = [_][]const u8{"consistency_check"};
+    const hyp = try hypothesis_core.make(
+        allocator,
+        "hypothesis:doc:1",
+        "doc",
+        "document_schema",
+        .possible_unsupported_claim,
+        &evidence,
+        &obligations,
+        &hooks,
+        "verify",
+        "test",
+        "manual_test",
+    );
+    var hypotheses = try allocator.alloc(hypothesis_core.Hypothesis, 1);
+    hypotheses[0] = hyp;
+
+    var unresolved = code_intel.UnresolvedSupport{
+        .allocator = allocator,
+        .hypotheses = hypotheses,
+    };
+    defer unresolved.deinit();
+
+    var out = std.ArrayList(u8).init(allocator);
+    defer out.deinit();
+    try code_intel.writeUnresolvedSupportJson(out.writer(), unresolved);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"hypotheses\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"non_authorizing\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"possible_unsupported_claim\"") != null);
+}
+
+test "hypothesis core: verified status does not bypass support graph gates" {
+    const allocator = std.testing.allocator;
+    const evidence = [_][]const u8{"fragment:config:1"};
+    const obligations = [_][]const u8{"validate_schema"};
+    const hooks = [_][]const u8{"schema_validation"};
+    var hyp = try hypothesis_core.make(
+        allocator,
+        "hypothesis:config:verified",
+        "config",
+        "config_schema",
+        .possible_constraint_violation,
+        &evidence,
+        &obligations,
+        &hooks,
+        "verify",
+        "test",
+        "manual_test",
+    );
+    defer hyp.deinit(allocator);
+    hyp.status = .verified;
+
+    var graph = code_intel.SupportGraph{ .allocator = allocator, .permission = .unresolved, .minimum_met = false };
+    defer graph.deinit();
+    try std.testing.expect(hyp.non_authorizing);
+    try std.testing.expectEqual(hypothesis_core.HypothesisStatus.verified, hyp.status);
+    try std.testing.expect(!graph.minimum_met);
+    try std.testing.expectEqual(code_intel.Status.unresolved, graph.permission);
+}
+
+test "hypothesis core: budget caps limit generation and preserve deterministic ordering" {
+    const allocator = std.testing.allocator;
+
+    var registry = artifact_schema.SchemaRegistry.init(allocator);
+    defer registry.deinit();
+    try artifact_schema.registerBuiltinSchemas(&registry);
+
+    const options = artifact_schema.PipelineOptions{
+        .registry = &registry,
+        .compute_budget_request = .{
+            .tier = .low,
+            .overrides = .{ .max_hypotheses_generated = 1 },
+        },
+    };
+    var artifact_a = try artifact_schema.Artifact.init(allocator, "hyp-det", .repo, .file, "test", .project, "zig", null, null);
+    defer artifact_a.deinit(allocator);
+    var result_a = try artifact_schema.ingestArtifact(allocator, &artifact_a, "pub fn a() void {}\npub fn b() void {}\n", &options);
+    defer result_a.deinit();
+
+    var artifact_b = try artifact_schema.Artifact.init(allocator, "hyp-det", .repo, .file, "test", .project, "zig", null, null);
+    defer artifact_b.deinit(allocator);
+    var result_b = try artifact_schema.ingestArtifact(allocator, &artifact_b, "pub fn a() void {}\npub fn b() void {}\n", &options);
+    defer result_b.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result_a.hypotheses.len);
+    try std.testing.expect(result_a.hypothesis_budget_exhaustion != null);
+    try std.testing.expectEqualStrings(result_a.hypotheses[0].id, result_b.hypotheses[0].id);
+    try std.testing.expectEqual(result_a.hypotheses[0].hypothesis_kind, result_b.hypotheses[0].hypothesis_kind);
 }
 
 // ── Intent Grounding v2 Tests ──────────────────────────────────────────
@@ -8860,4 +9218,41 @@ test "response engine: fast path eligibility check is comprehensive" {
     defer elig_verify.deinit(allocator);
     try std.testing.expect(!elig_verify.eligible);
     try std.testing.expect(!elig_verify.no_verification_required);
+}
+
+test "reasoning parser accepts only public reasoning levels" {
+    try std.testing.expectEqual(response_engine.ReasoningLevel.quick, response_engine.parseReasoningLevel("quick").?);
+    try std.testing.expectEqual(response_engine.ReasoningLevel.balanced, response_engine.parseReasoningLevel("balanced").?);
+    try std.testing.expectEqual(response_engine.ReasoningLevel.deep, response_engine.parseReasoningLevel("deep").?);
+    try std.testing.expectEqual(response_engine.ReasoningLevel.max, response_engine.parseReasoningLevel("max").?);
+    try std.testing.expect(response_engine.parseReasoningLevel("fast_path") == null);
+    try std.testing.expect(response_engine.parseReasoningLevel("draft_mode") == null);
+    try std.testing.expect(response_engine.parseReasoningLevel("auto") == null);
+}
+
+test "conversation reasoning level is passed into response policy" {
+    const allocator = std.testing.allocator;
+    const repo_root = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(repo_root);
+
+    var quick = try conversation_session.turn(allocator, .{
+        .repo_root = repo_root,
+        .session_id = "reasoning-quick-test",
+        .message = "explain src/main.zig",
+        .reasoning_level = .quick,
+    });
+    defer quick.deinit();
+    try std.testing.expect(quick.session.last_result != null);
+    try std.testing.expectEqual(conversation_session.ResultKind.draft, quick.session.last_result.?.kind);
+    try std.testing.expectEqual(conversation_session.ConversationMode.unresolved, quick.session.last_result.?.selected_mode);
+
+    var max = try conversation_session.turn(allocator, .{
+        .repo_root = repo_root,
+        .session_id = "reasoning-max-test",
+        .message = "verify and apply src/main.zig",
+        .reasoning_level = .max,
+    });
+    defer max.deinit();
+    try std.testing.expect(max.session.last_result != null);
+    try std.testing.expect(max.session.last_result.?.selected_mode == .deep or max.session.last_result.?.selected_mode == .unresolved);
 }

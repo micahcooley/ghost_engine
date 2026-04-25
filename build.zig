@@ -147,6 +147,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "ghost_task_operator", .root = "src/task_operator_cli.zig" },
         .{ .name = "ghost_intent_grounding", .root = "src/intent_grounding_cli.zig" },
         .{ .name = "ghost_knowledge_pack", .root = "src/knowledge_packs.zig" },
+        .{ .name = "ghost_gip", .root = "src/gip_cli.zig" },
     };
 
     for (exes) |cfg| {

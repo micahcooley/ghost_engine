@@ -67,6 +67,19 @@ pub const Status = enum {
     suppressed,
 };
 
+pub const SignalSource = enum {
+    entity,
+    relation,
+    obligation,
+    anchor,
+    verifier_hint,
+    schema,
+    retained_token,
+    retained_pattern,
+    rune_vsa,
+    fallback,
+};
+
 pub const Entry = struct {
     id: []const u8,
     source_kind: SourceKind,
@@ -74,6 +87,14 @@ pub const Entry = struct {
     artifact_type: ArtifactType = .unknown,
     entity_signals: u16 = 0,
     relation_signals: u16 = 0,
+    obligation_signals: u16 = 0,
+    anchor_signals: u16 = 0,
+    verifier_hint_signals: u16 = 0,
+    schema_signals: u16 = 0,
+    retained_token_signals: u16 = 0,
+    retained_pattern_signals: u16 = 0,
+    rune_vsa_signals: u16 = 0,
+    signal_source: SignalSource = .fallback,
     trust_class: TrustClass = .exploratory,
     freshness_state: FreshnessState = .unknown,
     provenance: []const u8 = "",
@@ -111,6 +132,15 @@ pub const Decision = struct {
     support_potential_upper_bound: u16,
     considered_rank: u16 = 0,
     selected_rank: u16 = 0,
+    selected_signal_source: SignalSource = .fallback,
+    retained_token_signal_count: u16 = 0,
+    retained_pattern_signal_count: u16 = 0,
+    schema_entity_signal_count: u16 = 0,
+    schema_relation_signal_count: u16 = 0,
+    obligation_signal_count: u16 = 0,
+    anchor_signal_count: u16 = 0,
+    verifier_hint_signal_count: u16 = 0,
+    fallback_signal_used: bool = false,
 
     pub fn deinit(self: *Decision) void {
         self.allocator.free(self.id);
@@ -157,8 +187,15 @@ pub fn supportPotentialUpperBound(entry: Entry) u16 {
     var score: u16 = 0;
     if (entry.exact_anchor) score += 420;
     if (entry.schema_compatible) score += 160;
-    score += @as(u16, @min(entry.entity_signals, 12)) * 18;
-    score += @as(u16, @min(entry.relation_signals, 12)) * 14;
+    score += @as(u16, @min(entry.anchor_signals, 12)) * 180;
+    score += @as(u16, @min(entry.entity_signals, 12)) * 80;
+    score += @as(u16, @min(entry.relation_signals, 12)) * 24;
+    score += @as(u16, @min(entry.obligation_signals, 12)) * 22;
+    score += @as(u16, @min(entry.verifier_hint_signals, 12)) * 20;
+    score += @as(u16, @min(entry.schema_signals, 12)) * 16;
+    score += @as(u16, @min(entry.retained_pattern_signals, 12)) * 8;
+    score += @as(u16, @min(entry.retained_token_signals, 12)) * 5;
+    score += @as(u16, @min(entry.rune_vsa_signals, 12)) * 3;
     score += switch (entry.trust_class) {
         .core => 220,
         .promoted => 180,
@@ -264,16 +301,54 @@ fn appendDecisionBounded(
         .support_potential_upper_bound = upper,
         .considered_rank = considered_rank,
         .selected_rank = selected_rank,
+        .selected_signal_source = selectedSignalSource(entry),
+        .retained_token_signal_count = entry.retained_token_signals,
+        .retained_pattern_signal_count = entry.retained_pattern_signals,
+        .schema_entity_signal_count = entry.entity_signals,
+        .schema_relation_signal_count = entry.relation_signals,
+        .obligation_signal_count = entry.obligation_signals,
+        .anchor_signal_count = entry.anchor_signals,
+        .verifier_hint_signal_count = entry.verifier_hint_signals,
+        .fallback_signal_used = selectedSignalSource(entry) == .fallback or entry.retained_token_signals + entry.retained_pattern_signals + entry.rune_vsa_signals > 0 and entry.entity_signals + entry.relation_signals + entry.obligation_signals + entry.anchor_signals + entry.verifier_hint_signals + entry.schema_signals == 0,
     });
 }
 
 fn lessThanRanked(_: void, lhs: Ranked, rhs: Ranked) bool {
     if (lhs.upper != rhs.upper) return lhs.upper > rhs.upper;
+    if (selectedSignalSource(lhs.entry) != selectedSignalSource(rhs.entry)) return signalSourceRank(selectedSignalSource(lhs.entry)) > signalSourceRank(selectedSignalSource(rhs.entry));
     if (lhs.entry.exact_anchor != rhs.entry.exact_anchor) return lhs.entry.exact_anchor;
     if (lhs.entry.trust_class != rhs.entry.trust_class) return trustRank(lhs.entry.trust_class) > trustRank(rhs.entry.trust_class);
     if (lhs.entry.source_family != rhs.entry.source_family) return @intFromEnum(lhs.entry.source_family) < @intFromEnum(rhs.entry.source_family);
     if (lhs.entry.stable_rank != rhs.entry.stable_rank) return lhs.entry.stable_rank < rhs.entry.stable_rank;
     return std.mem.lessThan(u8, lhs.entry.id, rhs.entry.id);
+}
+
+pub fn selectedSignalSource(entry: Entry) SignalSource {
+    if (entry.anchor_signals > 0 or entry.exact_anchor) return .anchor;
+    if (entry.entity_signals > 0) return .entity;
+    if (entry.relation_signals > 0) return .relation;
+    if (entry.obligation_signals > 0) return .obligation;
+    if (entry.verifier_hint_signals > 0) return .verifier_hint;
+    if (entry.schema_signals > 0 or entry.schema_compatible) return .schema;
+    if (entry.retained_pattern_signals > 0) return .retained_pattern;
+    if (entry.retained_token_signals > 0) return .retained_token;
+    if (entry.rune_vsa_signals > 0) return .rune_vsa;
+    return entry.signal_source;
+}
+
+fn signalSourceRank(source: SignalSource) u8 {
+    return switch (source) {
+        .anchor => 9,
+        .entity => 8,
+        .relation => 7,
+        .obligation => 6,
+        .verifier_hint => 5,
+        .schema => 4,
+        .retained_pattern => 3,
+        .retained_token => 2,
+        .rune_vsa => 1,
+        .fallback => 0,
+    };
 }
 
 fn trustRank(trust: TrustClass) u8 {
@@ -343,6 +418,10 @@ pub fn sourceFamilyName(family: SourceFamily) []const u8 {
     return @tagName(family);
 }
 
+pub fn signalSourceName(source: SignalSource) []const u8 {
+    return @tagName(source);
+}
+
 test "exact anchor beats generic deterministic candidate" {
     const allocator = std.testing.allocator;
     const entries = [_]Entry{
@@ -352,6 +431,26 @@ test "exact anchor beats generic deterministic candidate" {
     var trace = try select(allocator, &entries, .{ .max_selected = 2 });
     defer trace.deinit();
     try std.testing.expectEqualStrings("exact", trace.entries[0].id);
+}
+
+test "structured entity and anchor signals outrank retained token fallback" {
+    const allocator = std.testing.allocator;
+    const entries = [_]Entry{
+        .{ .id = "token-only", .source_kind = .artifact, .source_family = .docs, .retained_token_signals = 12, .trust_class = .core, .freshness_state = .active },
+        .{ .id = "schema-anchor", .source_kind = .artifact, .source_family = .docs, .entity_signals = 1, .anchor_signals = 1, .trust_class = .project, .freshness_state = .active },
+    };
+    var trace = try select(allocator, &entries, .{ .max_selected = 2 });
+    defer trace.deinit();
+    try std.testing.expectEqualStrings("schema-anchor", trace.entries[0].id);
+    try std.testing.expectEqual(SignalSource.anchor, trace.entries[0].selected_signal_source);
+    try std.testing.expect(!trace.entries[0].fallback_signal_used);
+}
+
+test "relation and obligation signals improve deterministic priority without authorizing support" {
+    const relation_entry = Entry{ .id = "relation", .source_kind = .relation, .source_family = .docs, .relation_signals = 1, .obligation_signals = 1, .trust_class = .project, .freshness_state = .active };
+    const token_entry = Entry{ .id = "token", .source_kind = .artifact, .source_family = .docs, .retained_token_signals = 4, .trust_class = .project, .freshness_state = .active };
+    try std.testing.expect(supportPotentialUpperBound(relation_entry) > supportPotentialUpperBound(token_entry));
+    try std.testing.expectEqual(SignalSource.relation, selectedSignalSource(relation_entry));
 }
 
 test "stale low trust candidate is skipped while fresh high trust is selected" {

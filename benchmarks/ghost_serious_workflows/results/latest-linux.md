@@ -3,7 +3,7 @@
 - total cases: 42
 - passed cases: 42
 - failed cases: 0
-- total benchmark wall time: 134375 ms
+- total benchmark wall time: 135468 ms
 - code impact correctness rate: 100%
 - contradiction detection correctness rate: 100%
 - unresolved-vs-unsupported correctness rate: 100%
@@ -23,8 +23,8 @@
 - runtime-pass rate: 83% (5/6)
 - verifier adapters: runs=38, passed=32, failed=6, blocked=0, skipped=0, budget_exhausted=0
 - verifier domains: code=36, non_code=2
-- latency per verified result: 7154 ms
-- cold start / warm start: 274 ms / 346 ms
+- latency per verified result: 7269 ms
+- cold start / warm start: 263 ms / 328 ms
 - cold cache changed files / warm cache changed files: 15 / 0
 - workflow cases: 7; passing workflow cases: 7
 - task-state distribution: planned=0, running=0, blocked=2, unresolved=1, verified_complete=4, failed=0
@@ -38,19 +38,24 @@
 - reinforcement reuse hit rate after reinforcement: 100%
 - draft intent resolution improvement: 7% measurable event coverage
 - unsupported proof-admission block count: 3
-- measured repo scan / cache refresh / index materialize: 867 / 4193 / 525 ms
-- measured support-aware routing index build: 179 ms; considered / selected / skipped / suppressed / cap_hits: 12 / 12 / 0 / 0 / 0
-- measured pack mount resolve / manifest preview load / pack routing / pack catalog load: 1441 / 1179 / 258 / 1815 ms
+- measured repo scan / cache refresh / index materialize: 824 / 4009 / 496 ms
+- measured support-aware routing index build: 171 ms; considered / selected / skipped / suppressed / cap_hits: 12 / 12 / 0 / 0 / 0
+- discovery signals: retained_token=0, retained_pattern=0, schema_entity=4, schema_relation=0, obligation=8, anchor=4, verifier_hint=3, fallback_used=0
+- universal hypotheses: generated=9, selected=3, suppressed=7, budget_hits=1, rules_fired=2, code=8, non_code=1
+- hypothesis triage: selected=3, suppressed=6, duplicates=0, budget_hits=0, selected_code=2, selected_non_code=1
+- hypothesis verifier handoff: eligible=3, scheduled=1, completed=0, blocked=1, skipped=1, budget_exhausted=1, code_jobs=1, non_code_jobs=2
+- verifier candidates: proposed=2, blocked=0, materialized=1, budget_hits=0, code=1, non_code=1
+- measured pack mount resolve / manifest preview load / pack routing / pack catalog load: 1357 / 1097 / 255 / 1700 ms
 - measured pack candidate surfaces / activated packs / skipped packs: 21 / 25 / 24
 - measured pack budget cap hits / local-truth wins: 4 / 1
-- measured support graph build: 156 ms
+- measured support graph build: 164 ms
 - response mode distribution: draft=1, fast=1, deep=1
-- measured response mode selection / draft path / fast path / deep path: 0 / 2 / 1 / 1 ms
-- measured artifact schema pipeline / verifier adapter dispatch: 3 / 14 ms
+- measured response mode selection / draft path / fast path / deep path: 0 / 1 / 1 / 1 ms
+- measured artifact schema pipeline / verifier adapter dispatch: 8 / 16 ms
 - measured artifact json render / persist / panic capture: 0 / 0 / 0 ms
-- measured verification workspace / build / test / runtime: 4310 / 67183 / 11388 / 6179 ms
-- measured task artifact writes: 8 ms across 30 writes
-- measured task session saves: 19 ms across 25 saves
+- measured verification workspace / build / test / runtime: 4053 / 68831 / 11560 / 6281 ms
+- measured task artifact writes: 7 ms across 30 writes
+- measured task session saves: 16 ms across 25 saves
 
 Notes:
 - patch compile-pass and test-pass rates are per attempted candidate verification step, not per benchmark case.
@@ -59,12 +64,12 @@ Notes:
 
 ## Pack Scaling
 
-- small vs large pack manifest preview / routing / catalog load delta: 156 / 33 / 255 ms
+- small vs large pack manifest preview / routing / catalog load delta: 147 / 33 / 241 ms
 - small vs large pack peak candidate surfaces / peak activated / skipped delta: 3 / 2 / -4
 - tier comparison:
   low -> peak_activated=1, peak_candidate_surfaces=2, cap_hits=4, routing_ms=28
-  high -> peak_activated=3, peak_candidate_surfaces=5, cap_hits=0, routing_ms=54
-  max -> peak_activated=3, peak_candidate_surfaces=5, cap_hits=0, routing_ms=69
+  high -> peak_activated=3, peak_candidate_surfaces=5, cap_hits=0, routing_ms=52
+  max -> peak_activated=3, peak_candidate_surfaces=5, cap_hits=0, routing_ms=68
 
 ## Case Results
 
@@ -72,8 +77,8 @@ Notes:
 - `contradiction_call_site`: pass; expected `supported_success` got `supported_success`; tier=medium; pack_caps=0; local_truth=0; partials=0; ambiguities=0; suppressed_noise=0; reuse_hits=0; proof_blocks=0; status=supported; tier=medium; evidence=1; support_nodes=10; packs=0/0/0; pack_candidates=0; cap_hits=0
 - `contradiction_signature`: pass; expected `supported_success` got `supported_success`; tier=medium; pack_caps=0; local_truth=0; partials=0; ambiguities=0; suppressed_noise=0; reuse_hits=0; proof_blocks=0; status=supported; tier=medium; evidence=1; support_nodes=10; packs=0/0/0; pack_candidates=0; cap_hits=0
 - `contradiction_ownership`: pass; expected `supported_success` got `supported_success`; tier=medium; pack_caps=0; local_truth=0; partials=0; ambiguities=0; suppressed_noise=0; reuse_hits=0; proof_blocks=0; status=supported; tier=medium; evidence=2; support_nodes=13; packs=0/0/0; pack_candidates=0; cap_hits=0
-- `ambiguous_target_unresolved`: pass; expected `correct_unresolved_or_refused` got `correct_unresolved_or_refused`; tier=medium; pack_caps=0; local_truth=0; partials=2; ambiguities=1; suppressed_noise=0; reuse_hits=0; proof_blocks=0; status=unresolved; tier=medium; evidence=0; support_nodes=15; packs=0/0/0; pack_candidates=0; cap_hits=0
-- `cold_warm_code_intel_start`: pass; expected `supported_success` got `supported_success`; tier=medium; pack_caps=0; local_truth=0; partials=0; ambiguities=0; suppressed_noise=0; reuse_hits=0; proof_blocks=0; cold=274ms warm=346ms cold_changed=15 warm_changed=0
+- `ambiguous_target_unresolved`: pass; expected `correct_unresolved_or_refused` got `correct_unresolved_or_refused`; tier=medium; pack_caps=0; local_truth=0; partials=2; ambiguities=1; suppressed_noise=0; reuse_hits=0; proof_blocks=0; status=unresolved; tier=medium; evidence=0; support_nodes=39; packs=0/0/0; pack_candidates=0; cap_hits=0
+- `cold_warm_code_intel_start`: pass; expected `supported_success` got `supported_success`; tier=medium; pack_caps=0; local_truth=0; partials=0; ambiguities=0; suppressed_noise=0; reuse_hits=0; proof_blocks=0; cold=263ms warm=328ms cold_changed=15 warm_changed=0
 - `pack_active_runtime_grounding`: pass; expected `supported_success` got `supported_success`; tier=medium; pack_caps=0; local_truth=0; partials=0; ambiguities=0; suppressed_noise=0; reuse_hits=0; proof_blocks=0; status=supported; tier=medium; evidence=1; support_nodes=16; packs=2/6/0; pack_candidates=1; cap_hits=0
 - `pack_large_runtime_grounding`: pass; expected `supported_success` got `supported_success`; tier=medium; pack_caps=0; local_truth=0; partials=0; ambiguities=0; suppressed_noise=8; reuse_hits=0; proof_blocks=0; status=supported; tier=medium; evidence=1; support_nodes=27; packs=6/2/0; pack_candidates=4; cap_hits=0
 - `pack_irrelevant_skipped_bounded`: pass; expected `supported_success` got `supported_success`; tier=medium; pack_caps=0; local_truth=0; partials=0; ambiguities=0; suppressed_noise=0; reuse_hits=0; proof_blocks=0; status=supported; tier=medium; evidence=1; support_nodes=15; packs=0/8/0; pack_candidates=0; cap_hits=0
@@ -81,9 +86,9 @@ Notes:
 - `pack_large_high_tier_bounded`: pass; expected `supported_success` got `supported_success`; tier=high; pack_caps=0; local_truth=0; partials=0; ambiguities=0; suppressed_noise=9; reuse_hits=0; proof_blocks=0; status=supported; tier=high; evidence=1; support_nodes=27; packs=6/2/0; pack_candidates=5; cap_hits=0
 - `pack_large_max_tier_bounded`: pass; expected `supported_success` got `supported_success`; tier=max; pack_caps=0; local_truth=0; partials=0; ambiguities=0; suppressed_noise=10; reuse_hits=0; proof_blocks=0; status=supported; tier=max; evidence=1; support_nodes=27; packs=6/2/0; pack_candidates=5; cap_hits=0
 - `pack_trust_conflict_visibility`: pass; expected `supported_success` got `supported_success`; tier=medium; pack_caps=0; local_truth=1; partials=0; ambiguities=0; suppressed_noise=8; reuse_hits=0; proof_blocks=0; status=supported; tier=medium; evidence=1; support_nodes=27; packs=3/2/3; pack_candidates=4; cap_hits=0
-- `tank_malformed_symbolic_partial`: pass; expected `correct_unresolved_or_refused` got `correct_unresolved_or_refused`; tier=medium; pack_caps=0; local_truth=0; partials=2; ambiguities=0; suppressed_noise=0; reuse_hits=0; proof_blocks=0; status=unresolved; tier=medium; evidence=0; support_nodes=12; packs=0/0/0; pack_candidates=0; cap_hits=0
-- `tank_mixed_stacktrace_partial`: pass; expected `correct_unresolved_or_refused` got `correct_unresolved_or_refused`; tier=medium; pack_caps=0; local_truth=0; partials=2; ambiguities=0; suppressed_noise=2; reuse_hits=0; proof_blocks=0; status=unresolved; tier=medium; evidence=0; support_nodes=13; packs=0/0/0; pack_candidates=0; cap_hits=0
-- `tank_noisy_anchor_suppression`: pass; expected `correct_unresolved_or_refused` got `correct_unresolved_or_refused`; tier=medium; pack_caps=0; local_truth=0; partials=2; ambiguities=1; suppressed_noise=4; reuse_hits=0; proof_blocks=0; status=unresolved; tier=medium; evidence=0; support_nodes=14; packs=0/0/0; pack_candidates=0; cap_hits=0
+- `tank_malformed_symbolic_partial`: pass; expected `correct_unresolved_or_refused` got `correct_unresolved_or_refused`; tier=medium; pack_caps=0; local_truth=0; partials=2; ambiguities=0; suppressed_noise=0; reuse_hits=0; proof_blocks=0; status=unresolved; tier=medium; evidence=0; support_nodes=23; packs=0/0/0; pack_candidates=0; cap_hits=0
+- `tank_mixed_stacktrace_partial`: pass; expected `correct_unresolved_or_refused` got `correct_unresolved_or_refused`; tier=medium; pack_caps=0; local_truth=0; partials=2; ambiguities=0; suppressed_noise=2; reuse_hits=0; proof_blocks=0; status=unresolved; tier=medium; evidence=0; support_nodes=24; packs=0/0/0; pack_candidates=0; cap_hits=0
+- `tank_noisy_anchor_suppression`: pass; expected `correct_unresolved_or_refused` got `correct_unresolved_or_refused`; tier=medium; pack_caps=0; local_truth=0; partials=2; ambiguities=1; suppressed_noise=4; reuse_hits=0; proof_blocks=0; status=unresolved; tier=medium; evidence=0; support_nodes=35; packs=0/0/0; pack_candidates=0; cap_hits=0
 - `tank_reinforced_grounding_reuse`: pass; expected `supported_success` got `supported_success`; tier=medium; pack_caps=0; local_truth=0; partials=0; ambiguities=0; suppressed_noise=0; reuse_hits=1; proof_blocks=0; status=supported; tier=medium; evidence=0; support_nodes=7; packs=0/0/0; pack_candidates=0; cap_hits=0
 - `patch_verified_success`: pass; expected `supported_success` got `supported_success`; tier=medium; pack_caps=0; local_truth=0; partials=0; ambiguities=0; suppressed_noise=0; reuse_hits=0; proof_blocks=0; status=supported; verified=1; build=1/1; test=1/1; runtime=0/0; repairs=0/0
 - `patch_minimal_refactor_selection`: pass; expected `supported_success` got `supported_success`; tier=medium; pack_caps=0; local_truth=0; partials=0; ambiguities=0; suppressed_noise=0; reuse_hits=0; proof_blocks=0; status=supported; verified=1; build=1/1; test=1/1; runtime=0/0; repairs=1/1

@@ -383,6 +383,12 @@ pub const Record = struct {
     sources: [][]u8 = &.{},
     tokens: [][]u8 = &.{},
     patterns: [][]u8 = &.{},
+    schema_entity_signals: [][]u8 = &.{},
+    schema_relation_signals: [][]u8 = &.{},
+    obligation_signals: [][]u8 = &.{},
+    anchor_signals: [][]u8 = &.{},
+    verifier_hint_signals: [][]u8 = &.{},
+    schema_signals: [][]u8 = &.{},
     provenance: [][]u8 = &.{},
 
     pub fn deinit(self: *Record) void {
@@ -392,10 +398,22 @@ pub const Record = struct {
         for (self.sources) |item| self.allocator.free(item);
         for (self.tokens) |item| self.allocator.free(item);
         for (self.patterns) |item| self.allocator.free(item);
+        for (self.schema_entity_signals) |item| self.allocator.free(item);
+        for (self.schema_relation_signals) |item| self.allocator.free(item);
+        for (self.obligation_signals) |item| self.allocator.free(item);
+        for (self.anchor_signals) |item| self.allocator.free(item);
+        for (self.verifier_hint_signals) |item| self.allocator.free(item);
+        for (self.schema_signals) |item| self.allocator.free(item);
         for (self.provenance) |item| self.allocator.free(item);
         self.allocator.free(self.sources);
         self.allocator.free(self.tokens);
         self.allocator.free(self.patterns);
+        self.allocator.free(self.schema_entity_signals);
+        self.allocator.free(self.schema_relation_signals);
+        self.allocator.free(self.obligation_signals);
+        self.allocator.free(self.anchor_signals);
+        self.allocator.free(self.verifier_hint_signals);
+        self.allocator.free(self.schema_signals);
         if (self.provenance.len > 0) self.allocator.free(self.provenance);
         self.* = undefined;
     }
@@ -437,6 +455,12 @@ pub const Record = struct {
             .sources = try cloneStringSlice(allocator, self.sources),
             .tokens = try cloneStringSlice(allocator, self.tokens),
             .patterns = try cloneStringSlice(allocator, self.patterns),
+            .schema_entity_signals = try cloneStringSlice(allocator, self.schema_entity_signals),
+            .schema_relation_signals = try cloneStringSlice(allocator, self.schema_relation_signals),
+            .obligation_signals = try cloneStringSlice(allocator, self.obligation_signals),
+            .anchor_signals = try cloneStringSlice(allocator, self.anchor_signals),
+            .verifier_hint_signals = try cloneStringSlice(allocator, self.verifier_hint_signals),
+            .schema_signals = try cloneStringSlice(allocator, self.schema_signals),
             .provenance = try cloneStringSlice(allocator, self.provenance),
         };
         errdefer out.deinit();
@@ -480,6 +504,7 @@ pub const SupportReference = struct {
     lineage_support_count: u16 = 0,
     token_support_count: u16 = 0,
     pattern_support_count: u16 = 0,
+    structured_support_count: u16 = 0,
     source_support_count: u16 = 0,
     selection_mode: SelectionMode = .direct,
     consensus_hash: u64 = 0,
@@ -517,6 +542,7 @@ pub const ReverseLinkReference = struct {
     lineage_support_count: u16 = 0,
     token_support_count: u16 = 0,
     pattern_support_count: u16 = 0,
+    structured_support_count: u16 = 0,
     source_support_count: u16 = 0,
     selection_mode: SelectionMode = .direct,
     consensus_hash: u64 = 0,
@@ -1979,10 +2005,11 @@ fn collectFamilyLookup(
         const source_hits = countSupportMatches(record.sources, options.rel_paths);
         const token_hits = countTextMatches(record.tokens, options.tokens);
         const pattern_hits = countTextMatches(record.patterns, options.patterns);
-        if (source_hits == 0 and token_hits == 0 and pattern_hits == 0) continue;
+        const structured_hits = countRecordStructuredSignalMatches(record, options.tokens, options.patterns);
+        if (source_hits == 0 and token_hits == 0 and pattern_hits == 0 and structured_hits == 0) continue;
 
         const source_spec = preferredSupportSource(record.sources, options.rel_paths) orelse preferredGroundingSource(record.sources) orelse familyName(record.family);
-        const score = computeFamilyLookupScore(record, source_hits, token_hits, pattern_hits);
+        const score = computeFamilyLookupScore(record, source_hits, token_hits, pattern_hits + structured_hits);
         try out.append(.{
             .concept_id = try allocator.dupe(u8, record.concept_id),
             .family = record.family,
@@ -2057,6 +2084,7 @@ const MatchAccumulator = struct {
     lineage_support_count: u16 = 0,
     token_support_count: u16 = 0,
     pattern_support_count: u16 = 0,
+    structured_support_count: u16 = 0,
     source_support_count: u16 = 0,
     depth: u8 = std.math.maxInt(u8),
     supporting_entry_index: usize = std.math.maxInt(usize),
@@ -2086,6 +2114,7 @@ fn collectSupportLookup(
         const direct_support_count = countSupportMatches(entry.record.sources, options.rel_paths);
         const token_support_count = countTextMatches(entry.record.tokens, options.tokens);
         const pattern_support_count = countTextMatches(entry.record.patterns, options.patterns);
+        const structured_support_count = countRecordStructuredSignalMatches(entry.record, options.tokens, options.patterns);
         try upsertMatch(&matches, .{
             .entry_index = entry_index,
             .source_spec = source_match,
@@ -2093,6 +2122,7 @@ fn collectSupportLookup(
             .lineage_support_count = direct_support_count,
             .token_support_count = token_support_count,
             .pattern_support_count = pattern_support_count,
+            .structured_support_count = structured_support_count,
             .source_support_count = direct_support_count,
             .depth = 0,
             .supporting_entry_index = entry_index,
@@ -2109,6 +2139,7 @@ fn collectSupportLookup(
                 .lineage_support_count = direct_support_count,
                 .token_support_count = token_support_count,
                 .pattern_support_count = pattern_support_count,
+                .structured_support_count = structured_support_count,
                 .source_support_count = direct_support_count,
                 .depth = @intCast(depth),
                 .supporting_entry_index = entry_index,
@@ -2191,10 +2222,11 @@ fn collectGroundingLookup(
         const source_support_count = countSupportMatches(entry.record.sources, options.rel_paths);
         const token_support_count = countTextMatches(entry.record.tokens, options.tokens);
         const pattern_support_count = countTextMatches(entry.record.patterns, options.patterns);
-        if (!groundingEligible(entry.record, token_support_count, pattern_support_count, source_support_count, 0)) continue;
+        const structured_support_count = countRecordStructuredSignalMatches(entry.record, options.tokens, options.patterns);
+        if (!groundingEligible(entry.record, token_support_count, pattern_support_count + structured_support_count, source_support_count, 0)) continue;
 
         const source_spec = preferredGroundingSource(entry.record.sources) orelse continue;
-        const direct_support_count = computeGroundingSupportWeight(token_support_count, pattern_support_count, source_support_count);
+        const direct_support_count = computeGroundingSupportWeight(token_support_count, pattern_support_count + structured_support_count, source_support_count);
         try upsertMatch(&matches, .{
             .entry_index = entry_index,
             .source_spec = source_spec,
@@ -2202,6 +2234,7 @@ fn collectGroundingLookup(
             .lineage_support_count = direct_support_count,
             .token_support_count = token_support_count,
             .pattern_support_count = pattern_support_count,
+            .structured_support_count = structured_support_count,
             .source_support_count = source_support_count,
             .depth = 0,
             .supporting_entry_index = entry_index,
@@ -2211,7 +2244,7 @@ fn collectGroundingLookup(
         var depth: usize = 1;
         while (parent_id != null and depth <= MAX_PARENT_CHAIN_DEPTH) : (depth += 1) {
             const parent_index = findEntryIndex(entries.items, parent_id.?, entry.staged) orelse break;
-            if (!groundingEligible(entries.items[parent_index].record, token_support_count, pattern_support_count, source_support_count, @intCast(depth))) break;
+            if (!groundingEligible(entries.items[parent_index].record, token_support_count, pattern_support_count + structured_support_count, source_support_count, @intCast(depth))) break;
             try upsertMatch(&matches, .{
                 .entry_index = parent_index,
                 .source_spec = source_spec,
@@ -2219,6 +2252,7 @@ fn collectGroundingLookup(
                 .lineage_support_count = direct_support_count,
                 .token_support_count = token_support_count,
                 .pattern_support_count = pattern_support_count,
+                .structured_support_count = structured_support_count,
                 .source_support_count = source_support_count,
                 .depth = @intCast(depth),
                 .supporting_entry_index = entry_index,
@@ -2438,6 +2472,7 @@ fn upsertMatch(matches: *std.ArrayList(MatchAccumulator), next: MatchAccumulator
         match.lineage_support_count +|= next.lineage_support_count;
         match.token_support_count = @max(match.token_support_count, next.token_support_count);
         match.pattern_support_count = @max(match.pattern_support_count, next.pattern_support_count);
+        match.structured_support_count = @max(match.structured_support_count, next.structured_support_count);
         match.source_support_count = @max(match.source_support_count, next.source_support_count);
         if (next.depth < match.depth) {
             match.depth = next.depth;
@@ -2478,6 +2513,7 @@ fn computeLookupScore(record: *const Record, match: MatchAccumulator, options: L
     score += @as(u32, match.lineage_support_count) * 80;
     score += @as(u32, match.token_support_count) * 60;
     score += @as(u32, match.pattern_support_count) * 95;
+    score += @as(u32, match.structured_support_count) * 180;
     if (options.prefer_higher_tiers) score += @as(u32, tierRank(record.tier)) * 60;
     if (options.category_hint) |category_hint| {
         if (category_hint == record.category) score += 50;
@@ -2508,6 +2544,23 @@ fn countTextMatches(candidates: [][]u8, needles: []const []const u8) u16 {
     return count;
 }
 
+fn countRecordStructuredSignalMatches(record: *const Record, tokens: []const []const u8, patterns: []const []const u8) u16 {
+    var count: u16 = 0;
+    count +|= countTextMatches(record.anchor_signals, tokens);
+    count +|= countTextMatches(record.anchor_signals, patterns);
+    count +|= countTextMatches(record.schema_entity_signals, tokens);
+    count +|= countTextMatches(record.schema_entity_signals, patterns);
+    count +|= countTextMatches(record.schema_relation_signals, tokens);
+    count +|= countTextMatches(record.schema_relation_signals, patterns);
+    count +|= countTextMatches(record.obligation_signals, tokens);
+    count +|= countTextMatches(record.obligation_signals, patterns);
+    count +|= countTextMatches(record.verifier_hint_signals, tokens);
+    count +|= countTextMatches(record.verifier_hint_signals, patterns);
+    count +|= countTextMatches(record.schema_signals, tokens);
+    count +|= countTextMatches(record.schema_signals, patterns);
+    return count;
+}
+
 fn computeGroundingSupportWeight(token_hits: u16, pattern_hits: u16, source_hits: u16) u16 {
     var total: u16 = 0;
     total +|= token_hits;
@@ -2534,6 +2587,7 @@ fn computeGroundingScore(record: *const Record, match: MatchAccumulator, options
     score += @as(u32, record.reuse_score) / 4;
     score += @as(u32, match.token_support_count) * 90;
     score += @as(u32, match.pattern_support_count) * 150;
+    score += @as(u32, match.structured_support_count) * 240;
     score += @as(u32, match.source_support_count) * 45;
     if (options.prefer_higher_tiers) score += @as(u32, tierRank(record.tier)) * 60;
     if (options.category_hint) |category_hint| {
@@ -4278,6 +4332,12 @@ fn serializeCatalog(allocator: std.mem.Allocator, records: []const Record) ![]u8
         for (record.sources) |item| try appendLine(&out, "source", item);
         for (record.tokens) |item| try appendLine(&out, "token", item);
         for (record.patterns) |item| try appendLine(&out, "pattern", item);
+        for (record.schema_entity_signals) |item| try appendLine(&out, "schema_entity_signal", item);
+        for (record.schema_relation_signals) |item| try appendLine(&out, "schema_relation_signal", item);
+        for (record.obligation_signals) |item| try appendLine(&out, "obligation_signal", item);
+        for (record.anchor_signals) |item| try appendLine(&out, "anchor_signal", item);
+        for (record.verifier_hint_signals) |item| try appendLine(&out, "verifier_hint_signal", item);
+        for (record.schema_signals) |item| try appendLine(&out, "schema_signal", item);
         for (record.provenance) |item| try appendLine(&out, "provenance", item);
         try out.appendSlice("end\n");
     }
@@ -4483,6 +4543,12 @@ const RecordBuilder = struct {
     sources: std.ArrayList([]u8),
     tokens: std.ArrayList([]u8),
     patterns: std.ArrayList([]u8),
+    schema_entity_signals: std.ArrayList([]u8),
+    schema_relation_signals: std.ArrayList([]u8),
+    obligation_signals: std.ArrayList([]u8),
+    anchor_signals: std.ArrayList([]u8),
+    verifier_hint_signals: std.ArrayList([]u8),
+    schema_signals: std.ArrayList([]u8),
     provenance: std.ArrayList([]u8),
 
     fn init(allocator: std.mem.Allocator) RecordBuilder {
@@ -4491,6 +4557,12 @@ const RecordBuilder = struct {
             .sources = std.ArrayList([]u8).init(allocator),
             .tokens = std.ArrayList([]u8).init(allocator),
             .patterns = std.ArrayList([]u8).init(allocator),
+            .schema_entity_signals = std.ArrayList([]u8).init(allocator),
+            .schema_relation_signals = std.ArrayList([]u8).init(allocator),
+            .obligation_signals = std.ArrayList([]u8).init(allocator),
+            .anchor_signals = std.ArrayList([]u8).init(allocator),
+            .verifier_hint_signals = std.ArrayList([]u8).init(allocator),
+            .schema_signals = std.ArrayList([]u8).init(allocator),
             .provenance = std.ArrayList([]u8).init(allocator),
         };
     }
@@ -4502,10 +4574,22 @@ const RecordBuilder = struct {
         for (self.sources.items) |item| self.allocator.free(item);
         for (self.tokens.items) |item| self.allocator.free(item);
         for (self.patterns.items) |item| self.allocator.free(item);
+        for (self.schema_entity_signals.items) |item| self.allocator.free(item);
+        for (self.schema_relation_signals.items) |item| self.allocator.free(item);
+        for (self.obligation_signals.items) |item| self.allocator.free(item);
+        for (self.anchor_signals.items) |item| self.allocator.free(item);
+        for (self.verifier_hint_signals.items) |item| self.allocator.free(item);
+        for (self.schema_signals.items) |item| self.allocator.free(item);
         for (self.provenance.items) |item| self.allocator.free(item);
         self.sources.deinit();
         self.tokens.deinit();
         self.patterns.deinit();
+        self.schema_entity_signals.deinit();
+        self.schema_relation_signals.deinit();
+        self.obligation_signals.deinit();
+        self.anchor_signals.deinit();
+        self.verifier_hint_signals.deinit();
+        self.schema_signals.deinit();
         self.provenance.deinit();
         self.* = undefined;
     }
@@ -4649,6 +4733,30 @@ const RecordBuilder = struct {
             try self.patterns.append(try self.allocator.dupe(u8, line["pattern ".len..]));
             return;
         }
+        if (std.mem.startsWith(u8, line, "schema_entity_signal ")) {
+            try self.schema_entity_signals.append(try self.allocator.dupe(u8, line["schema_entity_signal ".len..]));
+            return;
+        }
+        if (std.mem.startsWith(u8, line, "schema_relation_signal ")) {
+            try self.schema_relation_signals.append(try self.allocator.dupe(u8, line["schema_relation_signal ".len..]));
+            return;
+        }
+        if (std.mem.startsWith(u8, line, "obligation_signal ")) {
+            try self.obligation_signals.append(try self.allocator.dupe(u8, line["obligation_signal ".len..]));
+            return;
+        }
+        if (std.mem.startsWith(u8, line, "anchor_signal ")) {
+            try self.anchor_signals.append(try self.allocator.dupe(u8, line["anchor_signal ".len..]));
+            return;
+        }
+        if (std.mem.startsWith(u8, line, "verifier_hint_signal ")) {
+            try self.verifier_hint_signals.append(try self.allocator.dupe(u8, line["verifier_hint_signal ".len..]));
+            return;
+        }
+        if (std.mem.startsWith(u8, line, "schema_signal ")) {
+            try self.schema_signals.append(try self.allocator.dupe(u8, line["schema_signal ".len..]));
+            return;
+        }
         if (std.mem.startsWith(u8, line, "provenance ")) {
             try self.provenance.append(try self.allocator.dupe(u8, line["provenance ".len..]));
             return;
@@ -4710,6 +4818,12 @@ const RecordBuilder = struct {
             .sources = try self.sources.toOwnedSlice(),
             .tokens = try self.tokens.toOwnedSlice(),
             .patterns = try self.patterns.toOwnedSlice(),
+            .schema_entity_signals = try self.schema_entity_signals.toOwnedSlice(),
+            .schema_relation_signals = try self.schema_relation_signals.toOwnedSlice(),
+            .obligation_signals = try self.obligation_signals.toOwnedSlice(),
+            .anchor_signals = try self.anchor_signals.toOwnedSlice(),
+            .verifier_hint_signals = try self.verifier_hint_signals.toOwnedSlice(),
+            .schema_signals = try self.schema_signals.toOwnedSlice(),
             .provenance = try self.provenance.toOwnedSlice(),
         };
         self.concept_id = null;
@@ -4718,6 +4832,12 @@ const RecordBuilder = struct {
         self.sources = std.ArrayList([]u8).init(self.allocator);
         self.tokens = std.ArrayList([]u8).init(self.allocator);
         self.patterns = std.ArrayList([]u8).init(self.allocator);
+        self.schema_entity_signals = std.ArrayList([]u8).init(self.allocator);
+        self.schema_relation_signals = std.ArrayList([]u8).init(self.allocator);
+        self.obligation_signals = std.ArrayList([]u8).init(self.allocator);
+        self.anchor_signals = std.ArrayList([]u8).init(self.allocator);
+        self.verifier_hint_signals = std.ArrayList([]u8).init(self.allocator);
+        self.schema_signals = std.ArrayList([]u8).init(self.allocator);
         self.provenance = std.ArrayList([]u8).init(self.allocator);
         return out;
     }

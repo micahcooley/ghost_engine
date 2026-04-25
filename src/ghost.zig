@@ -31,10 +31,12 @@ pub const knowledge_packs = @import("knowledge_packs.zig");
 pub const compute_budget = @import("compute_budget.zig");
 pub const support_routing = @import("support_routing.zig");
 pub const artifact_schema = @import("artifact_schema.zig");
+pub const hypothesis_core = @import("hypothesis_core.zig");
 pub const intent_grounding = @import("intent_grounding.zig");
 pub const response_engine = @import("response_engine.zig");
 pub const conversation_session = @import("conversation_session.zig");
 pub const verifier_adapter = @import("verifier_adapter.zig");
 pub const repo_hygiene = @import("repo_hygiene.zig");
+pub const gip = @import("gip.zig");
 
 pub const VERSION = @import("build_options").ghost_version;

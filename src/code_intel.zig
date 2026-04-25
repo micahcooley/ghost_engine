@@ -10,6 +10,7 @@ const shards = @import("shards.zig");
 const support_routing = @import("support_routing.zig");
 const sys = @import("sys.zig");
 const task_intent = @import("task_intent.zig");
+const hypothesis_core = @import("hypothesis_core.zig");
 
 pub const QueryKind = enum {
     impact,
@@ -768,6 +769,19 @@ pub const SupportNodeKind = enum {
     verifier_run,
     verifier_evidence,
     verifier_failure,
+    hypothesis,
+    hypothesis_evidence,
+    hypothesis_obligation,
+    hypothesis_verifier_need,
+    hypothesis_triage,
+    hypothesis_duplicate_group,
+    hypothesis_score,
+    hypothesis_verifier_job,
+    hypothesis_verifier_result,
+    verifier_candidate,
+    verifier_candidate_check_plan,
+    verifier_candidate_artifact,
+    verifier_candidate_safety_obligation,
     action_surface,
     routing_candidate,
 };
@@ -799,6 +813,27 @@ pub const SupportEdgeKind = enum {
     discharges,
     failed_by,
     produced_evidence,
+    hypothesized_from,
+    involves_entity,
+    involves_relation,
+    requires_obligation,
+    needs_verifier,
+    schedules_verifier,
+    verifier_job_for,
+    verifier_result_for,
+    produces_verifier_evidence,
+    blocked_verification_by,
+    proposes_verifier_for,
+    candidate_checks,
+    candidate_requires_input,
+    candidate_requires_approval,
+    candidate_blocked_by,
+    candidate_materializes_as,
+    rejected_by,
+    triages,
+    suppresses,
+    duplicates,
+    ranks_above,
 };
 
 pub const PartialSupportLevel = enum {
@@ -936,6 +971,9 @@ pub const UnresolvedSupport = struct {
     missing_obligations: []MissingObligation = &.{},
     suppressed_noise: []SuppressedNoise = &.{},
     freshness_checks: []FreshnessCheck = &.{},
+    hypotheses: []hypothesis_core.Hypothesis = &.{},
+    hypothesis_triage: ?hypothesis_core.TriageResult = null,
+    hypothesis_budget_exhaustion: ?compute_budget.Exhaustion = null,
 
     pub fn deinit(self: *UnresolvedSupport) void {
         for (self.partial_findings) |*item| item.deinit(self.allocator);
@@ -948,6 +986,10 @@ pub const UnresolvedSupport = struct {
         if (self.suppressed_noise.len != 0) self.allocator.free(self.suppressed_noise);
         for (self.freshness_checks) |*item| item.deinit(self.allocator);
         if (self.freshness_checks.len != 0) self.allocator.free(self.freshness_checks);
+        for (self.hypotheses) |*item| item.deinit(self.allocator);
+        if (self.hypotheses.len != 0) self.allocator.free(self.hypotheses);
+        if (self.hypothesis_triage) |*triage| triage.deinit();
+        if (self.hypothesis_budget_exhaustion) |*exhaustion| exhaustion.deinit();
         self.* = undefined;
     }
 };
@@ -3494,6 +3536,31 @@ fn deriveCodeIntelPartialSupport(allocator: std.mem.Allocator, index: *const Rep
         });
     }
 
+    var hypotheses = std.ArrayList(hypothesis_core.Hypothesis).init(allocator);
+    errdefer {
+        for (hypotheses.items) |*item| item.deinit(allocator);
+        hypotheses.deinit();
+    }
+    var hypothesis_budget_exhaustion: ?compute_budget.Exhaustion = null;
+    errdefer if (hypothesis_budget_exhaustion) |*exhaustion| exhaustion.deinit();
+    try deriveHypothesesFromUnresolved(
+        allocator,
+        result,
+        partial_findings.items,
+        ambiguity_sets.items,
+        missing_obligations.items,
+        freshness_checks.items,
+        &hypotheses,
+        &hypothesis_budget_exhaustion,
+    );
+    var hypothesis_triage = try hypothesis_core.triage(allocator, hypotheses.items, .{
+        .max_hypotheses_selected = result.effective_budget.max_hypotheses_selected,
+        .max_hypotheses_per_artifact = @max(@as(usize, 1), result.effective_budget.max_hypotheses_selected / 2),
+        .max_hypotheses_per_kind = @max(@as(usize, 1), result.effective_budget.max_hypotheses_selected / 2),
+        .max_duplicate_groups_traced = result.effective_budget.max_routing_suppressed_traces,
+    });
+    errdefer hypothesis_triage.deinit();
+
     result.unresolved = .{
         .allocator = allocator,
         .partial_findings = try partial_findings.toOwnedSlice(),
@@ -3501,7 +3568,169 @@ fn deriveCodeIntelPartialSupport(allocator: std.mem.Allocator, index: *const Rep
         .missing_obligations = try missing_obligations.toOwnedSlice(),
         .suppressed_noise = try suppressed_noise.toOwnedSlice(),
         .freshness_checks = try freshness_checks.toOwnedSlice(),
+        .hypotheses = try hypotheses.toOwnedSlice(),
+        .hypothesis_triage = hypothesis_triage,
+        .hypothesis_budget_exhaustion = hypothesis_budget_exhaustion,
     };
+    hypothesis_triage = .{ .allocator = allocator };
+    hypothesis_budget_exhaustion = null;
+}
+
+fn deriveHypothesesFromUnresolved(
+    allocator: std.mem.Allocator,
+    result: *const Result,
+    partial_findings: []const PartialFinding,
+    ambiguity_sets: []const AmbiguitySet,
+    missing_obligations: []const MissingObligation,
+    freshness_checks: []const FreshnessCheck,
+    out: *std.ArrayList(hypothesis_core.Hypothesis),
+    budget_exhaustion: *?compute_budget.Exhaustion,
+) !void {
+    const max_generated = result.effective_budget.max_hypotheses_generated;
+    if (max_generated == 0) {
+        budget_exhaustion.* = try compute_budget.Exhaustion.init(
+            allocator,
+            .max_hypotheses_generated,
+            .hypothesis_generation,
+            1,
+            0,
+            "hypothesis generation cap is zero for the selected compute budget",
+            "all hypothesis construction skipped",
+        );
+        return;
+    }
+
+    for (missing_obligations) |item| {
+        if (try hypothesisCapHit(allocator, result, out, budget_exhaustion)) return;
+        const id = try std.fmt.allocPrint(allocator, "hypothesis:{s}:missing_obligation:{d}", .{ result.query_target, out.items.len + 1 });
+        defer allocator.free(id);
+        const evidence = [_][]const u8{item.detail orelse item.label};
+        const obligations = [_][]const u8{item.label};
+        const hooks = [_][]const u8{"select_safe_verifier"};
+        try out.append(try hypothesis_core.make(
+            allocator,
+            id,
+            item.scope,
+            "universal_artifact_schema",
+            .possible_missing_obligation,
+            evidence[0..@min(evidence.len, result.effective_budget.max_hypothesis_evidence_fragments)],
+            obligations[0..@min(obligations.len, result.effective_budget.max_hypothesis_obligations)],
+            hooks[0..@min(hooks.len, result.effective_budget.max_hypothesis_verifier_needs)],
+            "verify",
+            "unresolved.missing_obligations",
+            "generated_from_missing_obligation",
+        ));
+    }
+
+    for (ambiguity_sets) |item| {
+        if (try hypothesisCapHit(allocator, result, out, budget_exhaustion)) return;
+        const id = try std.fmt.allocPrint(allocator, "hypothesis:{s}:ambiguity:{d}", .{ result.query_target, out.items.len + 1 });
+        defer allocator.free(id);
+        const evidence = [_][]const u8{item.reason orelse item.label};
+        const obligations = [_][]const u8{"disambiguate_competing_mappings"};
+        const hooks = [_][]const u8{"consistency_check"};
+        try out.append(try hypothesis_core.make(
+            allocator,
+            id,
+            item.scope,
+            "universal_artifact_schema",
+            .possible_ambiguity,
+            evidence[0..@min(evidence.len, result.effective_budget.max_hypothesis_evidence_fragments)],
+            obligations[0..@min(obligations.len, result.effective_budget.max_hypothesis_obligations)],
+            hooks[0..@min(hooks.len, result.effective_budget.max_hypothesis_verifier_needs)],
+            "annotate",
+            "unresolved.ambiguity_sets",
+            "generated_from_ambiguity_set",
+        ));
+    }
+
+    for (freshness_checks) |item| {
+        if (item.state != .stale) continue;
+        if (try hypothesisCapHit(allocator, result, out, budget_exhaustion)) return;
+        const id = try std.fmt.allocPrint(allocator, "hypothesis:{s}:freshness:{d}", .{ result.query_target, out.items.len + 1 });
+        defer allocator.free(id);
+        const evidence = [_][]const u8{item.detail orelse item.label};
+        const obligations = [_][]const u8{"refresh_stale_support"};
+        const hooks = [_][]const u8{"freshness_check"};
+        try out.append(try hypothesis_core.make(
+            allocator,
+            id,
+            item.scope,
+            "universal_artifact_schema",
+            .possible_stale_information,
+            evidence[0..@min(evidence.len, result.effective_budget.max_hypothesis_evidence_fragments)],
+            obligations[0..@min(obligations.len, result.effective_budget.max_hypothesis_obligations)],
+            hooks[0..@min(hooks.len, result.effective_budget.max_hypothesis_verifier_needs)],
+            "verify",
+            "unresolved.freshness_checks",
+            "generated_from_stale_freshness_check",
+        ));
+    }
+
+    if (result.contradiction_traces.len > 0 and out.items.len < max_generated) {
+        const item = result.contradiction_traces[0];
+        const id = try std.fmt.allocPrint(allocator, "hypothesis:{s}:contradiction:{d}", .{ result.query_target, out.items.len + 1 });
+        defer allocator.free(id);
+        const evidence = [_][]const u8{item.reason};
+        const obligations = [_][]const u8{"resolve_possible_inconsistency"};
+        const hooks = [_][]const u8{"consistency_check"};
+        try out.append(try hypothesis_core.make(
+            allocator,
+            id,
+            result.query_target,
+            "universal_artifact_schema",
+            .possible_inconsistency,
+            evidence[0..@min(evidence.len, result.effective_budget.max_hypothesis_evidence_fragments)],
+            obligations[0..@min(obligations.len, result.effective_budget.max_hypothesis_obligations)],
+            hooks[0..@min(hooks.len, result.effective_budget.max_hypothesis_verifier_needs)],
+            "verify",
+            "contradiction_traces",
+            "generated_from_contradiction_trace",
+        ));
+    }
+
+    if (partial_findings.len > 0 and result.evidence.len == 0 and out.items.len < max_generated) {
+        const item = partial_findings[0];
+        const id = try std.fmt.allocPrint(allocator, "hypothesis:{s}:unsupported:{d}", .{ result.query_target, out.items.len + 1 });
+        defer allocator.free(id);
+        const evidence = [_][]const u8{item.detail orelse item.label};
+        const obligations = [_][]const u8{"collect_provenance_backed_evidence"};
+        const hooks = [_][]const u8{"select_safe_verifier"};
+        try out.append(try hypothesis_core.make(
+            allocator,
+            id,
+            item.scope,
+            "universal_artifact_schema",
+            .possible_unsupported_claim,
+            evidence[0..@min(evidence.len, result.effective_budget.max_hypothesis_evidence_fragments)],
+            obligations[0..@min(obligations.len, result.effective_budget.max_hypothesis_obligations)],
+            hooks[0..@min(hooks.len, result.effective_budget.max_hypothesis_verifier_needs)],
+            "verify",
+            "unresolved.partial_findings",
+            "generated_from_partial_without_evidence",
+        ));
+    }
+}
+
+fn hypothesisCapHit(
+    allocator: std.mem.Allocator,
+    result: *const Result,
+    out: *const std.ArrayList(hypothesis_core.Hypothesis),
+    budget_exhaustion: *?compute_budget.Exhaustion,
+) !bool {
+    if (out.items.len < result.effective_budget.max_hypotheses_generated) return false;
+    if (budget_exhaustion.* == null) {
+        budget_exhaustion.* = try compute_budget.Exhaustion.init(
+            allocator,
+            .max_hypotheses_generated,
+            .hypothesis_generation,
+            out.items.len + 1,
+            result.effective_budget.max_hypotheses_generated,
+            "hypothesis construction reached the visible generation cap",
+            "remaining hypothesis sources were skipped without authorizing support",
+        );
+    }
+    return true;
 }
 
 fn appendParserCascadeAmbiguitySet(
@@ -3854,6 +4083,10 @@ fn buildCodeIntelSupportGraph(allocator: std.mem.Allocator, result: *const Resul
         try appendSupportGraphEdge(allocator, &edges, "output", "gap", .blocked_by);
     }
     try appendUnresolvedSupportGraph(allocator, &nodes, &edges, "output", result.partial_support, &result.unresolved);
+    try appendHypothesesSupportGraph(allocator, &nodes, &edges, "output", result.unresolved.hypotheses);
+    if (result.unresolved.hypothesis_triage) |triage| {
+        try appendHypothesisTriageSupportGraph(allocator, &nodes, &edges, "output", triage);
+    }
 
     return .{
         .allocator = allocator,
@@ -3865,6 +4098,103 @@ fn buildCodeIntelSupportGraph(allocator: std.mem.Allocator, result: *const Resul
         .nodes = try nodes.toOwnedSlice(),
         .edges = try edges.toOwnedSlice(),
     };
+}
+
+fn appendHypothesisTriageSupportGraph(
+    allocator: std.mem.Allocator,
+    nodes: *std.ArrayList(SupportGraphNode),
+    edges: *std.ArrayList(SupportGraphEdge),
+    parent_id: []const u8,
+    triage: hypothesis_core.TriageResult,
+) !void {
+    if (triage.total == 0) return;
+    try appendSupportGraphNode(allocator, nodes, "hypothesis_triage", .hypothesis_triage, "selected for investigation", null, 0, @intCast(triage.selected), false, "non-authorizing deterministic hypothesis triage; selected does not mean supported");
+    try appendSupportGraphEdge(allocator, edges, "hypothesis_triage", parent_id, .triages);
+    var previous_score_id: ?[]const u8 = null;
+    for (triage.items, 0..) |item, idx| {
+        if (idx >= 6) break;
+        const score_id = try std.fmt.allocPrint(allocator, "hypothesis_score_{d}", .{idx + 1});
+        defer allocator.free(score_id);
+        const detail = try std.fmt.allocPrint(
+            allocator,
+            "rank={d}; status={s}; selected_for_investigation={s}; reason={s}; policy={s}",
+            .{
+                item.rank,
+                hypothesis_core.triageStatusName(item.triage_status),
+                if (item.selected_for_next_stage) "true" else "false",
+                item.suppression_reason orelse "none",
+                triage.scoring_policy_version,
+            },
+        );
+        defer allocator.free(detail);
+        try appendSupportGraphNode(allocator, nodes, score_id, .hypothesis_score, item.hypothesis_id, null, 0, item.score, false, detail);
+        try appendSupportGraphEdge(allocator, edges, "hypothesis_triage", score_id, if (item.selected_for_next_stage) .triages else .suppresses);
+        if (previous_score_id) |previous| {
+            try appendSupportGraphEdge(allocator, edges, previous, score_id, .ranks_above);
+            allocator.free(previous);
+        }
+        if (item.duplicate_group_id) |group| {
+            const group_id = try std.fmt.allocPrint(allocator, "hypothesis_duplicate_group_{d}", .{idx + 1});
+            defer allocator.free(group_id);
+            try appendSupportGraphNode(allocator, nodes, group_id, .hypothesis_duplicate_group, group, null, 0, 0, false, "duplicate hypotheses remain traceable and non-authorizing");
+            try appendSupportGraphEdge(allocator, edges, group_id, score_id, .duplicates);
+        }
+        previous_score_id = try allocator.dupe(u8, score_id);
+    }
+    if (previous_score_id) |value| allocator.free(value);
+}
+
+fn appendHypothesesSupportGraph(
+    allocator: std.mem.Allocator,
+    nodes: *std.ArrayList(SupportGraphNode),
+    edges: *std.ArrayList(SupportGraphEdge),
+    parent_id: []const u8,
+    hypotheses: []const hypothesis_core.Hypothesis,
+) !void {
+    for (hypotheses, 0..) |item, idx| {
+        if (idx >= 4) break;
+        const node_id = try std.fmt.allocPrint(allocator, "hypothesis_{d}", .{idx + 1});
+        defer allocator.free(node_id);
+        const detail = try std.fmt.allocPrint(
+            allocator,
+            "kind={s}; status={s}; source_rule={s}; artifact_scope={s}; schema={s}; non_authorizing={s}; provenance={s}; trace={s}",
+            .{
+                hypothesis_core.kindName(item.hypothesis_kind),
+                hypothesis_core.statusName(item.status),
+                item.source_rule,
+                item.artifact_scope,
+                item.schema_name,
+                if (item.non_authorizing) "true" else "false",
+                item.provenance,
+                item.trace,
+            },
+        );
+        defer allocator.free(detail);
+        try appendSupportGraphNode(allocator, nodes, node_id, .hypothesis, item.id, null, 0, 0, false, detail);
+        try appendSupportGraphEdge(allocator, edges, node_id, parent_id, .hypothesized_from);
+
+        for (item.evidence_fragments, 0..) |fragment, evidence_idx| {
+            if (evidence_idx >= 2) break;
+            const evidence_id = try std.fmt.allocPrint(allocator, "hypothesis_{d}_evidence_{d}", .{ idx + 1, evidence_idx + 1 });
+            defer allocator.free(evidence_id);
+            try appendSupportGraphNode(allocator, nodes, evidence_id, .hypothesis_evidence, fragment, null, 0, 0, false, "non-authorizing hypothesis evidence fragment");
+            try appendSupportGraphEdge(allocator, edges, node_id, evidence_id, .hypothesized_from);
+        }
+        for (item.missing_obligations, 0..) |obligation, obligation_idx| {
+            if (obligation_idx >= 2) break;
+            const obligation_id = try std.fmt.allocPrint(allocator, "hypothesis_{d}_obligation_{d}", .{ idx + 1, obligation_idx + 1 });
+            defer allocator.free(obligation_id);
+            try appendSupportGraphNode(allocator, nodes, obligation_id, .hypothesis_obligation, obligation, null, 0, 0, false, "hypothesis requires normal proof-gated obligation resolution");
+            try appendSupportGraphEdge(allocator, edges, node_id, obligation_id, .requires_obligation);
+        }
+        for (item.verifier_hooks_needed, 0..) |hook, hook_idx| {
+            if (hook_idx >= 2) break;
+            const hook_id = try std.fmt.allocPrint(allocator, "hypothesis_{d}_verifier_need_{d}", .{ idx + 1, hook_idx + 1 });
+            defer allocator.free(hook_id);
+            try appendSupportGraphNode(allocator, nodes, hook_id, .hypothesis_verifier_need, hook, null, 0, 0, false, "safe bounded verifier hook needed before any claim promotion");
+            try appendSupportGraphEdge(allocator, edges, node_id, hook_id, .needs_verifier);
+        }
+    }
 }
 
 pub fn appendUnresolvedSupportGraph(
@@ -4033,6 +4363,8 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
     try writeSubsystemArray(writer, result.affected_subsystems);
     try writer.writeAll(",\"partialSupport\":");
     try writePartialSupportJson(writer, result.partial_support);
+    try writer.writeAll(",\"hypotheses\":");
+    try writeHypothesesJson(writer, result.unresolved.hypotheses, result.unresolved.hypothesis_budget_exhaustion);
     try writer.writeAll(",\"unresolved\":");
     try writeUnresolvedSupportJson(writer, result.unresolved);
     try writer.writeAll(",\"packInfluence\":");
@@ -4069,7 +4401,7 @@ fn writeComputeBudgetJson(writer: anytype, budget: compute_budget.Effective, exh
     try writer.writeAll(",\"effectiveTier\":");
     try writeJsonString(writer, compute_budget.tierName(budget.effective_tier));
     try writer.print(
-        ",\"limits\":{{\"maxBranches\":{d},\"maxProofQueueSize\":{d},\"maxRepairs\":{d},\"maxMountedPacksConsidered\":{d},\"maxPacksActivated\":{d},\"maxPackCandidateSurfaces\":{d},\"maxRoutingEntriesConsidered\":{d},\"maxRoutingEntriesSelected\":{d},\"maxRoutingSuppressedTraces\":{d},\"maxGraphNodes\":{d},\"maxGraphObligations\":{d},\"maxAmbiguitySets\":{d},\"maxRuntimeChecks\":{d},\"maxWallTimeMs\":{d},\"maxTempWorkBytes\":{d}}}",
+        ",\"limits\":{{\"maxBranches\":{d},\"maxProofQueueSize\":{d},\"maxRepairs\":{d},\"maxMountedPacksConsidered\":{d},\"maxPacksActivated\":{d},\"maxPackCandidateSurfaces\":{d},\"maxRoutingEntriesConsidered\":{d},\"maxRoutingEntriesSelected\":{d},\"maxRoutingSuppressedTraces\":{d},\"maxGraphNodes\":{d},\"maxGraphObligations\":{d},\"maxAmbiguitySets\":{d},\"maxRuntimeChecks\":{d},\"maxVerifierRuns\":{d},\"maxVerifierTimeMs\":{d}",
         .{
             budget.max_branches,
             budget.max_proof_queue_size,
@@ -4084,6 +4416,34 @@ fn writeComputeBudgetJson(writer: anytype, budget: compute_budget.Effective, exh
             budget.max_graph_obligations,
             budget.max_ambiguity_sets,
             budget.max_runtime_checks,
+            budget.max_verifier_runs,
+            budget.max_verifier_time_ms,
+        },
+    );
+    try writer.print(
+        ",\"maxExternalVerifierRuns\":{d},\"maxVerifierEvidenceBytes\":{d},\"maxHypothesesGenerated\":{d},\"maxHypothesesSelected\":{d},\"maxHypothesisEvidenceFragments\":{d},\"maxHypothesisObligations\":{d},\"maxHypothesisVerifierNeeds\":{d},\"maxHypothesisVerifierJobs\":{d},\"maxHypothesisVerifierJobsPerArtifact\":{d},\"maxHypothesisVerifierTimeMs\":{d},\"maxHypothesisVerifierEvidenceBytes\":{d}",
+        .{
+            budget.max_external_verifier_runs,
+            budget.max_verifier_evidence_bytes,
+            budget.max_hypotheses_generated,
+            budget.max_hypotheses_selected,
+            budget.max_hypothesis_evidence_fragments,
+            budget.max_hypothesis_obligations,
+            budget.max_hypothesis_verifier_needs,
+            budget.max_hypothesis_verifier_jobs,
+            budget.max_hypothesis_verifier_jobs_per_artifact,
+            budget.max_hypothesis_verifier_time_ms,
+            budget.max_hypothesis_verifier_evidence_bytes,
+        },
+    );
+    try writer.print(
+        ",\"maxVerifierCandidatesGenerated\":{d},\"maxVerifierCandidateArtifacts\":{d},\"maxVerifierCandidateCommands\":{d},\"maxVerifierCandidateBytes\":{d},\"maxVerifierCandidateObligations\":{d},\"maxWallTimeMs\":{d},\"maxTempWorkBytes\":{d}}}",
+        .{
+            budget.max_verifier_candidates_generated,
+            budget.max_verifier_candidate_artifacts,
+            budget.max_verifier_candidate_commands,
+            budget.max_verifier_candidate_bytes,
+            budget.max_verifier_candidate_obligations,
             budget.max_wall_time_ms,
             budget.max_temp_work_bytes,
         },
@@ -5678,6 +6038,10 @@ fn routeEvidenceSeeds(
             .artifact_type = routingArtifactTypeFromFamily(family),
             .entity_signals = if (exact_symbol or same_file) 2 else 0,
             .relation_signals = if (compatible_family) 1 else 0,
+            .anchor_signals = if (same_file or exact_path or exact_symbol) 1 else 0,
+            .schema_signals = if (compatible_family) 1 else 0,
+            .retained_token_signals = if (!exact_symbol and !same_file and compatible_family) 1 else 0,
+            .retained_pattern_signals = if (!exact_path and compatible_family) 1 else 0,
             .trust_class = routingTrustFromAbstractionTrust(if (corpus) |meta| meta.trust_class else .project),
             .freshness_state = .active,
             .provenance = seed.reason,
@@ -8173,6 +8537,15 @@ fn writeCandidateTraceArray(writer: anytype, items: []const CandidateTrace) !voi
     try writer.writeAll("]");
 }
 
+fn writeStringArray(writer: anytype, items: []const []const u8) !void {
+    try writer.writeAll("[");
+    for (items, 0..) |item, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try writeJsonString(writer, item);
+    }
+    try writer.writeAll("]");
+}
+
 pub fn writeAbstractionTraceArray(writer: anytype, items: []const AbstractionTrace) !void {
     try writer.writeAll("[");
     for (items, 0..) |item, idx| {
@@ -8424,10 +8797,19 @@ pub fn writeSupportRoutingTraceJson(writer: anytype, trace: support_routing.Trac
         try writeJsonFieldString(writer, "sourceFamily", support_routing.sourceFamilyName(entry.source_family), false);
         try writeJsonFieldString(writer, "status", support_routing.statusName(entry.status), false);
         try writeJsonFieldString(writer, "skipReason", support_routing.skipReasonName(entry.skip_reason), false);
-        try writer.print(",\"supportPotentialUpperBound\":{d},\"consideredRank\":{d},\"selectedRank\":{d}", .{
+        try writeJsonFieldString(writer, "selectedSignalSource", support_routing.signalSourceName(entry.selected_signal_source), false);
+        try writer.print(",\"supportPotentialUpperBound\":{d},\"consideredRank\":{d},\"selectedRank\":{d},\"retainedTokenSignalCount\":{d},\"retainedPatternSignalCount\":{d},\"schemaEntitySignalCount\":{d},\"schemaRelationSignalCount\":{d},\"obligationSignalCount\":{d},\"anchorSignalCount\":{d},\"verifierHintSignalCount\":{d},\"fallbackSignalUsed\":{s}", .{
             entry.support_potential_upper_bound,
             entry.considered_rank,
             entry.selected_rank,
+            entry.retained_token_signal_count,
+            entry.retained_pattern_signal_count,
+            entry.schema_entity_signal_count,
+            entry.schema_relation_signal_count,
+            entry.obligation_signal_count,
+            entry.anchor_signal_count,
+            entry.verifier_hint_signal_count,
+            if (entry.fallback_signal_used) "true" else "false",
         });
         try writeOptionalStringField(writer, "provenance", entry.provenance);
         try writer.writeAll("}");
@@ -8585,6 +8967,19 @@ fn supportNodeKindName(kind: SupportNodeKind) []const u8 {
         .verifier_run => "verifier_run",
         .verifier_evidence => "verifier_evidence",
         .verifier_failure => "verifier_failure",
+        .hypothesis => "hypothesis",
+        .hypothesis_evidence => "hypothesis_evidence",
+        .hypothesis_obligation => "hypothesis_obligation",
+        .hypothesis_verifier_need => "hypothesis_verifier_need",
+        .hypothesis_triage => "hypothesis_triage",
+        .hypothesis_duplicate_group => "hypothesis_duplicate_group",
+        .hypothesis_score => "hypothesis_score",
+        .hypothesis_verifier_job => "hypothesis_verifier_job",
+        .hypothesis_verifier_result => "hypothesis_verifier_result",
+        .verifier_candidate => "verifier_candidate",
+        .verifier_candidate_check_plan => "verifier_candidate_check_plan",
+        .verifier_candidate_artifact => "verifier_candidate_artifact",
+        .verifier_candidate_safety_obligation => "verifier_candidate_safety_obligation",
         .action_surface => "action_surface",
         .routing_candidate => "routing_candidate",
     };
@@ -8618,6 +9013,27 @@ fn supportEdgeKindName(kind: SupportEdgeKind) []const u8 {
         .discharges => "discharges",
         .failed_by => "failed_by",
         .produced_evidence => "produced_evidence",
+        .hypothesized_from => "hypothesized_from",
+        .involves_entity => "involves_entity",
+        .involves_relation => "involves_relation",
+        .requires_obligation => "requires_obligation",
+        .needs_verifier => "needs_verifier",
+        .schedules_verifier => "schedules_verifier",
+        .verifier_job_for => "verifier_job_for",
+        .verifier_result_for => "verifier_result_for",
+        .produces_verifier_evidence => "produces_verifier_evidence",
+        .blocked_verification_by => "blocked_verification_by",
+        .proposes_verifier_for => "proposes_verifier_for",
+        .candidate_checks => "candidate_checks",
+        .candidate_requires_input => "candidate_requires_input",
+        .candidate_requires_approval => "candidate_requires_approval",
+        .candidate_blocked_by => "candidate_blocked_by",
+        .candidate_materializes_as => "candidate_materializes_as",
+        .rejected_by => "rejected_by",
+        .triages => "triages",
+        .suppresses => "suppresses",
+        .duplicates => "duplicates",
+        .ranks_above => "ranks_above",
     };
 }
 
@@ -8734,7 +9150,153 @@ pub fn writeUnresolvedSupportJson(writer: anytype, unresolved: UnresolvedSupport
         if (item.detail) |detail| try writeOptionalStringField(writer, "detail", detail);
         try writer.writeAll("}");
     }
+    try writer.writeAll("],\"hypotheses\":");
+    try writeHypothesesJson(writer, unresolved.hypotheses, unresolved.hypothesis_budget_exhaustion);
+    try writer.writeAll(",\"hypothesis_triage\":");
+    if (unresolved.hypothesis_triage) |triage| {
+        try writeHypothesisTriageJson(writer, triage);
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll("}");
+}
+
+pub fn writeHypothesesJson(
+    writer: anytype,
+    hypotheses: []const hypothesis_core.Hypothesis,
+    budget_exhaustion: ?compute_budget.Exhaustion,
+) !void {
+    const summary = hypothesis_core.counts(hypotheses);
+    try writer.writeAll("{");
+    try writer.print(
+        "\"generated_hypothesis_count\":{d},\"selected_hypothesis_count\":{d},\"suppressed_hypothesis_count\":{d},\"hypothesis_generation_budget_hit_count\":{d},\"hypothesis_generation_rules_fired\":{d},\"total_count\":{d},\"proposed_count\":{d},\"selected_count\":{d},\"verified_count\":{d},\"rejected_count\":{d},\"blocked_count\":{d},\"unresolved_count\":{d}",
+        .{
+            summary.total_count,
+            summary.selected_count,
+            if (budget_exhaustion == null) @as(usize, 0) else @as(usize, 1),
+            if (budget_exhaustion == null) @as(usize, 0) else @as(usize, 1),
+            countHypothesisRulesFired(hypotheses),
+            summary.total_count,
+            summary.proposed_count,
+            summary.selected_count,
+            summary.verified_count,
+            summary.rejected_count,
+            summary.blocked_count,
+            summary.unresolved_count,
+        },
+    );
+    if (budget_exhaustion) |value| {
+        try writer.writeAll(",\"budgetExhaustion\":{");
+        try writeJsonFieldString(writer, "limit", compute_budget.limitName(value.limit), true);
+        try writeJsonFieldString(writer, "stage", compute_budget.stageName(value.stage), false);
+        try writer.print(",\"used\":{d},\"limitValue\":{d}", .{ value.used, value.limit_value });
+        try writeOptionalStringField(writer, "detail", value.detail);
+        try writeOptionalStringField(writer, "skipped", value.skipped);
+        try writer.writeAll("}");
+    }
+    try writer.writeAll(",\"items\":[");
+    for (hypotheses, 0..) |item, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try writer.writeAll("{");
+        try writeJsonFieldString(writer, "id", item.id, true);
+        try writeJsonFieldString(writer, "kind", hypothesis_core.kindName(item.hypothesis_kind), false);
+        try writeJsonFieldString(writer, "status", hypothesis_core.statusName(item.status), false);
+        try writeJsonFieldString(writer, "sourceRule", item.source_rule, false);
+        try writer.writeAll(",\"sourceSignals\":");
+        try writeStringArray(writer, item.source_signals);
+        try writeJsonFieldString(writer, "artifactScope", item.artifact_scope, false);
+        try writeJsonFieldString(writer, "schemaName", item.schema_name, false);
+        try writer.writeAll(",\"relatedEntities\":");
+        try writeStringArray(writer, item.affected_entities);
+        try writer.writeAll(",\"relatedRelations\":");
+        try writeStringArray(writer, item.involved_relations);
+        try writer.writeAll(",\"evidenceSummary\":");
+        try writeStringArray(writer, item.evidence_fragments);
+        try writer.writeAll(",\"missingObligations\":");
+        try writeStringArray(writer, item.missing_obligations);
+        try writer.writeAll(",\"verifierHooksNeeded\":");
+        try writeStringArray(writer, item.verifier_hooks_needed);
+        try writeJsonFieldString(writer, "suggestedActionSurface", item.suggested_action_surface, false);
+        try writeJsonFieldString(writer, "supportPotential", hypothesis_core.supportPotentialName(item.support_potential), false);
+        try writeJsonFieldString(writer, "riskOrValueLevel", hypothesis_core.riskOrValueLevelName(item.risk_or_value_level), false);
+        try writer.print(",\"non_authorizing\":{s}", .{if (item.non_authorizing) "true" else "false"});
+        try writeJsonFieldString(writer, "provenance", item.provenance, false);
+        try writeJsonFieldString(writer, "trace", item.trace, false);
+        try writer.writeAll("}");
+    }
     try writer.writeAll("]}");
+}
+
+fn writeHypothesisTriageJson(writer: anytype, triage: hypothesis_core.TriageResult) !void {
+    try writer.writeAll("{");
+    try writer.print(
+        "\"total\":{d},\"selected\":{d},\"suppressed\":{d},\"duplicates\":{d},\"blocked\":{d},\"deferred\":{d},\"budget_hits\":{d},\"hypotheses_scored\":{d},\"hypotheses_selected\":{d},\"duplicate_groups_traced\":{d},\"per_artifact_caps_hit\":{d},\"per_kind_caps_hit\":{d}",
+        .{
+            triage.total,
+            triage.selected,
+            triage.suppressed,
+            triage.duplicates,
+            triage.blocked,
+            triage.deferred,
+            triage.budget_hits,
+            triage.hypotheses_scored,
+            triage.hypotheses_selected,
+            triage.duplicate_groups_traced,
+            triage.per_artifact_caps_hit,
+            triage.per_kind_caps_hit,
+        },
+    );
+    try writeJsonFieldString(writer, "scoring_policy_version", triage.scoring_policy_version, false);
+    try writer.print(",\"selected_code_hypothesis_count\":{d},\"selected_non_code_hypothesis_count\":{d}", .{ triage.selected_code_count, triage.selected_non_code_count });
+    try writer.writeAll(",\"top_selected_hypothesis_kinds\":");
+    try writeStringArray(writer, triage.top_selected_kinds);
+    try writer.writeAll(",\"items\":[");
+    for (triage.items, 0..) |item, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try writer.writeAll("{");
+        try writeJsonFieldString(writer, "hypothesis_id", item.hypothesis_id, true);
+        try writer.print(",\"rank\":{d},\"score\":{d}", .{ item.rank, item.score });
+        try writeJsonFieldString(writer, "triage_status", hypothesis_core.triageStatusName(item.triage_status), false);
+        if (item.duplicate_group_id) |group| try writeJsonFieldString(writer, "duplicate_group_id", group, false);
+        if (item.suppression_reason) |reason| try writeJsonFieldString(writer, "suppression_reason", reason, false);
+        try writer.print(",\"selected_for_next_stage\":{s}", .{if (item.selected_for_next_stage) "true" else "false"});
+        try writer.writeAll(",\"score_breakdown\":{");
+        try writer.print(
+            "\"support_potential_score\":{d},\"verifier_availability_score\":{d},\"provenance_score\":{d},\"trust_score\":{d},\"freshness_score\":{d},\"obligation_cost\":{d},\"relation_strength_score\":{d},\"novelty_score\":{d},\"artifact_schema_compatibility_score\":{d},\"evidence_fragment_score\":{d},\"negative_score\":{d}",
+            .{
+                item.score_breakdown.support_potential_score,
+                item.score_breakdown.verifier_availability_score,
+                item.score_breakdown.provenance_score,
+                item.score_breakdown.trust_score,
+                item.score_breakdown.freshness_score,
+                item.score_breakdown.obligation_cost,
+                item.score_breakdown.relation_strength_score,
+                item.score_breakdown.novelty_score,
+                item.score_breakdown.artifact_schema_compatibility_score,
+                item.score_breakdown.evidence_fragment_score,
+                item.score_breakdown.negative_score,
+            },
+        );
+        try writer.writeAll("}");
+        try writeJsonFieldString(writer, "trace", item.trace, false);
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]}");
+}
+
+fn countHypothesisRulesFired(hypotheses: []const hypothesis_core.Hypothesis) usize {
+    var count: usize = 0;
+    for (hypotheses, 0..) |item, idx| {
+        var seen = false;
+        for (hypotheses[0..idx]) |prior| {
+            if (std.mem.eql(u8, item.source_rule, prior.source_rule)) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) count += 1;
+    }
+    return count;
 }
 
 fn writeBlockingFlagsJson(writer: anytype, flags: BlockingFlags) !void {

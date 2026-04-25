@@ -33,6 +33,32 @@ pub const ResponseMode = enum {
     auto_path,
 };
 
+/// User-facing compute willingness. These are the only levels normal users
+/// should need to choose; response modes remain internal policy outcomes.
+pub const ReasoningLevel = enum {
+    quick,
+    balanced,
+    deep,
+    max,
+};
+
+pub const ModeSelectionReason = enum {
+    explicit_internal_mode,
+    user_requested_draft,
+    quick_planning_draft,
+    quick_simple_grounded_fast,
+    quick_verification_deep,
+    balanced_planning_draft,
+    balanced_simple_grounded_fast,
+    balanced_actionable_deep,
+    deep_explanation_not_deep,
+    deep_actionable_deep,
+    max_explanation_not_deep,
+    max_actionable_deep,
+    no_deep_value,
+    unresolved_no_escalation,
+};
+
 pub const DraftReason = enum {
     planning,
     explanation,
@@ -92,26 +118,32 @@ pub const EligibilityResult = struct {
 pub const ResponseConfig = struct {
     /// Which mode to use. auto_path is the default.
     mode: ResponseMode = .auto_path,
+    /// User-facing reasoning level. Biases internal mode selection and maps
+    /// directly to compute willingness without bypassing proof gates.
+    reasoning_level: ReasoningLevel = .balanced,
     /// Compute budget request. If null, defaults are used.
     budget_request: compute_budget.Request = .{},
     /// Whether the user explicitly requested deep verification.
     user_requested_deep: bool = false,
     /// Whether the user explicitly requested a fast unverified draft.
     user_requested_draft: bool = false,
+    /// True only for wording such as "just draft" / "draft only"; this is the
+    /// only draft override allowed to cover patch/verify-shaped requests.
+    explicit_user_draft_override: bool = false,
 
     /// Convenience: create a fast-path-only config.
     pub fn fastOnly() ResponseConfig {
-        return .{ .mode = .fast_path };
+        return .{ .mode = .fast_path, .reasoning_level = .quick };
     }
 
     /// Convenience: create a draft-mode config.
     pub fn draftOnly() ResponseConfig {
-        return .{ .mode = .draft_mode, .user_requested_draft = true };
+        return .{ .mode = .draft_mode, .reasoning_level = .quick, .user_requested_draft = true };
     }
 
     /// Convenience: create a deep-path config.
     pub fn deepOnly() ResponseConfig {
-        return .{ .mode = .deep_path };
+        return .{ .mode = .deep_path, .reasoning_level = .deep };
     }
 
     /// Convenience: create an auto-path config (default).
@@ -235,6 +267,12 @@ pub const ResponseResult = struct {
 
     /// Which mode was actually selected and executed.
     selected_mode: ResponseMode = .auto_path,
+    /// User-facing reasoning level requested for this response.
+    requested_reasoning_level: ReasoningLevel = .balanced,
+    /// Internal policy reason for the selected response mode.
+    mode_selection_reason: ModeSelectionReason = .no_deep_value,
+    /// True when explicit user wording changed the default selection bias.
+    user_override_detected: bool = false,
     /// Whether the engine escalated from fast to deep.
     escalated: bool = false,
     /// Why escalation occurred, if it did.
@@ -380,6 +418,26 @@ fn hasPhrase(gi: *const intent_grounding.GroundedIntent, phrase: []const u8) boo
     return std.mem.indexOf(u8, gi.normalized_form, phrase) != null;
 }
 
+pub fn reasoningLevelName(level: ReasoningLevel) []const u8 {
+    return @tagName(level);
+}
+
+pub fn parseReasoningLevel(text: []const u8) ?ReasoningLevel {
+    inline for ([_]ReasoningLevel{ .quick, .balanced, .deep, .max }) |level| {
+        if (std.mem.eql(u8, text, @tagName(level))) return level;
+    }
+    return null;
+}
+
+pub fn computeTierForReasoningLevel(level: ReasoningLevel) compute_budget.Tier {
+    return switch (level) {
+        .quick => .low,
+        .balanced => .medium,
+        .deep => .high,
+        .max => .max,
+    };
+}
+
 fn actionSurfaceRequiresVerifier(gi: *const intent_grounding.GroundedIntent) bool {
     for (gi.action_surfaces) |surface| {
         switch (surface) {
@@ -409,7 +467,8 @@ fn explicitVerificationRequested(gi: *const intent_grounding.GroundedIntent) boo
 }
 
 fn explicitPatchApplicationRequested(gi: *const intent_grounding.GroundedIntent) bool {
-    return hasPhrase(gi, "apply patch") or
+    return hasPhrase(gi, "apply") or
+        hasPhrase(gi, "apply patch") or
         hasPhrase(gi, "edit ") or
         hasPhrase(gi, "change ") or
         hasPhrase(gi, "modify ") or
@@ -418,15 +477,40 @@ fn explicitPatchApplicationRequested(gi: *const intent_grounding.GroundedIntent)
         hasPhrase(gi, "refactor ");
 }
 
+fn explicitDraftOverrideRequested(gi: *const intent_grounding.GroundedIntent) bool {
+    return hasPhrase(gi, "just draft") or
+        hasPhrase(gi, "draft only") or
+        hasPhrase(gi, "just give me a draft") or
+        hasPhrase(gi, "just give me a quick draft") or
+        hasPhrase(gi, "quick draft");
+}
+
+fn explicitQuickRequested(gi: *const intent_grounding.GroundedIntent) bool {
+    return hasPhrase(gi, "quick answer") or
+        hasPhrase(gi, "quickly") or
+        hasPhrase(gi, "fast answer");
+}
+
+fn userOverrideDetected(gi: *const intent_grounding.GroundedIntent, config: ResponseConfig) bool {
+    return config.user_requested_deep or
+        config.user_requested_draft or
+        config.explicit_user_draft_override or
+        explicitDraftOverrideRequested(gi) or
+        explicitQuickRequested(gi) or
+        explicitVerificationRequested(gi) or
+        explicitPatchApplicationRequested(gi);
+}
+
 pub fn checkDraftEligibility(
     gi: *const intent_grounding.GroundedIntent,
     config: ResponseConfig,
 ) DraftEligibility {
     if (config.user_requested_deep or config.mode == .deep_path) return .{};
-    if (explicitVerificationRequested(gi) or explicitPatchApplicationRequested(gi)) return .{};
-    if (config.mode != .draft_mode and !config.user_requested_draft and actionSurfaceCanPatch(gi)) return .{};
+    const explicit_draft_override = config.explicit_user_draft_override or explicitDraftOverrideRequested(gi);
+    if ((explicitVerificationRequested(gi) or explicitPatchApplicationRequested(gi)) and !explicit_draft_override) return .{};
+    if (config.mode != .draft_mode and !config.user_requested_draft and !explicit_draft_override and actionSurfaceCanPatch(gi)) return .{};
 
-    if (config.user_requested_draft or config.mode == .draft_mode or
+    if (explicit_draft_override or config.user_requested_draft or config.mode == .draft_mode or
         hasPhrase(gi, "draft") or hasPhrase(gi, "fast") or hasPhrase(gi, "unverified"))
     {
         return .{
@@ -528,6 +612,106 @@ fn buildDraftContract(
             .user_requested_draft => "Apply patch with verification",
         }),
     };
+}
+
+const ModePolicyDecision = struct {
+    mode: ResponseMode,
+    reason: ModeSelectionReason,
+    escalation_reason: ?EscalationReason = null,
+};
+
+fn selectModeByPolicy(
+    gi: *const intent_grounding.GroundedIntent,
+    config: ResponseConfig,
+    draft_eligibility: DraftEligibility,
+    fast_eligibility: *const EligibilityResult,
+) ModePolicyDecision {
+    if (draft_eligibility.eligible and (config.explicit_user_draft_override or explicitDraftOverrideRequested(gi))) {
+        return .{ .mode = .draft_mode, .reason = .user_requested_draft };
+    }
+
+    const verification_requested = explicitVerificationRequested(gi) or gi.intent_class == .verification;
+    const actionable_requested = explicitPatchApplicationRequested(gi) or actionSurfaceCanPatch(gi);
+    const explanation_only = draft_eligibility.eligible and !verification_requested and !actionable_requested;
+
+    switch (config.reasoning_level) {
+        .quick => {
+            if (draft_eligibility.eligible and !actionable_requested) {
+                return .{ .mode = .draft_mode, .reason = .quick_planning_draft };
+            }
+            if (fast_eligibility.eligible) {
+                return .{ .mode = .fast_path, .reason = .quick_simple_grounded_fast };
+            }
+            if (verification_requested or actionable_requested) {
+                return .{
+                    .mode = .deep_path,
+                    .reason = .quick_verification_deep,
+                    .escalation_reason = if (actionSurfaceRequiresVerifier(gi)) .action_surface_requires_proof else .requires_verification,
+                };
+            }
+        },
+        .balanced => {
+            if (draft_eligibility.eligible and !actionable_requested) {
+                return .{ .mode = .draft_mode, .reason = .balanced_planning_draft };
+            }
+            if (fast_eligibility.eligible) {
+                return .{ .mode = .fast_path, .reason = .balanced_simple_grounded_fast };
+            }
+            if (actionable_requested or verification_requested) {
+                return .{
+                    .mode = .deep_path,
+                    .reason = .balanced_actionable_deep,
+                    .escalation_reason = if (actionSurfaceRequiresVerifier(gi)) .action_surface_requires_proof else .requires_verification,
+                };
+            }
+        },
+        .deep => {
+            if (explanation_only) {
+                if (draft_eligibility.eligible) return .{ .mode = .draft_mode, .reason = .deep_explanation_not_deep };
+                if (fast_eligibility.eligible) return .{ .mode = .fast_path, .reason = .deep_explanation_not_deep };
+            }
+            if (actionable_requested or verification_requested or (!fast_eligibility.eligible and gi.intent_class != .ambiguous)) {
+                return .{
+                    .mode = .deep_path,
+                    .reason = .deep_actionable_deep,
+                    .escalation_reason = if (actionSurfaceRequiresVerifier(gi)) .action_surface_requires_proof else .requires_verification,
+                };
+            }
+            if (fast_eligibility.eligible) {
+                return .{ .mode = .fast_path, .reason = .no_deep_value };
+            }
+        },
+        .max => {
+            if (explanation_only) {
+                if (draft_eligibility.eligible) return .{ .mode = .draft_mode, .reason = .max_explanation_not_deep };
+                if (fast_eligibility.eligible) return .{ .mode = .fast_path, .reason = .max_explanation_not_deep };
+            }
+            if (actionable_requested or verification_requested or (!fast_eligibility.eligible and gi.intent_class != .ambiguous)) {
+                return .{
+                    .mode = .deep_path,
+                    .reason = .max_actionable_deep,
+                    .escalation_reason = if (actionSurfaceRequiresVerifier(gi)) .action_surface_requires_proof else .requires_verification,
+                };
+            }
+            if (fast_eligibility.eligible) {
+                return .{ .mode = .fast_path, .reason = .no_deep_value };
+            }
+        },
+    }
+
+    if (fast_eligibility.eligible) {
+        return .{ .mode = .fast_path, .reason = .no_deep_value };
+    }
+    if (determineEscalation(gi, fast_eligibility)) |reason| {
+        return .{ .mode = .deep_path, .reason = .balanced_actionable_deep, .escalation_reason = reason };
+    }
+    return .{ .mode = .auto_path, .reason = .unresolved_no_escalation };
+}
+
+fn applyPolicyTrace(result: *ResponseResult, config: ResponseConfig, reason: ModeSelectionReason, override_detected: bool) void {
+    result.requested_reasoning_level = config.reasoning_level;
+    result.mode_selection_reason = reason;
+    result.user_override_detected = override_detected;
 }
 
 // ── Fast Path Execution ───────────────────────────────────────────────
@@ -851,44 +1035,46 @@ fn executeAutoPath(
     config: ResponseConfig,
 ) !ResponseResult {
     const draft_eligibility = checkDraftEligibility(gi, config);
-    if (draft_eligibility.eligible) {
-        const draft_started = std.time.nanoTimestamp();
-        var result = try executeDraftPath(allocator, gi, budget, draft_eligibility);
-        result.latency.draft_path_us = elapsedUs(draft_started);
-        return result;
-    }
-
-    // Step 1: Check fast path eligibility.
     const eligibility_started = std.time.nanoTimestamp();
     var eligibility = try checkFastPathEligibility(allocator, gi, &budget);
     const eligibility_us = elapsedUs(eligibility_started);
     defer eligibility.deinit(allocator);
 
-    if (eligibility.eligible) {
-        // Fast path is available — use it.
-        const fast_started = std.time.nanoTimestamp();
-        var result = try executeFastPath(allocator, gi, budget);
-        result.latency.eligibility_check_us = eligibility_us;
-        result.latency.fast_path_us = elapsedUs(fast_started);
-        return result;
+    const policy = selectModeByPolicy(gi, config, draft_eligibility, &eligibility);
+    const override_detected = userOverrideDetected(gi, config);
+
+    switch (policy.mode) {
+        .draft_mode => {
+            const draft_started = std.time.nanoTimestamp();
+            var result = try executeDraftPath(allocator, gi, budget, draft_eligibility);
+            result.latency.eligibility_check_us = eligibility_us;
+            result.latency.draft_path_us = elapsedUs(draft_started);
+            applyPolicyTrace(&result, config, policy.reason, override_detected);
+            return result;
+        },
+        .fast_path => {
+            const fast_started = std.time.nanoTimestamp();
+            var result = try executeFastPath(allocator, gi, budget);
+            result.latency.eligibility_check_us = eligibility_us;
+            result.latency.fast_path_us = elapsedUs(fast_started);
+            applyPolicyTrace(&result, config, policy.reason, override_detected);
+            return result;
+        },
+        .deep_path => {
+            const deep_started = std.time.nanoTimestamp();
+            var result = try executeDeepPath(allocator, gi, budget, policy.escalation_reason orelse .requires_verification);
+            result.latency.eligibility_check_us = eligibility_us;
+            result.latency.escalation_us = 0;
+            result.latency.deep_path_us = elapsedUs(deep_started);
+            applyPolicyTrace(&result, config, policy.reason, override_detected);
+            return result;
+        },
+        .auto_path => {},
     }
 
-    // Step 2: Not eligible for fast path. Determine escalation.
+    // No escalation justified. Return unresolved with partial findings.
     const escalation_started = std.time.nanoTimestamp();
-    const escalation_reason = determineEscalation(gi, &eligibility);
     const escalation_us = elapsedUs(escalation_started);
-
-    if (escalation_reason) |reason| {
-        // Escalation is justified — run deep path.
-        const deep_started = std.time.nanoTimestamp();
-        var result = try executeDeepPath(allocator, gi, budget, reason);
-        result.latency.eligibility_check_us = eligibility_us;
-        result.latency.escalation_us = escalation_us;
-        result.latency.deep_path_us = elapsedUs(deep_started);
-        return result;
-    }
-
-    // Step 3: No escalation justified. Return unresolved with partial findings.
     var partial_findings = std.ArrayList(PartialFinding).init(allocator);
     errdefer {
         for (partial_findings.items) |*pf| pf.deinit(allocator);
@@ -935,6 +1121,7 @@ fn executeAutoPath(
     };
     result.latency.eligibility_check_us = eligibility_us;
     result.latency.escalation_us = escalation_us;
+    applyPolicyTrace(&result, config, policy.reason, override_detected);
     return result;
 }
 
@@ -1064,12 +1251,14 @@ pub fn execute(
             const fast_started = std.time.nanoTimestamp();
             var fast = try executeFastPath(allocator, gi, budget);
             fast.latency.fast_path_us = elapsedUs(fast_started);
+            applyPolicyTrace(&fast, config, .explicit_internal_mode, userOverrideDetected(gi, config));
             break :blk fast;
         },
         .deep_path => blk: {
             const deep_started = std.time.nanoTimestamp();
             var deep = try executeDeepPath(allocator, gi, budget, if (config.user_requested_deep) .user_requested_depth else null);
             deep.latency.deep_path_us = elapsedUs(deep_started);
+            applyPolicyTrace(&deep, config, .explicit_internal_mode, userOverrideDetected(gi, config));
             break :blk deep;
         },
         .draft_mode => blk: {
@@ -1078,11 +1267,13 @@ pub fn execute(
                 const deep_started = std.time.nanoTimestamp();
                 var deep = try executeDeepPath(allocator, gi, budget, if (actionSurfaceRequiresVerifier(gi)) .action_surface_requires_proof else .requires_verification);
                 deep.latency.deep_path_us = elapsedUs(deep_started);
+                applyPolicyTrace(&deep, config, .explicit_internal_mode, userOverrideDetected(gi, config));
                 break :blk deep;
             }
             const draft_started = std.time.nanoTimestamp();
             var draft = try executeDraftPath(allocator, gi, budget, draft_eligibility);
             draft.latency.draft_path_us = elapsedUs(draft_started);
+            applyPolicyTrace(&draft, config, .explicit_internal_mode, userOverrideDetected(gi, config));
             break :blk draft;
         },
         .auto_path => try executeAutoPath(allocator, gi, budget, config),
@@ -1097,13 +1288,14 @@ pub fn execute(
 }
 
 /// Resolve the compute budget for the given response config.
-/// Fast path → low tier, Deep path → high tier, Auto path → medium tier.
+/// User-facing reasoning levels map to compute tiers for auto policy:
+/// quick→low, balanced→medium, deep→high, max→max.
 pub fn resolveBudget(config: ResponseConfig) compute_budget.Effective {
     const tier: compute_budget.Tier = switch (config.mode) {
-        .draft_mode => .low,
+        .draft_mode => computeTierForReasoningLevel(config.reasoning_level),
         .fast_path => .low,
         .deep_path => .high,
-        .auto_path => .medium,
+        .auto_path => computeTierForReasoningLevel(config.reasoning_level),
     };
     var request = config.budget_request;
     if (request.tier == .auto) {
@@ -1136,6 +1328,20 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const ResponseResult) !
     try writer.writeAll("\"selectedMode\":\"");
     try writer.writeAll(@tagName(result.selected_mode));
     try writer.writeAll("\"");
+    try writer.writeAll(",\"requested_reasoning_level\":\"");
+    try writer.writeAll(@tagName(result.requested_reasoning_level));
+    try writer.writeAll("\"");
+    try writer.writeAll(",\"effective_compute_budget_tier\":\"");
+    try writer.writeAll(compute_budget.tierName(result.effective_budget.effective_tier));
+    try writer.writeAll("\"");
+    try writer.writeAll(",\"selected_response_mode\":\"");
+    try writer.writeAll(@tagName(result.selected_mode));
+    try writer.writeAll("\"");
+    try writer.writeAll(",\"mode_selection_reason\":\"");
+    try writer.writeAll(@tagName(result.mode_selection_reason));
+    try writer.writeAll("\"");
+    try writer.writeAll(",\"user_override_detected\":");
+    try writer.writeAll(if (result.user_override_detected) "true" else "false");
     try writer.writeAll(",\"escalated\":");
     try writer.writeAll(if (result.escalated) "true" else "false");
     if (result.escalation_reason) |reason| {
@@ -1624,6 +1830,205 @@ test "response engine: support contract preserved in fast path" {
             result.grounded_intent.status,
         );
     }
+}
+
+test "reasoning policy: level maps to compute budget tier" {
+    try std.testing.expectEqual(compute_budget.Tier.low, computeTierForReasoningLevel(.quick));
+    try std.testing.expectEqual(compute_budget.Tier.medium, computeTierForReasoningLevel(.balanced));
+    try std.testing.expectEqual(compute_budget.Tier.high, computeTierForReasoningLevel(.deep));
+    try std.testing.expectEqual(compute_budget.Tier.max, computeTierForReasoningLevel(.max));
+
+    var quick = ResponseConfig.autoPath();
+    quick.reasoning_level = .quick;
+    try std.testing.expectEqual(compute_budget.Tier.low, resolveBudget(quick).effective_tier);
+
+    var balanced = ResponseConfig.autoPath();
+    balanced.reasoning_level = .balanced;
+    try std.testing.expectEqual(compute_budget.Tier.medium, resolveBudget(balanced).effective_tier);
+
+    var deep = ResponseConfig.autoPath();
+    deep.reasoning_level = .deep;
+    try std.testing.expectEqual(compute_budget.Tier.high, resolveBudget(deep).effective_tier);
+
+    var max = ResponseConfig.autoPath();
+    max.reasoning_level = .max;
+    try std.testing.expectEqual(compute_budget.Tier.max, resolveBudget(max).effective_tier);
+}
+
+test "reasoning policy: quick planning selects draft" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "plan options for src/main.zig", .{});
+    defer gi.deinit();
+
+    var config = ResponseConfig.autoPath();
+    config.reasoning_level = .quick;
+    var result = try execute(allocator, &gi, config);
+    defer result.deinit();
+
+    try std.testing.expectEqual(ResponseMode.draft_mode, result.selected_mode);
+    try std.testing.expectEqual(ModeSelectionReason.quick_planning_draft, result.mode_selection_reason);
+    try std.testing.expectEqual(compute_budget.Tier.low, result.effective_budget.effective_tier);
+    try std.testing.expectEqual(StopReason.unresolved, result.stop_reason);
+}
+
+test "reasoning policy: quick simple grounded question selects fast" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "quick answer summarize src/main.zig", .{});
+    defer gi.deinit();
+
+    var config = ResponseConfig.autoPath();
+    config.reasoning_level = .quick;
+    var result = try execute(allocator, &gi, config);
+    defer result.deinit();
+
+    try std.testing.expectEqual(ResponseMode.fast_path, result.selected_mode);
+    try std.testing.expectEqual(ModeSelectionReason.quick_simple_grounded_fast, result.mode_selection_reason);
+    try std.testing.expect(result.user_override_detected);
+}
+
+test "reasoning policy: quick explicit verify selects deep" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "verify src/main.zig:init is correct", .{});
+    defer gi.deinit();
+
+    var config = ResponseConfig.autoPath();
+    config.reasoning_level = .quick;
+    var result = try execute(allocator, &gi, config);
+    defer result.deinit();
+
+    try std.testing.expectEqual(ResponseMode.deep_path, result.selected_mode);
+    try std.testing.expectEqual(ModeSelectionReason.quick_verification_deep, result.mode_selection_reason);
+    try std.testing.expect(result.user_override_detected);
+}
+
+test "reasoning policy: balanced vague planning selects draft" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "brainstorm ideas for src/main.zig", .{});
+    defer gi.deinit();
+
+    var config = ResponseConfig.autoPath();
+    config.reasoning_level = .balanced;
+    var result = try execute(allocator, &gi, config);
+    defer result.deinit();
+
+    try std.testing.expectEqual(ResponseMode.draft_mode, result.selected_mode);
+    try std.testing.expectEqual(ModeSelectionReason.balanced_planning_draft, result.mode_selection_reason);
+}
+
+test "reasoning policy: balanced actionable request selects deep when verifier exists" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "fix src/main.zig", .{});
+    defer gi.deinit();
+
+    var config = ResponseConfig.autoPath();
+    config.reasoning_level = .balanced;
+    var result = try execute(allocator, &gi, config);
+    defer result.deinit();
+
+    try std.testing.expectEqual(ResponseMode.deep_path, result.selected_mode);
+    try std.testing.expectEqual(ModeSelectionReason.balanced_actionable_deep, result.mode_selection_reason);
+}
+
+test "reasoning policy: deep explanation-only does not force deep" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "explain src/main.zig", .{});
+    defer gi.deinit();
+
+    var config = ResponseConfig.autoPath();
+    config.reasoning_level = .deep;
+    var result = try execute(allocator, &gi, config);
+    defer result.deinit();
+
+    try std.testing.expect(result.selected_mode == .draft_mode or result.selected_mode == .fast_path);
+    try std.testing.expect(result.selected_mode != .deep_path);
+    try std.testing.expectEqual(ModeSelectionReason.deep_explanation_not_deep, result.mode_selection_reason);
+}
+
+test "reasoning policy: max explanation-only does not force deep" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "explain src/main.zig", .{});
+    defer gi.deinit();
+
+    var config = ResponseConfig.autoPath();
+    config.reasoning_level = .max;
+    var result = try execute(allocator, &gi, config);
+    defer result.deinit();
+
+    try std.testing.expect(result.selected_mode == .draft_mode or result.selected_mode == .fast_path);
+    try std.testing.expect(result.selected_mode != .deep_path);
+    try std.testing.expectEqual(ModeSelectionReason.max_explanation_not_deep, result.mode_selection_reason);
+    try std.testing.expectEqual(compute_budget.Tier.max, result.effective_budget.effective_tier);
+}
+
+test "reasoning policy: max fix request selects deep" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "fix src/main.zig", .{});
+    defer gi.deinit();
+
+    var config = ResponseConfig.autoPath();
+    config.reasoning_level = .max;
+    var result = try execute(allocator, &gi, config);
+    defer result.deinit();
+
+    try std.testing.expectEqual(ResponseMode.deep_path, result.selected_mode);
+    try std.testing.expectEqual(ModeSelectionReason.max_actionable_deep, result.mode_selection_reason);
+}
+
+test "reasoning policy: max just draft override selects draft" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "just draft fix src/main.zig", .{});
+    defer gi.deinit();
+
+    var config = ResponseConfig.autoPath();
+    config.reasoning_level = .max;
+    var result = try execute(allocator, &gi, config);
+    defer result.deinit();
+
+    try std.testing.expectEqual(ResponseMode.draft_mode, result.selected_mode);
+    try std.testing.expectEqual(ModeSelectionReason.user_requested_draft, result.mode_selection_reason);
+    try std.testing.expect(result.user_override_detected);
+    try std.testing.expectEqual(StopReason.unresolved, result.stop_reason);
+    try std.testing.expectEqual(VerificationState.unverified, result.draft.mode.verification_state);
+}
+
+test "reasoning policy: deterministic selection across repeated max runs" {
+    const allocator = std.testing.allocator;
+    var gi1 = try intent_grounding.ground(allocator, "fix src/main.zig", .{});
+    defer gi1.deinit();
+    var gi2 = try intent_grounding.ground(allocator, "fix src/main.zig", .{});
+    defer gi2.deinit();
+
+    var config = ResponseConfig.autoPath();
+    config.reasoning_level = .max;
+    var result1 = try execute(allocator, &gi1, config);
+    defer result1.deinit();
+    var result2 = try execute(allocator, &gi2, config);
+    defer result2.deinit();
+
+    try std.testing.expectEqual(result1.selected_mode, result2.selected_mode);
+    try std.testing.expectEqual(result1.mode_selection_reason, result2.mode_selection_reason);
+    try std.testing.expectEqual(result1.requested_reasoning_level, result2.requested_reasoning_level);
+    try std.testing.expectEqual(result1.effective_budget.effective_tier, result2.effective_budget.effective_tier);
+}
+
+test "reasoning policy: render json exposes mapper trace" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "verify src/main.zig:init is correct", .{});
+    defer gi.deinit();
+
+    var config = ResponseConfig.autoPath();
+    config.reasoning_level = .quick;
+    var result = try execute(allocator, &gi, config);
+    defer result.deinit();
+
+    const rendered = try renderJson(allocator, &result);
+    defer allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"requested_reasoning_level\":\"quick\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"effective_compute_budget_tier\":\"low\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"selected_response_mode\":\"deep_path\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"mode_selection_reason\":\"quick_verification_deep\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"user_override_detected\":true") != null);
 }
 
 fn writeJsonStringArray(writer: anytype, items: []const []u8) !void {

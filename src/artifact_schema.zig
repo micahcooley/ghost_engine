@@ -2,6 +2,7 @@ const std = @import("std");
 const abstractions = @import("abstractions.zig");
 const code_intel = @import("code_intel.zig");
 const compute_budget = @import("compute_budget.zig");
+const hypothesis_core = @import("hypothesis_core.zig");
 const shards = @import("shards.zig");
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -29,6 +30,7 @@ pub const MAX_ARTIFACTS_PER_BATCH: usize = 32;
 pub const MAX_ENTITIES_PER_FRAGMENT: usize = 16;
 pub const MAX_RELATIONS_PER_BATCH: usize = 64;
 pub const MAX_OBLIGATIONS_PER_BATCH: usize = 32;
+pub const MAX_DISCOVERY_SIGNALS_PER_KIND: usize = 64;
 
 // ── Core Types ──────────────────────────────────────────────────────────
 
@@ -242,6 +244,27 @@ pub const VerifierResult = enum {
     skipped,
 };
 
+pub const DiscoverySignalSummary = struct {
+    retained_token_signal_count: u32 = 0,
+    retained_pattern_signal_count: u32 = 0,
+    schema_entity_signal_count: u32 = 0,
+    schema_relation_signal_count: u32 = 0,
+    obligation_signal_count: u32 = 0,
+    anchor_signal_count: u32 = 0,
+    verifier_hint_signal_count: u32 = 0,
+    schema_signal_count: u32 = 0,
+    fallback_signal_used: bool = false,
+
+    pub fn structuredCount(self: DiscoverySignalSummary) u32 {
+        return self.schema_entity_signal_count +
+            self.schema_relation_signal_count +
+            self.obligation_signal_count +
+            self.anchor_signal_count +
+            self.verifier_hint_signal_count +
+            self.schema_signal_count;
+    }
+};
+
 // ── Schema Registry ─────────────────────────────────────────────────────
 
 /// Defines structure for a class of artifacts. Schemas define entity types,
@@ -332,6 +355,9 @@ pub const PipelineResult = struct {
     relations: []RelationEdge,
     obligations: []Obligation,
     verifier_hooks: []VerifierHook,
+    discovery_signals: DiscoverySignalSummary = .{},
+    hypotheses: []hypothesis_core.Hypothesis = &.{},
+    hypothesis_budget_exhaustion: ?compute_budget.Exhaustion = null,
     /// The schema name resolved for each artifact (parallel to artifacts).
     resolved_schemas: []const []const u8 = &.{},
     /// Malformed artifacts that still produced fragments (never collapsed).
@@ -356,6 +382,9 @@ pub const PipelineResult = struct {
         if (self.obligations.len > 0) self.allocator.free(self.obligations);
         for (self.verifier_hooks) |*v| v.deinit(self.allocator);
         if (self.verifier_hooks.len > 0) self.allocator.free(self.verifier_hooks);
+        for (self.hypotheses) |*h| h.deinit(self.allocator);
+        if (self.hypotheses.len > 0) self.allocator.free(self.hypotheses);
+        if (self.hypothesis_budget_exhaustion) |*ex| ex.deinit();
         if (self.resolved_schemas.len > 0) self.allocator.free(self.resolved_schemas);
         if (self.budget_exhaustion) |*ex| ex.deinit();
         self.* = undefined;
@@ -398,6 +427,48 @@ pub const PipelineOptions = struct {
     /// Default trust class for artifacts without explicit class.
     default_trust_class: abstractions.TrustClass = .exploratory,
 };
+
+pub fn summarizeDiscoverySignals(
+    artifacts: []const Artifact,
+    fragments: []const Fragment,
+    entities: []const Entity,
+    relations: []const RelationEdge,
+    obligations: []const Obligation,
+    verifier_hooks: []const VerifierHook,
+    resolved_schema_name: []const u8,
+) DiscoverySignalSummary {
+    var out = DiscoverySignalSummary{};
+    if (resolved_schema_name.len > 0 and !std.mem.eql(u8, resolved_schema_name, "unknown")) out.schema_signal_count = 1;
+    out.schema_entity_signal_count = @intCast(@min(entities.len, MAX_DISCOVERY_SIGNALS_PER_KIND));
+    out.schema_relation_signal_count = @intCast(@min(relations.len, MAX_DISCOVERY_SIGNALS_PER_KIND));
+    out.obligation_signal_count = @intCast(@min(obligations.len, MAX_DISCOVERY_SIGNALS_PER_KIND));
+    out.verifier_hint_signal_count = @intCast(@min(verifier_hooks.len, MAX_DISCOVERY_SIGNALS_PER_KIND));
+    for (artifacts) |artifact| {
+        if (out.anchor_signal_count >= MAX_DISCOVERY_SIGNALS_PER_KIND) break;
+        if (artifact.content_path != null or artifact.id.len > 0) out.anchor_signal_count += 1;
+    }
+    for (fragments) |fragment| {
+        if (out.anchor_signal_count >= MAX_DISCOVERY_SIGNALS_PER_KIND) break;
+        if (fragment.region.len > 0 and fragment.parser_stage != .fallback) out.anchor_signal_count += 1;
+    }
+    for (entities) |entity| {
+        if (out.anchor_signal_count >= MAX_DISCOVERY_SIGNALS_PER_KIND) break;
+        if (isAnchorEntityType(entity.entity_type)) out.anchor_signal_count += 1;
+    }
+    out.fallback_signal_used = out.structuredCount() == 0;
+    return out;
+}
+
+fn isAnchorEntityType(entity_type: []const u8) bool {
+    return std.mem.eql(u8, entity_type, "heading") or
+        std.mem.eql(u8, entity_type, "section") or
+        std.mem.eql(u8, entity_type, "key") or
+        std.mem.eql(u8, entity_type, "path") or
+        std.mem.eql(u8, entity_type, "symbol") or
+        std.mem.eql(u8, entity_type, "module") or
+        std.mem.eql(u8, entity_type, "function") or
+        std.mem.eql(u8, entity_type, "type_decl");
+}
 
 // ── Routing Signals ─────────────────────────────────────────────────────
 
@@ -1041,6 +1112,24 @@ pub fn ingestArtifact(
         verifier_hooks = try createVerifierHooks(allocator, entities, &s);
     }
 
+    // 7. Construct only minimal, non-authorizing hypotheses from universal
+    // pipeline state. Domain meaning stays in schemas and verifier hooks.
+    var hypothesis_budget_exhaustion: ?compute_budget.Exhaustion = null;
+    errdefer if (hypothesis_budget_exhaustion) |*ex| ex.deinit();
+    const effective_budget = compute_budget.resolve(options.compute_budget_request);
+    const hypotheses = try constructHypothesesFromPipelineState(
+        allocator,
+        artifact.id,
+        schema_name,
+        fragments,
+        entities,
+        relations,
+        obligations,
+        verifier_hooks,
+        effective_budget,
+        &hypothesis_budget_exhaustion,
+    );
+
     const artifacts_slice = try allocator.alloc(Artifact, 1);
     artifacts_slice[0] = .{
         .id = try allocator.dupe(u8, artifact.id),
@@ -1053,6 +1142,7 @@ pub fn ingestArtifact(
         .content_hash = artifact.content_hash,
         .schema_name = owned_schema_name,
     };
+    const discovery_signals = summarizeDiscoverySignals(artifacts_slice, fragments, entities, relations, obligations, verifier_hooks, schema_name);
 
     return .{
         .allocator = allocator,
@@ -1062,11 +1152,358 @@ pub fn ingestArtifact(
         .relations = relations,
         .obligations = obligations,
         .verifier_hooks = verifier_hooks,
+        .discovery_signals = discovery_signals,
+        .hypotheses = hypotheses,
+        .hypothesis_budget_exhaustion = hypothesis_budget_exhaustion,
         .malformed_count = 0,
         .unrouted_count = if (schema == null) 1 else 0,
         .budget_exhaustion = null,
         .profile = .{},
     };
+}
+
+pub fn constructHypothesesFromPipelineState(
+    allocator: std.mem.Allocator,
+    artifact_scope: []const u8,
+    schema_name: []const u8,
+    fragments: []const Fragment,
+    entities: []const Entity,
+    relations: []const RelationEdge,
+    obligations: []const Obligation,
+    verifier_hooks: []const VerifierHook,
+    effective_budget: compute_budget.Effective,
+    budget_exhaustion: *?compute_budget.Exhaustion,
+) ![]hypothesis_core.Hypothesis {
+    var out = std.ArrayList(hypothesis_core.Hypothesis).init(allocator);
+    errdefer {
+        for (out.items) |*item| item.deinit(allocator);
+        out.deinit();
+    }
+
+    for (obligations) |obligation| {
+        if (!obligation.pending) continue;
+        if (try artifactHypothesisCapHit(allocator, effective_budget, &out, budget_exhaustion)) break;
+        const id = try std.fmt.allocPrint(allocator, "hypothesis:{s}:missing_obligation:{d}", .{ artifact_scope, out.items.len + 1 });
+        defer allocator.free(id);
+        const evidence = [_][]const u8{obligation.detail orelse obligation.label};
+        const missing = [_][]const u8{obligation.label};
+        const hooks = [_][]const u8{matchingVerifierHookForObligation(obligation, verifier_hooks) orelse "schema_verifier_hook"};
+        const source_signals = [_][]const u8{ "obligation", obligation.id, obligation.entity_id };
+        const affected = [_][]const u8{obligation.entity_id};
+        try out.append(try hypothesis_core.makeWithSignals(
+            allocator,
+            id,
+            artifact_scope,
+            schema_name,
+            .possible_missing_obligation,
+            &affected,
+            &.{},
+            evidence[0..@min(evidence.len, effective_budget.max_hypothesis_evidence_fragments)],
+            missing[0..@min(missing.len, effective_budget.max_hypothesis_obligations)],
+            hooks[0..@min(hooks.len, effective_budget.max_hypothesis_verifier_needs)],
+            "verify",
+            "missing_obligation",
+            &source_signals,
+            "artifact_pipeline.obligations",
+            "generated_from_pending_obligation",
+        ));
+    }
+
+    for (relations) |relation| {
+        if (relation.relation != .contradicts) continue;
+        if (try artifactHypothesisCapHit(allocator, effective_budget, &out, budget_exhaustion)) break;
+        const id = try std.fmt.allocPrint(allocator, "hypothesis:{s}:relation:{d}", .{ artifact_scope, out.items.len + 1 });
+        defer allocator.free(id);
+        const relation_label = try std.fmt.allocPrint(allocator, "{s}->{s}", .{ relation.from_entity_id, relation.to_entity_id });
+        defer allocator.free(relation_label);
+        const evidence = [_][]const u8{relation_label};
+        const missing = [_][]const u8{"resolve_possible_inconsistency"};
+        const hooks = [_][]const u8{"consistency_check"};
+        const affected = [_][]const u8{ relation.from_entity_id, relation.to_entity_id };
+        const involved = [_][]const u8{relation_label};
+        const source_signals = [_][]const u8{ "relation", relation.provenance, relation_label };
+        try out.append(try hypothesis_core.makeWithSignals(
+            allocator,
+            id,
+            artifact_scope,
+            schema_name,
+            .possible_inconsistency,
+            &affected,
+            &involved,
+            evidence[0..@min(evidence.len, effective_budget.max_hypothesis_evidence_fragments)],
+            missing[0..@min(missing.len, effective_budget.max_hypothesis_obligations)],
+            hooks[0..@min(hooks.len, effective_budget.max_hypothesis_verifier_needs)],
+            "verify",
+            "contradictory_relation",
+            &source_signals,
+            "artifact_pipeline.relations",
+            "generated_from_contradiction_relation",
+        ));
+    }
+
+    for (verifier_hooks) |hook| {
+        if (hook.result == .passed) continue;
+        if (try artifactHypothesisCapHit(allocator, effective_budget, &out, budget_exhaustion)) break;
+        const id = try std.fmt.allocPrint(allocator, "hypothesis:{s}:verifier_need:{d}", .{ artifact_scope, out.items.len + 1 });
+        defer allocator.free(id);
+        const evidence = [_][]const u8{if (fragments.len > 0) fragments[0].region else hook.label};
+        const missing = [_][]const u8{if (hasMatchingPendingObligation(hook, obligations)) "resolve_pending_verifier_obligation" else "bind_verifier_hook_to_obligation"};
+        const hooks = [_][]const u8{hook.hook_type};
+        var affected_buf: [1][]const u8 = undefined;
+        const affected = if (hook.entity_id) |entity_id| blk: {
+            affected_buf[0] = entity_id;
+            break :blk affected_buf[0..1];
+        } else affected_buf[0..0];
+        const source_signals = [_][]const u8{ "verifier_hint", hook.id, hook.hook_type };
+        try out.append(try hypothesis_core.makeWithSignals(
+            allocator,
+            id,
+            artifact_scope,
+            schema_name,
+            if (hasMatchingPendingObligation(hook, obligations)) .possible_unsupported_claim else .possible_missing_obligation,
+            affected,
+            &.{},
+            evidence[0..@min(evidence.len, effective_budget.max_hypothesis_evidence_fragments)],
+            missing[0..@min(missing.len, effective_budget.max_hypothesis_obligations)],
+            hooks[0..@min(hooks.len, effective_budget.max_hypothesis_verifier_needs)],
+            "verify",
+            "verifier_gap",
+            &source_signals,
+            "artifact_pipeline.verifier_hooks",
+            "generated_from_unbound_verifier_hook",
+        ));
+    }
+
+    for (entities, 0..) |entity, idx| {
+        if (try artifactHypothesisCapHit(allocator, effective_budget, &out, budget_exhaustion)) break;
+        if (entity.partially_grounded) {
+            const id = try std.fmt.allocPrint(allocator, "hypothesis:{s}:constraint:{d}", .{ artifact_scope, out.items.len + 1 });
+            defer allocator.free(id);
+            const evidence = [_][]const u8{entity.label};
+            const missing = [_][]const u8{"ground_entity_before_promotion"};
+            const hooks = [_][]const u8{"consistency_check"};
+            const affected = [_][]const u8{entity.id};
+            const source_signals = [_][]const u8{ "entity", entity.provenance, entity.id };
+            try out.append(try hypothesis_core.makeWithSignals(
+                allocator,
+                id,
+                artifact_scope,
+                schema_name,
+                .possible_constraint_violation,
+                &affected,
+                &.{},
+                evidence[0..@min(evidence.len, effective_budget.max_hypothesis_evidence_fragments)],
+                missing[0..@min(missing.len, effective_budget.max_hypothesis_obligations)],
+                hooks[0..@min(hooks.len, effective_budget.max_hypothesis_verifier_needs)],
+                "annotate",
+                "constraint_mismatch",
+                &source_signals,
+                "artifact_pipeline.entities",
+                "generated_from_partially_grounded_entity",
+            ));
+        }
+
+        var duplicate_count: usize = 0;
+        for (entities[idx + 1 ..]) |other| {
+            if (std.mem.eql(u8, entity.label, other.label) and !std.mem.eql(u8, entity.id, other.id)) duplicate_count += 1;
+        }
+        if (duplicate_count > 0) {
+            if (try artifactHypothesisCapHit(allocator, effective_budget, &out, budget_exhaustion)) break;
+            const id = try std.fmt.allocPrint(allocator, "hypothesis:{s}:ambiguity:{d}", .{ artifact_scope, out.items.len + 1 });
+            defer allocator.free(id);
+            const evidence = [_][]const u8{entity.label};
+            const missing = [_][]const u8{"disambiguate_competing_bindings"};
+            const hooks = [_][]const u8{"consistency_check"};
+            const affected = [_][]const u8{entity.id};
+            const source_signals = [_][]const u8{ "entity", entity.provenance, entity.label };
+            try out.append(try hypothesis_core.makeWithSignals(
+                allocator,
+                id,
+                artifact_scope,
+                schema_name,
+                .possible_ambiguity,
+                &affected,
+                &.{},
+                evidence[0..@min(evidence.len, effective_budget.max_hypothesis_evidence_fragments)],
+                missing[0..@min(missing.len, effective_budget.max_hypothesis_obligations)],
+                hooks[0..@min(hooks.len, effective_budget.max_hypothesis_verifier_needs)],
+                "annotate",
+                "ambiguous_binding",
+                &source_signals,
+                "artifact_pipeline.entities",
+                "generated_from_duplicate_entity_binding",
+            ));
+        }
+    }
+
+    for (relations, 0..) |relation, idx| {
+        if (try artifactHypothesisCapHit(allocator, effective_budget, &out, budget_exhaustion)) break;
+        if (!entityExists(entities, relation.from_entity_id) or !entityExists(entities, relation.to_entity_id)) {
+            const id = try std.fmt.allocPrint(allocator, "hypothesis:{s}:constraint:{d}", .{ artifact_scope, out.items.len + 1 });
+            defer allocator.free(id);
+            const relation_label = try std.fmt.allocPrint(allocator, "{s}:{s}->{s}", .{ @tagName(relation.relation), relation.from_entity_id, relation.to_entity_id });
+            defer allocator.free(relation_label);
+            const evidence = [_][]const u8{relation_label};
+            const missing = [_][]const u8{"ground_relation_endpoints"};
+            const hooks = [_][]const u8{"consistency_check"};
+            const affected = [_][]const u8{ relation.from_entity_id, relation.to_entity_id };
+            const involved = [_][]const u8{relation_label};
+            const source_signals = [_][]const u8{ "relation", relation.provenance, relation_label };
+            try out.append(try hypothesis_core.makeWithSignals(
+                allocator,
+                id,
+                artifact_scope,
+                schema_name,
+                .possible_constraint_violation,
+                &affected,
+                &involved,
+                evidence[0..@min(evidence.len, effective_budget.max_hypothesis_evidence_fragments)],
+                missing[0..@min(missing.len, effective_budget.max_hypothesis_obligations)],
+                hooks[0..@min(hooks.len, effective_budget.max_hypothesis_verifier_needs)],
+                "verify",
+                "constraint_mismatch",
+                &source_signals,
+                "artifact_pipeline.relations",
+                "generated_from_unresolved_relation_endpoint",
+            ));
+        }
+
+        if (hasOpposingRelation(relations[idx + 1 ..], relation)) {
+            if (try artifactHypothesisCapHit(allocator, effective_budget, &out, budget_exhaustion)) break;
+            const id = try std.fmt.allocPrint(allocator, "hypothesis:{s}:behavior_mismatch:{d}", .{ artifact_scope, out.items.len + 1 });
+            defer allocator.free(id);
+            const relation_label = try std.fmt.allocPrint(allocator, "{s}:{s}->{s}", .{ @tagName(relation.relation), relation.from_entity_id, relation.to_entity_id });
+            defer allocator.free(relation_label);
+            const evidence = [_][]const u8{relation_label};
+            const missing = [_][]const u8{"compare_expected_and_observed_relations"};
+            const hooks = [_][]const u8{"consistency_check"};
+            const affected = [_][]const u8{ relation.from_entity_id, relation.to_entity_id };
+            const involved = [_][]const u8{relation_label};
+            const source_signals = [_][]const u8{ "relation", relation.provenance, relation_label };
+            try out.append(try hypothesis_core.makeWithSignals(
+                allocator,
+                id,
+                artifact_scope,
+                schema_name,
+                .possible_behavior_mismatch,
+                &affected,
+                &involved,
+                evidence[0..@min(evidence.len, effective_budget.max_hypothesis_evidence_fragments)],
+                missing[0..@min(missing.len, effective_budget.max_hypothesis_obligations)],
+                hooks[0..@min(hooks.len, effective_budget.max_hypothesis_verifier_needs)],
+                "verify",
+                "behavior_mismatch",
+                &source_signals,
+                "artifact_pipeline.relations",
+                "generated_from_opposing_relation_pair",
+            ));
+        }
+    }
+
+    for (obligations, 0..) |obligation, idx| {
+        if (try artifactHypothesisCapHit(allocator, effective_budget, &out, budget_exhaustion)) break;
+        if (!hasDuplicateObligation(obligations[idx + 1 ..], obligation)) continue;
+        const id = try std.fmt.allocPrint(allocator, "hypothesis:{s}:optimization:{d}", .{ artifact_scope, out.items.len + 1 });
+        defer allocator.free(id);
+        const evidence = [_][]const u8{obligation.label};
+        const missing = [_][]const u8{"deduplicate_repeated_obligation"};
+        const hooks = [_][]const u8{"consistency_check"};
+        const affected = [_][]const u8{obligation.entity_id};
+        const source_signals = [_][]const u8{ "obligation", obligation.id, obligation.entity_id };
+        try out.append(try hypothesis_core.makeWithSignals(
+            allocator,
+            id,
+            artifact_scope,
+            schema_name,
+            .possible_optimization,
+            &affected,
+            &.{},
+            evidence[0..@min(evidence.len, effective_budget.max_hypothesis_evidence_fragments)],
+            missing[0..@min(missing.len, effective_budget.max_hypothesis_obligations)],
+            hooks[0..@min(hooks.len, effective_budget.max_hypothesis_verifier_needs)],
+            "restructure",
+            "optimization_opportunity",
+            &source_signals,
+            "artifact_pipeline.obligations",
+            "generated_from_repeated_obligation",
+        ));
+    }
+
+    markSelectedHypotheses(out.items, effective_budget.max_hypotheses_selected);
+
+    return out.toOwnedSlice();
+}
+
+fn markSelectedHypotheses(items: []hypothesis_core.Hypothesis, max_selected: usize) void {
+    for (items, 0..) |*item, idx| {
+        if (idx < max_selected) item.status = .selected_for_verification;
+    }
+}
+
+fn matchingVerifierHookForObligation(obligation: Obligation, hooks: []const VerifierHook) ?[]const u8 {
+    for (hooks) |hook| {
+        if (std.mem.indexOf(u8, obligation.label, hook.hook_type) != null) return hook.hook_type;
+    }
+    return null;
+}
+
+fn hasMatchingPendingObligation(hook: VerifierHook, obligations: []const Obligation) bool {
+    for (obligations) |obligation| {
+        if (!obligation.pending) continue;
+        if (std.mem.indexOf(u8, obligation.label, hook.hook_type) != null) return true;
+    }
+    return false;
+}
+
+fn entityExists(entities: []const Entity, id: []const u8) bool {
+    for (entities) |entity| {
+        if (std.mem.eql(u8, entity.id, id)) return true;
+    }
+    return false;
+}
+
+fn hasOpposingRelation(rest: []const RelationEdge, relation: RelationEdge) bool {
+    for (rest) |other| {
+        const same_pair = std.mem.eql(u8, relation.from_entity_id, other.from_entity_id) and
+            std.mem.eql(u8, relation.to_entity_id, other.to_entity_id);
+        const reversed_pair = std.mem.eql(u8, relation.from_entity_id, other.to_entity_id) and
+            std.mem.eql(u8, relation.to_entity_id, other.from_entity_id);
+        if (same_pair and ((relation.relation == .supports and other.relation == .contradicts) or
+            (relation.relation == .contradicts and other.relation == .supports)))
+        {
+            return true;
+        }
+        if (reversed_pair and relation.relation == .ordered_before and other.relation == .ordered_before) return true;
+    }
+    return false;
+}
+
+fn hasDuplicateObligation(rest: []const Obligation, obligation: Obligation) bool {
+    for (rest) |other| {
+        if (std.mem.eql(u8, obligation.label, other.label) and std.mem.eql(u8, obligation.scope, other.scope)) return true;
+    }
+    return false;
+}
+
+fn artifactHypothesisCapHit(
+    allocator: std.mem.Allocator,
+    effective_budget: compute_budget.Effective,
+    out: *const std.ArrayList(hypothesis_core.Hypothesis),
+    budget_exhaustion: *?compute_budget.Exhaustion,
+) !bool {
+    if (out.items.len < effective_budget.max_hypotheses_generated) return false;
+    if (budget_exhaustion.* == null) {
+        budget_exhaustion.* = try compute_budget.Exhaustion.init(
+            allocator,
+            .max_hypotheses_generated,
+            .hypothesis_generation,
+            out.items.len + 1,
+            effective_budget.max_hypotheses_generated,
+            "artifact hypothesis construction reached the visible generation cap",
+            "remaining universal artifact hypothesis sources were skipped",
+        );
+    }
+    return true;
 }
 
 // ── Support Graph Extension Helpers ─────────────────────────────────────
@@ -1140,6 +1577,29 @@ pub fn appendArtifactSupportNodes(
             .score = 0,
             .usable = !obligation.pending,
             .detail = obligation.detail,
+        });
+    }
+
+    for (result.hypotheses) |hypothesis| {
+        try nodes.append(.{
+            .id = try std.fmt.allocPrint(allocator, "hypothesis:{s}", .{hypothesis.id}),
+            .kind = .hypothesis,
+            .label = try allocator.dupe(u8, hypothesis.id),
+            .rel_path = null,
+            .line = 0,
+            .score = 0,
+            .usable = false,
+            .detail = try std.fmt.allocPrint(
+                allocator,
+                "kind={s}; status={s}; source_rule={s}; non_authorizing={s}; provenance={s}",
+                .{
+                    hypothesis_core.kindName(hypothesis.hypothesis_kind),
+                    hypothesis_core.statusName(hypothesis.status),
+                    hypothesis.source_rule,
+                    if (hypothesis.non_authorizing) "true" else "false",
+                    hypothesis.provenance,
+                },
+            ),
         });
     }
 
@@ -1316,7 +1776,8 @@ fn matchesEntityType(text: []const u8, entity_type: []const u8) bool {
     if (std.mem.eql(u8, entity_type, "key")) {
         // key = value or key: value
         if (std.mem.indexOf(u8, text, " = ") != null or
-            std.mem.indexOf(u8, text, ": ") != null) {
+            std.mem.indexOf(u8, text, ": ") != null)
+        {
             // Not a heading.
             if (text[0] != '#') return true;
         }
@@ -1451,4 +1912,184 @@ fn referencesEntity(source_label: []const u8, target_label: []const u8) bool {
 
 fn labelContains(haystack: []const u8, needle: []const u8) bool {
     return std.mem.indexOf(u8, haystack, needle) != null and needle.len > 2;
+}
+
+test "non-code artifact produces bounded schema-derived discovery signals" {
+    const allocator = std.testing.allocator;
+    var registry = SchemaRegistry.init(allocator);
+    defer registry.deinit();
+    try registerBuiltinSchemas(&registry);
+    var artifact = try Artifact.init(allocator, "doc-a", .repo, .document, "test:doc", .project, "md", "docs/runbook.md", null);
+    defer artifact.deinit(allocator);
+    var result = try ingestArtifact(
+        allocator,
+        &artifact,
+        "# Runtime Contract\n\nport: 8080\n\nThis paragraph names the runtime contract and verifier expectation.\n",
+        &.{ .registry = &registry },
+    );
+    defer result.deinit();
+    try std.testing.expect(result.discovery_signals.schema_signal_count > 0);
+    try std.testing.expect(result.discovery_signals.schema_entity_signal_count > 0);
+    try std.testing.expect(result.discovery_signals.anchor_signal_count > 0);
+    try std.testing.expect(!result.discovery_signals.fallback_signal_used);
+}
+
+test "code artifact uses the same schema-derived discovery signal path" {
+    const allocator = std.testing.allocator;
+    var registry = SchemaRegistry.init(allocator);
+    defer registry.deinit();
+    try registerBuiltinSchemas(&registry);
+    var artifact = try Artifact.init(allocator, "code-a", .repo, .file, "test:code", .project, "zig", "src/main.zig", null);
+    defer artifact.deinit(allocator);
+    var result = try ingestArtifact(
+        allocator,
+        &artifact,
+        "const Worker = struct {};\npub fn run() void {}\n",
+        &.{ .registry = &registry },
+    );
+    defer result.deinit();
+    try std.testing.expect(result.discovery_signals.schema_signal_count > 0);
+    try std.testing.expect(result.discovery_signals.schema_entity_signal_count > 0);
+    try std.testing.expect(result.discovery_signals.anchor_signal_count > 0);
+    try std.testing.expectEqual(@as(u32, 0), result.discovery_signals.retained_token_signal_count);
+}
+
+fn deinitTestHypotheses(allocator: std.mem.Allocator, hypotheses: []hypothesis_core.Hypothesis) void {
+    for (hypotheses) |*item| item.deinit(allocator);
+    if (hypotheses.len != 0) allocator.free(hypotheses);
+}
+
+test "missing obligation generates possible_missing_obligation" {
+    const allocator = std.testing.allocator;
+    var exhaustion: ?compute_budget.Exhaustion = null;
+    defer if (exhaustion) |*ex| ex.deinit();
+    const obligations = [_]Obligation{.{
+        .id = "obl:test:e1",
+        .label = "verify consistency for e1",
+        .scope = "document_schema",
+        .entity_id = "e1",
+        .pending = true,
+    }};
+    const hooks = [_]VerifierHook{.{
+        .id = "vh:consistency",
+        .label = "consistency verification",
+        .hook_type = "consistency_check",
+    }};
+    const hypotheses = try constructHypothesesFromPipelineState(
+        allocator,
+        "doc",
+        "document_schema",
+        &.{},
+        &.{},
+        &.{},
+        &obligations,
+        &hooks,
+        compute_budget.resolve(.{ .tier = .medium }),
+        &exhaustion,
+    );
+    defer deinitTestHypotheses(allocator, hypotheses);
+    try std.testing.expect(hypotheses.len > 0);
+    try std.testing.expectEqual(hypothesis_core.HypothesisKind.possible_missing_obligation, hypotheses[0].hypothesis_kind);
+    try std.testing.expect(hypotheses[0].non_authorizing);
+}
+
+test "contradictory relation generates possible_inconsistency" {
+    const allocator = std.testing.allocator;
+    var exhaustion: ?compute_budget.Exhaustion = null;
+    defer if (exhaustion) |*ex| ex.deinit();
+    const entities = [_]Entity{
+        .{ .id = "e1", .entity_type = "section", .fragment_index = 0, .label = "Expected", .provenance = "prov", .artifact_id = "doc" },
+        .{ .id = "e2", .entity_type = "paragraph", .fragment_index = 1, .label = "Observed", .provenance = "prov", .artifact_id = "doc" },
+    };
+    const relations = [_]RelationEdge{.{
+        .relation = .contradicts,
+        .from_entity_id = "e1",
+        .to_entity_id = "e2",
+        .provenance = "prov:relation",
+    }};
+    const hypotheses = try constructHypothesesFromPipelineState(allocator, "doc", "document_schema", &.{}, &entities, &relations, &.{}, &.{}, compute_budget.resolve(.{ .tier = .medium }), &exhaustion);
+    defer deinitTestHypotheses(allocator, hypotheses);
+    try std.testing.expect(hypotheses.len > 0);
+    try std.testing.expectEqual(hypothesis_core.HypothesisKind.possible_inconsistency, hypotheses[0].hypothesis_kind);
+}
+
+test "verifier hint without verifier result generates non-authorizing hypothesis" {
+    const allocator = std.testing.allocator;
+    var exhaustion: ?compute_budget.Exhaustion = null;
+    defer if (exhaustion) |*ex| ex.deinit();
+    const fragments = [_]Fragment{.{
+        .artifact_id = "cfg",
+        .offset = 0,
+        .line = 1,
+        .region = "line 1",
+        .parser_stage = .strict,
+        .raw_text = "port = 3000",
+        .provenance = "prov:fragment",
+    }};
+    const hooks = [_]VerifierHook{.{
+        .id = "vh:schema",
+        .label = "schema verification",
+        .hook_type = "schema_validation",
+        .result = .pending,
+    }};
+    const hypotheses = try constructHypothesesFromPipelineState(allocator, "cfg", "config_schema", &fragments, &.{}, &.{}, &.{}, &hooks, compute_budget.resolve(.{ .tier = .medium }), &exhaustion);
+    defer deinitTestHypotheses(allocator, hypotheses);
+    try std.testing.expectEqual(hypothesis_core.HypothesisKind.possible_missing_obligation, hypotheses[0].hypothesis_kind);
+    try std.testing.expect(hypotheses[0].non_authorizing);
+    try std.testing.expectEqualStrings("verifier_gap", hypotheses[0].source_rule);
+}
+
+test "ambiguous binding generates possible_ambiguity with deterministic order" {
+    const allocator = std.testing.allocator;
+    var exhaustion: ?compute_budget.Exhaustion = null;
+    defer if (exhaustion) |*ex| ex.deinit();
+    const entities = [_]Entity{
+        .{ .id = "e1", .entity_type = "section", .fragment_index = 0, .label = "target", .provenance = "prov", .artifact_id = "doc" },
+        .{ .id = "e2", .entity_type = "heading", .fragment_index = 1, .label = "target", .provenance = "prov", .artifact_id = "doc" },
+    };
+    const h1 = try constructHypothesesFromPipelineState(allocator, "doc", "document_schema", &.{}, &entities, &.{}, &.{}, &.{}, compute_budget.resolve(.{ .tier = .medium }), &exhaustion);
+    defer deinitTestHypotheses(allocator, h1);
+    var exhaustion2: ?compute_budget.Exhaustion = null;
+    defer if (exhaustion2) |*ex| ex.deinit();
+    const h2 = try constructHypothesesFromPipelineState(allocator, "doc", "document_schema", &.{}, &entities, &.{}, &.{}, &.{}, compute_budget.resolve(.{ .tier = .medium }), &exhaustion2);
+    defer deinitTestHypotheses(allocator, h2);
+    try std.testing.expectEqual(h1.len, h2.len);
+    try std.testing.expectEqual(hypothesis_core.HypothesisKind.possible_ambiguity, h1[0].hypothesis_kind);
+    try std.testing.expectEqualStrings(h1[0].id, h2[0].id);
+}
+
+test "non-code and code artifacts use the same hypothesis generation rules" {
+    const allocator = std.testing.allocator;
+    var registry = SchemaRegistry.init(allocator);
+    defer registry.deinit();
+    try registerBuiltinSchemas(&registry);
+    var doc = try Artifact.init(allocator, "doc-h", .repo, .document, "test:doc", .project, "md", "docs/runbook.md", null);
+    defer doc.deinit(allocator);
+    var code = try Artifact.init(allocator, "code-h", .repo, .file, "test:code", .project, "zig", "src/main.zig", null);
+    defer code.deinit(allocator);
+    var doc_result = try ingestArtifact(allocator, &doc, "# Contract\n\nThis paragraph has enough text to become a paragraph entity.\n", &.{ .registry = &registry });
+    defer doc_result.deinit();
+    var code_result = try ingestArtifact(allocator, &code, "const Worker = struct {};\npub fn run() void {}\n", &.{ .registry = &registry });
+    defer code_result.deinit();
+    try std.testing.expect(doc_result.hypotheses.len > 0);
+    try std.testing.expect(code_result.hypotheses.len > 0);
+    try std.testing.expect(!std.mem.eql(u8, doc_result.hypotheses[0].source_rule, "code"));
+    try std.testing.expect(!std.mem.eql(u8, code_result.hypotheses[0].source_rule, "code"));
+    try std.testing.expect(doc_result.hypotheses[0].non_authorizing);
+    try std.testing.expect(code_result.hypotheses[0].non_authorizing);
+}
+
+test "budget caps limit generated hypotheses deterministically" {
+    const allocator = std.testing.allocator;
+    var exhaustion: ?compute_budget.Exhaustion = null;
+    defer if (exhaustion) |*ex| ex.deinit();
+    const obligations = [_]Obligation{
+        .{ .id = "obl:1", .label = "verify one", .scope = "s", .entity_id = "e1", .pending = true },
+        .{ .id = "obl:2", .label = "verify two", .scope = "s", .entity_id = "e2", .pending = true },
+    };
+    const budget = compute_budget.resolve(.{ .tier = .low, .overrides = .{ .max_hypotheses_generated = 1 } });
+    const hypotheses = try constructHypothesesFromPipelineState(allocator, "a", "s", &.{}, &.{}, &.{}, &obligations, &.{}, budget, &exhaustion);
+    defer deinitTestHypotheses(allocator, hypotheses);
+    try std.testing.expectEqual(@as(usize, 1), hypotheses.len);
+    try std.testing.expect(exhaustion != null);
 }

@@ -19,21 +19,21 @@ pub const DEFAULT_PORT: u16 = 47470; // "GHOST" on a phone keypad = 44678, but w
 
 // ── Packet Types ──
 pub const PacketType = enum(u8) {
-    myelin_lock = 0x01,   // A slot has been myelinated (MSB set)
-    heartbeat   = 0x02,   // Periodic liveness probe
-    lattice_lock = 0x03,  // A lattice entry has saturated (MSB set on u16)
-    gossip_hash = 0x04,   // Rolling checksum gossip to detect desync
+    myelin_lock = 0x01, // A slot has been myelinated (MSB set)
+    heartbeat = 0x02, // Periodic liveness probe
+    lattice_lock = 0x03, // A lattice entry has saturated (MSB set on u16)
+    gossip_hash = 0x04, // Rolling checksum gossip to detect desync
 };
 
 // ── Saturation Sync Packet (16 bytes, fixed) ──
 // Broadcast when a MeaningMatrix accumulator crosses the saturation threshold.
 // The receiver flips the MSB on its local copy without needing any data transfer.
 pub const MyelinPacket = extern struct {
-    magic: u16 = CLUSTER_MAGIC,  // [0..1]  Protocol identifier
+    magic: u16 = CLUSTER_MAGIC, // [0..1]  Protocol identifier
     version: u8 = CLUSTER_VERSION, // [2]     Version tag
     ptype: u8 = @intFromEnum(PacketType.myelin_lock), // [3] Packet type
-    slot_index: u32 = 0,         // [4..7]  Which MeaningMatrix slot was locked
-    tag_hash: u64 = 0,           // [8..15] The FNV-1a tag of the concept that was locked
+    slot_index: u32 = 0, // [4..7]  Which MeaningMatrix slot was locked
+    tag_hash: u64 = 0, // [8..15] The FNV-1a tag of the concept that was locked
 
     pub fn validate(self: *const MyelinPacket) bool {
         return self.magic == CLUSTER_MAGIC and self.version == CLUSTER_VERSION;
@@ -45,9 +45,9 @@ pub const GossipPacket = extern struct {
     magic: u16 = CLUSTER_MAGIC,
     version: u8 = CLUSTER_VERSION,
     ptype: u8 = @intFromEnum(PacketType.gossip_hash),
-    node_id: u32 = 0,             // V29.1: Prevents self-echoing
+    node_id: u32 = 0, // V29.1: Prevents self-echoing
     slot_index: u32 = 0,
-    slot_hash: u64 = 0,           // slot_hash starts at offset 8, making GossipPacket 16 bytes
+    slot_hash: u64 = 0, // slot_hash starts at offset 8, making GossipPacket 16 bytes
 
     pub fn validate(self: *const GossipPacket) bool {
         return self.magic == CLUSTER_MAGIC and self.version == CLUSTER_VERSION;
@@ -59,10 +59,10 @@ pub const HeartbeatPacket = extern struct {
     magic: u16 = CLUSTER_MAGIC,
     version: u8 = CLUSTER_VERSION,
     ptype: u8 = @intFromEnum(PacketType.heartbeat),
-    node_id: u32 = 0,           // [4..7]  Random node identifier
-    uptime_sec: u32 = 0,        // [8..11] Seconds since node boot
-    tcp_port: u16 = 0,          // [12..13] V29.1: Explicit sync listener port
-    _pad: u16 = 0,              // [14..15] Alignment padding
+    node_id: u32 = 0, // [4..7]  Random node identifier
+    uptime_sec: u32 = 0, // [8..11] Seconds since node boot
+    tcp_port: u16 = 0, // [12..13] V29.1: Explicit sync listener port
+    _pad: u16 = 0, // [14..15] Alignment padding
 
     pub fn validate(self: *const HeartbeatPacket) bool {
         return self.magic == CLUSTER_MAGIC and self.version == CLUSTER_VERSION;
@@ -74,8 +74,8 @@ pub const LatticeLockPacket = extern struct {
     magic: u16 = CLUSTER_MAGIC,
     version: u8 = CLUSTER_VERSION,
     ptype: u8 = @intFromEnum(PacketType.lattice_lock),
-    entry_index: u32 = 0,        // [4..7]  Which lattice u16 entry was locked
-    lock_value: u16 = 0,         // [8..9]  The value with MSB set
+    entry_index: u32 = 0, // [4..7]  Which lattice u16 entry was locked
+    lock_value: u16 = 0, // [8..9]  The value with MSB set
     _pad: [6]u8 = [_]u8{0} ** 6, // [10..15] Alignment padding
 
     pub fn validate(self: *const LatticeLockPacket) bool {
@@ -466,7 +466,7 @@ pub const ClusterNode = struct {
                 if (err == error.SocketNotListening or err == error.FileDescriptorBad or err == error.ConnectionAborted) break;
                 continue; // Ignore transient errors
             };
-            
+
             // Handle request inline (simple blocking logic, fine for slow background sync)
             var req_buf: [4]u8 = undefined;
             const n = std.posix.recv(client_fd, &req_buf, 0) catch 0;
@@ -491,20 +491,20 @@ pub const ClusterNode = struct {
         var current_slot: u32 = 0;
         while (self.is_active.load(.acquire)) {
             // V29.1: Increased gossip rate (10ms wait = 100 slots/sec)
-            sys.sleep(10); 
+            sys.sleep(10);
             const slots = self.matrix_slots;
             if (slots == 0) continue;
-            
+
             const data = self.meaning_matrix_data orelse continue;
-            
+
             current_slot = (current_slot + 1) % slots;
             const base = @as(usize, current_slot) * 1024;
             const end = base + 1024;
             if (end > data.len) continue;
-            
+
             const bytes = std.mem.sliceAsBytes(data[base..end]);
             const hash = ghost_state.wyhash(0, @as(u64, @truncate(std.hash.Wyhash.hash(0, bytes))));
-            
+
             const packet = GossipPacket{
                 .node_id = self.node_id,
                 .slot_index = current_slot,
@@ -541,8 +541,8 @@ pub const ClusterNode = struct {
 
             const p = peer orelse return; // Can't sync if we haven't seen a heartbeat yet
 
-            sys.print("[GOSSIP] Hash mismatch on slot {d} with node {X:0>8}! Syncing via TCP port {d}...\n", .{pkt.slot_index, p.node_id, p.tcp_port});
-            
+            sys.print("[GOSSIP] Hash mismatch on slot {d} with node {X:0>8}! Syncing via TCP port {d}...\n", .{ pkt.slot_index, p.node_id, p.tcp_port });
+
             // Connect back via TCP to pull the exact slot
             const tcp_sock = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP) catch return;
             defer std.posix.close(tcp_sock);

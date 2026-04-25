@@ -1004,9 +1004,19 @@ fn collectConceptPreview(allocator: std.mem.Allocator, abstraction_catalog_abs_p
     var lines = std.mem.tokenizeScalar(u8, bytes, '\n');
     while (lines.next()) |line_raw| {
         const line = std.mem.trimRight(u8, line_raw, "\r");
-        if (!std.mem.startsWith(u8, line, "concept ")) continue;
-        count += 1;
-        try store.appendPreviewItem(allocator, out, line["concept ".len..]);
+        if (std.mem.startsWith(u8, line, "concept ")) {
+            count += 1;
+            try store.appendPreviewItem(allocator, out, line["concept ".len..]);
+        } else if (std.mem.startsWith(u8, line, "schema_entity_signal ") or
+            std.mem.startsWith(u8, line, "schema_relation_signal ") or
+            std.mem.startsWith(u8, line, "obligation_signal ") or
+            std.mem.startsWith(u8, line, "anchor_signal ") or
+            std.mem.startsWith(u8, line, "verifier_hint_signal ") or
+            std.mem.startsWith(u8, line, "schema_signal "))
+        {
+            const value_start = (std.mem.indexOfScalar(u8, line, ' ') orelse continue) + 1;
+            try store.appendPreviewItem(allocator, out, line[value_start..]);
+        }
     }
     return count;
 }

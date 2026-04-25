@@ -55,7 +55,7 @@ pub const SovereignSurveillance = struct {
                 _ = iter.next(); // "QUERY"
                 const lex_hex = iter.next() orelse continue;
                 const sem_hex = iter.next() orelse continue;
-                
+
                 const lex = std.fmt.parseInt(u64, lex_hex, 16) catch 0;
                 const sem = std.fmt.parseInt(u64, sem_hex, 16) catch 0;
 
@@ -79,7 +79,7 @@ pub const SovereignSurveillance = struct {
                 }
 
                 var resp_buf: [128]u8 = undefined;
-                const resp = try std.fmt.bufPrint(&resp_buf, "RESONANCE {x} {d}\n", .{best_cp, best_energy});
+                const resp = try std.fmt.bufPrint(&resp_buf, "RESONANCE {x} {d}\n", .{ best_cp, best_energy });
                 _ = try sys.os_layer.writeAll(hPipe, resp);
             } else if (std.mem.startsWith(u8, cmd, "ETCH")) {
                 const content = cmd[5..];
@@ -90,5 +90,4 @@ pub const SovereignSurveillance = struct {
             }
         }
     }
-
 };

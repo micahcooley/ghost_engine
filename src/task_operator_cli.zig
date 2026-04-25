@@ -4,6 +4,7 @@ const compute_budget = core.compute_budget;
 const conversation_session = core.conversation_session;
 const external_evidence = core.external_evidence;
 const operator_workflow = core.operator_workflow;
+const response_engine = core.response_engine;
 const sys = core.sys;
 
 const Command = enum {
@@ -65,6 +66,9 @@ pub fn main() !void {
     var other_target: ?[]const u8 = null;
     var patch_caps = core.patch_candidates.Caps{};
     var compute_request: compute_budget.Request = .{};
+    var requested_reasoning: ?response_engine.ReasoningLevel = null;
+    var compute_tier_explicit = false;
+    var advanced = false;
     var evidence_urls = std.ArrayList([]const u8).init(allocator);
     defer evidence_urls.deinit();
     var evidence_queries = std.ArrayList(external_evidence.QueryInput).init(allocator);
@@ -112,10 +116,18 @@ pub fn main() !void {
         } else if (std.mem.startsWith(u8, arg, "--max-lines=")) {
             patch_caps.max_lines_per_hunk = std.fmt.parseUnsigned(u32, arg["--max-lines=".len..], 10) catch patch_caps.max_lines_per_hunk;
         } else if (std.mem.startsWith(u8, arg, "--compute-tier=")) {
+            compute_tier_explicit = true;
             compute_request.tier = parseComputeTier(arg["--compute-tier=".len..]) orelse {
                 printUsage();
                 return error.InvalidArguments;
             };
+        } else if (std.mem.startsWith(u8, arg, "--reasoning=")) {
+            requested_reasoning = response_engine.parseReasoningLevel(arg["--reasoning=".len..]) orelse {
+                sys.print("invalid --reasoning value; expected quick, balanced, deep, or max\n", .{});
+                return error.InvalidArguments;
+            };
+        } else if (std.mem.eql(u8, arg, "--advanced")) {
+            advanced = true;
         } else if (std.mem.startsWith(u8, arg, "--budget-max-branches=")) {
             compute_request.overrides.max_branches = std.fmt.parseUnsigned(u32, arg["--budget-max-branches=".len..], 10) catch null;
         } else if (std.mem.startsWith(u8, arg, "--budget-max-proof-queue=")) {
@@ -158,6 +170,15 @@ pub fn main() !void {
         } else {
             try positionals.append(arg);
         }
+    }
+
+    const reasoning_level = requested_reasoning orelse .balanced;
+    if (requested_reasoning != null and compute_tier_explicit and !advanced) {
+        sys.print("--reasoning and --compute-tier cannot be combined unless --advanced is set\n", .{});
+        return error.InvalidArguments;
+    }
+    if (requested_reasoning != null and !compute_tier_explicit) {
+        compute_request.tier = response_engine.computeTierForReasoningLevel(reasoning_level);
     }
 
     const evidence_request = if (evidence_urls.items.len > 0 or evidence_queries.items.len > 0)
@@ -323,6 +344,7 @@ pub fn main() !void {
                 .message = message,
                 .context_artifacts = context_artifacts.items,
                 .compute_budget_request = compute_request,
+                .reasoning_level = reasoning_level,
             });
             defer result.deinit();
             const rendered = switch (render_mode) {
@@ -403,7 +425,7 @@ fn looksLikePath(value: []const u8) bool {
 
 fn printUsage() void {
     sys.print(
-        "Usage: ghost_task_operator <project|start|run|resume|show|support|inspect|plan|verify|oracle|chat|replay> [args] [--intent=text] [--message=text] [--context-artifact=id] [--repo=/abs/path] [--project-shard=id] [--task-id=id] [--request=text] [--evidence-url=url] [--evidence-query=text] [--compute-tier=auto|low|medium|high|max] [--budget-max-branches=N] [--budget-max-proof-queue=N] [--budget-max-repairs=N] [--budget-max-mounted-packs=N] [--budget-max-activated-packs=N] [--budget-max-pack-surfaces=N] [--budget-max-graph-nodes=N] [--budget-max-obligations=N] [--budget-max-ambiguity-sets=N] [--budget-max-runtime-checks=N] [--budget-max-wall-ms=N] [--budget-max-temp-bytes=N] [--max-steps=N] [--max-items=N] [--max-candidates=N] [--max-files=N] [--max-hunks=N] [--max-lines=N] [--reopen] [--no-panic-dump] [--no-external] [--render=summary|concise|json|report]\n",
+        "Usage: ghost_task_operator <project|start|run|resume|show|support|inspect|plan|verify|oracle|chat|replay> [args] [--intent=text] [--message=text] [--reasoning=quick|balanced|deep|max] [--context-artifact=id] [--repo=/abs/path] [--project-shard=id] [--task-id=id] [--request=text] [--evidence-url=url] [--evidence-query=text] [--max-steps=N] [--max-items=N] [--max-candidates=N] [--max-files=N] [--max-hunks=N] [--max-lines=N] [--reopen] [--no-panic-dump] [--no-external] [--render=summary|concise|json|report]\n\nExamples:\n  ghost_task_operator chat --message=\"explain this\" --reasoning=quick\n  ghost_task_operator chat --message=\"fix this bug\" --reasoning=deep\n  ghost_task_operator chat --message=\"verify and apply this\" --reasoning=max\n\nAdvanced/debug: --advanced allows explicit --compute-tier=auto|low|medium|high|max and --budget-max-* overrides. If --reasoning and --compute-tier are both provided, --compute-tier wins only with --advanced.\n",
         .{},
     );
 }

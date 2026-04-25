@@ -9,6 +9,7 @@ const config = core.config;
 const execution = core.execution;
 const external_evidence = core.external_evidence;
 const feedback = core.feedback;
+const hypothesis_core = core.hypothesis_core;
 const intent_grounding = core.intent_grounding;
 const knowledge_packs = core.knowledge_packs;
 const mc = core.inference;
@@ -248,6 +249,42 @@ const CaseResult = struct {
     routing_skipped_count: u32 = 0,
     routing_suppressed_count: u32 = 0,
     routing_budget_cap_hit_count: u32 = 0,
+    retained_token_signal_count: u32 = 0,
+    retained_pattern_signal_count: u32 = 0,
+    schema_entity_signal_count: u32 = 0,
+    schema_relation_signal_count: u32 = 0,
+    obligation_signal_count: u32 = 0,
+    anchor_signal_count: u32 = 0,
+    verifier_hint_signal_count: u32 = 0,
+    fallback_signal_used_count: u32 = 0,
+    generated_hypothesis_count: u32 = 0,
+    selected_hypothesis_count: u32 = 0,
+    suppressed_hypothesis_count: u32 = 0,
+    hypothesis_triage_selected_count: u32 = 0,
+    hypothesis_triage_suppressed_count: u32 = 0,
+    hypothesis_duplicate_count: u32 = 0,
+    hypothesis_budget_hit_count: u32 = 0,
+    selected_code_hypothesis_count: u32 = 0,
+    selected_non_code_hypothesis_count: u32 = 0,
+    top_selected_hypothesis_kinds: [@typeInfo(hypothesis_core.HypothesisKind).@"enum".fields.len]u32 = [_]u32{0} ** @typeInfo(hypothesis_core.HypothesisKind).@"enum".fields.len,
+    hypothesis_generation_budget_hit_count: u32 = 0,
+    hypothesis_generation_rules_fired: u32 = 0,
+    non_code_hypothesis_count: u32 = 0,
+    code_hypothesis_count: u32 = 0,
+    hypothesis_verifier_eligible_count: u32 = 0,
+    hypothesis_verifier_scheduled_count: u32 = 0,
+    hypothesis_verifier_completed_count: u32 = 0,
+    hypothesis_verifier_blocked_count: u32 = 0,
+    hypothesis_verifier_skipped_count: u32 = 0,
+    hypothesis_verifier_budget_exhausted_count: u32 = 0,
+    code_hypothesis_verifier_job_count: u32 = 0,
+    non_code_hypothesis_verifier_job_count: u32 = 0,
+    verifier_candidate_proposed_count: u32 = 0,
+    verifier_candidate_blocked_count: u32 = 0,
+    verifier_candidate_materialized_count: u32 = 0,
+    verifier_candidate_budget_hit_count: u32 = 0,
+    code_verifier_candidate_count: u32 = 0,
+    non_code_verifier_candidate_count: u32 = 0,
     pack_mount_resolve_ms: u64 = 0,
     pack_manifest_preview_load_ms: u64 = 0,
     pack_routing_ms: u64 = 0,
@@ -380,6 +417,42 @@ const Metrics = struct {
     routing_skipped_count: u32 = 0,
     routing_suppressed_count: u32 = 0,
     routing_budget_cap_hit_count: u32 = 0,
+    retained_token_signal_count: u32 = 0,
+    retained_pattern_signal_count: u32 = 0,
+    schema_entity_signal_count: u32 = 0,
+    schema_relation_signal_count: u32 = 0,
+    obligation_signal_count: u32 = 0,
+    anchor_signal_count: u32 = 0,
+    verifier_hint_signal_count: u32 = 0,
+    fallback_signal_used_count: u32 = 0,
+    generated_hypothesis_count: u32 = 0,
+    selected_hypothesis_count: u32 = 0,
+    suppressed_hypothesis_count: u32 = 0,
+    hypothesis_triage_selected_count: u32 = 0,
+    hypothesis_triage_suppressed_count: u32 = 0,
+    hypothesis_duplicate_count: u32 = 0,
+    hypothesis_budget_hit_count: u32 = 0,
+    selected_code_hypothesis_count: u32 = 0,
+    selected_non_code_hypothesis_count: u32 = 0,
+    top_selected_hypothesis_kinds: [@typeInfo(hypothesis_core.HypothesisKind).@"enum".fields.len]u32 = [_]u32{0} ** @typeInfo(hypothesis_core.HypothesisKind).@"enum".fields.len,
+    hypothesis_generation_budget_hit_count: u32 = 0,
+    hypothesis_generation_rules_fired: u32 = 0,
+    non_code_hypothesis_count: u32 = 0,
+    code_hypothesis_count: u32 = 0,
+    hypothesis_verifier_eligible_count: u32 = 0,
+    hypothesis_verifier_scheduled_count: u32 = 0,
+    hypothesis_verifier_completed_count: u32 = 0,
+    hypothesis_verifier_blocked_count: u32 = 0,
+    hypothesis_verifier_skipped_count: u32 = 0,
+    hypothesis_verifier_budget_exhausted_count: u32 = 0,
+    code_hypothesis_verifier_job_count: u32 = 0,
+    non_code_hypothesis_verifier_job_count: u32 = 0,
+    verifier_candidate_proposed_count: u32 = 0,
+    verifier_candidate_blocked_count: u32 = 0,
+    verifier_candidate_materialized_count: u32 = 0,
+    verifier_candidate_budget_hit_count: u32 = 0,
+    code_verifier_candidate_count: u32 = 0,
+    non_code_verifier_candidate_count: u32 = 0,
     pack_mount_resolve_ms: u64 = 0,
     pack_manifest_preview_load_ms: u64 = 0,
     pack_routing_ms: u64 = 0,
@@ -1467,6 +1540,36 @@ fn measurePhase3LatencyProbes(allocator: std.mem.Allocator, metrics: *Metrics) !
     );
     defer pipeline.deinit();
     metrics.artifact_schema_pipeline_ms += sys.getMilliTick() - pipeline_started;
+    metrics.retained_token_signal_count += pipeline.discovery_signals.retained_token_signal_count;
+    metrics.retained_pattern_signal_count += pipeline.discovery_signals.retained_pattern_signal_count;
+    metrics.schema_entity_signal_count += pipeline.discovery_signals.schema_entity_signal_count;
+    metrics.schema_relation_signal_count += pipeline.discovery_signals.schema_relation_signal_count;
+    metrics.obligation_signal_count += pipeline.discovery_signals.obligation_signal_count;
+    metrics.anchor_signal_count += pipeline.discovery_signals.anchor_signal_count;
+    metrics.verifier_hint_signal_count += pipeline.discovery_signals.verifier_hint_signal_count;
+    if (pipeline.discovery_signals.fallback_signal_used) metrics.fallback_signal_used_count += 1;
+    recordPipelineHypotheses(metrics, &pipeline);
+
+    var doc_artifact = try artifact_schema.Artifact.init(
+        allocator,
+        "phase3-hypothesis-doc",
+        .repo,
+        .document,
+        "bench_phase3_hypothesis_doc",
+        .project,
+        "md",
+        "docs/contract.md",
+        null,
+    );
+    defer doc_artifact.deinit(allocator);
+    var doc_pipeline = try artifact_schema.ingestArtifact(
+        allocator,
+        &doc_artifact,
+        "# Runtime Contract\n\nThis contract says the observed retry window must match the configured retry window.\n",
+        &pipeline_options,
+    );
+    defer doc_pipeline.deinit();
+    recordPipelineHypotheses(metrics, &doc_pipeline);
 
     var registry = verifier_adapter.Registry.init(allocator);
     defer registry.deinit();
@@ -1521,6 +1624,99 @@ fn countResponseMode(metrics: *Metrics, mode: response_engine.ResponseMode) void
         .deep_path => metrics.response_deep_path_count += 1,
         .auto_path => {},
     }
+}
+
+fn recordPipelineHypotheses(metrics: *Metrics, pipeline: *const artifact_schema.PipelineResult) void {
+    const summary = hypothesis_core.counts(pipeline.hypotheses);
+    metrics.generated_hypothesis_count += @intCast(summary.total_count);
+    if (pipeline.hypothesis_budget_exhaustion != null) {
+        metrics.hypothesis_generation_budget_hit_count += 1;
+        metrics.suppressed_hypothesis_count += 1;
+    }
+    var triage_result = hypothesis_core.triage(std.heap.page_allocator, pipeline.hypotheses, .{
+        .max_hypotheses_selected = 3,
+        .max_hypotheses_per_artifact = 2,
+        .max_hypotheses_per_kind = 2,
+        .max_duplicate_groups_traced = 8,
+    }) catch null;
+    if (triage_result) |*triaged| {
+        defer triaged.deinit();
+        metrics.selected_hypothesis_count += @intCast(triaged.selected);
+        metrics.suppressed_hypothesis_count += @intCast(triaged.suppressed + triaged.duplicates + triaged.blocked + triaged.deferred);
+        metrics.hypothesis_triage_selected_count += @intCast(triaged.selected);
+        metrics.hypothesis_triage_suppressed_count += @intCast(triaged.suppressed + triaged.blocked + triaged.deferred);
+        metrics.hypothesis_duplicate_count += @intCast(triaged.duplicates);
+        metrics.hypothesis_budget_hit_count += @intCast(triaged.budget_hits);
+        metrics.selected_code_hypothesis_count += @intCast(triaged.selected_code_count);
+        metrics.selected_non_code_hypothesis_count += @intCast(triaged.selected_non_code_count);
+        for (triaged.items, 0..) |item, idx| {
+            if (!item.selected_for_next_stage) continue;
+            const kind_idx = @intFromEnum(pipeline.hypotheses[idx].hypothesis_kind);
+            metrics.top_selected_hypothesis_kinds[kind_idx] += 1;
+        }
+        var registry = verifier_adapter.Registry.init(std.heap.page_allocator);
+        defer registry.deinit();
+        verifier_adapter.registerBuiltinAdapters(&registry) catch {};
+        var tracker = verifier_adapter.BudgetTracker.init(std.heap.page_allocator, compute_budget.resolve(.{ .tier = .medium }));
+        const artifact: ?*const artifact_schema.Artifact = if (pipeline.artifacts.len > 0) &pipeline.artifacts[0] else null;
+        var handoff = verifier_adapter.handoffSelectedHypotheses(
+            std.heap.page_allocator,
+            &registry,
+            &tracker,
+            pipeline.hypotheses,
+            triaged.*,
+            .{
+                .artifact = artifact,
+                .entities = pipeline.entities,
+                .relations = pipeline.relations,
+                .obligations = pipeline.obligations,
+                .fragments = pipeline.fragments,
+            },
+            .deep,
+        ) catch null;
+        if (handoff) |*value| {
+            defer value.deinit();
+            metrics.hypothesis_verifier_eligible_count += @intCast(value.eligible_count);
+            metrics.hypothesis_verifier_scheduled_count += @intCast(value.scheduled_count);
+            metrics.hypothesis_verifier_completed_count += @intCast(value.completed_count);
+            metrics.hypothesis_verifier_blocked_count += @intCast(value.blocked_count);
+            metrics.hypothesis_verifier_skipped_count += @intCast(value.skipped_count);
+            metrics.hypothesis_verifier_budget_exhausted_count += @intCast(value.budget_exhausted_count);
+            metrics.code_hypothesis_verifier_job_count += @intCast(value.code_job_count);
+            metrics.non_code_hypothesis_verifier_job_count += @intCast(value.non_code_job_count);
+            metrics.verifier_candidate_proposed_count += @intCast(value.verifier_candidate_proposed_count);
+            metrics.verifier_candidate_blocked_count += @intCast(value.verifier_candidate_blocked_count);
+            metrics.verifier_candidate_materialized_count += @intCast(value.verifier_candidate_materialized_count);
+            metrics.verifier_candidate_budget_hit_count += @intCast(value.verifier_candidate_budget_exhausted_count);
+            metrics.code_verifier_candidate_count += @intCast(value.code_verifier_candidate_count);
+            metrics.non_code_verifier_candidate_count += @intCast(value.non_code_verifier_candidate_count);
+        }
+    } else {
+        metrics.selected_hypothesis_count += @intCast(summary.selected_count);
+    }
+    metrics.hypothesis_generation_rules_fired += @intCast(countPipelineHypothesisRulesFired(pipeline.hypotheses));
+    for (pipeline.hypotheses) |hypothesis| {
+        if (std.mem.eql(u8, hypothesis.schema_name, "code_artifact_schema")) {
+            metrics.code_hypothesis_count += 1;
+        } else {
+            metrics.non_code_hypothesis_count += 1;
+        }
+    }
+}
+
+fn countPipelineHypothesisRulesFired(hypotheses: []const hypothesis_core.Hypothesis) usize {
+    var count: usize = 0;
+    for (hypotheses, 0..) |item, idx| {
+        var seen = false;
+        for (hypotheses[0..idx]) |prior| {
+            if (std.mem.eql(u8, item.source_rule, prior.source_rule)) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) count += 1;
+    }
+    return count;
 }
 
 fn recordPhase3VerifierResult(metrics: *Metrics, result: *const verifier_adapter.Result) void {
@@ -3377,7 +3573,7 @@ fn renderJsonReport(allocator: std.mem.Allocator, metrics: *const Metrics, resul
         scaledFraction(metrics.reinforcement_event_count, metrics.total_cases),
         metrics.unsupported_proof_admission_block_count,
     });
-    try writer.print(",\"repoScanMs\":{d},\"cacheRefreshMs\":{d},\"indexMaterializeMs\":{d},\"routingIndexBuildMs\":{d},\"routingCandidatesConsidered\":{d},\"routingCandidatesSelected\":{d},\"routingCandidatesSkipped\":{d},\"routingCandidatesSuppressed\":{d},\"routingBudgetCapHits\":{d},\"packMountResolveMs\":{d},\"packManifestPreviewLoadMs\":{d},\"packRoutingMs\":{d},\"packCatalogLoadMs\":{d},\"packCandidateSurfaceCount\":{d},\"packActivatedCount\":{d},\"packSkippedCount\":{d},\"packBudgetCapsHitCount\":{d},\"packLocalTruthWinCount\":{d},\"supportGraphBuildMs\":{d}", .{
+    try writer.print(",\"repoScanMs\":{d},\"cacheRefreshMs\":{d},\"indexMaterializeMs\":{d},\"routingIndexBuildMs\":{d},\"routingCandidatesConsidered\":{d},\"routingCandidatesSelected\":{d},\"routingCandidatesSkipped\":{d},\"routingCandidatesSuppressed\":{d},\"routingBudgetCapHits\":{d},\"retainedTokenSignalCount\":{d},\"retainedPatternSignalCount\":{d},\"schemaEntitySignalCount\":{d},\"schemaRelationSignalCount\":{d},\"obligationSignalCount\":{d},\"anchorSignalCount\":{d},\"verifierHintSignalCount\":{d},\"fallbackSignalUsedCount\":{d}", .{
         metrics.repo_scan_ms,
         metrics.cache_refresh_ms,
         metrics.index_materialize_ms,
@@ -3387,6 +3583,47 @@ fn renderJsonReport(allocator: std.mem.Allocator, metrics: *const Metrics, resul
         metrics.routing_skipped_count,
         metrics.routing_suppressed_count,
         metrics.routing_budget_cap_hit_count,
+        metrics.retained_token_signal_count,
+        metrics.retained_pattern_signal_count,
+        metrics.schema_entity_signal_count,
+        metrics.schema_relation_signal_count,
+        metrics.obligation_signal_count,
+        metrics.anchor_signal_count,
+        metrics.verifier_hint_signal_count,
+        metrics.fallback_signal_used_count,
+    });
+    try writer.print(",\"generatedHypothesisCount\":{d},\"selectedHypothesisCount\":{d},\"suppressedHypothesisCount\":{d},\"hypothesisGenerationBudgetHitCount\":{d},\"hypothesisGenerationRulesFired\":{d},\"codeHypothesisCount\":{d},\"nonCodeHypothesisCount\":{d},\"hypothesisTriageSelectedCount\":{d},\"hypothesisTriageSuppressedCount\":{d},\"hypothesisDuplicateCount\":{d},\"hypothesisBudgetHitCount\":{d},\"selectedCodeHypothesisCount\":{d},\"selectedNonCodeHypothesisCount\":{d},\"hypothesisVerifierEligibleCount\":{d},\"hypothesisVerifierScheduledCount\":{d},\"hypothesisVerifierCompletedCount\":{d},\"hypothesisVerifierBlockedCount\":{d},\"hypothesisVerifierSkippedCount\":{d},\"hypothesisVerifierBudgetExhaustedCount\":{d},\"codeHypothesisVerifierJobCount\":{d},\"nonCodeHypothesisVerifierJobCount\":{d},\"verifierCandidateProposedCount\":{d},\"verifierCandidateBlockedCount\":{d},\"verifierCandidateMaterializedCount\":{d},\"verifierCandidateBudgetHitCount\":{d},\"codeVerifierCandidateCount\":{d},\"nonCodeVerifierCandidateCount\":{d}", .{
+        metrics.generated_hypothesis_count,
+        metrics.selected_hypothesis_count,
+        metrics.suppressed_hypothesis_count,
+        metrics.hypothesis_generation_budget_hit_count,
+        metrics.hypothesis_generation_rules_fired,
+        metrics.code_hypothesis_count,
+        metrics.non_code_hypothesis_count,
+        metrics.hypothesis_triage_selected_count,
+        metrics.hypothesis_triage_suppressed_count,
+        metrics.hypothesis_duplicate_count,
+        metrics.hypothesis_budget_hit_count,
+        metrics.selected_code_hypothesis_count,
+        metrics.selected_non_code_hypothesis_count,
+        metrics.hypothesis_verifier_eligible_count,
+        metrics.hypothesis_verifier_scheduled_count,
+        metrics.hypothesis_verifier_completed_count,
+        metrics.hypothesis_verifier_blocked_count,
+        metrics.hypothesis_verifier_skipped_count,
+        metrics.hypothesis_verifier_budget_exhausted_count,
+        metrics.code_hypothesis_verifier_job_count,
+        metrics.non_code_hypothesis_verifier_job_count,
+        metrics.verifier_candidate_proposed_count,
+        metrics.verifier_candidate_blocked_count,
+        metrics.verifier_candidate_materialized_count,
+        metrics.verifier_candidate_budget_hit_count,
+        metrics.code_verifier_candidate_count,
+        metrics.non_code_verifier_candidate_count,
+    });
+    try writer.writeAll(",\"topSelectedHypothesisKinds\":");
+    try writeTopSelectedHypothesisKindsJson(writer, &metrics.top_selected_hypothesis_kinds);
+    try writer.print(",\"packMountResolveMs\":{d},\"packManifestPreviewLoadMs\":{d},\"packRoutingMs\":{d},\"packCatalogLoadMs\":{d},\"packCandidateSurfaceCount\":{d},\"packActivatedCount\":{d},\"packSkippedCount\":{d},\"packBudgetCapsHitCount\":{d},\"packLocalTruthWinCount\":{d},\"supportGraphBuildMs\":{d}", .{
         metrics.pack_mount_resolve_ms,
         metrics.pack_manifest_preview_load_ms,
         metrics.pack_routing_ms,
@@ -3646,6 +3883,51 @@ fn renderMarkdownReport(allocator: std.mem.Allocator, metrics: *const Metrics, r
         metrics.routing_skipped_count,
         metrics.routing_suppressed_count,
         metrics.routing_budget_cap_hit_count,
+    });
+    try writer.print("- discovery signals: retained_token={d}, retained_pattern={d}, schema_entity={d}, schema_relation={d}, obligation={d}, anchor={d}, verifier_hint={d}, fallback_used={d}\n", .{
+        metrics.retained_token_signal_count,
+        metrics.retained_pattern_signal_count,
+        metrics.schema_entity_signal_count,
+        metrics.schema_relation_signal_count,
+        metrics.obligation_signal_count,
+        metrics.anchor_signal_count,
+        metrics.verifier_hint_signal_count,
+        metrics.fallback_signal_used_count,
+    });
+    try writer.print("- universal hypotheses: generated={d}, selected={d}, suppressed={d}, budget_hits={d}, rules_fired={d}, code={d}, non_code={d}\n", .{
+        metrics.generated_hypothesis_count,
+        metrics.selected_hypothesis_count,
+        metrics.suppressed_hypothesis_count,
+        metrics.hypothesis_generation_budget_hit_count,
+        metrics.hypothesis_generation_rules_fired,
+        metrics.code_hypothesis_count,
+        metrics.non_code_hypothesis_count,
+    });
+    try writer.print("- hypothesis triage: selected={d}, suppressed={d}, duplicates={d}, budget_hits={d}, selected_code={d}, selected_non_code={d}\n", .{
+        metrics.hypothesis_triage_selected_count,
+        metrics.hypothesis_triage_suppressed_count,
+        metrics.hypothesis_duplicate_count,
+        metrics.hypothesis_budget_hit_count,
+        metrics.selected_code_hypothesis_count,
+        metrics.selected_non_code_hypothesis_count,
+    });
+    try writer.print("- hypothesis verifier handoff: eligible={d}, scheduled={d}, completed={d}, blocked={d}, skipped={d}, budget_exhausted={d}, code_jobs={d}, non_code_jobs={d}\n", .{
+        metrics.hypothesis_verifier_eligible_count,
+        metrics.hypothesis_verifier_scheduled_count,
+        metrics.hypothesis_verifier_completed_count,
+        metrics.hypothesis_verifier_blocked_count,
+        metrics.hypothesis_verifier_skipped_count,
+        metrics.hypothesis_verifier_budget_exhausted_count,
+        metrics.code_hypothesis_verifier_job_count,
+        metrics.non_code_hypothesis_verifier_job_count,
+    });
+    try writer.print("- verifier candidates: proposed={d}, blocked={d}, materialized={d}, budget_hits={d}, code={d}, non_code={d}\n", .{
+        metrics.verifier_candidate_proposed_count,
+        metrics.verifier_candidate_blocked_count,
+        metrics.verifier_candidate_materialized_count,
+        metrics.verifier_candidate_budget_hit_count,
+        metrics.code_verifier_candidate_count,
+        metrics.non_code_verifier_candidate_count,
     });
     try writer.print("- measured pack mount resolve / manifest preview load / pack routing / pack catalog load: {d} / {d} / {d} / {d} ms\n", .{
         metrics.pack_mount_resolve_ms,
@@ -3975,6 +4257,22 @@ fn writeOptionalStringField(writer: anytype, key: []const u8, value: []const u8)
     try writeJsonString(writer, key);
     try writer.writeByte(':');
     try writeJsonString(writer, value);
+}
+
+fn writeTopSelectedHypothesisKindsJson(writer: anytype, counts_by_kind: []const u32) !void {
+    try writer.writeByte('[');
+    var emitted: usize = 0;
+    for (counts_by_kind, 0..) |count, idx| {
+        if (count == 0) continue;
+        if (emitted != 0) try writer.writeByte(',');
+        try writer.writeByte('{');
+        const kind: hypothesis_core.HypothesisKind = @enumFromInt(idx);
+        try writeJsonFieldString(writer, "kind", hypothesis_core.kindName(kind), true);
+        try writer.print(",\"count\":{d}", .{count});
+        try writer.writeByte('}');
+        emitted += 1;
+    }
+    try writer.writeByte(']');
 }
 
 fn writeJsonString(writer: anytype, value: []const u8) !void {

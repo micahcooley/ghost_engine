@@ -26,6 +26,20 @@ pub const Limit = enum {
     max_verifier_time_ms,
     max_external_verifier_runs,
     max_verifier_evidence_bytes,
+    max_hypotheses_generated,
+    max_hypotheses_selected,
+    max_hypothesis_evidence_fragments,
+    max_hypothesis_obligations,
+    max_hypothesis_verifier_needs,
+    max_hypothesis_verifier_jobs,
+    max_hypothesis_verifier_jobs_per_artifact,
+    max_hypothesis_verifier_time_ms,
+    max_hypothesis_verifier_evidence_bytes,
+    max_verifier_candidates_generated,
+    max_verifier_candidate_artifacts,
+    max_verifier_candidate_commands,
+    max_verifier_candidate_bytes,
+    max_verifier_candidate_obligations,
     max_wall_time_ms,
     max_temp_work_bytes,
 };
@@ -49,6 +63,13 @@ pub const Stage = enum {
     artifact_schema_routing,
     support_aware_routing_index,
     artifact_obligation_attachment,
+    hypothesis_generation,
+    hypothesis_selection,
+    hypothesis_evidence_collection,
+    hypothesis_obligation_collection,
+    hypothesis_verifier_need_collection,
+    verifier_candidate_generation,
+    verifier_candidate_artifact_planning,
 };
 
 pub const Overrides = struct {
@@ -69,6 +90,20 @@ pub const Overrides = struct {
     max_verifier_time_ms: ?u32 = null,
     max_external_verifier_runs: ?usize = null,
     max_verifier_evidence_bytes: ?usize = null,
+    max_hypotheses_generated: ?usize = null,
+    max_hypotheses_selected: ?usize = null,
+    max_hypothesis_evidence_fragments: ?usize = null,
+    max_hypothesis_obligations: ?usize = null,
+    max_hypothesis_verifier_needs: ?usize = null,
+    max_hypothesis_verifier_jobs: ?usize = null,
+    max_hypothesis_verifier_jobs_per_artifact: ?usize = null,
+    max_hypothesis_verifier_time_ms: ?u32 = null,
+    max_hypothesis_verifier_evidence_bytes: ?usize = null,
+    max_verifier_candidates_generated: ?usize = null,
+    max_verifier_candidate_artifacts: ?usize = null,
+    max_verifier_candidate_commands: ?usize = null,
+    max_verifier_candidate_bytes: ?usize = null,
+    max_verifier_candidate_obligations: ?usize = null,
     max_wall_time_ms: ?u32 = null,
     max_temp_work_bytes: ?usize = null,
 };
@@ -104,6 +139,20 @@ pub const Effective = struct {
     max_verifier_time_ms: u32,
     max_external_verifier_runs: usize,
     max_verifier_evidence_bytes: usize,
+    max_hypotheses_generated: usize,
+    max_hypotheses_selected: usize,
+    max_hypothesis_evidence_fragments: usize,
+    max_hypothesis_obligations: usize,
+    max_hypothesis_verifier_needs: usize,
+    max_hypothesis_verifier_jobs: usize,
+    max_hypothesis_verifier_jobs_per_artifact: usize,
+    max_hypothesis_verifier_time_ms: u32,
+    max_hypothesis_verifier_evidence_bytes: usize,
+    max_verifier_candidates_generated: usize,
+    max_verifier_candidate_artifacts: usize,
+    max_verifier_candidate_commands: usize,
+    max_verifier_candidate_bytes: usize,
+    max_verifier_candidate_obligations: usize,
     max_wall_time_ms: u32,
     max_temp_work_bytes: usize,
 };
@@ -190,6 +239,20 @@ pub fn resolve(request: Request) Effective {
     applyOverrideU32(&effective.max_verifier_time_ms, request.overrides.max_verifier_time_ms, 1);
     applyOverrideUsize(&effective.max_external_verifier_runs, request.overrides.max_external_verifier_runs, 0);
     applyOverrideUsize(&effective.max_verifier_evidence_bytes, request.overrides.max_verifier_evidence_bytes, 0);
+    applyOverrideUsize(&effective.max_hypotheses_generated, request.overrides.max_hypotheses_generated, 0);
+    applyOverrideUsize(&effective.max_hypotheses_selected, request.overrides.max_hypotheses_selected, 0);
+    applyOverrideUsize(&effective.max_hypothesis_evidence_fragments, request.overrides.max_hypothesis_evidence_fragments, 0);
+    applyOverrideUsize(&effective.max_hypothesis_obligations, request.overrides.max_hypothesis_obligations, 0);
+    applyOverrideUsize(&effective.max_hypothesis_verifier_needs, request.overrides.max_hypothesis_verifier_needs, 0);
+    applyOverrideUsize(&effective.max_hypothesis_verifier_jobs, request.overrides.max_hypothesis_verifier_jobs, 0);
+    applyOverrideUsize(&effective.max_hypothesis_verifier_jobs_per_artifact, request.overrides.max_hypothesis_verifier_jobs_per_artifact, 0);
+    applyOverrideU32(&effective.max_hypothesis_verifier_time_ms, request.overrides.max_hypothesis_verifier_time_ms, 1);
+    applyOverrideUsize(&effective.max_hypothesis_verifier_evidence_bytes, request.overrides.max_hypothesis_verifier_evidence_bytes, 0);
+    applyOverrideUsize(&effective.max_verifier_candidates_generated, request.overrides.max_verifier_candidates_generated, 0);
+    applyOverrideUsize(&effective.max_verifier_candidate_artifacts, request.overrides.max_verifier_candidate_artifacts, 0);
+    applyOverrideUsize(&effective.max_verifier_candidate_commands, request.overrides.max_verifier_candidate_commands, 0);
+    applyOverrideUsize(&effective.max_verifier_candidate_bytes, request.overrides.max_verifier_candidate_bytes, 0);
+    applyOverrideUsize(&effective.max_verifier_candidate_obligations, request.overrides.max_verifier_candidate_obligations, 0);
     applyOverrideU32(&effective.max_wall_time_ms, request.overrides.max_wall_time_ms, 1);
     applyOverrideUsize(&effective.max_temp_work_bytes, request.overrides.max_temp_work_bytes, 1024);
 
@@ -210,6 +273,27 @@ pub fn resolve(request: Request) Effective {
     }
     if (effective.max_proof_queue_size > 4) {
         effective.max_proof_queue_size = 4;
+    }
+    if (effective.max_hypotheses_selected > effective.max_hypotheses_generated) {
+        effective.max_hypotheses_selected = effective.max_hypotheses_generated;
+    }
+    if (effective.max_hypothesis_verifier_jobs > effective.max_hypotheses_selected) {
+        effective.max_hypothesis_verifier_jobs = effective.max_hypotheses_selected;
+    }
+    if (effective.max_hypothesis_verifier_jobs_per_artifact > effective.max_hypothesis_verifier_jobs) {
+        effective.max_hypothesis_verifier_jobs_per_artifact = effective.max_hypothesis_verifier_jobs;
+    }
+    if (effective.max_hypothesis_verifier_time_ms > effective.max_verifier_time_ms) {
+        effective.max_hypothesis_verifier_time_ms = effective.max_verifier_time_ms;
+    }
+    if (effective.max_hypothesis_verifier_evidence_bytes > effective.max_verifier_evidence_bytes) {
+        effective.max_hypothesis_verifier_evidence_bytes = effective.max_verifier_evidence_bytes;
+    }
+    if (effective.max_verifier_candidate_artifacts > effective.max_verifier_candidates_generated) {
+        effective.max_verifier_candidate_artifacts = effective.max_verifier_candidates_generated;
+    }
+    if (effective.max_verifier_candidate_commands > effective.max_verifier_candidates_generated) {
+        effective.max_verifier_candidate_commands = effective.max_verifier_candidates_generated;
     }
     return effective;
 }
@@ -242,6 +326,20 @@ fn preset(tier: Tier) Effective {
             .max_verifier_time_ms = 12_000,
             .max_external_verifier_runs = 3,
             .max_verifier_evidence_bytes = 64 * 1024,
+            .max_hypotheses_generated = 8,
+            .max_hypotheses_selected = 3,
+            .max_hypothesis_evidence_fragments = 3,
+            .max_hypothesis_obligations = 3,
+            .max_hypothesis_verifier_needs = 2,
+            .max_hypothesis_verifier_jobs = 2,
+            .max_hypothesis_verifier_jobs_per_artifact = 1,
+            .max_hypothesis_verifier_time_ms = 4_000,
+            .max_hypothesis_verifier_evidence_bytes = 16 * 1024,
+            .max_verifier_candidates_generated = 2,
+            .max_verifier_candidate_artifacts = 1,
+            .max_verifier_candidate_commands = 1,
+            .max_verifier_candidate_bytes = 8 * 1024,
+            .max_verifier_candidate_obligations = 4,
             .max_wall_time_ms = 12_000,
             .max_temp_work_bytes = 256 * 1024,
         },
@@ -271,6 +369,20 @@ fn preset(tier: Tier) Effective {
             .max_verifier_time_ms = 4_000,
             .max_external_verifier_runs = 0,
             .max_verifier_evidence_bytes = 16 * 1024,
+            .max_hypotheses_generated = 3,
+            .max_hypotheses_selected = 1,
+            .max_hypothesis_evidence_fragments = 2,
+            .max_hypothesis_obligations = 2,
+            .max_hypothesis_verifier_needs = 1,
+            .max_hypothesis_verifier_jobs = 1,
+            .max_hypothesis_verifier_jobs_per_artifact = 1,
+            .max_hypothesis_verifier_time_ms = 1_000,
+            .max_hypothesis_verifier_evidence_bytes = 8 * 1024,
+            .max_verifier_candidates_generated = 1,
+            .max_verifier_candidate_artifacts = 1,
+            .max_verifier_candidate_commands = 0,
+            .max_verifier_candidate_bytes = 4 * 1024,
+            .max_verifier_candidate_obligations = 2,
             .max_wall_time_ms = 4_000,
             .max_temp_work_bytes = 64 * 1024,
         },
@@ -300,6 +412,20 @@ fn preset(tier: Tier) Effective {
             .max_verifier_time_ms = 15_000,
             .max_external_verifier_runs = 5,
             .max_verifier_evidence_bytes = 96 * 1024,
+            .max_hypotheses_generated = 12,
+            .max_hypotheses_selected = 5,
+            .max_hypothesis_evidence_fragments = 4,
+            .max_hypothesis_obligations = 4,
+            .max_hypothesis_verifier_needs = 3,
+            .max_hypothesis_verifier_jobs = 4,
+            .max_hypothesis_verifier_jobs_per_artifact = 2,
+            .max_hypothesis_verifier_time_ms = 6_000,
+            .max_hypothesis_verifier_evidence_bytes = 24 * 1024,
+            .max_verifier_candidates_generated = 4,
+            .max_verifier_candidate_artifacts = 2,
+            .max_verifier_candidate_commands = 2,
+            .max_verifier_candidate_bytes = 16 * 1024,
+            .max_verifier_candidate_obligations = 6,
             .max_wall_time_ms = 15_000,
             .max_temp_work_bytes = 512 * 1024,
         },
@@ -329,6 +455,20 @@ fn preset(tier: Tier) Effective {
             .max_verifier_time_ms = 15_000,
             .max_external_verifier_runs = 8,
             .max_verifier_evidence_bytes = 128 * 1024,
+            .max_hypotheses_generated = 16,
+            .max_hypotheses_selected = 8,
+            .max_hypothesis_evidence_fragments = 6,
+            .max_hypothesis_obligations = 6,
+            .max_hypothesis_verifier_needs = 4,
+            .max_hypothesis_verifier_jobs = 6,
+            .max_hypothesis_verifier_jobs_per_artifact = 3,
+            .max_hypothesis_verifier_time_ms = 8_000,
+            .max_hypothesis_verifier_evidence_bytes = 32 * 1024,
+            .max_verifier_candidates_generated = 6,
+            .max_verifier_candidate_artifacts = 3,
+            .max_verifier_candidate_commands = 3,
+            .max_verifier_candidate_bytes = 24 * 1024,
+            .max_verifier_candidate_obligations = 8,
             .max_wall_time_ms = 15_000,
             .max_temp_work_bytes = 1024 * 1024,
         },

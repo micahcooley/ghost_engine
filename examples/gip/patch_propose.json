@@ -1,0 +1,18 @@
+{
+  "gipVersion": "gip.v0.1",
+  "kind": "artifact.patch.propose",
+  "path": "examples/gip/patch_propose.json",
+  "edits": [
+    {
+      "editId": "test-1",
+      "span": {
+        "startLine": 1,
+        "startCol": 1,
+        "endLine": 1,
+        "endCol": 2
+      },
+      "replacement": "{"
+    }
+  ],
+  "reason": "testing proposal"
+}

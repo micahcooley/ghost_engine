@@ -6924,7 +6924,7 @@ fn writeComputeBudgetJson(writer: anytype, budget: compute_budget.Effective, exh
     try writer.writeAll(",\"effectiveTier\":");
     try writeJsonString(writer, compute_budget.tierName(budget.effective_tier));
     try writer.print(
-        ",\"limits\":{{\"maxBranches\":{d},\"maxProofQueueSize\":{d},\"maxRepairs\":{d},\"maxMountedPacksConsidered\":{d},\"maxPacksActivated\":{d},\"maxPackCandidateSurfaces\":{d},\"maxGraphNodes\":{d},\"maxGraphObligations\":{d},\"maxAmbiguitySets\":{d},\"maxRuntimeChecks\":{d},\"maxVerifierRuns\":{d},\"maxVerifierTimeMs\":{d},\"maxExternalVerifierRuns\":{d},\"maxVerifierEvidenceBytes\":{d},\"maxWallTimeMs\":{d},\"maxTempWorkBytes\":{d}}}",
+        ",\"limits\":{{\"maxBranches\":{d},\"maxProofQueueSize\":{d},\"maxRepairs\":{d},\"maxMountedPacksConsidered\":{d},\"maxPacksActivated\":{d},\"maxPackCandidateSurfaces\":{d},\"maxGraphNodes\":{d},\"maxGraphObligations\":{d},\"maxAmbiguitySets\":{d},\"maxRuntimeChecks\":{d},\"maxVerifierRuns\":{d},\"maxVerifierTimeMs\":{d},\"maxExternalVerifierRuns\":{d},\"maxVerifierEvidenceBytes\":{d}",
         .{
             budget.max_branches,
             budget.max_proof_queue_size,
@@ -6940,6 +6940,25 @@ fn writeComputeBudgetJson(writer: anytype, budget: compute_budget.Effective, exh
             budget.max_verifier_time_ms,
             budget.max_external_verifier_runs,
             budget.max_verifier_evidence_bytes,
+        },
+    );
+    try writer.print(
+        ",\"maxHypothesesGenerated\":{d},\"maxHypothesesSelected\":{d},\"maxHypothesisEvidenceFragments\":{d},\"maxHypothesisObligations\":{d},\"maxHypothesisVerifierNeeds\":{d},\"maxHypothesisVerifierJobs\":{d},\"maxHypothesisVerifierJobsPerArtifact\":{d},\"maxHypothesisVerifierTimeMs\":{d},\"maxHypothesisVerifierEvidenceBytes\":{d},\"maxVerifierCandidatesGenerated\":{d},\"maxVerifierCandidateArtifacts\":{d},\"maxVerifierCandidateCommands\":{d},\"maxVerifierCandidateBytes\":{d},\"maxVerifierCandidateObligations\":{d},\"maxWallTimeMs\":{d},\"maxTempWorkBytes\":{d}}}",
+        .{
+            budget.max_hypotheses_generated,
+            budget.max_hypotheses_selected,
+            budget.max_hypothesis_evidence_fragments,
+            budget.max_hypothesis_obligations,
+            budget.max_hypothesis_verifier_needs,
+            budget.max_hypothesis_verifier_jobs,
+            budget.max_hypothesis_verifier_jobs_per_artifact,
+            budget.max_hypothesis_verifier_time_ms,
+            budget.max_hypothesis_verifier_evidence_bytes,
+            budget.max_verifier_candidates_generated,
+            budget.max_verifier_candidate_artifacts,
+            budget.max_verifier_candidate_commands,
+            budget.max_verifier_candidate_bytes,
+            budget.max_verifier_candidate_obligations,
             budget.max_wall_time_ms,
             budget.max_temp_work_bytes,
         },

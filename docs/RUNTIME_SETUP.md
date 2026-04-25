@@ -213,15 +213,24 @@ Important behavior:
 - rebuild shaders on Linux with `./compile_shaders.sh`
 - after shader edits, use `zig build test-parity`
 
-## Response Modes And Verifier Hooks
+## Reasoning Levels And Verifier Hooks
 
-The Phase 3 response engine is a bounded control surface over grounded artifact obligations:
+The normal user-facing control is `--reasoning=quick|balanced|deep|max`. It means how hard Ghost should try, not a direct response-mode selector:
+
+- `quick` is fast and minimal effort.
+- `balanced` is the default.
+- `deep` is more thorough and may verify when useful.
+- `max` is the most thorough setting, but it does not force deep execution when deep adds no value.
+
+The Phase 3 response engine is a bounded control surface over grounded artifact obligations. Internal modes are automatic policy outcomes:
 
 - `draft_mode` is unverified only. Draft results stay `unresolved`, report `verificationState=unverified`, and include assumptions or missing information.
 - explicit verify/proof/test/correctness requests and patch-capable action surfaces are not allowed to complete through draft mode.
 - `fast_path` requires the same explicit eligibility gate used by auto mode and does not run speculative scheduling or verifier hooks.
 - `deep_path` is the verifier-capable path. Verifier hook outputs are evidence; they do not directly authorize final support without the support graph and obligation gates.
 - budget exhaustion remains a first-class stop reason and is not collapsed into ordinary unresolved output.
+
+Trace JSON continues to report `requested_reasoning_level`, `effective_compute_budget_tier`, `selected_response_mode`, and `mode_selection_reason` so advanced inspection can see the automatic selection without exposing mode choice as the normal UX.
 
 ## Panic Dumps
 

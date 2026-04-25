@@ -3,6 +3,7 @@ const core = @import("ghost_core");
 const code_intel = core.code_intel;
 const compute_budget = core.compute_budget;
 const mc = core.inference;
+const response_engine = core.response_engine;
 const sys = core.sys;
 const task_intent = core.task_intent;
 const technical_drafts = core.technical_drafts;
@@ -20,6 +21,11 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
+    if (args.len >= 2 and (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h"))) {
+        printUsage();
+        return;
+    }
+
     if (args.len < 3) {
         printUsage();
         return error.InvalidArguments;
@@ -33,6 +39,9 @@ pub fn main() !void {
     var max_items: usize = 8;
     var reasoning_mode: mc.ReasoningMode = .proof;
     var compute_request: compute_budget.Request = .{};
+    var requested_reasoning: ?response_engine.ReasoningLevel = null;
+    var compute_tier_explicit = false;
+    var advanced = false;
     var intent_text: ?[]const u8 = null;
     var output_format: OutputFormat = .json;
     var draft_type: technical_drafts.DraftType = .proof_backed_explanation;
@@ -56,10 +65,18 @@ pub fn main() !void {
                 return error.InvalidArguments;
             };
         } else if (std.mem.startsWith(u8, arg, "--compute-tier=")) {
+            compute_tier_explicit = true;
             compute_request.tier = parseComputeTier(arg["--compute-tier=".len..]) orelse {
                 printUsage();
                 return error.InvalidArguments;
             };
+        } else if (std.mem.startsWith(u8, arg, "--reasoning=")) {
+            requested_reasoning = response_engine.parseReasoningLevel(arg["--reasoning=".len..]) orelse {
+                sys.print("invalid --reasoning value; expected quick, balanced, deep, or max\n", .{});
+                return error.InvalidArguments;
+            };
+        } else if (std.mem.eql(u8, arg, "--advanced")) {
+            advanced = true;
         } else if (std.mem.startsWith(u8, arg, "--budget-max-branches=")) {
             compute_request.overrides.max_branches = std.fmt.parseUnsigned(u32, arg["--budget-max-branches=".len..], 10) catch null;
         } else if (std.mem.startsWith(u8, arg, "--budget-max-mounted-packs=")) {
@@ -101,6 +118,14 @@ pub fn main() !void {
         } else {
             try positionals.append(arg);
         }
+    }
+
+    if (requested_reasoning != null and compute_tier_explicit and !advanced) {
+        sys.print("--reasoning and --compute-tier cannot be combined unless --advanced is set\n", .{});
+        return error.InvalidArguments;
+    }
+    if (requested_reasoning) |level| {
+        if (!compute_tier_explicit) compute_request.tier = response_engine.computeTierForReasoningLevel(level);
     }
 
     var parsed_intent: ?task_intent.Task = null;
@@ -186,7 +211,7 @@ fn translateIntentQueryKind(kind: task_intent.QueryKind) code_intel.QueryKind {
 
 fn printUsage() void {
     sys.print(
-        "Usage: ghost_code_intel <impact|breaks-if|contradicts> <target> [other-target] [--intent=text] [--repo=/abs/path] [--project-shard=id] [--reasoning-mode=proof|exploratory] [--compute-tier=auto|low|medium|high|max] [--budget-max-branches=N] [--budget-max-mounted-packs=N] [--budget-max-activated-packs=N] [--budget-max-pack-surfaces=N] [--budget-max-routing-considered=N] [--budget-max-routing-selected=N] [--budget-max-routing-suppressed-traces=N] [--budget-max-graph-nodes=N] [--budget-max-obligations=N] [--budget-max-ambiguity-sets=N] [--max-items=N] [--render=json|draft] [--draft-type=proof-backed-explanation|refactor-plan|contradiction-report|code-change-summary|technical-design-alternatives]\n",
+        "Usage: ghost_code_intel <impact|breaks-if|contradicts> <target> [other-target] [--intent=text] [--reasoning=quick|balanced|deep|max] [--repo=/abs/path] [--project-shard=id] [--max-items=N] [--render=json|draft]\n\nAdvanced/debug: --advanced enables --reasoning-mode=proof|exploratory, --compute-tier=auto|low|medium|high|max, --budget-max-* overrides, and --draft-type=proof-backed-explanation|refactor-plan|contradiction-report|code-change-summary|technical-design-alternatives. If --reasoning and --compute-tier are both provided, --compute-tier wins only with --advanced.\n",
         .{},
     );
 }
