@@ -1,0 +1,5 @@
+panic: sync failed
+at sync (src/runtime/worker.zig:3)
+at sync (src/ui/worker.zig:3)
+path=src/runtime/worker.zig
+path=src/ui/worker.zig

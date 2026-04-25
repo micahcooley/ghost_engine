@@ -1,0 +1,8 @@
+[budget]
+max_catalog_records = 48
+max_candidate_surfaces = 12
+max_pack_activation = 4
+
+[routing]
+mode = "deterministic"
+truth_priority = "project"

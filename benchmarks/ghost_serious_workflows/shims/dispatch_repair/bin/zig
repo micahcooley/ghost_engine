@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+if [ "${1:-}" = "build" ] && [ "${2:-}" = "test" ]; then
+  if grep -R -q "@call(.auto," "$PWD/src" || grep -R -q "const forwarded_impl =" "$PWD/src" || grep -R -q "const forwarded_result =" "$PWD/src"; then
+    echo "dispatch boundary unstable; normalize wrapper dispatch" >&2
+    exit 1
+  fi
+fi
+exit 0

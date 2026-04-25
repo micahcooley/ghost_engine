@@ -27,9 +27,54 @@ Symbolic ingestion is also implemented for bounded cross-symbol grounding:
 - `.md`, `.txt`, `.rst`
 - `.toml`, `.yaml`, `.yml`, `.json`, `.ini`, `.cfg`, `.conf`, `.env`
 - `.xml`, `.html`
-- `.rules`, `.dsl`
+- `.rules`, `.dsl`, `.test`, `.spec`
+- `.tf`, `.tfvars`, `.tpl`
 
 The symbolic path is structural and bounded. It extracts symbolic units, references, and structural hints so Ghost can ground documentation or configuration concepts into code or runtime targets when deterministic support exists.
+
+## Corpus Ingestion
+
+`ghost_corpus_ingest` is the deterministic bridge from external corpus material into shard-local memory inputs.
+
+Current ingestion contract:
+
+- scans one explicit corpus path on demand
+- classifies each file into `code`, `docs`, `specs`, `configs`, or `symbolic`
+- rejects unsupported or weakly structured inputs instead of falling back to loose interpretation
+- stages all accepted items under the selected shard first
+- manual `ghost_corpus_ingest` runs stop at the staged manifest; operator-driven external evidence can apply the staged set into shard-local live corpus immediately for support recovery
+
+Current classification rules are explicit:
+
+- native code: `.zig`, `.comp`, `.sigil`, `.c`, `.cc`, `.cpp`, `.cxx`, `.h`, `.hh`, `.hpp`, `.hxx`
+- docs: `.md`, `.txt`, `.rst`, `.html`, `.xml`
+- configs: `.toml`, `.yaml`, `.yml`, `.json`, `.ini`, `.cfg`, `.conf`, `.env`, `.tf`, `.tfvars`, `.tpl`
+- symbolic DSL/tests/specs: `.rules`, `.dsl`, `.test`, `.spec`
+- anything else: rejected
+
+Dedup and normalization are deterministic:
+
+- exact duplicate: identical raw bytes
+- normalized duplicate: identical bytes after CRLF-to-LF normalization
+- unique items only are copied into shard-local live storage
+
+Every live corpus item carries:
+
+- shard-local provenance
+- trust class
+- lineage id and lineage version
+
+That metadata is attached to `code_intel` subjects, evidence, abstraction traces, and grounding traces when the result depends on ingested corpus surfaces.
+
+Bounded external evidence now reuses the same path instead of a separate web-memory system:
+
+- the operator accepts explicit URLs and/or bounded search queries
+- fetch happens only inside the evidence-acquisition step, never during core reasoning
+- fetched files are snapshotted under the active shard, then staged through `ghost_corpus_ingest`
+- the task-operator evidence path applies that staged snapshot into the shard-local live corpus immediately before the rerun
+- provenance records include source URL, fetch time, content hash, trust class, and lineage
+- support graphs surface `external_evidence` nodes plus the acquisition outcome handoff
+- reruns resolve through both the staged shard-local corpus path and stable source-basename aliases such as `@corpus/docs/runbook.md`
 
 ## Persistence
 
@@ -92,6 +137,20 @@ Important behavior:
 - if minimum support is missing, Ghost downgrades the result back to `unresolved`
 - support graphs are not decorative; they are part of the output permission contract
 
+## Phase 3 Artifact And Routing Surfaces
+
+The Phase 3 artifact schema is domain-neutral:
+
+- every bounded input is an artifact
+- artifacts are split into fragments
+- fragments produce entities and relations
+- relations and schema hooks produce obligations and verifier hooks
+- action surfaces describe what Ghost may attempt, but never bypass support/proof gates
+
+Code artifacts remain one supported domain with build, test, and runtime verifier hooks. Documents, config, logs, corpus entries, pack previews, task records, and external evidence are not architectural second-class inputs; they use the same artifact/fragments/entities/relations/obligations shape when they enter Phase 3 plumbing.
+
+Support-aware routing is also non-authorizing. Routing candidates carry deterministic upper-bound support potential plus selected/skipped/suppressed status. They can influence which artifact surfaces are inspected first, but selected routing candidates do not count as final evidence and do not directly authorize `supported`.
+
 ## Patch Candidate Flow
 
 `ghost_patch_candidates` is proof-backed patch generation with explicit verification.
@@ -99,11 +158,18 @@ Important behavior:
 Current flow:
 
 1. Run `code_intel` in exploratory mode to widen bounded candidate discovery.
-2. Build strategy hypotheses and patch scaffolds.
+2. Build strategy hypotheses and deterministic synthesized patch candidates.
 3. Cluster candidates and queue a bounded subset for proof mode.
 4. Verify queued candidates with build, test, and optional runtime workflows when Linux-native workflows are detected.
 5. Re-rank verified survivors under proof mode.
 6. Select the minimal verified survivor using `bounded_refactor_minimality_v1`.
+
+Current synthesis behavior:
+
+- Zig-first bounded rewrites emit real unified-diff hunks instead of comment scaffolds
+- supported operators are explicit and serialized as `rewriteOperators`
+- support traces record which rewrite operators fired and which semantic surfaces justified them
+- when the semantic graph cannot justify a bounded rewrite, patch generation stays `unresolved`
 
 The output `supportGraph.flowMode` for this workflow is `explore_then_proof`.
 
@@ -113,7 +179,10 @@ Implemented verification behavior:
 
 - build verification
 - test verification
-- runtime verification when a bounded Linux-native runtime workflow is available
+- bounded runtime-oracle verification after build/test when a fixture provides runtime oracle support
+- explicit ordered event-sequence checks in bounded runtime oracles
+- explicit bounded state-transition checks in bounded runtime oracles
+- runtime-unresolved results when runtime evidence is required but the oracle support is insufficient
 - one bounded retry cycle
 - bounded refinement traces when a smaller follow-up candidate is generated
 
@@ -122,6 +191,14 @@ Implemented selection behavior:
 - verified survivors can still be rejected by the honesty gate
 - the final winner prefers smaller verified scope, not the broadest patch
 - if no candidate survives verification, final output is `unresolved`
+
+The verifier adapter interface treats adapters as evidence producers:
+
+- passed adapters discharge named obligations only through the support graph
+- failed adapters create failure or contradiction evidence
+- blocked or missing adapters leave obligations remaining
+- non-code adapters such as config schema validation, document citation checks, freshness checks, and consistency checks use the same result contract as build/test/runtime adapters
+- speculative scheduler traces preserve considered, selected, pruned, and failed candidates instead of deleting losing branches
 
 ## Execution Harness
 
@@ -142,17 +219,23 @@ This harness is intentionally narrower than a general shell executor.
 
 From the latest Linux serious-workflow report in this workspace:
 
-- 15/15 benchmark cases passed
-- 5 verified supported patch results
-- patch compile-pass rate: 85% (12/14 build attempts)
-- test-pass rate: 75% (9/12 test attempts)
-- runtime-pass rate: 0% (0/0 runtime attempts)
+- 42/42 benchmark cases passed
+- verified-complete workflow rate: 100%
+- external-evidence-assisted workflow rate: 100%
+- runtime-verified patch workflow rate: 100%
+- 13 verified supported patch or task-verification results
+- patch compile-pass rate: 84% (16/19 build attempts)
+- test-pass rate: 87% (14/16 test attempts)
+- runtime-pass rate: 83% (5/6 runtime attempts)
+- response mode distribution, response path timings, artifact schema pipeline time, verifier adapter dispatch time, and code/non-code verifier counts are reported in the serious-workflow benchmark outputs
 
-The `0/0` runtime rate exists because the suite does not yet include a positive runtime-verified patch fixture. It does not mean runtime verification is currently broken.
+That runtime rate is per attempted bounded runtime verification step in the current deterministic suite.
 
 ## Current Limits
 
 - the code-intel pilot only supports `impact`, `breaks-if`, and `contradicts`
 - native support is bounded, not full compiler-level understanding
 - symbolic grounding is structural and support-backed, not open-ended semantic interpretation
+- externally ingested corpus targets now resolve through deterministic staged paths and stable original-basename aliases, but alias coverage is still bounded to ingested corpus classes Ghost currently indexes
 - draft renderers are deterministic views over bounded traces, not a second reasoning engine
+- draft mode is not a verifier substitute; proof, correctness, test, verify, and patch-capable requests must use the verifier-capable path

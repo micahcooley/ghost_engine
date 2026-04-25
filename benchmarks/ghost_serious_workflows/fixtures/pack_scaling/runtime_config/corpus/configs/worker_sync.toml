@@ -1,0 +1,7 @@
+[worker]
+mode = "sync"
+retry_window_ms = 180
+checkpoint_flush = "safe"
+
+[guards]
+pack_preview = "visible"

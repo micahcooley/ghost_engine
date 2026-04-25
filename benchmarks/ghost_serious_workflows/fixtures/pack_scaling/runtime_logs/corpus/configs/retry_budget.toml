@@ -1,0 +1,6 @@
+[retry]
+window_ms = 220
+max_replays = 3
+
+[trace]
+observer = "worker_sync"

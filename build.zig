@@ -140,8 +140,13 @@ pub fn build(b: *std.Build) void {
         .{ .name = "probe_inference", .root = "src/probe_inference.zig" },
         .{ .name = "sigil_core", .root = "src/sigil_core.zig" },
         .{ .name = "ghost_code_intel", .root = "src/code_intel_cli.zig" },
+        .{ .name = "ghost_corpus_ingest", .root = "src/corpus_ingest_cli.zig" },
         .{ .name = "ghost_patch_candidates", .root = "src/patch_candidates_cli.zig" },
+        .{ .name = "ghost_panic_dump", .root = "src/panic_dump_cli.zig" },
         .{ .name = "ghost_task_intent", .root = "src/task_intent_cli.zig" },
+        .{ .name = "ghost_task_operator", .root = "src/task_operator_cli.zig" },
+        .{ .name = "ghost_intent_grounding", .root = "src/intent_grounding_cli.zig" },
+        .{ .name = "ghost_knowledge_pack", .root = "src/knowledge_packs.zig" },
     };
 
     for (exes) |cfg| {
@@ -182,6 +187,16 @@ pub fn build(b: *std.Build) void {
     run_bench.step.dependOn(b.getInstallStep());
     const bench_step = b.step("bench-serious-workflows", "Run the serious workflow benchmark suite");
     bench_step.dependOn(&run_bench.step);
+
+    const hygiene_cmd = b.addSystemCommand(&.{
+        "git",
+        "status",
+        "--short",
+        "--untracked-files=all",
+    });
+    hygiene_cmd.has_side_effects = true;
+    const hygiene_step = b.step("repo-hygiene", "Print repository status after ignoring generated Ghost state");
+    hygiene_step.dependOn(&hygiene_cmd.step);
 
     // ── 9. Unit & Integration Tests ──
     const main_tests = b.addTest(.{

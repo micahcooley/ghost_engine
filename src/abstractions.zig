@@ -1,6 +1,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const ghost_state = @import("ghost_state.zig");
+const knowledge_pack_store = @import("knowledge_pack_store.zig");
 const shards = @import("shards.zig");
 const sys = @import("sys.zig");
 const vsa = @import("vsa_core.zig");
@@ -46,6 +47,17 @@ pub const Category = enum(u8) {
     interface,
     state,
     invariant,
+};
+
+pub const Family = enum(u8) {
+    distilled,
+    parser_sketch,
+    grounding_schema,
+    route_suppressor,
+    claim_template,
+    intent_interpretation,
+    action_surface,
+    verifier_pattern,
 };
 
 pub const SelectionMode = enum(u8) {
@@ -106,14 +118,69 @@ pub const LineageOperation = enum(u8) {
     prune_mark_prunable,
     prune_refresh,
     prune_collect,
+    reinforce_observe,
+    reinforce_promote,
+    reinforce_demote,
+};
+
+pub const ReinforcementOutcome = enum(u8) {
+    success,
+    failure,
+    ambiguous,
+    contradicted,
+};
+
+pub const ReinforcementEvent = struct {
+    family: Family,
+    key: []const u8,
+    case_id: []const u8,
+    tier: Tier = .pattern,
+    category: Category,
+    outcome: ReinforcementOutcome,
+    source_specs: []const []const u8 = &.{},
+    tokens: []const []const u8 = &.{},
+    patterns: []const []const u8 = &.{},
+    detail: ?[]const u8 = null,
+};
+
+pub const ReinforcementApplyOptions = struct {
+    max_events: usize = 8,
+    max_new_records: usize = 4,
+};
+
+pub const FamilyLookupOptions = struct {
+    family: Family,
+    rel_paths: []const []const u8 = &.{},
+    tokens: []const []const u8 = &.{},
+    patterns: []const []const u8 = &.{},
+    max_items: usize = 4,
+    include_staged: bool = false,
+    pack_routing_stage: PackRoutingStage = .family,
+    pack_routing: ?*PackRoutingCollector = null,
+    pack_routing_caps: PackRoutingCaps = .{},
+    pack_conflict_policy: PackConflictPolicy = .{},
+};
+
+const ReinforcementStats = struct {
+    success_count: u32 = 0,
+    failure_count: u32 = 0,
+    ambiguity_count: u32 = 0,
+    contradiction_count: u32 = 0,
+    independent_case_count: u32 = 0,
 };
 
 pub const LookupOptions = struct {
     rel_paths: []const []const u8,
+    tokens: []const []const u8 = &.{},
+    patterns: []const []const u8 = &.{},
     max_items: usize = 4,
     include_staged: bool = false,
     prefer_higher_tiers: bool = true,
     category_hint: ?Category = null,
+    pack_routing_stage: PackRoutingStage = .support,
+    pack_routing: ?*PackRoutingCollector = null,
+    pack_routing_caps: PackRoutingCaps = .{},
+    pack_conflict_policy: PackConflictPolicy = .{},
 };
 
 pub const GroundingOptions = struct {
@@ -124,11 +191,166 @@ pub const GroundingOptions = struct {
     include_staged: bool = false,
     prefer_higher_tiers: bool = true,
     category_hint: ?Category = null,
+    pack_routing_stage: PackRoutingStage = .grounding,
+    pack_routing: ?*PackRoutingCollector = null,
+    pack_routing_caps: PackRoutingCaps = .{},
+    pack_conflict_policy: PackConflictPolicy = .{},
+};
+
+pub const PackRoutingStage = enum {
+    support,
+    grounding,
+    reverse_grounding,
+    family,
+};
+
+pub const PackConflictCategory = enum {
+    none,
+    same_concept_incompatible,
+    same_anchor_competing,
+    trust_mismatch,
+    stale_pack,
+    incompatible_pack_family,
+};
+
+pub const PackCompetitionPolicy = enum {
+    refuse_all_competing,
+    prefer_higher_trust_only,
+    deterministic_winner,
+};
+
+pub const PackConflictPolicy = struct {
+    competition: PackCompetitionPolicy = .refuse_all_competing,
+};
+
+pub const PackRoutingStatus = enum {
+    activated,
+    skipped,
+    suppressed,
+    conflict_refused,
+    stale_blocked,
+    trust_blocked,
+};
+
+pub const PackRoutingCaps = struct {
+    max_considered_per_query: usize = 6,
+    max_activated_per_query: usize = 3,
+    max_candidate_surfaces_per_query: usize = 6,
+};
+
+pub const PackRoutingTrace = struct {
+    allocator: std.mem.Allocator,
+    stage: PackRoutingStage,
+    pack_id: []u8,
+    pack_version: []u8,
+    owner_id: []u8,
+    status: PackRoutingStatus,
+    reason: []u8,
+    policy: PackConflictPolicy = .{},
+    conflict_category: PackConflictCategory = .none,
+    trust_class: TrustClass = .exploratory,
+    freshness_state: knowledge_pack_store.PackFreshness = .active,
+    score: u32 = 0,
+    support_potential_upper_bound: u16 = 0,
+    call_id: u16 = 0,
+    considered_rank: u16 = 0,
+    activation_rank: u16 = 0,
+    path_hits: u16 = 0,
+    symbol_hits: u16 = 0,
+    domain_hits: u16 = 0,
+    file_family_hits: u16 = 0,
+    candidate_surfaces: u16 = 0,
+    suppressed_candidates: u16 = 0,
+    conflict_refused: bool = false,
+    local_truth_won: bool = false,
+
+    pub fn deinit(self: *PackRoutingTrace) void {
+        self.allocator.free(self.pack_id);
+        self.allocator.free(self.pack_version);
+        self.allocator.free(self.owner_id);
+        self.allocator.free(self.reason);
+        self.* = undefined;
+    }
+};
+
+pub const PackRoutingCollector = struct {
+    allocator: std.mem.Allocator,
+    traces: std.ArrayList(PackRoutingTrace),
+    next_call_id: u16 = 1,
+
+    pub fn init(allocator: std.mem.Allocator) PackRoutingCollector {
+        return .{
+            .allocator = allocator,
+            .traces = std.ArrayList(PackRoutingTrace).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *PackRoutingCollector) void {
+        for (self.traces.items) |*trace| trace.deinit();
+        self.traces.deinit();
+        self.* = undefined;
+    }
+
+    pub fn toOwnedSlice(self: *PackRoutingCollector) ![]PackRoutingTrace {
+        return self.traces.toOwnedSlice();
+    }
+
+    fn append(self: *PackRoutingCollector, trace: PackRoutingTrace) !void {
+        try self.traces.append(trace);
+    }
+
+    pub fn beginCall(self: *PackRoutingCollector) u16 {
+        const call_id = self.next_call_id;
+        self.next_call_id +%= 1;
+        if (self.next_call_id == 0) self.next_call_id = 1;
+        return call_id;
+    }
+
+    pub fn noteCandidateSurfaces(
+        self: *PackRoutingCollector,
+        stage: PackRoutingStage,
+        owner_id: []const u8,
+        kept: usize,
+        suppressed: usize,
+    ) void {
+        var idx = self.traces.items.len;
+        while (idx > 0) {
+            idx -= 1;
+            const trace = &self.traces.items[idx];
+            if (trace.stage != stage) continue;
+            if (!std.mem.eql(u8, trace.owner_id, owner_id)) continue;
+            trace.candidate_surfaces = @intCast(@min(kept, std.math.maxInt(u16)));
+            trace.suppressed_candidates = @intCast(@min(suppressed, std.math.maxInt(u16)));
+            return;
+        }
+    }
+
+    pub fn noteConflict(
+        self: *PackRoutingCollector,
+        stage: PackRoutingStage,
+        owner_id: []const u8,
+        status: PackRoutingStatus,
+        category: PackConflictCategory,
+        local_truth_won: bool,
+    ) void {
+        var idx = self.traces.items.len;
+        while (idx > 0) {
+            idx -= 1;
+            const trace = &self.traces.items[idx];
+            if (trace.stage != stage) continue;
+            if (!std.mem.eql(u8, trace.owner_id, owner_id)) continue;
+            trace.status = status;
+            trace.conflict_refused = trace.conflict_refused or status == .conflict_refused;
+            trace.conflict_category = category;
+            trace.local_truth_won = trace.local_truth_won or local_truth_won;
+        }
+    }
 };
 
 pub const Record = struct {
     allocator: std.mem.Allocator,
     concept_id: []u8,
+    family: Family = .distilled,
     tier: Tier = .pattern,
     category: Category = .syntax,
     parent_concept_id: ?[]u8 = null,
@@ -150,6 +372,11 @@ pub const Record = struct {
     lineage_version: u32 = 0,
     trust_class: TrustClass = .exploratory,
     decay_state: DecayState = .active,
+    success_count: u32 = 0,
+    failure_count: u32 = 0,
+    ambiguity_count: u32 = 0,
+    contradiction_count: u32 = 0,
+    independent_case_count: u32 = 0,
     first_revision: u32 = 0,
     last_revision: u32 = 0,
     last_review_revision: u32 = 0,
@@ -177,6 +404,7 @@ pub const Record = struct {
         var out = Record{
             .allocator = allocator,
             .concept_id = try allocator.dupe(u8, self.concept_id),
+            .family = self.family,
             .tier = self.tier,
             .category = self.category,
             .parent_concept_id = if (self.parent_concept_id) |parent_concept_id| try allocator.dupe(u8, parent_concept_id) else null,
@@ -198,6 +426,11 @@ pub const Record = struct {
             .lineage_version = self.lineage_version,
             .trust_class = self.trust_class,
             .decay_state = self.decay_state,
+            .success_count = self.success_count,
+            .failure_count = self.failure_count,
+            .ambiguity_count = self.ambiguity_count,
+            .contradiction_count = self.contradiction_count,
+            .independent_case_count = self.independent_case_count,
             .first_revision = self.first_revision,
             .last_revision = self.last_revision,
             .last_review_revision = self.last_review_revision,
@@ -227,6 +460,7 @@ pub const Record = struct {
 
 pub const SupportReference = struct {
     concept_id: []u8,
+    family: Family = .distilled,
     source_spec: []u8,
     staged: bool,
     tier: Tier,
@@ -256,6 +490,44 @@ pub const SupportReference = struct {
     conflict_concept_id: ?[]u8 = null,
     conflict_owner_kind: ?shards.Kind = null,
     conflict_owner_id: ?[]u8 = null,
+    pack_outcome: PackRoutingStatus = .skipped,
+    pack_conflict_category: PackConflictCategory = .none,
+};
+
+pub const ReverseLinkReference = struct {
+    concept_id: []u8,
+    family: Family = .distilled,
+    matched_source_spec: []u8,
+    symbolic_source_spec: []u8,
+    staged: bool,
+    tier: Tier,
+    category: Category,
+    trust_class: TrustClass = .exploratory,
+    decay_state: DecayState = .active,
+    owner_kind: shards.Kind,
+    owner_id: []u8,
+    lineage_id: []u8 = &.{},
+    lineage_version: u32 = 0,
+    parent_concept_id: ?[]u8 = null,
+    supporting_concept_id: ?[]u8 = null,
+    quality_score: u16 = 0,
+    confidence_score: u16 = 0,
+    lookup_score: u16 = 0,
+    direct_support_count: u16 = 0,
+    lineage_support_count: u16 = 0,
+    token_support_count: u16 = 0,
+    pattern_support_count: u16 = 0,
+    source_support_count: u16 = 0,
+    selection_mode: SelectionMode = .direct,
+    consensus_hash: u64 = 0,
+    usable: bool = true,
+    resolution: ReuseResolution = .local,
+    conflict_kind: ConflictKind = .none,
+    conflict_concept_id: ?[]u8 = null,
+    conflict_owner_kind: ?shards.Kind = null,
+    conflict_owner_id: ?[]u8 = null,
+    pack_outcome: PackRoutingStatus = .skipped,
+    pack_conflict_category: PackConflictCategory = .none,
 };
 
 pub const ReuseEntry = struct {
@@ -352,6 +624,11 @@ pub const PruneMode = enum(u8) {
     collect,
 };
 
+pub const ExportState = enum {
+    live,
+    staged,
+};
+
 pub const PruneStageResult = struct {
     allocator: std.mem.Allocator,
     mode: PruneMode,
@@ -404,6 +681,108 @@ const RegionSpec = struct {
     }
 };
 
+const MountedPackCatalog = struct {
+    allocator: std.mem.Allocator,
+    owner_id: []u8,
+    records: []Record,
+
+    fn deinit(self: *MountedPackCatalog) void {
+        self.allocator.free(self.owner_id);
+        for (self.records) |*record| record.deinit();
+        self.allocator.free(self.records);
+        self.* = undefined;
+    }
+};
+
+const PackRequestFamily = enum {
+    code,
+    docs,
+    config,
+    tests,
+    logs,
+    other,
+};
+
+const MountedPackCandidate = struct {
+    mount_index: usize,
+    score: u32 = 0,
+    path_hits: u16 = 0,
+    symbol_hits: u16 = 0,
+    domain_hits: u16 = 0,
+    file_family_hits: u16 = 0,
+    trust_class: TrustClass = .exploratory,
+    freshness_state: knowledge_pack_store.PackFreshness = .active,
+    eligible: bool = false,
+    compatible: bool = true,
+    conflict_category: PackConflictCategory = .none,
+    reason: []const u8 = "",
+};
+
+const RoutedMountLoad = struct {
+    mounts: []knowledge_pack_store.ResolvedMount,
+    traces: []PackRoutingTrace,
+
+    fn deinit(self: *RoutedMountLoad, allocator: std.mem.Allocator) void {
+        for (self.mounts) |*mount| mount.deinit();
+        allocator.free(self.mounts);
+        for (self.traces) |*trace| trace.deinit();
+        allocator.free(self.traces);
+        self.* = undefined;
+    }
+};
+
+pub const LookupProfile = struct {
+    pack_mount_resolve_ms: u64 = 0,
+    pack_manifest_preview_load_ms: u64 = 0,
+    pack_routing_ms: u64 = 0,
+    pack_catalog_load_ms: u64 = 0,
+};
+
+const MAX_CATALOG_CACHE_ENTRIES: usize = 16;
+
+const CatalogCacheEntry = struct {
+    allocator: std.mem.Allocator,
+    abs_path: []u8,
+    size_bytes: u64,
+    mtime_ns: i128,
+    records: []Record,
+
+    fn deinit(self: *CatalogCacheEntry) void {
+        self.allocator.free(self.abs_path);
+        for (self.records) |*record| record.deinit();
+        self.allocator.free(self.records);
+        self.* = undefined;
+    }
+};
+
+var lookup_profile: LookupProfile = .{};
+var catalog_cache: ?std.ArrayList(CatalogCacheEntry) = null;
+
+pub fn resetLookupProfile() void {
+    lookup_profile = .{};
+}
+
+pub fn readLookupProfile() LookupProfile {
+    return lookup_profile;
+}
+
+fn catalogCache() *std.ArrayList(CatalogCacheEntry) {
+    if (catalog_cache == null) {
+        catalog_cache = std.ArrayList(CatalogCacheEntry).init(std.heap.page_allocator);
+    }
+    return &catalog_cache.?;
+}
+
+fn cloneCatalogRecords(allocator: std.mem.Allocator, records: []const Record) !std.ArrayList(Record) {
+    var out = std.ArrayList(Record).init(allocator);
+    errdefer deinitCatalog(&out);
+    try out.ensureTotalCapacity(records.len);
+    for (records) |*record| {
+        try out.append(try record.clone(allocator));
+    }
+    return out;
+}
+
 pub fn isCommand(script: []const u8) bool {
     const trimmed = std.mem.trim(u8, script, " \r\n\t");
     return std.mem.startsWith(u8, trimmed, COMMIT_COMMAND_NAME) or
@@ -429,6 +808,19 @@ pub fn categoryName(category: Category) []const u8 {
         .interface => "interface",
         .state => "state",
         .invariant => "invariant",
+    };
+}
+
+pub fn familyName(family: Family) []const u8 {
+    return switch (family) {
+        .distilled => "distilled",
+        .parser_sketch => "parser_sketch",
+        .grounding_schema => "grounding_schema",
+        .route_suppressor => "route_suppressor",
+        .claim_template => "claim_template",
+        .intent_interpretation => "intent_interpretation",
+        .action_surface => "action_surface",
+        .verifier_pattern => "verifier_pattern",
     };
 }
 
@@ -460,6 +852,18 @@ pub fn reuseResolutionName(resolution: ReuseResolution) []const u8 {
     };
 }
 
+pub fn packConflictCategoryName(category: PackConflictCategory) []const u8 {
+    return @tagName(category);
+}
+
+pub fn packCompetitionPolicyName(policy: PackCompetitionPolicy) []const u8 {
+    return @tagName(policy);
+}
+
+pub fn packRoutingStatusName(status: PackRoutingStatus) []const u8 {
+    return @tagName(status);
+}
+
 pub fn conflictKindName(kind: ConflictKind) []const u8 {
     return switch (kind) {
         .none => "none",
@@ -475,6 +879,10 @@ pub fn trustClassName(class: TrustClass) []const u8 {
         .promoted => "promoted",
         .core => "core",
     };
+}
+
+pub fn parseTrustClassName(text: []const u8) ?TrustClass {
+    return parseTrustClass(text);
 }
 
 pub fn decayStateName(state: DecayState) []const u8 {
@@ -514,6 +922,18 @@ fn lineageOperationName(operation: LineageOperation) []const u8 {
         .prune_mark_prunable => "prune_mark_prunable",
         .prune_refresh => "prune_refresh",
         .prune_collect => "prune_collect",
+        .reinforce_observe => "reinforce_observe",
+        .reinforce_promote => "reinforce_promote",
+        .reinforce_demote => "reinforce_demote",
+    };
+}
+
+fn reinforcementOutcomeName(outcome: ReinforcementOutcome) []const u8 {
+    return switch (outcome) {
+        .success => "success",
+        .failure => "failure",
+        .ambiguous => "ambiguous",
+        .contradicted => "contradicted",
     };
 }
 
@@ -590,6 +1010,68 @@ pub fn applyStaged(allocator: std.mem.Allocator, paths: *const shards.Paths) !vo
     try clearStaged(allocator, paths);
 }
 
+pub fn replaceImportedLiveRecords(
+    allocator: std.mem.Allocator,
+    paths: *const shards.Paths,
+    concept_prefix: []const u8,
+    imported_records: []const Record,
+) !void {
+    var live = try loadCatalog(allocator, paths.abstractions_live_abs_path);
+    try normalizeCatalogRecords(allocator, live.items, paths.metadata.kind, paths.metadata.id, defaultTrustForKind(paths.metadata.kind));
+    defer deinitCatalog(&live);
+
+    if (concept_prefix.len > 0) {
+        var idx: usize = 0;
+        while (idx < live.items.len) {
+            if (!std.mem.startsWith(u8, live.items[idx].concept_id, concept_prefix)) {
+                idx += 1;
+                continue;
+            }
+            var removed = live.orderedRemove(idx);
+            removed.deinit();
+        }
+    }
+
+    var state = try loadCatalogState(allocator, paths);
+    const revision = state.revision + 1;
+    var changed = false;
+
+    for (imported_records) |record| {
+        if (!record.valid_to_commit) return error.AbstractionBelowThreshold;
+        if (record.concept_id.len == 0 or record.sources.len == 0) return error.InvalidAbstractionCatalog;
+        if (record.tokens.len == 0 and record.patterns.len == 0) return error.InvalidAbstractionCatalog;
+
+        var next = try record.clone(allocator);
+        errdefer next.deinit();
+        if (next.lineage_id.len == 0) next.lineage_id = try makeLineageId(allocator, paths.metadata.kind, paths.metadata.id, next.concept_id);
+        if (next.lineage_version == 0) next.lineage_version = 1;
+        if (next.provenance.len == 0) {
+            const extra = try std.fmt.allocPrint(allocator, "hash={d}", .{next.consensus_hash});
+            defer allocator.free(extra);
+            try appendRecordProvenance(&next, allocator, try buildOperationProvenance(
+                allocator,
+                .distilled,
+                paths.metadata.kind,
+                paths.metadata.id,
+                next.concept_id,
+                next.lineage_id,
+                next.lineage_version,
+                next.trust_class,
+                extra,
+            ));
+        }
+        try finalizeStagedRecord(allocator, &next, live.items, paths.metadata.kind, paths.metadata.id, revision);
+        try upsertRecord(&live, next);
+        changed = true;
+    }
+
+    if (changed or concept_prefix.len > 0) {
+        state.revision = revision;
+        try persistCatalog(allocator, paths.abstractions_live_abs_path, live.items);
+        try persistCatalogState(allocator, paths, state);
+    }
+}
+
 pub fn writeLiveToSlot(allocator: std.mem.Allocator, paths: *const shards.Paths, slot_dir: []const u8) !void {
     const slot_path = try std.fs.path.join(allocator, &.{ slot_dir, config.ABSTRACTION_SLOT_FILE_NAME });
     defer allocator.free(slot_path);
@@ -606,6 +1088,60 @@ pub fn writeLiveToSlot(allocator: std.mem.Allocator, paths: *const shards.Paths,
     const slot_state_path = try std.fs.path.join(allocator, &.{ slot_dir, STATE_SLOT_FILE_NAME });
     defer allocator.free(slot_state_path);
     try copyMaybeFile(allocator, live_state_path, slot_state_path);
+}
+
+pub fn exportCatalogBundle(
+    allocator: std.mem.Allocator,
+    paths: *const shards.Paths,
+    state: ExportState,
+    dst_root: []const u8,
+) !void {
+    const catalog_src = switch (state) {
+        .live => paths.abstractions_live_abs_path,
+        .staged => paths.abstractions_staged_abs_path,
+    };
+    const catalog_dst = try std.fs.path.join(allocator, &.{ dst_root, config.ABSTRACTION_SLOT_FILE_NAME });
+    defer allocator.free(catalog_dst);
+    try copyMaybeFile(allocator, catalog_src, catalog_dst);
+
+    const reuse_src = switch (state) {
+        .live => try reuseLivePath(allocator, paths),
+        .staged => try reuseStagedPath(allocator, paths),
+    };
+    defer allocator.free(reuse_src);
+    const reuse_dst = try std.fs.path.join(allocator, &.{ dst_root, REUSE_SLOT_FILE_NAME });
+    defer allocator.free(reuse_dst);
+    try copyMaybeFile(allocator, reuse_src, reuse_dst);
+
+    const state_src = try stateLivePath(allocator, paths);
+    defer allocator.free(state_src);
+    const state_dst = try std.fs.path.join(allocator, &.{ dst_root, STATE_SLOT_FILE_NAME });
+    defer allocator.free(state_dst);
+    try copyMaybeFile(allocator, state_src, state_dst);
+}
+
+pub fn loadLiveRecordSnapshot(allocator: std.mem.Allocator, paths: *const shards.Paths) ![]Record {
+    var live = try loadCatalog(allocator, paths.abstractions_live_abs_path);
+    errdefer deinitCatalog(&live);
+    try normalizeCatalogRecords(allocator, live.items, paths.metadata.kind, paths.metadata.id, defaultTrustForKind(paths.metadata.kind));
+    return try live.toOwnedSlice();
+}
+
+pub fn loadCatalogSnapshotFromPath(allocator: std.mem.Allocator, abs_path: []const u8) ![]Record {
+    var records = try loadCatalog(allocator, abs_path);
+    errdefer deinitCatalog(&records);
+    return try records.toOwnedSlice();
+}
+
+pub fn deinitRecordSlice(records: []Record) void {
+    if (records.len == 0) return;
+    const allocator = records[0].allocator;
+    for (records) |*record| record.deinit();
+    allocator.free(records);
+}
+
+pub fn saveCatalogSnapshotToPath(allocator: std.mem.Allocator, abs_path: []const u8, records: []const Record) !void {
+    try persistCatalog(allocator, abs_path, records);
 }
 
 pub fn restoreLiveFromSlot(allocator: std.mem.Allocator, paths: *const shards.Paths, slot_dir: []const u8) !void {
@@ -912,6 +1448,8 @@ pub fn renderJson(allocator: std.mem.Allocator, record: *const Record) ![]u8 {
 
     try out.appendSlice("{\"concept\":\"");
     try appendEscapedJson(&out, record.concept_id);
+    try out.appendSlice("\",\"family\":\"");
+    try appendEscapedJson(&out, familyName(record.family));
     try out.appendSlice("\",\"tier\":\"");
     try appendEscapedJson(&out, tierName(record.tier));
     try out.appendSlice("\",\"category\":\"");
@@ -956,7 +1494,17 @@ pub fn renderJson(allocator: std.mem.Allocator, record: *const Record) ![]u8 {
     try appendEscapedJson(&out, trustClassName(record.trust_class));
     try out.appendSlice("\",\"decay\":\"");
     try appendEscapedJson(&out, decayStateName(record.decay_state));
-    try out.appendSlice("\",\"firstRevision\":");
+    try out.appendSlice("\",\"successCount\":");
+    try appendIntJson(&out, record.success_count);
+    try out.appendSlice(",\"failureCount\":");
+    try appendIntJson(&out, record.failure_count);
+    try out.appendSlice(",\"ambiguityCount\":");
+    try appendIntJson(&out, record.ambiguity_count);
+    try out.appendSlice(",\"contradictionCount\":");
+    try appendIntJson(&out, record.contradiction_count);
+    try out.appendSlice(",\"independentCaseCount\":");
+    try appendIntJson(&out, record.independent_case_count);
+    try out.appendSlice(",\"firstRevision\":");
     try appendIntJson(&out, record.first_revision);
     try out.appendSlice(",\"lastRevision\":");
     try appendIntJson(&out, record.last_revision);
@@ -1137,6 +1685,7 @@ pub fn lookupGroundingConcepts(
         out.deinit();
     }
     try mergeCrossShardSupport(allocator, local_refs.items, core_refs.items, reuse_live.items, reuse_staged.items, &out);
+    try mergeMountedPackGroundingReferences(allocator, paths, options, &out);
     trimSupportReferenceList(allocator, &out, options.max_items);
     return out.toOwnedSlice();
 }
@@ -1202,6 +1751,7 @@ pub fn lookupConcepts(
         out.deinit();
     }
     try mergeCrossShardSupport(allocator, local_refs.items, core_refs.items, reuse_live.items, reuse_staged.items, &out);
+    try mergeMountedPackSupportReferences(allocator, paths, options, &out);
     return out.toOwnedSlice();
 }
 
@@ -1210,12 +1760,278 @@ pub fn deinitSupportReferences(allocator: std.mem.Allocator, items: []SupportRef
     allocator.free(items);
 }
 
+pub fn lookupReverseSymbolicLinks(
+    allocator: std.mem.Allocator,
+    paths: *const shards.Paths,
+    options: LookupOptions,
+) ![]ReverseLinkReference {
+    var support_options = options;
+    support_options.pack_routing = null;
+    const support_refs = try lookupConcepts(allocator, paths, support_options);
+    defer deinitSupportReferences(allocator, support_refs);
+
+    var local_live = try loadCatalog(allocator, paths.abstractions_live_abs_path);
+    try normalizeCatalogRecords(allocator, local_live.items, paths.metadata.kind, paths.metadata.id, defaultTrustForKind(paths.metadata.kind));
+    defer deinitCatalog(&local_live);
+
+    var local_staged = std.ArrayList(Record).init(allocator);
+    defer deinitCatalog(&local_staged);
+    if (options.include_staged) {
+        local_staged = try loadCatalog(allocator, paths.abstractions_staged_abs_path);
+        try normalizeCatalogRecords(allocator, local_staged.items, paths.metadata.kind, paths.metadata.id, defaultTrustForKind(paths.metadata.kind));
+    }
+
+    var core_live = std.ArrayList(Record).init(allocator);
+    defer deinitCatalog(&core_live);
+    if (paths.metadata.kind == .project) {
+        var core_metadata = try shards.resolveCoreMetadata(allocator);
+        defer core_metadata.deinit();
+        var core_paths = try shards.resolvePaths(allocator, core_metadata.metadata);
+        defer core_paths.deinit();
+        core_live = try loadCatalog(allocator, core_paths.abstractions_live_abs_path);
+        try normalizeCatalogRecords(allocator, core_live.items, core_paths.metadata.kind, core_paths.metadata.id, defaultTrustForKind(core_paths.metadata.kind));
+    }
+
+    var out = std.ArrayList(ReverseLinkReference).init(allocator);
+    errdefer {
+        for (out.items) |item| deinitReverseLinkReferenceItem(allocator, item);
+        out.deinit();
+    }
+
+    const pack_catalogs = try loadMountedPackCatalogs(
+        allocator,
+        paths,
+        options.rel_paths,
+        options.tokens,
+        options.patterns,
+        options.pack_routing_stage,
+        options.pack_routing_caps,
+        options.pack_conflict_policy,
+        options.pack_routing,
+    );
+    defer {
+        for (pack_catalogs) |*catalog| catalog.deinit();
+        allocator.free(pack_catalogs);
+    }
+
+    for (support_refs) |ref| {
+        const record = findReverseLinkRecord(paths, local_live.items, local_staged.items, core_live.items, pack_catalogs, ref) orelse continue;
+        try appendReverseLinksForRecord(allocator, ref, record, options.rel_paths, &out);
+    }
+
+    sortReverseLinkReferences(out.items);
+    trimReverseLinkReferenceList(allocator, &out, options.max_items);
+    return out.toOwnedSlice();
+}
+
+pub fn deinitReverseLinkReferences(allocator: std.mem.Allocator, items: []ReverseLinkReference) void {
+    for (items) |item| deinitReverseLinkReferenceItem(allocator, item);
+    allocator.free(items);
+}
+
+pub fn inspectMountedPackRouting(
+    allocator: std.mem.Allocator,
+    paths: *const shards.Paths,
+    rel_paths: []const []const u8,
+    tokens: []const []const u8,
+    patterns: []const []const u8,
+    stage: PackRoutingStage,
+    caps: PackRoutingCaps,
+) ![]PackRoutingTrace {
+    const routed = try routeMountedPacks(allocator, paths, rel_paths, tokens, patterns, stage, caps, .{}, 0);
+    defer {
+        for (routed.mounts) |*mount| mount.deinit();
+        allocator.free(routed.mounts);
+    }
+    return routed.traces;
+}
+
+pub fn lookupFamilyConcepts(
+    allocator: std.mem.Allocator,
+    paths: *const shards.Paths,
+    options: FamilyLookupOptions,
+) ![]SupportReference {
+    var live = try loadCatalog(allocator, paths.abstractions_live_abs_path);
+    try normalizeCatalogRecords(allocator, live.items, paths.metadata.kind, paths.metadata.id, defaultTrustForKind(paths.metadata.kind));
+    defer deinitCatalog(&live);
+
+    var staged = std.ArrayList(Record).init(allocator);
+    defer deinitCatalog(&staged);
+    if (options.include_staged) {
+        staged = try loadCatalog(allocator, paths.abstractions_staged_abs_path);
+        try normalizeCatalogRecords(allocator, staged.items, paths.metadata.kind, paths.metadata.id, defaultTrustForKind(paths.metadata.kind));
+    }
+
+    var out = std.ArrayList(SupportReference).init(allocator);
+    errdefer {
+        for (out.items) |item| deinitSupportReferenceItem(allocator, item);
+        out.deinit();
+    }
+
+    try collectFamilyLookup(allocator, paths.metadata.kind, paths.metadata.id, live.items, false, options, &out);
+    if (options.include_staged) try collectFamilyLookup(allocator, paths.metadata.kind, paths.metadata.id, staged.items, true, options, &out);
+    try mergeMountedPackFamilyReferences(allocator, paths, options, &out);
+    sortSupportReferences(out.items);
+    trimSupportReferenceList(allocator, &out, options.max_items);
+    return out.toOwnedSlice();
+}
+
+pub fn applyReinforcementEvents(
+    allocator: std.mem.Allocator,
+    paths: *const shards.Paths,
+    events: []const ReinforcementEvent,
+    options: ReinforcementApplyOptions,
+) !usize {
+    if (events.len == 0 or options.max_events == 0 or options.max_new_records == 0) return 0;
+
+    var live = try loadCatalog(allocator, paths.abstractions_live_abs_path);
+    try normalizeCatalogRecords(allocator, live.items, paths.metadata.kind, paths.metadata.id, defaultTrustForKind(paths.metadata.kind));
+    defer deinitCatalog(&live);
+
+    var state = try loadCatalogState(allocator, paths);
+    var applied: usize = 0;
+    var new_records: usize = 0;
+
+    for (events[0..@min(events.len, options.max_events)]) |event| {
+        const concept_id = try reinforcementConceptId(allocator, event);
+        defer allocator.free(concept_id);
+
+        var target = findMutableRecord(live.items, concept_id);
+        if (target == null) {
+            if (new_records >= options.max_new_records) break;
+            try live.append(try initReinforcementRecord(allocator, paths, event, concept_id));
+            target = &live.items[live.items.len - 1];
+            new_records += 1;
+        }
+
+        const already_seen = reinforcementCaseSeen(target.?, event.case_id, event.outcome);
+        if (already_seen) continue;
+
+        try mergeUniqueTextInto(&target.?.sources, allocator, event.source_specs);
+        try mergeUniqueTextInto(&target.?.tokens, allocator, event.tokens);
+        try mergeUniqueTextInto(&target.?.patterns, allocator, event.patterns);
+        applyReinforcementOutcome(target.?, event.outcome);
+        refreshReinforcementRecord(target.?);
+
+        const extra = try reinforcementExtra(allocator, event);
+        defer allocator.free(extra);
+        try appendRecordProvenance(target.?, allocator, try buildOperationProvenance(
+            allocator,
+            .reinforce_observe,
+            paths.metadata.kind,
+            paths.metadata.id,
+            target.?.concept_id,
+            target.?.lineage_id,
+            target.?.lineage_version + 1,
+            target.?.trust_class,
+            extra,
+        ));
+
+        const post_state = promotionLineageOperation(target.?);
+        if (post_state) |operation| {
+            try appendRecordProvenance(target.?, allocator, try buildOperationProvenance(
+                allocator,
+                operation,
+                paths.metadata.kind,
+                paths.metadata.id,
+                target.?.concept_id,
+                target.?.lineage_id,
+                target.?.lineage_version + 1,
+                target.?.trust_class,
+                null,
+            ));
+        }
+
+        applied += 1;
+    }
+
+    if (applied > 0) {
+        state.revision +|= 1;
+        for (live.items) |*record| try finalizeStagedRecord(allocator, record, &.{}, paths.metadata.kind, paths.metadata.id, state.revision);
+        try persistCatalog(allocator, paths.abstractions_live_abs_path, live.items);
+        try persistCatalogState(allocator, paths, state);
+    }
+
+    return applied;
+}
+
 pub fn countUsableReferences(items: []const SupportReference) usize {
     var count: usize = 0;
     for (items) |item| {
         if (item.usable) count += 1;
     }
     return count;
+}
+
+fn collectFamilyLookup(
+    allocator: std.mem.Allocator,
+    owner_kind: shards.Kind,
+    owner_id: []const u8,
+    records: []const Record,
+    staged: bool,
+    options: FamilyLookupOptions,
+    out: *std.ArrayList(SupportReference),
+) !void {
+    for (records) |*record| {
+        if (record.family != options.family) continue;
+        if (!reinforcementUsable(record)) continue;
+
+        const source_hits = countSupportMatches(record.sources, options.rel_paths);
+        const token_hits = countTextMatches(record.tokens, options.tokens);
+        const pattern_hits = countTextMatches(record.patterns, options.patterns);
+        if (source_hits == 0 and token_hits == 0 and pattern_hits == 0) continue;
+
+        const source_spec = preferredSupportSource(record.sources, options.rel_paths) orelse preferredGroundingSource(record.sources) orelse familyName(record.family);
+        const score = computeFamilyLookupScore(record, source_hits, token_hits, pattern_hits);
+        try out.append(.{
+            .concept_id = try allocator.dupe(u8, record.concept_id),
+            .family = record.family,
+            .source_spec = try allocator.dupe(u8, source_spec),
+            .staged = staged,
+            .tier = record.tier,
+            .category = record.category,
+            .trust_class = record.trust_class,
+            .decay_state = record.decay_state,
+            .owner_kind = owner_kind,
+            .owner_id = try allocator.dupe(u8, owner_id),
+            .lineage_id = try allocator.dupe(u8, record.lineage_id),
+            .lineage_version = record.lineage_version,
+            .parent_concept_id = if (record.parent_concept_id) |value| try allocator.dupe(u8, value) else null,
+            .supporting_concept_id = null,
+            .quality_score = record.quality_score,
+            .confidence_score = record.confidence_score,
+            .lookup_score = score,
+            .direct_support_count = source_hits,
+            .lineage_support_count = @intCast(record.independent_case_count),
+            .token_support_count = token_hits,
+            .pattern_support_count = pattern_hits,
+            .source_support_count = source_hits,
+            .selection_mode = if (record.promotion_ready) .promoted else .fallback,
+            .consensus_hash = record.consensus_hash,
+            .usable = reinforcementUsable(record),
+            .resolution = .local,
+        });
+    }
+}
+
+fn preferredSupportSource(sources: [][]u8, rel_paths: []const []const u8) ?[]const u8 {
+    for (sources) |source| {
+        for (rel_paths) |rel_path| {
+            if (rel_path.len == 0) continue;
+            if (std.mem.indexOf(u8, source, rel_path) != null) return source;
+        }
+    }
+    return null;
+}
+
+fn computeFamilyLookupScore(record: *const Record, source_hits: u16, token_hits: u16, pattern_hits: u16) u16 {
+    var score: u32 = @as(u32, record.quality_score);
+    score += @as(u32, record.confidence_score) / 2;
+    score += @as(u32, record.independent_case_count) * 80;
+    score += @as(u32, source_hits) * 70;
+    score += @as(u32, token_hits) * 65;
+    score += @as(u32, pattern_hits) * 95;
+    return @intCast(@min(score, @as(u32, MAX_SCORE)));
 }
 
 fn matchSupportSource(sources: [][]u8, rel_paths: []const []const u8) ?[]const u8 {
@@ -1268,11 +2084,15 @@ fn collectSupportLookup(
     for (entries.items, 0..) |entry, entry_index| {
         const source_match = matchSupportSource(entry.record.sources, options.rel_paths) orelse continue;
         const direct_support_count = countSupportMatches(entry.record.sources, options.rel_paths);
+        const token_support_count = countTextMatches(entry.record.tokens, options.tokens);
+        const pattern_support_count = countTextMatches(entry.record.patterns, options.patterns);
         try upsertMatch(&matches, .{
             .entry_index = entry_index,
             .source_spec = source_match,
             .direct_support_count = direct_support_count,
             .lineage_support_count = direct_support_count,
+            .token_support_count = token_support_count,
+            .pattern_support_count = pattern_support_count,
             .source_support_count = direct_support_count,
             .depth = 0,
             .supporting_entry_index = entry_index,
@@ -1287,6 +2107,8 @@ fn collectSupportLookup(
                 .source_spec = source_match,
                 .direct_support_count = 0,
                 .lineage_support_count = direct_support_count,
+                .token_support_count = token_support_count,
+                .pattern_support_count = pattern_support_count,
                 .source_support_count = direct_support_count,
                 .depth = @intCast(depth),
                 .supporting_entry_index = entry_index,
@@ -1312,6 +2134,7 @@ fn collectSupportLookup(
 
         try out.append(.{
             .concept_id = try allocator.dupe(u8, record.concept_id),
+            .family = record.family,
             .source_spec = try allocator.dupe(u8, match.source_spec),
             .staged = entry.staged,
             .tier = record.tier,
@@ -1419,6 +2242,7 @@ fn collectGroundingLookup(
 
         try out.append(.{
             .concept_id = try allocator.dupe(u8, record.concept_id),
+            .family = record.family,
             .source_spec = try allocator.dupe(u8, match.source_spec),
             .staged = entry.staged,
             .tier = record.tier,
@@ -1470,6 +2294,143 @@ fn countSupportMatches(sources: [][]u8, rel_paths: []const []const u8) u16 {
     return count;
 }
 
+fn findReverseLinkRecord(
+    paths: *const shards.Paths,
+    local_live: []const Record,
+    local_staged: []const Record,
+    core_live: []const Record,
+    pack_catalogs: []const MountedPackCatalog,
+    ref: SupportReference,
+) ?*const Record {
+    if (ref.owner_kind == paths.metadata.kind and std.mem.eql(u8, ref.owner_id, paths.metadata.id)) {
+        return findRecordByConceptId(local_live, local_staged, ref.concept_id, ref.staged);
+    }
+    if (ref.owner_kind == .core) {
+        return findRecordByConceptId(core_live, &.{}, ref.concept_id, false);
+    }
+    for (pack_catalogs) |*catalog| {
+        if (!std.mem.eql(u8, catalog.owner_id, ref.owner_id)) continue;
+        return findRecordByConceptId(catalog.records, &.{}, ref.concept_id, false);
+    }
+    return null;
+}
+
+fn findRecordByConceptId(
+    live_records: []const Record,
+    staged_records: []const Record,
+    concept_id: []const u8,
+    prefer_staged: bool,
+) ?*const Record {
+    if (prefer_staged) {
+        for (staged_records) |*record| {
+            if (std.mem.eql(u8, record.concept_id, concept_id)) return record;
+        }
+    }
+    for (live_records) |*record| {
+        if (std.mem.eql(u8, record.concept_id, concept_id)) return record;
+    }
+    if (!prefer_staged) {
+        for (staged_records) |*record| {
+            if (std.mem.eql(u8, record.concept_id, concept_id)) return record;
+        }
+    }
+    return null;
+}
+
+fn appendReverseLinksForRecord(
+    allocator: std.mem.Allocator,
+    ref: SupportReference,
+    record: *const Record,
+    rel_paths: []const []const u8,
+    out: *std.ArrayList(ReverseLinkReference),
+) !void {
+    for (record.sources) |source| {
+        if (!isReverseSymbolicSource(source, rel_paths)) continue;
+        try out.append(.{
+            .concept_id = try allocator.dupe(u8, ref.concept_id),
+            .family = ref.family,
+            .matched_source_spec = try allocator.dupe(u8, ref.source_spec),
+            .symbolic_source_spec = try allocator.dupe(u8, source),
+            .staged = ref.staged,
+            .tier = ref.tier,
+            .category = ref.category,
+            .trust_class = ref.trust_class,
+            .decay_state = ref.decay_state,
+            .owner_kind = ref.owner_kind,
+            .owner_id = try allocator.dupe(u8, ref.owner_id),
+            .lineage_id = if (ref.lineage_id.len > 0) try allocator.dupe(u8, ref.lineage_id) else &.{},
+            .lineage_version = ref.lineage_version,
+            .parent_concept_id = if (ref.parent_concept_id) |parent_concept_id| try allocator.dupe(u8, parent_concept_id) else null,
+            .supporting_concept_id = if (ref.supporting_concept_id) |supporting_concept_id| try allocator.dupe(u8, supporting_concept_id) else null,
+            .quality_score = ref.quality_score,
+            .confidence_score = ref.confidence_score,
+            .lookup_score = ref.lookup_score,
+            .direct_support_count = ref.direct_support_count,
+            .lineage_support_count = ref.lineage_support_count,
+            .token_support_count = ref.token_support_count,
+            .pattern_support_count = ref.pattern_support_count,
+            .source_support_count = ref.source_support_count,
+            .selection_mode = ref.selection_mode,
+            .consensus_hash = ref.consensus_hash,
+            .usable = ref.usable,
+            .resolution = ref.resolution,
+            .conflict_kind = ref.conflict_kind,
+            .conflict_concept_id = if (ref.conflict_concept_id) |conflict_concept_id| try allocator.dupe(u8, conflict_concept_id) else null,
+            .conflict_owner_kind = ref.conflict_owner_kind,
+            .conflict_owner_id = if (ref.conflict_owner_id) |conflict_owner_id| try allocator.dupe(u8, conflict_owner_id) else null,
+            .pack_outcome = ref.pack_outcome,
+            .pack_conflict_category = ref.pack_conflict_category,
+        });
+    }
+}
+
+fn isReverseSymbolicSource(source_spec: []const u8, rel_paths: []const []const u8) bool {
+    if (std.mem.startsWith(u8, source_spec, "code_intel:last_result")) return false;
+    const rel_path = reverseSourceRelPath(source_spec) orelse return false;
+    for (rel_paths) |rel_path_match| {
+        if (rel_path_match.len == 0) continue;
+        if (std.mem.indexOf(u8, source_spec, rel_path_match) != null or std.mem.eql(u8, rel_path, rel_path_match)) return false;
+    }
+    return isSymbolicSurfacePath(rel_path);
+}
+
+fn reverseSourceRelPath(source_spec: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, source_spec, "file:")) {
+        const rel_path = std.mem.trim(u8, source_spec["file:".len..], " \r\n\t");
+        return if (rel_path.len == 0) null else rel_path;
+    }
+    if (std.mem.startsWith(u8, source_spec, "region:")) {
+        const payload = source_spec["region:".len..];
+        const colon = std.mem.lastIndexOfScalar(u8, payload, ':') orelse return null;
+        const rel_path = payload[0..colon];
+        return if (rel_path.len == 0) null else rel_path;
+    }
+    return null;
+}
+
+fn isSymbolicSurfacePath(rel_path: []const u8) bool {
+    return std.mem.endsWith(u8, rel_path, ".md") or
+        std.mem.endsWith(u8, rel_path, ".txt") or
+        std.mem.endsWith(u8, rel_path, ".rst") or
+        std.mem.endsWith(u8, rel_path, ".html") or
+        std.mem.endsWith(u8, rel_path, ".xml") or
+        std.mem.endsWith(u8, rel_path, ".toml") or
+        std.mem.endsWith(u8, rel_path, ".yaml") or
+        std.mem.endsWith(u8, rel_path, ".yml") or
+        std.mem.endsWith(u8, rel_path, ".json") or
+        std.mem.endsWith(u8, rel_path, ".ini") or
+        std.mem.endsWith(u8, rel_path, ".cfg") or
+        std.mem.endsWith(u8, rel_path, ".conf") or
+        std.mem.endsWith(u8, rel_path, ".env") or
+        std.mem.endsWith(u8, rel_path, ".tf") or
+        std.mem.endsWith(u8, rel_path, ".tfvars") or
+        std.mem.endsWith(u8, rel_path, ".tpl") or
+        std.mem.endsWith(u8, rel_path, ".rules") or
+        std.mem.endsWith(u8, rel_path, ".dsl") or
+        std.mem.endsWith(u8, rel_path, ".test") or
+        std.mem.endsWith(u8, rel_path, ".spec");
+}
+
 fn upsertMatch(matches: *std.ArrayList(MatchAccumulator), next: MatchAccumulator) !void {
     for (matches.items) |*match| {
         if (match.entry_index != next.entry_index) continue;
@@ -1499,6 +2460,7 @@ fn findEntryIndex(entries: []const CatalogEntry, concept_id: []const u8, preferr
 }
 
 fn lookupEligible(record: *const Record, match: MatchAccumulator) bool {
+    if (record.family != .distilled and !reinforcementUsable(record)) return false;
     const support_hits = @max(match.direct_support_count, match.lineage_support_count);
     if (support_hits == 0) return false;
     if (match.depth == 0) return true;
@@ -1514,6 +2476,8 @@ fn computeLookupScore(record: *const Record, match: MatchAccumulator, options: L
     score += @as(u32, record.reuse_score) / 3;
     score += @as(u32, match.direct_support_count) * 120;
     score += @as(u32, match.lineage_support_count) * 80;
+    score += @as(u32, match.token_support_count) * 60;
+    score += @as(u32, match.pattern_support_count) * 95;
     if (options.prefer_higher_tiers) score += @as(u32, tierRank(record.tier)) * 60;
     if (options.category_hint) |category_hint| {
         if (category_hint == record.category) score += 50;
@@ -1524,6 +2488,7 @@ fn computeLookupScore(record: *const Record, match: MatchAccumulator, options: L
 
 fn preferredGroundingSource(sources: [][]u8) ?[]const u8 {
     for (sources) |source| {
+        if (std.mem.startsWith(u8, source, "file:")) return source;
         if (std.mem.startsWith(u8, source, "region:")) return source;
     }
     if (sources.len == 0) return null;
@@ -1552,7 +2517,7 @@ fn computeGroundingSupportWeight(token_hits: u16, pattern_hits: u16, source_hits
 }
 
 fn groundingEligible(record: *const Record, token_hits: u16, pattern_hits: u16, source_hits: u16, depth: u8) bool {
-    _ = record;
+    if (record.family != .distilled and !reinforcementUsable(record)) return false;
     const support_hits = computeGroundingSupportWeight(token_hits, pattern_hits, source_hits);
     if (support_hits == 0) return false;
     if (depth == 0) {
@@ -1603,11 +2568,54 @@ fn lessSupportReference(a: SupportReference, b: SupportReference) bool {
     return std.mem.order(u8, a.concept_id, b.concept_id) == .lt;
 }
 
+fn sortReverseLinkReferences(items: []ReverseLinkReference) void {
+    var i: usize = 1;
+    while (i < items.len) : (i += 1) {
+        var j = i;
+        while (j > 0 and lessReverseLinkReference(items[j], items[j - 1])) : (j -= 1) {
+            const tmp = items[j - 1];
+            items[j - 1] = items[j];
+            items[j] = tmp;
+        }
+    }
+}
+
+fn lessReverseLinkReference(a: ReverseLinkReference, b: ReverseLinkReference) bool {
+    if (a.usable != b.usable) return a.usable;
+    if (a.decay_state != b.decay_state) return decayRank(a.decay_state) < decayRank(b.decay_state);
+    if (a.trust_class != b.trust_class) return trustRank(a.trust_class) > trustRank(b.trust_class);
+    if (a.lookup_score != b.lookup_score) return a.lookup_score > b.lookup_score;
+    if (tierRank(a.tier) != tierRank(b.tier)) return tierRank(a.tier) > tierRank(b.tier);
+    if (a.direct_support_count != b.direct_support_count) return a.direct_support_count > b.direct_support_count;
+    if (a.lineage_support_count != b.lineage_support_count) return a.lineage_support_count > b.lineage_support_count;
+    if (reverseSourceRank(a.symbolic_source_spec) != reverseSourceRank(b.symbolic_source_spec)) return reverseSourceRank(a.symbolic_source_spec) > reverseSourceRank(b.symbolic_source_spec);
+    if (a.staged != b.staged) return a.staged;
+    if (a.owner_kind != b.owner_kind) return @intFromEnum(a.owner_kind) < @intFromEnum(b.owner_kind);
+    const concept_order = std.mem.order(u8, a.concept_id, b.concept_id);
+    if (concept_order != .eq) return concept_order == .lt;
+    return std.mem.order(u8, a.symbolic_source_spec, b.symbolic_source_spec) == .lt;
+}
+
+fn reverseSourceRank(source_spec: []const u8) u8 {
+    if (std.mem.startsWith(u8, source_spec, "region:")) return 2;
+    if (std.mem.startsWith(u8, source_spec, "file:")) return 1;
+    return 0;
+}
+
 fn trimSupportReferenceList(allocator: std.mem.Allocator, out: *std.ArrayList(SupportReference), max_items: usize) void {
     if (out.items.len <= max_items) return;
     var idx = max_items;
     while (idx < out.items.len) : (idx += 1) {
         deinitSupportReferenceItem(allocator, out.items[idx]);
+    }
+    out.items.len = max_items;
+}
+
+fn trimReverseLinkReferenceList(allocator: std.mem.Allocator, out: *std.ArrayList(ReverseLinkReference), max_items: usize) void {
+    if (out.items.len <= max_items) return;
+    var idx = max_items;
+    while (idx < out.items.len) : (idx += 1) {
+        deinitReverseLinkReferenceItem(allocator, out.items[idx]);
     }
     out.items.len = max_items;
 }
@@ -1623,9 +2631,22 @@ fn deinitSupportReferenceItem(allocator: std.mem.Allocator, item: SupportReferen
     if (item.conflict_owner_id) |conflict_owner_id| allocator.free(conflict_owner_id);
 }
 
+fn deinitReverseLinkReferenceItem(allocator: std.mem.Allocator, item: ReverseLinkReference) void {
+    allocator.free(item.concept_id);
+    allocator.free(item.matched_source_spec);
+    allocator.free(item.symbolic_source_spec);
+    allocator.free(item.owner_id);
+    if (item.lineage_id.len > 0) allocator.free(item.lineage_id);
+    if (item.parent_concept_id) |parent_concept_id| allocator.free(parent_concept_id);
+    if (item.supporting_concept_id) |supporting_concept_id| allocator.free(supporting_concept_id);
+    if (item.conflict_concept_id) |conflict_concept_id| allocator.free(conflict_concept_id);
+    if (item.conflict_owner_id) |conflict_owner_id| allocator.free(conflict_owner_id);
+}
+
 fn cloneSupportReference(allocator: std.mem.Allocator, item: SupportReference) !SupportReference {
     return .{
         .concept_id = try allocator.dupe(u8, item.concept_id),
+        .family = item.family,
         .source_spec = try allocator.dupe(u8, item.source_spec),
         .staged = item.staged,
         .tier = item.tier,
@@ -1655,6 +2676,8 @@ fn cloneSupportReference(allocator: std.mem.Allocator, item: SupportReference) !
         .conflict_concept_id = if (item.conflict_concept_id) |conflict_concept_id| try allocator.dupe(u8, conflict_concept_id) else null,
         .conflict_owner_kind = item.conflict_owner_kind,
         .conflict_owner_id = if (item.conflict_owner_id) |conflict_owner_id| try allocator.dupe(u8, conflict_owner_id) else null,
+        .pack_outcome = item.pack_outcome,
+        .pack_conflict_category = item.pack_conflict_category,
     };
 }
 
@@ -1718,6 +2741,700 @@ fn mergeCrossShardSupport(
     }
 
     sortSupportReferences(out.items);
+}
+
+fn mergeMountedPackGroundingReferences(
+    allocator: std.mem.Allocator,
+    paths: *const shards.Paths,
+    options: GroundingOptions,
+    out: *std.ArrayList(SupportReference),
+) !void {
+    if (paths.metadata.kind != .project) return;
+    const catalogs = try loadMountedPackCatalogs(allocator, paths, options.rel_paths, options.tokens, options.patterns, options.pack_routing_stage, options.pack_routing_caps, options.pack_conflict_policy, options.pack_routing);
+    defer {
+        for (catalogs) |*catalog| catalog.deinit();
+        allocator.free(catalogs);
+    }
+
+    var pack_refs = std.ArrayList(SupportReference).init(allocator);
+    defer {
+        for (pack_refs.items) |item| deinitSupportReferenceItem(allocator, item);
+        pack_refs.deinit();
+    }
+    for (catalogs) |*catalog| {
+        try collectGroundingLookup(allocator, .project, catalog.owner_id, catalog.records, &.{}, options, &pack_refs);
+    }
+    try appendResolvedPackReferences(allocator, out, pack_refs.items, options.pack_routing_stage, options.pack_routing, options.pack_conflict_policy, options.pack_routing_caps.max_candidate_surfaces_per_query);
+}
+
+fn mergeMountedPackSupportReferences(
+    allocator: std.mem.Allocator,
+    paths: *const shards.Paths,
+    options: LookupOptions,
+    out: *std.ArrayList(SupportReference),
+) !void {
+    if (paths.metadata.kind != .project) return;
+    const catalogs = try loadMountedPackCatalogs(allocator, paths, options.rel_paths, options.tokens, options.patterns, options.pack_routing_stage, options.pack_routing_caps, options.pack_conflict_policy, options.pack_routing);
+    defer {
+        for (catalogs) |*catalog| catalog.deinit();
+        allocator.free(catalogs);
+    }
+
+    var pack_refs = std.ArrayList(SupportReference).init(allocator);
+    defer {
+        for (pack_refs.items) |item| deinitSupportReferenceItem(allocator, item);
+        pack_refs.deinit();
+    }
+    for (catalogs) |*catalog| {
+        try collectSupportLookup(allocator, .project, catalog.owner_id, catalog.records, &.{}, options, &pack_refs);
+    }
+    try appendResolvedPackReferences(allocator, out, pack_refs.items, options.pack_routing_stage, options.pack_routing, options.pack_conflict_policy, options.pack_routing_caps.max_candidate_surfaces_per_query);
+}
+
+fn mergeMountedPackFamilyReferences(
+    allocator: std.mem.Allocator,
+    paths: *const shards.Paths,
+    options: FamilyLookupOptions,
+    out: *std.ArrayList(SupportReference),
+) !void {
+    if (paths.metadata.kind != .project) return;
+    const catalogs = try loadMountedPackCatalogs(allocator, paths, options.rel_paths, options.tokens, options.patterns, options.pack_routing_stage, options.pack_routing_caps, options.pack_conflict_policy, options.pack_routing);
+    defer {
+        for (catalogs) |*catalog| catalog.deinit();
+        allocator.free(catalogs);
+    }
+
+    var pack_refs = std.ArrayList(SupportReference).init(allocator);
+    defer {
+        for (pack_refs.items) |item| deinitSupportReferenceItem(allocator, item);
+        pack_refs.deinit();
+    }
+    for (catalogs) |*catalog| {
+        try collectFamilyLookup(allocator, .project, catalog.owner_id, catalog.records, false, options, &pack_refs);
+    }
+    try appendResolvedPackReferences(allocator, out, pack_refs.items, options.pack_routing_stage, options.pack_routing, options.pack_conflict_policy, options.pack_routing_caps.max_candidate_surfaces_per_query);
+}
+
+fn appendResolvedPackReferences(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(SupportReference),
+    pack_refs: []const SupportReference,
+    stage: PackRoutingStage,
+    collector: ?*PackRoutingCollector,
+    policy: PackConflictPolicy,
+    max_candidate_surfaces: usize,
+) !void {
+    var ordered_refs = std.ArrayList(SupportReference).init(allocator);
+    defer ordered_refs.deinit();
+    try ordered_refs.resize(pack_refs.len);
+    for (pack_refs, 0..) |item, idx| ordered_refs.items[idx] = item;
+    sortSupportReferences(ordered_refs.items);
+
+    var kept = std.ArrayList(bool).init(allocator);
+    defer kept.deinit();
+    try kept.resize(ordered_refs.items.len);
+    @memset(kept.items, false);
+
+    var surfaces_left = max_candidate_surfaces;
+    for (ordered_refs.items, 0..) |_, idx| {
+        if (surfaces_left == 0) break;
+        kept.items[idx] = true;
+        surfaces_left -= 1;
+    }
+
+    if (collector) |value| {
+        var idx: usize = 0;
+        while (idx < ordered_refs.items.len) : (idx += 1) {
+            const owner_id = ordered_refs.items[idx].owner_id;
+            var kept_count: usize = 0;
+            var suppressed_count: usize = 0;
+            var cursor = idx;
+            while (cursor < ordered_refs.items.len and std.mem.eql(u8, ordered_refs.items[cursor].owner_id, owner_id)) : (cursor += 1) {
+                if (kept.items[cursor]) kept_count += 1 else suppressed_count += 1;
+            }
+            value.noteCandidateSurfaces(stage, owner_id, kept_count, suppressed_count);
+            idx = cursor - 1;
+        }
+    }
+
+    for (ordered_refs.items, 0..) |pack_ref, idx| {
+        if (!kept.items[idx]) continue;
+        var next = try cloneSupportReference(allocator, pack_ref);
+        errdefer deinitSupportReferenceItem(allocator, next);
+        next.resolution = .imported;
+        next.reuse_decision = .adopt;
+        next.pack_outcome = .activated;
+
+        if (findHigherTrustConceptCompetitor(ordered_refs.items, idx)) |conflict| {
+            next.usable = false;
+            next.resolution = .conflict_refused;
+            next.conflict_kind = .incompatible;
+            next.conflict_concept_id = try allocator.dupe(u8, conflict.concept_id);
+            next.conflict_owner_kind = conflict.owner_kind;
+            next.conflict_owner_id = try allocator.dupe(u8, conflict.owner_id);
+            next.pack_outcome = .trust_blocked;
+            next.pack_conflict_category = .trust_mismatch;
+            if (collector) |value| value.noteConflict(stage, next.owner_id, .trust_blocked, .trust_mismatch, false);
+        } else if (policy.competition == .deterministic_winner) {
+            if (findEarlierConflictingPackReference(ordered_refs.items, idx)) |conflict| {
+                next.usable = false;
+                next.resolution = .conflict_refused;
+                next.conflict_kind = .incompatible;
+                next.conflict_concept_id = try allocator.dupe(u8, conflict.concept_id);
+                next.conflict_owner_kind = conflict.owner_kind;
+                next.conflict_owner_id = try allocator.dupe(u8, conflict.owner_id);
+                next.pack_outcome = .suppressed;
+                next.pack_conflict_category = .same_concept_incompatible;
+                if (collector) |value| value.noteConflict(stage, next.owner_id, .suppressed, .same_concept_incompatible, false);
+            }
+        } else if (findConflictingPackReference(ordered_refs.items, idx)) |conflict| {
+            next.usable = false;
+            next.resolution = .conflict_refused;
+            next.conflict_kind = .incompatible;
+            next.conflict_concept_id = try allocator.dupe(u8, conflict.concept_id);
+            next.conflict_owner_kind = conflict.owner_kind;
+            next.conflict_owner_id = try allocator.dupe(u8, conflict.owner_id);
+            next.pack_outcome = .conflict_refused;
+            next.pack_conflict_category = .same_concept_incompatible;
+            if (collector) |value| value.noteConflict(stage, next.owner_id, .conflict_refused, .same_concept_incompatible, false);
+        } else if (findSupportReference(out.items, pack_ref.concept_id)) |existing| {
+            if (!supportReferenceCompatible(existing, pack_ref)) {
+                next.usable = false;
+                next.resolution = .conflict_refused;
+                next.conflict_kind = .incompatible;
+                next.conflict_concept_id = try allocator.dupe(u8, existing.concept_id);
+                next.conflict_owner_kind = existing.owner_kind;
+                next.conflict_owner_id = try allocator.dupe(u8, existing.owner_id);
+                next.pack_outcome = .conflict_refused;
+                next.pack_conflict_category = .same_concept_incompatible;
+                if (collector) |value| value.noteConflict(stage, next.owner_id, .conflict_refused, .same_concept_incompatible, existing.owner_kind != .project or !std.mem.startsWith(u8, existing.owner_id, "pack/"));
+            }
+        }
+
+        try out.append(next);
+    }
+    sortSupportReferences(out.items);
+}
+
+fn findConflictingPackReference(items: []const SupportReference, idx: usize) ?SupportReference {
+    const needle = items[idx];
+    for (items, 0..) |item, other_idx| {
+        if (other_idx == idx) continue;
+        if (!std.mem.eql(u8, item.concept_id, needle.concept_id)) continue;
+        if (supportReferenceCompatible(item, needle)) continue;
+        return item;
+    }
+    return null;
+}
+
+fn findHigherTrustConceptCompetitor(items: []const SupportReference, idx: usize) ?SupportReference {
+    const needle = items[idx];
+    for (items, 0..) |item, other_idx| {
+        if (other_idx == idx) continue;
+        if (!std.mem.eql(u8, item.concept_id, needle.concept_id)) continue;
+        if (supportReferenceCompatible(item, needle)) continue;
+        if (trustRank(item.trust_class) > trustRank(needle.trust_class)) return item;
+    }
+    return null;
+}
+
+fn findEarlierConflictingPackReference(items: []const SupportReference, idx: usize) ?SupportReference {
+    const needle = items[idx];
+    for (items[0..idx]) |item| {
+        if (!std.mem.eql(u8, item.concept_id, needle.concept_id)) continue;
+        if (supportReferenceCompatible(item, needle)) continue;
+        return item;
+    }
+    return null;
+}
+
+fn routeMountedPacks(
+    allocator: std.mem.Allocator,
+    paths: *const shards.Paths,
+    rel_paths: []const []const u8,
+    tokens: []const []const u8,
+    patterns: []const []const u8,
+    stage: PackRoutingStage,
+    caps: PackRoutingCaps,
+    policy: PackConflictPolicy,
+    call_id: u16,
+) !RoutedMountLoad {
+    const started = sys.getMilliTick();
+    defer lookup_profile.pack_mount_resolve_ms += sys.getMilliTick() - started;
+    if (paths.metadata.kind != .project) {
+        return .{
+            .mounts = try allocator.alloc(knowledge_pack_store.ResolvedMount, 0),
+            .traces = try allocator.alloc(PackRoutingTrace, 0),
+        };
+    }
+
+    const manifest_started = sys.getMilliTick();
+    const mounts = try knowledge_pack_store.listResolvedMounts(allocator, paths);
+    lookup_profile.pack_manifest_preview_load_ms += sys.getMilliTick() - manifest_started;
+    errdefer {
+        for (mounts) |*mount| mount.deinit();
+        allocator.free(mounts);
+    }
+
+    const routing_started = sys.getMilliTick();
+    var candidates = try allocator.alloc(MountedPackCandidate, mounts.len);
+    defer allocator.free(candidates);
+    for (mounts, 0..) |*mount, idx| {
+        candidates[idx] = scoreMountedPack(mount, rel_paths, tokens, patterns);
+        candidates[idx].mount_index = idx;
+    }
+    sortMountedPackCandidates(candidates);
+
+    var traces = std.ArrayList(PackRoutingTrace).init(allocator);
+    errdefer {
+        for (traces.items) |*trace| trace.deinit();
+        traces.deinit();
+    }
+
+    var active_mounts = std.ArrayList(knowledge_pack_store.ResolvedMount).init(allocator);
+    errdefer {
+        for (active_mounts.items) |*mount| mount.deinit();
+        active_mounts.deinit();
+    }
+    var moved = try allocator.alloc(bool, mounts.len);
+    defer allocator.free(moved);
+    @memset(moved, false);
+
+    var considered_rank: u16 = 0;
+    var activation_rank: u16 = 0;
+    var considered_used: usize = 0;
+    var activated_used: usize = 0;
+
+    for (candidates, 0..) |candidate, candidate_idx| {
+        const mount = &mounts[candidate.mount_index];
+        var status: PackRoutingStatus = .skipped;
+        var reason = candidate.reason;
+        var considered_for_budget = false;
+        var activated = false;
+        var trace_candidate = candidate;
+
+        if (trace_candidate.freshness_state == .stale) {
+            status = .stale_blocked;
+            trace_candidate.conflict_category = .stale_pack;
+            reason = "stale pack was blocked by conservative freshness policy";
+        } else if (trace_candidate.compatible and trace_candidate.eligible) {
+            if (findHigherTrustAnchorCompetitor(candidates, candidate_idx)) |_| {
+                status = .trust_blocked;
+                trace_candidate.conflict_category = .trust_mismatch;
+                reason = "lower-trust pack lost to a higher-trust competing pack on the same anchor";
+            } else if (findEarlierAnchorPeer(candidates, candidate_idx)) |_| {
+                switch (policy.competition) {
+                    .refuse_all_competing, .prefer_higher_trust_only => {
+                        status = .conflict_refused;
+                        trace_candidate.conflict_category = .same_anchor_competing;
+                        reason = "competing packs matched the same anchor and conservative policy refused them";
+                    },
+                    .deterministic_winner => {
+                        status = .suppressed;
+                        trace_candidate.conflict_category = .same_anchor_competing;
+                        reason = "deterministic policy selected an earlier competing pack as the single winner";
+                    },
+                }
+            } else if ((policy.competition == .refuse_all_competing or policy.competition == .prefer_higher_trust_only) and
+                findLaterEqualTrustAnchorPeer(candidates, candidate_idx) != null)
+            {
+                status = .conflict_refused;
+                trace_candidate.conflict_category = .same_anchor_competing;
+                reason = "competing packs matched the same anchor and conservative policy refused them";
+            } else if (considered_used >= caps.max_considered_per_query) {
+                status = .suppressed;
+                reason = "pack preselection cap reached before this eligible mount could be considered";
+            } else {
+                considered_used += 1;
+                considered_rank += 1;
+                considered_for_budget = true;
+                if (activated_used >= caps.max_activated_per_query) {
+                    status = .suppressed;
+                    reason = "pack activation cap reached after higher-ranked mounts were selected";
+                } else {
+                    activated_used += 1;
+                    activation_rank += 1;
+                    status = .activated;
+                    activated = true;
+                    reason = if (findLaterAnchorPeer(candidates, candidate_idx) != null and policy.competition == .deterministic_winner)
+                        "deterministic policy chose a single competing pack winner by stable rank"
+                    else
+                        "deterministic pack route activated by bounded anchor match";
+                }
+            }
+        } else if (!trace_candidate.compatible) {
+            status = .suppressed;
+            if (trace_candidate.conflict_category == .none) trace_candidate.conflict_category = .incompatible_pack_family;
+            reason = "pack metadata was incompatible with deterministic Linux-first routing";
+        } else if (!mount.entry.enabled) {
+            status = .suppressed;
+            reason = "pack is mounted but disabled";
+        } else if (trace_candidate.eligible) {
+            if (considered_used >= caps.max_considered_per_query) {
+                status = .suppressed;
+            }
+        }
+
+        try traces.append(try makePackRoutingTrace(
+            allocator,
+            stage,
+            mount.entry.pack_id,
+            mount.entry.pack_version,
+            status,
+            reason,
+            policy,
+            trace_candidate,
+            call_id,
+            if (considered_for_budget) considered_rank else 0,
+            if (activated) activation_rank else 0,
+        ));
+
+        if (!activated) continue;
+        try active_mounts.append(mount.*);
+        moved[candidate.mount_index] = true;
+    }
+
+    for (mounts, 0..) |*mount, idx| {
+        if (moved[idx]) continue;
+        mount.deinit();
+    }
+    allocator.free(mounts);
+
+    lookup_profile.pack_routing_ms += sys.getMilliTick() - routing_started;
+    return .{
+        .mounts = try active_mounts.toOwnedSlice(),
+        .traces = try traces.toOwnedSlice(),
+    };
+}
+
+fn candidatesShareAnchor(a: MountedPackCandidate, b: MountedPackCandidate) bool {
+    if (!a.compatible or !b.compatible or !a.eligible or !b.eligible) return false;
+    return a.path_hits == b.path_hits and
+        a.symbol_hits == b.symbol_hits and
+        a.domain_hits == b.domain_hits and
+        a.file_family_hits == b.file_family_hits;
+}
+
+fn findHigherTrustAnchorCompetitor(items: []const MountedPackCandidate, idx: usize) ?MountedPackCandidate {
+    const needle = items[idx];
+    for (items, 0..) |item, item_idx| {
+        if (item_idx == idx) continue;
+        if (item.freshness_state != .active) continue;
+        if (!candidatesShareAnchor(item, needle)) continue;
+        if (trustRank(item.trust_class) > trustRank(needle.trust_class)) return item;
+    }
+    return null;
+}
+
+fn findEarlierAnchorPeer(items: []const MountedPackCandidate, idx: usize) ?MountedPackCandidate {
+    const needle = items[idx];
+    for (items[0..idx]) |item| {
+        if (item.freshness_state != .active) continue;
+        if (!candidatesShareAnchor(item, needle)) continue;
+        if (trustRank(item.trust_class) < trustRank(needle.trust_class)) continue;
+        return item;
+    }
+    return null;
+}
+
+fn findLaterAnchorPeer(items: []const MountedPackCandidate, idx: usize) ?MountedPackCandidate {
+    const needle = items[idx];
+    for (items[idx + 1 ..]) |item| {
+        if (item.freshness_state != .active) continue;
+        if (candidatesShareAnchor(item, needle)) return item;
+    }
+    return null;
+}
+
+fn findLaterEqualTrustAnchorPeer(items: []const MountedPackCandidate, idx: usize) ?MountedPackCandidate {
+    const needle = items[idx];
+    for (items[idx + 1 ..]) |item| {
+        if (item.freshness_state != .active) continue;
+        if (!candidatesShareAnchor(item, needle)) continue;
+        if (trustRank(item.trust_class) != trustRank(needle.trust_class)) continue;
+        return item;
+    }
+    return null;
+}
+
+fn makePackRoutingTrace(
+    allocator: std.mem.Allocator,
+    stage: PackRoutingStage,
+    pack_id: []const u8,
+    pack_version: []const u8,
+    status: PackRoutingStatus,
+    reason: []const u8,
+    policy: PackConflictPolicy,
+    candidate: MountedPackCandidate,
+    call_id: u16,
+    considered_rank: u16,
+    activation_rank: u16,
+) !PackRoutingTrace {
+    const owner_id = try std.fmt.allocPrint(allocator, "pack/{s}@{s}", .{ pack_id, pack_version });
+    errdefer allocator.free(owner_id);
+    return .{
+        .allocator = allocator,
+        .stage = stage,
+        .pack_id = try allocator.dupe(u8, pack_id),
+        .pack_version = try allocator.dupe(u8, pack_version),
+        .owner_id = owner_id,
+        .status = status,
+        .reason = try allocator.dupe(u8, reason),
+        .policy = policy,
+        .conflict_category = candidate.conflict_category,
+        .trust_class = candidate.trust_class,
+        .freshness_state = candidate.freshness_state,
+        .score = candidate.score,
+        .support_potential_upper_bound = @intCast(@min(candidate.score, @as(u32, 1000))),
+        .call_id = call_id,
+        .considered_rank = considered_rank,
+        .activation_rank = activation_rank,
+        .path_hits = candidate.path_hits,
+        .symbol_hits = candidate.symbol_hits,
+        .domain_hits = candidate.domain_hits,
+        .file_family_hits = candidate.file_family_hits,
+    };
+}
+
+pub fn clonePackRoutingTrace(allocator: std.mem.Allocator, trace: PackRoutingTrace) !PackRoutingTrace {
+    return .{
+        .allocator = allocator,
+        .stage = trace.stage,
+        .pack_id = try allocator.dupe(u8, trace.pack_id),
+        .pack_version = try allocator.dupe(u8, trace.pack_version),
+        .owner_id = try allocator.dupe(u8, trace.owner_id),
+        .status = trace.status,
+        .reason = try allocator.dupe(u8, trace.reason),
+        .policy = trace.policy,
+        .conflict_category = trace.conflict_category,
+        .trust_class = trace.trust_class,
+        .freshness_state = trace.freshness_state,
+        .score = trace.score,
+        .support_potential_upper_bound = trace.support_potential_upper_bound,
+        .call_id = trace.call_id,
+        .considered_rank = trace.considered_rank,
+        .activation_rank = trace.activation_rank,
+        .path_hits = trace.path_hits,
+        .symbol_hits = trace.symbol_hits,
+        .domain_hits = trace.domain_hits,
+        .file_family_hits = trace.file_family_hits,
+        .candidate_surfaces = trace.candidate_surfaces,
+        .suppressed_candidates = trace.suppressed_candidates,
+        .conflict_refused = trace.conflict_refused,
+        .local_truth_won = trace.local_truth_won,
+    };
+}
+
+fn scoreMountedPack(
+    mount: *const knowledge_pack_store.ResolvedMount,
+    rel_paths: []const []const u8,
+    tokens: []const []const u8,
+    patterns: []const []const u8,
+) MountedPackCandidate {
+    var out = MountedPackCandidate{ .mount_index = 0, .reason = "pack lacked a deterministic anchor for this query" };
+    out.trust_class = parseTrustClassName(mount.manifest.trust_class) orelse .exploratory;
+    out.freshness_state = mount.manifest.provenance.freshness_state;
+    if (!mount.entry.enabled) {
+        out.reason = "pack is mounted but disabled";
+        return out;
+    }
+    if (!mount.manifest.compatibility.linux_first or !mount.manifest.compatibility.deterministic_only or !std.mem.eql(u8, mount.manifest.compatibility.mount_schema, knowledge_pack_store.MOUNT_SCHEMA_VERSION)) {
+        out.compatible = false;
+        out.conflict_category = .incompatible_pack_family;
+        out.reason = "pack compatibility rejected deterministic Linux-first routing";
+        return out;
+    }
+
+    out.path_hits = countPackPreviewPathHits(mount.manifest.content.corpus_preview, rel_paths);
+    out.symbol_hits = countPackSymbolHits(mount.manifest.content.concept_preview, tokens, patterns);
+    out.domain_hits = countPackDomainHits(mount.manifest.domain_family, rel_paths, tokens, patterns);
+    out.file_family_hits = countPackFileFamilyHits(mount.manifest.content.corpus_preview, rel_paths);
+    out.eligible = out.path_hits != 0 or out.symbol_hits != 0 or out.domain_hits != 0 or out.file_family_hits != 0;
+    if (!out.eligible) return out;
+    out.score =
+        @as(u32, out.path_hits) * 2000 +
+        @as(u32, out.symbol_hits) * 1400 +
+        @as(u32, out.domain_hits) * 900 +
+        @as(u32, out.file_family_hits) * 250 +
+        @as(u32, trustRank(out.trust_class)) * 50;
+    out.reason = "eligible deterministic anchor";
+    return out;
+}
+
+fn sortMountedPackCandidates(items: []MountedPackCandidate) void {
+    var i: usize = 1;
+    while (i < items.len) : (i += 1) {
+        var j = i;
+        while (j > 0 and lessMountedPackCandidate(items[j], items[j - 1])) : (j -= 1) {
+            const tmp = items[j - 1];
+            items[j - 1] = items[j];
+            items[j] = tmp;
+        }
+    }
+}
+
+fn lessMountedPackCandidate(a: MountedPackCandidate, b: MountedPackCandidate) bool {
+    if (a.compatible != b.compatible) return a.compatible;
+    if (a.eligible != b.eligible) return a.eligible;
+    if (a.freshness_state != b.freshness_state) return a.freshness_state == .active;
+    if (a.trust_class != b.trust_class) return trustRank(a.trust_class) > trustRank(b.trust_class);
+    if (a.score != b.score) return a.score > b.score;
+    if (a.path_hits != b.path_hits) return a.path_hits > b.path_hits;
+    if (a.symbol_hits != b.symbol_hits) return a.symbol_hits > b.symbol_hits;
+    if (a.domain_hits != b.domain_hits) return a.domain_hits > b.domain_hits;
+    return a.mount_index < b.mount_index;
+}
+
+fn countPackPreviewPathHits(preview: [][]u8, rel_paths: []const []const u8) u16 {
+    var count: u16 = 0;
+    for (preview) |item| {
+        for (rel_paths) |rel_path| {
+            if (rel_path.len == 0) continue;
+            if (std.mem.indexOf(u8, item, rel_path) != null or std.mem.indexOf(u8, item, std.fs.path.basename(rel_path)) != null) {
+                count +|= 1;
+                break;
+            }
+        }
+    }
+    return count;
+}
+
+fn countPackSymbolHits(preview: [][]u8, tokens: []const []const u8, patterns: []const []const u8) u16 {
+    var count: u16 = 0;
+    for (preview) |item| {
+        var matched = false;
+        for (tokens) |token| {
+            if (token.len < 3) continue;
+            if (std.mem.indexOf(u8, item, token) != null) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            for (patterns) |pattern| {
+                if (pattern.len < 4) continue;
+                if (std.mem.indexOf(u8, item, pattern) != null) {
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if (matched) count +|= 1;
+    }
+    return count;
+}
+
+fn countPackDomainHits(domain_family: []const u8, rel_paths: []const []const u8, tokens: []const []const u8, patterns: []const []const u8) u16 {
+    if (std.mem.eql(u8, domain_family, "general")) return 0;
+    for (rel_paths) |rel_path| {
+        if (std.mem.indexOf(u8, rel_path, domain_family) != null) return 1;
+    }
+    for (tokens) |token| {
+        if (std.mem.eql(u8, token, domain_family) or std.mem.indexOf(u8, token, domain_family) != null) return 1;
+    }
+    for (patterns) |pattern| {
+        if (std.mem.indexOf(u8, pattern, domain_family) != null) return 1;
+    }
+    return 0;
+}
+
+fn countPackFileFamilyHits(preview: [][]u8, rel_paths: []const []const u8) u16 {
+    var family_hits: u16 = 0;
+    for (rel_paths) |rel_path| {
+        const family = requestFamilyForPath(rel_path);
+        if (family == .other) continue;
+        for (preview) |item| {
+            if (requestFamilyForPath(item) == family) {
+                family_hits +|= 1;
+                break;
+            }
+        }
+    }
+    return family_hits;
+}
+
+fn requestFamilyForPath(path: []const u8) PackRequestFamily {
+    if (std.mem.endsWith(u8, path, ".md") or std.mem.endsWith(u8, path, ".txt")) return .docs;
+    if (std.mem.endsWith(u8, path, ".json") or std.mem.endsWith(u8, path, ".toml") or std.mem.endsWith(u8, path, ".yaml") or std.mem.endsWith(u8, path, ".yml") or std.mem.endsWith(u8, path, ".cfg") or std.mem.endsWith(u8, path, ".conf") or std.mem.endsWith(u8, path, ".ini")) return .config;
+    if (std.mem.indexOf(u8, path, "/test") != null or std.mem.endsWith(u8, path, "_test.zig")) return .tests;
+    if (std.mem.indexOf(u8, path, "/log") != null or std.mem.endsWith(u8, path, ".log")) return .logs;
+    if (std.mem.endsWith(u8, path, ".zig") or std.mem.endsWith(u8, path, ".c") or std.mem.endsWith(u8, path, ".cpp") or std.mem.endsWith(u8, path, ".h")) return .code;
+    return .other;
+}
+
+fn loadMountedPackCatalogs(
+    allocator: std.mem.Allocator,
+    paths: *const shards.Paths,
+    rel_paths: []const []const u8,
+    tokens: []const []const u8,
+    patterns: []const []const u8,
+    stage: PackRoutingStage,
+    caps: PackRoutingCaps,
+    policy: PackConflictPolicy,
+    collector: ?*PackRoutingCollector,
+) ![]MountedPackCatalog {
+    const started = sys.getMilliTick();
+    defer lookup_profile.pack_catalog_load_ms += sys.getMilliTick() - started;
+    if (paths.metadata.kind != .project) return allocator.alloc(MountedPackCatalog, 0);
+    const call_id = if (collector) |value| value.beginCall() else 0;
+    var routed = try routeMountedPacks(allocator, paths, rel_paths, tokens, patterns, stage, caps, policy, call_id);
+    defer routed.deinit(allocator);
+    if (collector) |value| {
+        for (routed.traces) |trace| {
+            try value.append(try clonePackRoutingTrace(allocator, trace));
+        }
+    }
+
+    var out = std.ArrayList(MountedPackCatalog).init(allocator);
+    errdefer {
+        for (out.items) |*catalog| catalog.deinit();
+        out.deinit();
+    }
+    for (routed.mounts) |*mount| {
+        const owner_id = try mount.ownerId(allocator);
+        errdefer allocator.free(owner_id);
+        const prefix = try mount.mountPrefix(allocator);
+        defer allocator.free(prefix);
+        var records = try loadCatalog(allocator, mount.abstraction_catalog_abs_path);
+        defer deinitCatalog(&records);
+        try projectPackRecords(allocator, &records, prefix, owner_id);
+        try out.append(.{
+            .allocator = allocator,
+            .owner_id = owner_id,
+            .records = try records.toOwnedSlice(),
+        });
+    }
+    return out.toOwnedSlice();
+}
+
+fn projectPackRecords(
+    allocator: std.mem.Allocator,
+    records: *std.ArrayList(Record),
+    mount_prefix: []const u8,
+    owner_id: []const u8,
+) !void {
+    for (records.items) |*record| {
+        for (record.sources, 0..) |source, idx| {
+            const projected = try rewritePackSourceSpec(allocator, source, mount_prefix);
+            allocator.free(record.sources[idx]);
+            record.sources[idx] = projected;
+        }
+        for (record.provenance, 0..) |item, idx| {
+            const projected = try std.fmt.allocPrint(allocator, "{s}|pack_owner={s}", .{ item, owner_id });
+            allocator.free(record.provenance[idx]);
+            record.provenance[idx] = projected;
+        }
+        if (record.lineage_id.len > 0) allocator.free(record.lineage_id);
+        record.lineage_id = try std.fmt.allocPrint(allocator, "pack:{s}:{s}", .{ owner_id, record.concept_id });
+    }
+}
+
+fn rewritePackSourceSpec(allocator: std.mem.Allocator, source: []const u8, mount_prefix: []const u8) ![]u8 {
+    const corpus_prefix = "@corpus/";
+    const idx = std.mem.indexOf(u8, source, corpus_prefix) orelse return allocator.dupe(u8, source);
+    const before = source[0..idx];
+    const after = source[idx + corpus_prefix.len ..];
+    return std.fmt.allocPrint(allocator, "{s}{s}/{s}", .{ before, mount_prefix, after });
 }
 
 fn findSupportReference(items: []const SupportReference, concept_id: []const u8) ?SupportReference {
@@ -2528,6 +4245,7 @@ fn serializeCatalog(allocator: std.mem.Allocator, records: []const Record) ![]u8
     try out.append('\n');
     for (records) |record| {
         try appendLine(&out, "concept", record.concept_id);
+        try appendLine(&out, "family", familyName(record.family));
         try appendLine(&out, "tier", tierName(record.tier));
         try appendLine(&out, "category", categoryName(record.category));
         if (record.parent_concept_id) |parent_concept_id| try appendLine(&out, "parent", parent_concept_id);
@@ -2548,6 +4266,11 @@ fn serializeCatalog(allocator: std.mem.Allocator, records: []const Record) ![]u8
         try appendLineInt(&out, "lineage_version", record.lineage_version);
         try appendLine(&out, "trust_class", trustClassName(record.trust_class));
         try appendLine(&out, "decay_state", decayStateName(record.decay_state));
+        try appendLineInt(&out, "success_count", record.success_count);
+        try appendLineInt(&out, "failure_count", record.failure_count);
+        try appendLineInt(&out, "ambiguity_count", record.ambiguity_count);
+        try appendLineInt(&out, "contradiction_count", record.contradiction_count);
+        try appendLineInt(&out, "independent_case_count", record.independent_case_count);
         try appendLineInt(&out, "first_revision", record.first_revision);
         try appendLineInt(&out, "last_revision", record.last_revision);
         try appendLineInt(&out, "last_review_revision", record.last_review_revision);
@@ -2565,6 +4288,16 @@ fn loadCatalog(allocator: std.mem.Allocator, abs_path: []const u8) !std.ArrayLis
     var records = std.ArrayList(Record).init(allocator);
     errdefer deinitCatalog(&records);
     if (!fileExists(abs_path)) return records;
+
+    const stat_file = try std.fs.openFileAbsolute(abs_path, .{});
+    defer stat_file.close();
+    const stat = try stat_file.stat();
+    var cache = catalogCache();
+    for (cache.items) |*entry| {
+        if (!std.mem.eql(u8, entry.abs_path, abs_path)) continue;
+        if (entry.size_bytes != stat.size or entry.mtime_ns != stat.mtime) continue;
+        return try cloneCatalogRecords(allocator, entry.records);
+    }
 
     const bytes = try readOwnedFile(allocator, abs_path, 1 * 1024 * 1024);
     defer allocator.free(bytes);
@@ -2601,6 +4334,23 @@ fn loadCatalog(allocator: std.mem.Allocator, abs_path: []const u8) !std.ArrayLis
     }
 
     if (builder != null) return error.InvalidAbstractionCatalog;
+
+    if (cache.items.len >= MAX_CATALOG_CACHE_ENTRIES) {
+        cache.items[0].deinit();
+        _ = cache.orderedRemove(0);
+    }
+    const cached_abs_path = try std.heap.page_allocator.dupe(u8, abs_path);
+    errdefer std.heap.page_allocator.free(cached_abs_path);
+    var cached_records = try cloneCatalogRecords(std.heap.page_allocator, records.items);
+    errdefer deinitCatalog(&cached_records);
+    try cache.append(.{
+        .allocator = std.heap.page_allocator,
+        .abs_path = cached_abs_path,
+        .size_bytes = stat.size,
+        .mtime_ns = stat.mtime,
+        .records = try cached_records.toOwnedSlice(),
+    });
+
     return records;
 }
 
@@ -2700,6 +4450,7 @@ fn copyMaybeFile(allocator: std.mem.Allocator, from_path: []const u8, to_path: [
 const RecordBuilder = struct {
     allocator: std.mem.Allocator,
     concept_id: ?[]u8 = null,
+    family: Family = .distilled,
     tier: Tier = .pattern,
     category: Category = .syntax,
     parent_concept_id: ?[]u8 = null,
@@ -2721,6 +4472,11 @@ const RecordBuilder = struct {
     lineage_version: u32 = 0,
     trust_class: TrustClass = .exploratory,
     decay_state: DecayState = .active,
+    success_count: u32 = 0,
+    failure_count: u32 = 0,
+    ambiguity_count: u32 = 0,
+    contradiction_count: u32 = 0,
+    independent_case_count: u32 = 0,
     first_revision: u32 = 0,
     last_revision: u32 = 0,
     last_review_revision: u32 = 0,
@@ -2759,6 +4515,10 @@ const RecordBuilder = struct {
     }
 
     fn parseLine(self: *RecordBuilder, line: []const u8) !void {
+        if (std.mem.startsWith(u8, line, "family ")) {
+            self.family = parseFamily(line["family ".len..]) orelse return error.InvalidAbstractionCatalog;
+            return;
+        }
         if (std.mem.startsWith(u8, line, "tier ")) {
             self.tier = parseTier(line["tier ".len..]) orelse return error.InvalidAbstractionCatalog;
             return;
@@ -2841,6 +4601,26 @@ const RecordBuilder = struct {
             self.decay_state = parseDecayState(line["decay_state ".len..]) orelse return error.InvalidAbstractionCatalog;
             return;
         }
+        if (std.mem.startsWith(u8, line, "success_count ")) {
+            self.success_count = try std.fmt.parseUnsigned(u32, line["success_count ".len..], 10);
+            return;
+        }
+        if (std.mem.startsWith(u8, line, "failure_count ")) {
+            self.failure_count = try std.fmt.parseUnsigned(u32, line["failure_count ".len..], 10);
+            return;
+        }
+        if (std.mem.startsWith(u8, line, "ambiguity_count ")) {
+            self.ambiguity_count = try std.fmt.parseUnsigned(u32, line["ambiguity_count ".len..], 10);
+            return;
+        }
+        if (std.mem.startsWith(u8, line, "contradiction_count ")) {
+            self.contradiction_count = try std.fmt.parseUnsigned(u32, line["contradiction_count ".len..], 10);
+            return;
+        }
+        if (std.mem.startsWith(u8, line, "independent_case_count ")) {
+            self.independent_case_count = try std.fmt.parseUnsigned(u32, line["independent_case_count ".len..], 10);
+            return;
+        }
         if (std.mem.startsWith(u8, line, "first_revision ")) {
             self.first_revision = try std.fmt.parseUnsigned(u32, line["first_revision ".len..], 10);
             return;
@@ -2897,6 +4677,7 @@ const RecordBuilder = struct {
         const out = Record{
             .allocator = self.allocator,
             .concept_id = concept_id,
+            .family = self.family,
             .tier = self.tier,
             .category = self.category,
             .parent_concept_id = self.parent_concept_id,
@@ -2918,6 +4699,11 @@ const RecordBuilder = struct {
             .lineage_version = self.lineage_version,
             .trust_class = self.trust_class,
             .decay_state = self.decay_state,
+            .success_count = self.success_count,
+            .failure_count = self.failure_count,
+            .ambiguity_count = self.ambiguity_count,
+            .contradiction_count = self.contradiction_count,
+            .independent_case_count = self.independent_case_count,
             .first_revision = self.first_revision,
             .last_revision = self.last_revision,
             .last_review_revision = self.last_review_revision,
@@ -3231,6 +5017,18 @@ fn parseCategory(text: []const u8) ?Category {
     return null;
 }
 
+fn parseFamily(text: []const u8) ?Family {
+    if (std.ascii.eqlIgnoreCase(text, "distilled")) return .distilled;
+    if (std.ascii.eqlIgnoreCase(text, "parser_sketch")) return .parser_sketch;
+    if (std.ascii.eqlIgnoreCase(text, "grounding_schema")) return .grounding_schema;
+    if (std.ascii.eqlIgnoreCase(text, "route_suppressor")) return .route_suppressor;
+    if (std.ascii.eqlIgnoreCase(text, "claim_template")) return .claim_template;
+    if (std.ascii.eqlIgnoreCase(text, "intent_interpretation")) return .intent_interpretation;
+    if (std.ascii.eqlIgnoreCase(text, "action_surface")) return .action_surface;
+    if (std.ascii.eqlIgnoreCase(text, "verifier_pattern")) return .verifier_pattern;
+    return null;
+}
+
 fn tierRank(tier: Tier) u16 {
     return switch (tier) {
         .pattern => 0,
@@ -3513,6 +5311,7 @@ fn normalizeCatalogRecords(
     for (records) |*record| {
         if (record.lineage_id.len == 0) record.lineage_id = try makeLineageId(allocator, owner_kind, owner_id, record.concept_id);
         if (record.lineage_version == 0) record.lineage_version = 1;
+        if (record.family != .distilled) refreshReinforcementRecord(record);
         if (record.trust_class == .exploratory and owner_kind != .scratch and record.provenance.len == 0) {
             record.trust_class = default_trust;
         }
@@ -3554,6 +5353,150 @@ fn normalizeReuseEntries(
             }
         }
     }
+}
+
+fn reinforcementConceptId(allocator: std.mem.Allocator, event: ReinforcementEvent) ![]u8 {
+    const key = try sanitizeConceptId(allocator, event.key);
+    defer allocator.free(key);
+    return std.fmt.allocPrint(allocator, "{s}:{s}", .{ familyName(event.family), key });
+}
+
+fn initReinforcementRecord(
+    allocator: std.mem.Allocator,
+    paths: *const shards.Paths,
+    event: ReinforcementEvent,
+    concept_id: []const u8,
+) !Record {
+    var record = Record{
+        .allocator = allocator,
+        .concept_id = try allocator.dupe(u8, concept_id),
+        .family = event.family,
+        .tier = event.tier,
+        .category = event.category,
+        .example_count = 0,
+        .threshold_examples = reinforcementSuccessFloor(event.family),
+        .retained_token_count = @intCast(event.tokens.len),
+        .retained_pattern_count = @intCast(event.patterns.len),
+        .average_resonance = MIN_COMMIT_RESONANCE,
+        .min_resonance = MIN_COMMIT_RESONANCE,
+        .consensus_hash = std.hash.Fnv1a_64.hash(concept_id),
+        .valid_to_commit = true,
+        .vector = @splat(@as(u64, 0)),
+        .sources = try cloneStringSlice(allocator, event.source_specs),
+        .tokens = try cloneStringSlice(allocator, event.tokens),
+        .patterns = try cloneStringSlice(allocator, event.patterns),
+    };
+    errdefer record.deinit();
+    try applyInitialRecordMetadata(allocator, &record, paths.metadata.kind, paths.metadata.id, defaultTrustForKind(paths.metadata.kind), .reinforce_observe);
+    return record;
+}
+
+fn reinforcementExtra(allocator: std.mem.Allocator, event: ReinforcementEvent) ![]u8 {
+    if (event.detail) |detail| {
+        return std.fmt.allocPrint(allocator, "family={s};case={s};outcome={s};detail={s}", .{
+            familyName(event.family),
+            event.case_id,
+            reinforcementOutcomeName(event.outcome),
+            detail,
+        });
+    }
+    return std.fmt.allocPrint(allocator, "family={s};case={s};outcome={s}", .{
+        familyName(event.family),
+        event.case_id,
+        reinforcementOutcomeName(event.outcome),
+    });
+}
+
+fn applyReinforcementOutcome(record: *Record, outcome: ReinforcementOutcome) void {
+    switch (outcome) {
+        .success => {
+            record.success_count +|= 1;
+            record.independent_case_count +|= 1;
+            record.example_count = record.success_count;
+        },
+        .failure => record.failure_count +|= 1,
+        .ambiguous => record.ambiguity_count +|= 1,
+        .contradicted => record.contradiction_count +|= 1,
+    }
+}
+
+fn reinforcementCaseSeen(record: *const Record, case_id: []const u8, outcome: ReinforcementOutcome) bool {
+    var needle_buf = std.ArrayList(u8).init(record.allocator);
+    defer needle_buf.deinit();
+    needle_buf.appendSlice("case=") catch return false;
+    needle_buf.appendSlice(case_id) catch return false;
+    needle_buf.appendSlice(";outcome=") catch return false;
+    needle_buf.appendSlice(reinforcementOutcomeName(outcome)) catch return false;
+    for (record.provenance) |entry| {
+        if (std.mem.indexOf(u8, entry, needle_buf.items) != null) return true;
+    }
+    return false;
+}
+
+fn reinforcementSuccessFloor(family: Family) u32 {
+    return switch (family) {
+        .parser_sketch => 3,
+        .grounding_schema => 2,
+        .route_suppressor => 2,
+        .claim_template => 2,
+        .intent_interpretation => 2,
+        .action_surface => 2,
+        .verifier_pattern => 2,
+        .distilled => 2,
+    };
+}
+
+fn reinforcementIndependentFloor(family: Family) u32 {
+    return switch (family) {
+        .parser_sketch => 2,
+        .grounding_schema => 2,
+        .route_suppressor => 2,
+        .claim_template => 2,
+        .intent_interpretation => 2,
+        .action_surface => 2,
+        .verifier_pattern => 2,
+        .distilled => 2,
+    };
+}
+
+fn reinforcementUsable(record: *const Record) bool {
+    if (record.family == .distilled) return true;
+    if (record.decay_state != .active and record.decay_state != .protected) return false;
+    if (!record.promotion_ready) return false;
+    if (record.failure_count >= 2) return false;
+    if (record.ambiguity_count >= 2) return false;
+    if (record.contradiction_count > 0) return false;
+    return true;
+}
+
+fn refreshReinforcementRecord(record: *Record) void {
+    if (record.family == .distilled) return;
+    record.threshold_examples = reinforcementSuccessFloor(record.family);
+    record.example_count = record.success_count;
+    record.retained_token_count = @intCast(record.tokens.len);
+    record.retained_pattern_count = @intCast(record.patterns.len);
+    const positive = record.success_count * 180 + record.independent_case_count * 140;
+    const negative = record.failure_count * 180 + record.ambiguity_count * 150 + record.contradiction_count * 320;
+    record.support_score = @intCast(@min(@as(u32, 400), positive));
+    record.reuse_score = @intCast(@min(@as(u32, 250), record.independent_case_count * 80));
+    record.quality_score = @intCast(@min(@as(u32, MAX_SCORE), 420 + positive -| negative));
+    record.confidence_score = @intCast(@min(@as(u32, MAX_SCORE), 360 + positive -| negative));
+    record.promotion_ready = record.success_count >= record.threshold_examples and
+        record.independent_case_count >= reinforcementIndependentFloor(record.family) and
+        record.failure_count == 0 and
+        record.ambiguity_count <= 1 and
+        record.contradiction_count == 0;
+    record.decay_state = if (record.contradiction_count > 0 or record.failure_count >= 2 or record.ambiguity_count >= 2)
+        .stale
+    else
+        .active;
+}
+
+fn promotionLineageOperation(record: *const Record) ?LineageOperation {
+    if (record.family == .distilled) return null;
+    if (record.decay_state == .stale) return .reinforce_demote;
+    if (record.promotion_ready) return .reinforce_promote;
+    return null;
 }
 
 fn recordHasLineageOperation(record: *const Record, operation: LineageOperation) bool {
@@ -3738,8 +5681,8 @@ fn persistCatalogState(allocator: std.mem.Allocator, paths: *const shards.Paths,
 
 fn isKeyword(token: []const u8) bool {
     const keywords = [_][]const u8{
-        "if", "else", "return", "try", "catch", "orelse", "const", "var", "pub", "fn", "switch",
-        "while", "for", "break", "continue", "defer", "errdefer", "and", "or", "null", "true", "false",
+        "if",     "else", "return", "try",      "catch", "orelse",   "const", "var", "pub",  "fn",   "switch",
+        "while",  "for",  "break",  "continue", "defer", "errdefer", "and",   "or",  "null", "true", "false",
         "struct", "enum", "union",
     };
     for (keywords) |keyword| {

@@ -1,6 +1,7 @@
 const std = @import("std");
 const core = @import("ghost_core");
 const code_intel = core.code_intel;
+const compute_budget = core.compute_budget;
 const mc = core.inference;
 const sys = core.sys;
 const task_intent = core.task_intent;
@@ -31,6 +32,7 @@ pub fn main() !void {
     var project_shard: ?[]const u8 = null;
     var max_items: usize = 8;
     var reasoning_mode: mc.ReasoningMode = .proof;
+    var compute_request: compute_budget.Request = .{};
     var intent_text: ?[]const u8 = null;
     var output_format: OutputFormat = .json;
     var draft_type: technical_drafts.DraftType = .proof_backed_explanation;
@@ -53,6 +55,31 @@ pub fn main() !void {
                 printUsage();
                 return error.InvalidArguments;
             };
+        } else if (std.mem.startsWith(u8, arg, "--compute-tier=")) {
+            compute_request.tier = parseComputeTier(arg["--compute-tier=".len..]) orelse {
+                printUsage();
+                return error.InvalidArguments;
+            };
+        } else if (std.mem.startsWith(u8, arg, "--budget-max-branches=")) {
+            compute_request.overrides.max_branches = std.fmt.parseUnsigned(u32, arg["--budget-max-branches=".len..], 10) catch null;
+        } else if (std.mem.startsWith(u8, arg, "--budget-max-mounted-packs=")) {
+            compute_request.overrides.max_mounted_packs_considered = std.fmt.parseUnsigned(usize, arg["--budget-max-mounted-packs=".len..], 10) catch null;
+        } else if (std.mem.startsWith(u8, arg, "--budget-max-activated-packs=")) {
+            compute_request.overrides.max_packs_activated = std.fmt.parseUnsigned(usize, arg["--budget-max-activated-packs=".len..], 10) catch null;
+        } else if (std.mem.startsWith(u8, arg, "--budget-max-pack-surfaces=")) {
+            compute_request.overrides.max_pack_candidate_surfaces = std.fmt.parseUnsigned(usize, arg["--budget-max-pack-surfaces=".len..], 10) catch null;
+        } else if (std.mem.startsWith(u8, arg, "--budget-max-routing-considered=")) {
+            compute_request.overrides.max_routing_entries_considered = std.fmt.parseUnsigned(usize, arg["--budget-max-routing-considered=".len..], 10) catch null;
+        } else if (std.mem.startsWith(u8, arg, "--budget-max-routing-selected=")) {
+            compute_request.overrides.max_routing_entries_selected = std.fmt.parseUnsigned(usize, arg["--budget-max-routing-selected=".len..], 10) catch null;
+        } else if (std.mem.startsWith(u8, arg, "--budget-max-routing-suppressed-traces=")) {
+            compute_request.overrides.max_routing_suppressed_traces = std.fmt.parseUnsigned(usize, arg["--budget-max-routing-suppressed-traces=".len..], 10) catch null;
+        } else if (std.mem.startsWith(u8, arg, "--budget-max-graph-nodes=")) {
+            compute_request.overrides.max_graph_nodes = std.fmt.parseUnsigned(u32, arg["--budget-max-graph-nodes=".len..], 10) catch null;
+        } else if (std.mem.startsWith(u8, arg, "--budget-max-obligations=")) {
+            compute_request.overrides.max_graph_obligations = std.fmt.parseUnsigned(u32, arg["--budget-max-obligations=".len..], 10) catch null;
+        } else if (std.mem.startsWith(u8, arg, "--budget-max-ambiguity-sets=")) {
+            compute_request.overrides.max_ambiguity_sets = std.fmt.parseUnsigned(u32, arg["--budget-max-ambiguity-sets=".len..], 10) catch null;
         } else if (std.mem.startsWith(u8, arg, "--render=")) {
             const value = arg["--render=".len..];
             if (std.mem.eql(u8, value, "json")) {
@@ -111,6 +138,7 @@ pub fn main() !void {
         .repo_root = repo_root,
         .project_shard = project_shard,
         .reasoning_mode = reasoning_mode,
+        .compute_budget_request = compute_request,
         .query_kind = query_kind,
         .target = target,
         .other_target = other_target,
@@ -134,6 +162,13 @@ pub fn main() !void {
     sys.print("{s}\n", .{rendered});
 }
 
+fn parseComputeTier(text: []const u8) ?compute_budget.Tier {
+    inline for ([_]compute_budget.Tier{ .auto, .low, .medium, .high, .max }) |tier| {
+        if (std.mem.eql(u8, text, @tagName(tier))) return tier;
+    }
+    return null;
+}
+
 fn parseQueryKind(text: []const u8) ?code_intel.QueryKind {
     if (std.mem.eql(u8, text, "impact")) return .impact;
     if (std.mem.eql(u8, text, "breaks-if")) return .breaks_if;
@@ -151,7 +186,7 @@ fn translateIntentQueryKind(kind: task_intent.QueryKind) code_intel.QueryKind {
 
 fn printUsage() void {
     sys.print(
-        "Usage: ghost_code_intel <impact|breaks-if|contradicts> <target> [other-target] [--intent=text] [--repo=/abs/path] [--project-shard=id] [--reasoning-mode=proof|exploratory] [--max-items=N] [--render=json|draft] [--draft-type=proof-backed-explanation|refactor-plan|contradiction-report|code-change-summary|technical-design-alternatives]\n",
+        "Usage: ghost_code_intel <impact|breaks-if|contradicts> <target> [other-target] [--intent=text] [--repo=/abs/path] [--project-shard=id] [--reasoning-mode=proof|exploratory] [--compute-tier=auto|low|medium|high|max] [--budget-max-branches=N] [--budget-max-mounted-packs=N] [--budget-max-activated-packs=N] [--budget-max-pack-surfaces=N] [--budget-max-routing-considered=N] [--budget-max-routing-selected=N] [--budget-max-routing-suppressed-traces=N] [--budget-max-graph-nodes=N] [--budget-max-obligations=N] [--budget-max-ambiguity-sets=N] [--max-items=N] [--render=json|draft] [--draft-type=proof-backed-explanation|refactor-plan|contradiction-report|code-change-summary|technical-design-alternatives]\n",
         .{},
     );
 }

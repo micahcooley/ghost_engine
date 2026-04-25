@@ -5,6 +5,7 @@ Deterministic local inference and training over memory-mapped state, with option
 ## Current Stack
 
 - Layer 1 is a shard-aware memory civilization: one mounted committed shard plus one shard-local scratch overlay.
+- `ghost_task_operator` is the Linux-first serious-workflow entrypoint for bounded task sessions, support collection, patch verification, replay, and external evidence recovery.
 - `ghost_code_intel` builds a bounded semantic code graph for Zig-first repositories, with bounded native-code indexing and symbolic ingestion for docs, config, markup, and DSL-like files.
 - `ghost_patch_candidates` runs an explicit `explore_then_proof` flow: exploratory candidate generation, clustered handoff into proof mode, bounded build/test/runtime verification, then minimal verified survivor selection.
 - Support output is permissioned. Final `supported` results require both decision traces and evidence traces; otherwise the result is forced back to `unresolved`.
@@ -20,7 +21,12 @@ Deterministic local inference and training over memory-mapped state, with option
 - `sigil_core`
 - `ghost_code_intel`
 - `ghost_patch_candidates`
+- `ghost_panic_dump`
 - `ghost_task_intent`
+- `ghost_task_operator`
+- `ghost_corpus_ingest`
+- `ghost_intent_grounding`
+- `ghost_knowledge_pack`
 
 Named build steps:
 
@@ -152,20 +158,37 @@ Persisted shard-local outputs:
 - explicit `explore_then_proof` handoff reporting
 - support graph output with permission metadata
 
+## Phase 3 Response And Artifact Contracts
+
+Phase 3 is wired as universal artifact plumbing, not a code-only side path:
+
+- `artifact_schema` treats every bounded input as an artifact, then derives fragments, entities, relations, obligations, action surfaces, and verifier hooks.
+- code, documents, config, and logs are built-in schemas that use the same pipeline; code keeps build/test/runtime verifiers as one domain, not the architectural center.
+- `intent_grounding` v2 maps requests into explicit artifact bindings, action surfaces, ambiguity sets, and missing obligations without guessing.
+- `response_engine` separates `draft_mode`, `fast_path`, `deep_path`, and `auto_path`. Draft output is always unresolved and `verificationState=unverified`; explicit verify/proof/test/correctness or patch-capable requests are forced to the proof-capable path instead of draft.
+- fast path is allowed only after the same eligibility gate used by auto mode: grounded intent, resolved artifact bindings, no ambiguity sets, no missing obligations, no verifier-required action surface, and bounded support graph size.
+- deep path is the verifier-capable path. Speculative scheduler traces keep considered, selected, and pruned candidates visible; scheduler candidates do not authorize support by themselves.
+- verifier adapter results are evidence records. Passed adapters can discharge obligations, failed adapters produce failure evidence, and missing adapters remain obligations.
+
 ## Benchmark Snapshot
 
 Latest Linux serious-workflow report in this workspace:
 
-- suite status: 15/15 cases passed cleanly
-- verified supported patch results: 5
-- patch compile-pass rate: 85% (12/14 candidate build attempts)
-- test-pass rate: 75% (9/12 candidate test attempts)
-- runtime-pass rate: 0% (0/0 attempted runtime-verification steps)
-- latency per verified result: 6940 ms
-- cold start / warm start: 40 ms / 56 ms
-- cold cache changed files / warm cache changed files: 11 / 0
+- suite status: 42/42 cases passed cleanly
+- workflow status: 7/7 integrated operator workflow cases passed cleanly
+- task-state distribution: `verified_complete=4`, `blocked=2`, `unresolved=1`
+- support/provenance completeness: `27/28`
+- replay coverage: `1/1` replay workflow cases fully replayable
+- external evidence outcomes: `ingested=2`, `conflicting=0`, `insufficient=0`
+- verified supported patch or task-verification results: 13
+- patch compile-pass rate: 84% (16/19 candidate build attempts)
+- test-pass rate: 87% (14/16 candidate test attempts)
+- runtime-pass rate: 83% (5/6 attempted runtime-verification steps)
+- latency per verified result: 7509 ms
+- cold start / warm start: 276 ms / 360 ms
+- cold cache changed files / warm cache changed files: 15 / 0
 
-The `runtime-pass rate` is `0/0` because the suite does not yet contain a positive runtime-verified patch fixture. It does not mean the execution harness is currently failing.
+The runtime metric includes positive and negative runtime-oracle paths, including ordered event-sequence and bounded state-transition checks. It is not a claim that runtime verification usually succeeds; it is the measured rate across the current deterministic suite.
 
 Run the suite with:
 
@@ -175,6 +198,33 @@ zig build bench-serious-workflows
 
 The runner writes fresh reports under `benchmarks/ghost_serious_workflows/results/`.
 
+## Repository Hygiene
+
+Versioned source is limited to code, docs, benchmark fixtures, shims, and the canonical Linux benchmark reports:
+
+- `benchmarks/ghost_serious_workflows/results/latest-linux.json`
+- `benchmarks/ghost_serious_workflows/results/latest-linux.md`
+
+Generated state is local-only and ignored:
+
+- Zig caches and build outputs: `.zig-cache/`, `.ghost_zig_cache/`, fixture-local `.ghost_zig_*_cache/`, `zig-out/`
+- runtime shards: `platforms/<os>/<arch>/state/`
+- test shards: `state/test/`
+- transient logs and object files: `logs/*`, `*.o`
+- local corpus payloads under `corpus/`
+
+Regenerate from a clean checkout with:
+
+```bash
+zig build seed
+zig build
+zig build test
+zig build bench-serious-workflows
+zig build repo-hygiene
+```
+
+`repo-hygiene` prints the post-run Git status. A clean verification run should show only intentional source/docs changes plus the two canonical benchmark report files.
+
 ## Docs
 
 - [ARCHITECTURE.md](ARCHITECTURE.md): implemented stack overview
@@ -183,6 +233,7 @@ The runner writes fresh reports under `benchmarks/ghost_serious_workflows/result
 - [docs/CODE_INTEL_AND_PATCHING.md](docs/CODE_INTEL_AND_PATCHING.md): code-intel, task-intent, patch generation, and support graph behavior
 - [docs/ABSTRACTIONS_PROVENANCE_REPLAY.md](docs/ABSTRACTIONS_PROVENANCE_REPLAY.md): abstractions, provenance, trust, reuse, merge, prune, snapshot, and replay behavior
 - [docs/SERIOUS_WORKFLOWS_AND_BENCHMARKS.md](docs/SERIOUS_WORKFLOWS_AND_BENCHMARKS.md): serious-workflow suite layout and current measured scope
+- [docs/TASK_OPERATOR.md](docs/TASK_OPERATOR.md): bounded task-session and operator UX behavior
 - [SIGIL_REFERENCE.md](SIGIL_REFERENCE.md): current Sigil and shell command surface
 - [docs/ARCHITECTURE_PHASE1.md](docs/ARCHITECTURE_PHASE1.md): intentionally deferred work only
 
@@ -191,6 +242,7 @@ The runner writes fresh reports under `benchmarks/ghost_serious_workflows/result
 - Layer 2a is bounded GPU assistance only. Layer 2b stays CPU-first and authoritative.
 - Exploratory reasoning exists in code, but the runtime remains honesty-gated and does not ship a hype-first "best guess" mode.
 - Symbolic ingestion is bounded structural grounding. It is not universal semantic understanding of arbitrary repositories.
+- External evidence now resolves through both the staged shard-local corpus path Ghost writes and stable source-basename aliases such as `@corpus/docs/runbook.md`.
 - If a feature is staged, scaffolded, or bounded, the docs call that out directly.
 
 ## License

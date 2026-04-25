@@ -121,6 +121,11 @@ Current replay behavior:
 
 This means abstraction lineage and reuse state participate in replay for the mounted shard. Scratch-only staged work does not survive `discard`.
 
+The current Linux benchmark suite also measures replay directly from task state:
+
+- blocked task replay coverage: `1/1` replay workflow cases fully replayable
+- replay source in the measured case: embedded panic-dump artifact carried by the task
+
 ## Support And Provenance In Other Flows
 
 The abstraction system feeds other shipped surfaces:
@@ -134,3 +139,4 @@ The abstraction system feeds other shipped surfaces:
 - abstractions are explicit; there is no automatic implicit semantic distillation path
 - cross-shard reuse is bounded to current trust and provenance rules
 - replay is shard-local, not a global multi-shard transaction system
+- replay still depends on the recorded panic-dump artifact; it does not reconstruct a task session from task artifacts alone

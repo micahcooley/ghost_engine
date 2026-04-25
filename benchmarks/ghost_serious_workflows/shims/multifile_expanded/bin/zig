@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+if [ "${1:-}" = "build" ] && [ "${2:-}" = "test" ] && grep -q "__ghost_c" "$PWD/src/api/service.zig"; then
+  if ! grep -q "service\\.compute__ghost_" "$PWD/src/runtime/worker.zig"; then
+    echo "dependent surface expansion missing runtime worker adaptation" >&2
+    exit 1
+  fi
+  if ! grep -q "service\\.compute__ghost_" "$PWD/src/ui/render.zig"; then
+    echo "dependent surface expansion missing ui render adaptation" >&2
+    exit 1
+  fi
+fi
+exit 0

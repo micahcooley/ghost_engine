@@ -2,14 +2,14 @@
 set -eu
 STAMP_DIR=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 STAMP_FILE="$STAMP_DIR/build_fail_once.stamp"
-if [ "${1:-}" = "build" ] && [ "${2:-}" = "test" ] && grep -R -q "scaffold #1" "$PWD/src"; then
-  echo "simulated test failure for candidate_1" >&2
+if [ "${1:-}" = "build" ] && [ "${2:-}" = "test" ] && grep -R -q "const forwarded_impl =" "$PWD/src" && ! grep -R -q "service\\.compute__ghost_" "$PWD/src"; then
+  echo "simulated test failure for contradiction_split wrapper" >&2
   exit 1
 fi
-if [ "${1:-}" = "build" ] && [ -z "${2:-}" ] && grep -R -q "scaffold #2" "$PWD/src"; then
+if [ "${1:-}" = "build" ] && [ -z "${2:-}" ] && grep -R -q "@call(.auto," "$PWD/src"; then
   if [ ! -f "$STAMP_FILE" ]; then
     printf '1\n' > "$STAMP_FILE"
-    echo "simulated one-time build failure for candidate_2" >&2
+    echo "simulated one-time build failure for seam_adapter wrapper" >&2
     exit 1
   fi
 fi

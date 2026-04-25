@@ -1,0 +1,4 @@
+worker sync retry attempt 1
+worker sync retry attempt 2
+queue drift detected and bounded
+runtime observer recorded replay window closure

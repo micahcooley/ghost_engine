@@ -1,5 +1,8 @@
 const std = @import("std");
 const core = @import("ghost_core");
+const compute_budget = core.compute_budget;
+const mc = core.inference;
+const panic_dump = core.panic_dump;
 const patch_candidates = core.patch_candidates;
 const sys = core.sys;
 const task_intent = core.task_intent;
@@ -31,8 +34,10 @@ pub fn main() !void {
     var request_label: ?[]const u8 = null;
     var intent_text: ?[]const u8 = null;
     var caps = patch_candidates.Caps{};
+    var compute_request: compute_budget.Request = .{};
     var output_format: OutputFormat = .json;
     var draft_type: technical_drafts.DraftType = .proof_backed_explanation;
+    var emit_panic_dump = false;
     var positionals = std.ArrayList([]const u8).init(allocator);
     defer positionals.deinit();
 
@@ -56,6 +61,23 @@ pub fn main() !void {
             caps.max_hunks_per_candidate = std.fmt.parseUnsigned(usize, arg["--max-hunks=".len..], 10) catch caps.max_hunks_per_candidate;
         } else if (std.mem.startsWith(u8, arg, "--max-lines=")) {
             caps.max_lines_per_hunk = std.fmt.parseUnsigned(u32, arg["--max-lines=".len..], 10) catch caps.max_lines_per_hunk;
+        } else if (std.mem.startsWith(u8, arg, "--compute-tier=")) {
+            compute_request.tier = parseComputeTier(arg["--compute-tier=".len..]) orelse {
+                printUsage();
+                return error.InvalidArguments;
+            };
+        } else if (std.mem.startsWith(u8, arg, "--budget-max-branches=")) {
+            compute_request.overrides.max_branches = std.fmt.parseUnsigned(u32, arg["--budget-max-branches=".len..], 10) catch null;
+        } else if (std.mem.startsWith(u8, arg, "--budget-max-proof-queue=")) {
+            compute_request.overrides.max_proof_queue_size = std.fmt.parseUnsigned(usize, arg["--budget-max-proof-queue=".len..], 10) catch null;
+        } else if (std.mem.startsWith(u8, arg, "--budget-max-repairs=")) {
+            compute_request.overrides.max_repairs = std.fmt.parseUnsigned(u32, arg["--budget-max-repairs=".len..], 10) catch null;
+        } else if (std.mem.startsWith(u8, arg, "--budget-max-runtime-checks=")) {
+            compute_request.overrides.max_runtime_checks = std.fmt.parseUnsigned(usize, arg["--budget-max-runtime-checks=".len..], 10) catch null;
+        } else if (std.mem.startsWith(u8, arg, "--budget-max-wall-ms=")) {
+            compute_request.overrides.max_wall_time_ms = std.fmt.parseUnsigned(u32, arg["--budget-max-wall-ms=".len..], 10) catch null;
+        } else if (std.mem.startsWith(u8, arg, "--budget-max-temp-bytes=")) {
+            compute_request.overrides.max_temp_work_bytes = std.fmt.parseUnsigned(usize, arg["--budget-max-temp-bytes=".len..], 10) catch null;
         } else if (std.mem.startsWith(u8, arg, "--render=")) {
             const value = arg["--render=".len..];
             if (std.mem.eql(u8, value, "json")) {
@@ -71,6 +93,8 @@ pub fn main() !void {
                 printUsage();
                 return error.InvalidArguments;
             };
+        } else if (std.mem.eql(u8, arg, "--emit-panic-dump")) {
+            emit_panic_dump = true;
         } else if (std.mem.eql(u8, arg, "--help")) {
             printUsage();
             return;
@@ -122,11 +146,31 @@ pub fn main() !void {
         .request_label = request_label,
         .intent = if (parsed_intent) |*intent| intent else null,
         .caps = caps,
+        .compute_budget_request = compute_request,
         .persist_code_intel = true,
         .cache_persist = true,
         .stage_result = false,
     });
     defer result.deinit();
+
+    if (emit_panic_dump) {
+        panic_dump.global_recorder.reset();
+        panic_dump.global_recorder.capture(.{
+            .step = 1,
+            .active_branches = @intCast(result.candidates.len),
+            .reasoning_mode = mc.ReasoningMode.proof,
+            .step_count = 1,
+            .branch_count = @intCast(result.candidates.len),
+            .created_hypotheses = @intCast(result.candidates.len),
+            .expanded_hypotheses = @intCast(result.candidates.len),
+            .accepted_hypotheses = if (result.status == .supported) 1 else 0,
+            .unresolved_hypotheses = if (result.status == .unresolved) 1 else 0,
+            .confidence = result.confidence,
+            .stop_reason = result.stop_reason,
+        }, &.{}, &.{});
+        try panic_dump.capturePatchCandidatesResult(allocator, &result);
+        panic_dump.emitPanicDump(result.request_label);
+    }
 
     const rendered = switch (output_format) {
         .json => try patch_candidates.renderJson(allocator, &result),
@@ -138,6 +182,13 @@ pub fn main() !void {
     defer allocator.free(rendered);
     sys.printOut(rendered);
     sys.printOut("\n");
+}
+
+fn parseComputeTier(text: []const u8) ?compute_budget.Tier {
+    inline for ([_]compute_budget.Tier{ .auto, .low, .medium, .high, .max }) |tier| {
+        if (std.mem.eql(u8, text, @tagName(tier))) return tier;
+    }
+    return null;
 }
 
 fn parseQueryKind(text: []const u8) ?core.code_intel.QueryKind {
@@ -157,7 +208,7 @@ fn translateIntentQueryKind(kind: task_intent.QueryKind) core.code_intel.QueryKi
 
 fn printUsage() void {
     sys.print(
-        "Usage: ghost_patch_candidates <impact|breaks-if|contradicts> <target> [other-target] [--intent=text] [--request=text] [--repo=/abs/path] [--project-shard=id] [--max-candidates=N] [--max-files=N] [--max-hunks=N] [--max-lines=N] [--render=json|draft] [--draft-type=proof-backed-explanation|refactor-plan|contradiction-report|code-change-summary|technical-design-alternatives]\n",
+        "Usage: ghost_patch_candidates <impact|breaks-if|contradicts> <target> [other-target] [--intent=text] [--request=text] [--repo=/abs/path] [--project-shard=id] [--compute-tier=auto|low|medium|high|max] [--budget-max-branches=N] [--budget-max-proof-queue=N] [--budget-max-repairs=N] [--budget-max-runtime-checks=N] [--budget-max-wall-ms=N] [--budget-max-temp-bytes=N] [--max-candidates=N] [--max-files=N] [--max-hunks=N] [--max-lines=N] [--render=json|draft] [--draft-type=proof-backed-explanation|refactor-plan|contradiction-report|code-change-summary|technical-design-alternatives] [--emit-panic-dump]\n",
         .{},
     );
 }

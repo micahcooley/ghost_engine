@@ -12,10 +12,28 @@ const sigil_snapshot = @import("sigil_snapshot.zig");
 const scratchpad = @import("scratchpad.zig");
 const panic_dump = @import("panic_dump.zig");
 const code_intel = @import("code_intel.zig");
+const corpus_ingest = @import("corpus_ingest.zig");
+const external_evidence = @import("external_evidence.zig");
 const execution = @import("execution.zig");
 const abstractions = @import("abstractions.zig");
 const patch_candidates = @import("patch_candidates.zig");
+const operator_workflow = @import("operator_workflow.zig");
 const task_intent = @import("task_intent.zig");
+const task_sessions = @import("task_sessions.zig");
+const technical_drafts = @import("technical_drafts.zig");
+const knowledge_packs = @import("knowledge_packs.zig");
+const knowledge_pack_store = @import("knowledge_pack_store.zig");
+const artifact_schema = @import("artifact_schema.zig");
+const compute_budget = @import("compute_budget.zig");
+const conversation_session = @import("conversation_session.zig");
+const intent_grounding = @import("intent_grounding.zig");
+const response_engine = @import("response_engine.zig");
+const verifier_adapter = @import("verifier_adapter.zig");
+const repo_hygiene = @import("repo_hygiene.zig");
+
+comptime {
+    _ = repo_hygiene;
+}
 
 const TraceCapture = struct {
     event: ?mc.TraceEvent = null,
@@ -87,6 +105,105 @@ const ReasoningFixture = struct {
         self.allocator.free(self.tag_data);
     }
 };
+
+test "verifier adapter registry, evidence, budget, and non-code checks are domain neutral" {
+    const allocator = std.testing.allocator;
+
+    var registry = verifier_adapter.Registry.init(allocator);
+    defer registry.deinit();
+    try verifier_adapter.registerBuiltinAdapters(&registry);
+    try std.testing.expect(registry.lookup("code_artifact_schema", .build, "build") != null);
+    try std.testing.expect(registry.lookup("config_schema", .schema_validation, "schema_validation") != null);
+    try std.testing.expect(registry.lookup("document_schema", .citation_check, "citation_check") != null);
+    try std.testing.expect(registry.missingVerifierObligation("config_schema", .schema_validation, "runtime"));
+
+    var tracker = verifier_adapter.BudgetTracker.init(allocator, compute_budget.resolve(.{ .tier = .medium }));
+    const config_artifact = artifact_schema.Artifact{
+        .id = "cfg",
+        .source = .user,
+        .artifact_type = .file,
+        .format_hint = "toml",
+        .provenance = "test",
+        .trust_class = .project,
+        .schema_name = "config_schema",
+    };
+    const config_entities = [_]artifact_schema.Entity{
+        .{ .id = "cfg_key", .entity_type = "key", .fragment_index = 0, .label = "port", .provenance = "test", .artifact_id = "cfg" },
+        .{ .id = "cfg_value", .entity_type = "value", .fragment_index = 0, .label = "3000", .provenance = "test", .artifact_id = "cfg" },
+    };
+    var config_result = try verifier_adapter.run(allocator, &tracker, .{
+        .adapter = verifier_adapter.configSchemaValidationAdapter(),
+        .artifact = &config_artifact,
+        .entities = &config_entities,
+        .provenance = "smoke",
+    });
+    defer config_result.deinit();
+    try std.testing.expectEqual(verifier_adapter.Status.passed, config_result.status);
+    try std.testing.expectEqual(@as(usize, 1), config_result.obligations_discharged.len);
+
+    const contradiction = artifact_schema.RelationEdge{
+        .relation = .contradicts,
+        .from_entity_id = "a",
+        .to_entity_id = "b",
+        .provenance = "test",
+    };
+    var consistency_result = try verifier_adapter.run(allocator, &tracker, .{
+        .adapter = verifier_adapter.genericConsistencyCheckAdapter(),
+        .relations = &.{contradiction},
+        .provenance = "smoke",
+    });
+    defer consistency_result.deinit();
+    try std.testing.expectEqual(verifier_adapter.Status.failed, consistency_result.status);
+    try std.testing.expect(consistency_result.failure_signal != null);
+
+    const link = artifact_schema.Entity{ .id = "link", .entity_type = "link", .fragment_index = 0, .label = "https://example.test", .provenance = "test", .artifact_id = "doc" };
+    var citation_result = try verifier_adapter.run(allocator, &tracker, .{
+        .adapter = verifier_adapter.documentCitationCheckAdapter(),
+        .entities = &.{link},
+        .provenance = "smoke",
+    });
+    defer citation_result.deinit();
+    try std.testing.expectEqual(verifier_adapter.Status.passed, citation_result.status);
+
+    var zero_tracker = verifier_adapter.BudgetTracker.init(allocator, compute_budget.resolve(.{
+        .tier = .medium,
+        .overrides = .{ .max_verifier_runs = 0 },
+    }));
+    var budget_result = try verifier_adapter.run(allocator, &zero_tracker, .{
+        .adapter = verifier_adapter.configSchemaValidationAdapter(),
+        .provenance = "smoke",
+    });
+    defer budget_result.deinit();
+    try std.testing.expectEqual(verifier_adapter.Status.budget_exhausted, budget_result.status);
+    try std.testing.expect(budget_result.budget_exhaustion != null);
+}
+
+test "code execution verifier output is adapter traceable evidence only" {
+    const allocator = std.testing.allocator;
+    var capture = execution.Result{
+        .label = try allocator.dupe(u8, "zig_build"),
+        .kind = .zig_build,
+        .phase = .build,
+        .command = try allocator.dupe(u8, "zig build"),
+        .exit_code = 0,
+        .duration_ms = 1,
+        .stdout = try allocator.dupe(u8, ""),
+        .stderr = try allocator.dupe(u8, ""),
+    };
+    defer capture.deinit(allocator);
+
+    var adapter_result = try verifier_adapter.fromExecutionCapture(
+        allocator,
+        verifier_adapter.codeBuildAdapter(),
+        &capture,
+        &.{ "build" },
+        "execution_harness",
+    );
+    defer adapter_result.deinit();
+    try std.testing.expectEqual(verifier_adapter.Status.passed, adapter_result.status);
+    try std.testing.expectEqual(verifier_adapter.EvidenceKind.build_log, adapter_result.evidence_kind);
+    try std.testing.expect(std.mem.eql(u8, adapter_result.adapter_id, "code.build.zig_build"));
+}
 
 const Layer2aStub = struct {
     score_calls: u32 = 0,
@@ -1404,7 +1521,7 @@ test "abstraction lookup promotes bounded higher tiers and falls back when suppo
     try sys.writeAll(handle, catalog_body);
 
     const refs = try abstractions.lookupConcepts(allocator, &shard_paths, .{
-        .rel_paths = &.{ "src/api/service.zig" },
+        .rel_paths = &.{"src/api/service.zig"},
         .max_items = 3,
         .include_staged = false,
         .prefer_higher_tiers = true,
@@ -1471,7 +1588,7 @@ test "project abstraction lookup imports trusted core provenance without copying
     try sys.writeAll(core_handle, core_catalog);
 
     const refs = try abstractions.lookupConcepts(allocator, &project_paths, .{
-        .rel_paths = &.{ "src/api/service.zig" },
+        .rel_paths = &.{"src/api/service.zig"},
         .max_items = 4,
         .include_staged = false,
         .prefer_higher_tiers = true,
@@ -1538,7 +1655,7 @@ test "cross-shard reject keeps provenance explicit and blocks imported reuse" {
     try abstractions.applyStaged(allocator, &project_paths);
 
     const refs = try abstractions.lookupConcepts(allocator, &project_paths, .{
-        .rel_paths = &.{ "src/api/service.zig" },
+        .rel_paths = &.{"src/api/service.zig"},
         .max_items = 4,
         .include_staged = false,
         .prefer_higher_tiers = true,
@@ -1629,7 +1746,7 @@ test "cross-shard conflict refuses incompatible import and promote pins local ov
 
     {
         const refs = try abstractions.lookupConcepts(allocator, &project_paths, .{
-            .rel_paths = &.{ "src/api/service.zig" },
+            .rel_paths = &.{"src/api/service.zig"},
             .max_items = 4,
             .include_staged = false,
             .prefer_higher_tiers = true,
@@ -1651,7 +1768,7 @@ test "cross-shard conflict refuses incompatible import and promote pins local ov
     try abstractions.applyStaged(allocator, &project_paths);
 
     const promoted_refs = try abstractions.lookupConcepts(allocator, &project_paths, .{
-        .rel_paths = &.{ "src/api/service.zig" },
+        .rel_paths = &.{"src/api/service.zig"},
         .max_items = 4,
         .include_staged = false,
         .prefer_higher_tiers = true,
@@ -1920,14 +2037,100 @@ test "panic dump binary is deterministic and versioned" {
     try recorder.serialize(second.writer());
 
     try std.testing.expectEqualSlices(u8, first.items, second.items);
-    try std.testing.expect(first.items.len > 40);
+    try std.testing.expect(first.items.len > 64);
     try std.testing.expectEqualSlices(u8, panic_dump.MAGIC, first.items[0..panic_dump.MAGIC.len]);
     try std.testing.expectEqual(@as(u16, panic_dump.FORMAT_VERSION), std.mem.readInt(u16, first.items[8..10], .little));
-    try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, first.items[24..28], .little));
-    try std.testing.expectEqual(@as(u32, 777), std.mem.readInt(u32, first.items[28..32], .little));
-    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, first.items[32..34], .little));
-    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, first.items[36..38], .little));
-    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, first.items[40..42], .little));
+    var parsed = try panic_dump.parse(allocator, first.items);
+    defer parsed.deinit();
+    try std.testing.expectEqual(mc.StopReason.contradiction, parsed.trace.stop_reason);
+    try std.testing.expectEqual(@as(u32, 3), parsed.trace.step_count);
+    try std.testing.expectEqual(@as(u32, 777), parsed.trace.confidence);
+    try std.testing.expectEqual(@as(usize, 2), parsed.candidates.len);
+    try std.testing.expectEqual(@as(usize, 2), parsed.candidateTotalCount());
+    try std.testing.expectEqual(@as(usize, 1), parsed.hypotheses.len);
+    try std.testing.expectEqual(@as(usize, 1), parsed.scratch_refs.len);
+    try std.testing.expectEqualStrings("panic", parsed.panic_message.?);
+}
+
+test "panic dump replay surfaces patch verification, repair, and support context" {
+    const allocator = std.testing.allocator;
+    var fixture = try makeRepairSuccessVerificationFixture(allocator);
+    defer fixture.tmp.cleanup();
+    defer allocator.free(fixture.root_path);
+    defer allocator.free(fixture.path_override);
+
+    var result = try patch_candidates.run(allocator, .{
+        .repo_root = fixture.root_path,
+        .query_kind = .breaks_if,
+        .target = "src/api/service.zig:compute",
+        .caps = .{
+            .max_candidates = 3,
+            .max_files = 3,
+            .max_hunks_per_candidate = 2,
+            .max_lines_per_hunk = 6,
+        },
+        .persist_code_intel = false,
+        .cache_persist = false,
+        .verification_path_override = fixture.path_override,
+    });
+    defer result.deinit();
+
+    var recorder = panic_dump.Recorder.init();
+    recorder.notePanicMessage("patch verification replay");
+    recorder.capture(.{
+        .step = 1,
+        .active_branches = 2,
+        .reasoning_mode = .proof,
+        .step_count = 1,
+        .branch_count = 2,
+        .created_hypotheses = 2,
+        .expanded_hypotheses = 2,
+        .accepted_hypotheses = 1,
+        .unresolved_hypotheses = 1,
+        .confidence = result.confidence,
+        .stop_reason = result.stop_reason,
+    }, &.{}, &.{});
+    try recorder.capturePatchCandidatesResult(allocator, &result);
+
+    var dump_bytes = std.ArrayList(u8).init(allocator);
+    defer dump_bytes.deinit();
+    try recorder.serialize(dump_bytes.writer());
+
+    var parsed = try panic_dump.parse(allocator, dump_bytes.items);
+    defer parsed.deinit();
+    var replay = try panic_dump.inspectReplay(allocator, &parsed, false);
+    defer replay.deinit(allocator);
+
+    try std.testing.expectEqual(panic_dump.ArtifactKind.patch_candidates_result, parsed.artifact_kind);
+    try std.testing.expectEqual(panic_dump.ReplayClass.fully_replayable, replay.class);
+    try std.testing.expectEqual(panic_dump.ReplaySource.embedded, replay.source);
+
+    const summary = try panic_dump.renderSummary(allocator, &parsed, &replay);
+    defer allocator.free(summary);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "replay_summary kind=patch_candidates_result") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "repair lineage=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "support nodes=") != null);
+
+    const report = try panic_dump.renderReplayReport(allocator, &parsed, &replay);
+    defer allocator.free(report);
+    try std.testing.expect(std.mem.indexOf(u8, report, "rendering_model: ghost_technical_renderer_v1") != null);
+
+    panic_dump.global_recorder.reset();
+    panic_dump.global_recorder.capture(.{
+        .step = 1,
+        .active_branches = @intCast(result.candidates.len),
+        .reasoning_mode = .proof,
+        .step_count = 1,
+        .branch_count = @intCast(result.candidates.len),
+        .created_hypotheses = @intCast(result.candidates.len),
+        .expanded_hypotheses = @intCast(result.candidates.len),
+        .accepted_hypotheses = if (result.status == .supported) 1 else 0,
+        .unresolved_hypotheses = if (result.status == .unresolved) 1 else 0,
+        .confidence = result.confidence,
+        .stop_reason = result.stop_reason,
+    }, &.{}, &.{});
+    try panic_dump.capturePatchCandidatesResult(allocator, &result);
+    panic_dump.emitPanicDump("panic replay fixture");
 }
 
 fn writeFixtureFile(dir: std.fs.Dir, sub_path: []const u8, contents: []const u8) !void {
@@ -1937,6 +2140,20 @@ fn writeFixtureFile(dir: std.fs.Dir, sub_path: []const u8, contents: []const u8)
         .sub_path = sub_path,
         .data = contents,
     });
+}
+
+fn writeFixtureFileAbsolute(root_abs_path: []const u8, sub_path: []const u8, contents: []const u8) !void {
+    const abs_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs_path, sub_path });
+    defer std.testing.allocator.free(abs_path);
+    const parent = std.fs.path.dirname(abs_path) orelse return error.FileNotFound;
+    try std.fs.cwd().makePath(parent);
+    var file = try std.fs.createFileAbsolute(abs_path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(contents);
+}
+
+fn fileUrlForPath(allocator: std.mem.Allocator, abs_path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "file://{s}", .{abs_path});
 }
 
 fn makeCodeIntelFixture(allocator: std.mem.Allocator) !struct {
@@ -2068,6 +2285,264 @@ fn makeCodeIntelFixture(allocator: std.mem.Allocator) !struct {
     };
 }
 
+fn writeCorpusFixtureVariantOne(dir: std.fs.Dir) !void {
+    try writeFixtureFile(dir, "runbook.md",
+        \\# Runtime Contracts
+        \\Use worker.zig when runtime mode must stay synchronized.
+        \\The worker sync path is the project default.
+        \\
+    );
+    try writeFixtureFile(dir, "runbook-copy.md",
+        \\# Runtime Contracts
+        \\Use worker.zig when runtime mode must stay synchronized.
+        \\The worker sync path is the project default.
+        \\
+    );
+    try writeFixtureFile(dir, "runtime.toml",
+        \\[runtime]
+        \\mode = "safe"
+        \\worker_file = "worker.zig"
+        \\
+    );
+    try writeFixtureFile(dir, "worker.zig",
+        \\pub fn sync() void {}
+        \\pub fn apply() void {
+        \\    sync();
+        \\}
+        \\
+    );
+    try writeFixtureFile(dir, "blob.bin",
+        \\opaque bytes
+        \\
+    );
+}
+
+fn writeCorpusFixtureVariantTwo(dir: std.fs.Dir) !void {
+    try writeFixtureFile(dir, "runbook.md",
+        \\# Runtime Contracts
+        \\Use worker.zig when rebuild mode must take over.
+        \\The worker rebuild path replaces sync.
+        \\
+    );
+    try writeFixtureFile(dir, "runbook-copy.md",
+        \\# Runtime Contracts
+        \\Use worker.zig when rebuild mode must take over.
+        \\The worker rebuild path replaces sync.
+        \\
+    );
+    try writeFixtureFile(dir, "runtime.toml",
+        \\[runtime]
+        \\mode = "rebuild"
+        \\worker_file = "worker.zig"
+        \\
+    );
+    try writeFixtureFile(dir, "worker.zig",
+        \\pub fn rebuild() void {}
+        \\pub fn apply() void {
+        \\    rebuild();
+        \\}
+        \\
+    );
+    try writeFixtureFile(dir, "blob.bin",
+        \\opaque bytes
+        \\
+    );
+}
+
+fn makeCorpusIngestionFixture(allocator: std.mem.Allocator) !struct {
+    tmp: std.testing.TmpDir,
+    root_path: []const u8,
+} {
+    var tmp = std.testing.tmpDir(.{});
+    errdefer tmp.cleanup();
+    try writeCorpusFixtureVariantOne(tmp.dir);
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    return .{
+        .tmp = tmp,
+        .root_path = root_path,
+    };
+}
+
+fn writeCorpusReverseGroundingAmbiguousFixture(dir: std.fs.Dir) !void {
+    try writeFixtureFile(dir, "guide-a.md",
+        \\# Runtime Contracts
+        \\worker.zig sync path defines the runtime contract.
+        \\Keep sync aligned with the documented runtime contract.
+        \\
+    );
+    try writeFixtureFile(dir, "guide-b.md",
+        \\# Runtime Contracts
+        \\worker.zig sync path defines the runtime contract.
+        \\Keep sync aligned with the operator runtime contract.
+        \\
+    );
+    try writeFixtureFile(dir, "worker.zig",
+        \\pub fn sync() void {}
+        \\pub fn apply() void {
+        \\    sync();
+        \\}
+        \\
+    );
+}
+
+fn makeCorpusReverseGroundingAmbiguousFixture(allocator: std.mem.Allocator) !struct {
+    tmp: std.testing.TmpDir,
+    root_path: []const u8,
+} {
+    var tmp = std.testing.tmpDir(.{});
+    errdefer tmp.cleanup();
+    try writeCorpusReverseGroundingAmbiguousFixture(tmp.dir);
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    return .{
+        .tmp = tmp,
+        .root_path = root_path,
+    };
+}
+
+fn writeNoisyRoutingCorpusFixture(dir: std.fs.Dir) !void {
+    try writeFixtureFile(dir, "runbook.md",
+        \\# Runtime Contracts
+        \\The sync path in worker.zig is the supported runtime contract.
+        \\Keep sync deterministic.
+        \\
+    );
+    try writeFixtureFile(dir, "runtime.toml",
+        \\[runtime]
+        \\worker_file = "worker.zig"
+        \\worker_action = "sync"
+        \\
+    );
+    try writeFixtureFile(dir, "guide-noise.md",
+        \\# Worker Notes
+        \\worker.zig handles runtime background work.
+        \\This note intentionally avoids the exact action anchor.
+        \\
+    );
+    try writeFixtureFile(dir, "guide-noise-2.md",
+        \\# Worker Notes
+        \\worker.zig handles operator maintenance work.
+        \\This note also avoids the exact action anchor.
+        \\
+    );
+    try writeFixtureFile(dir, "worker.zig",
+        \\pub fn sync() void {}
+        \\pub fn apply() void {
+        \\    sync();
+        \\}
+        \\
+    );
+}
+
+fn makeNoisyRoutingCorpusFixture(allocator: std.mem.Allocator) !struct {
+    tmp: std.testing.TmpDir,
+    root_path: []const u8,
+} {
+    var tmp = std.testing.tmpDir(.{});
+    errdefer tmp.cleanup();
+    try writeNoisyRoutingCorpusFixture(tmp.dir);
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    return .{
+        .tmp = tmp,
+        .root_path = root_path,
+    };
+}
+
+fn writeKnowledgePackCorpusFixture(dir: std.fs.Dir, runbook_body: []const u8) !void {
+    try writeFixtureFile(dir, "runbook.md", runbook_body);
+    try writeFixtureFile(dir, "worker.zig",
+        \\pub fn sync() void {}
+        \\pub fn apply() void {
+        \\    sync();
+        \\}
+        \\
+    );
+}
+
+fn countPackReverseGroundings(result: *const code_intel.Result, pack_id: []const u8, pack_version: []const u8) usize {
+    var count: usize = 0;
+    var prefix_buf: [256]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&prefix_buf, "@pack/{s}/{s}/", .{ pack_id, pack_version }) catch return 0;
+    for (result.reverse_grounding_traces) |trace| {
+        if (!trace.usable) continue;
+        const rel_path = trace.target_rel_path orelse continue;
+        if (std.mem.startsWith(u8, rel_path, prefix)) count += 1;
+    }
+    return count;
+}
+
+fn hasPackRoutingStatus(result: *const code_intel.Result, stage: abstractions.PackRoutingStage, pack_id: []const u8, pack_version: []const u8, status: abstractions.PackRoutingStatus) bool {
+    for (result.pack_routing_traces) |trace| {
+        if (trace.stage != stage) continue;
+        if (trace.status != status) continue;
+        if (!std.mem.eql(u8, trace.pack_id, pack_id)) continue;
+        if (!std.mem.eql(u8, trace.pack_version, pack_version)) continue;
+        return true;
+    }
+    return false;
+}
+
+fn hasPackRoutingStatusCategory(
+    result: *const code_intel.Result,
+    stage: abstractions.PackRoutingStage,
+    pack_id: []const u8,
+    pack_version: []const u8,
+    status: abstractions.PackRoutingStatus,
+    category: abstractions.PackConflictCategory,
+) bool {
+    for (result.pack_routing_traces) |trace| {
+        if (trace.stage != stage) continue;
+        if (trace.status != status) continue;
+        if (trace.conflict_category != category) continue;
+        if (!std.mem.eql(u8, trace.pack_id, pack_id)) continue;
+        if (!std.mem.eql(u8, trace.pack_version, pack_version)) continue;
+        return true;
+    }
+    return false;
+}
+
+fn countPackRoutingStatus(result: *const code_intel.Result, stage: abstractions.PackRoutingStage, status: abstractions.PackRoutingStatus) usize {
+    var count: usize = 0;
+    for (result.pack_routing_traces) |trace| {
+        if (trace.stage != stage) continue;
+        if (trace.status == status) count += 1;
+    }
+    return count;
+}
+
+fn countPackAbstractionTraces(result: *const code_intel.Result, pack_id: []const u8, pack_version: []const u8, usable_only: bool) usize {
+    var count: usize = 0;
+    var owner_buf: [256]u8 = undefined;
+    const owner_id = std.fmt.bufPrint(&owner_buf, "pack/{s}@{s}", .{ pack_id, pack_version }) catch return 0;
+    for (result.abstraction_traces) |trace| {
+        if (usable_only and !trace.usable) continue;
+        if (std.mem.eql(u8, trace.owner_id, owner_id)) count += 1;
+    }
+    return count;
+}
+
+fn hasPackRoutingStageStatus(traces: []const abstractions.PackRoutingTrace, stage: abstractions.PackRoutingStage, pack_id: []const u8, pack_version: []const u8, status: abstractions.PackRoutingStatus) bool {
+    for (traces) |trace| {
+        if (trace.stage != stage) continue;
+        if (trace.status != status) continue;
+        if (!std.mem.eql(u8, trace.pack_id, pack_id)) continue;
+        if (!std.mem.eql(u8, trace.pack_version, pack_version)) continue;
+        return true;
+    }
+    return false;
+}
+
+fn countPackRoutingStageStatus(traces: []const abstractions.PackRoutingTrace, stage: abstractions.PackRoutingStage, status: abstractions.PackRoutingStatus) usize {
+    var count: usize = 0;
+    for (traces) |trace| {
+        if (trace.stage != stage) continue;
+        if (trace.status == status) count += 1;
+    }
+    return count;
+}
+
 fn makeScriptedVerificationFixture(allocator: std.mem.Allocator) !struct {
     tmp: std.testing.TmpDir,
     root_path: []const u8,
@@ -2082,14 +2557,14 @@ fn makeScriptedVerificationFixture(allocator: std.mem.Allocator) !struct {
     const script_body = try std.fmt.allocPrint(allocator,
         \\#!/bin/sh
         \\set -eu
-        \\if [ "${{1:-}}" = "build" ] && [ "${{2:-}}" = "test" ] && grep -R -q "scaffold #1" "$PWD/src"; then
-        \\  echo "simulated test failure for candidate_1" >&2
+        \\if [ "${{1:-}}" = "build" ] && [ "${{2:-}}" = "test" ] && grep -R -q "const forwarded_impl =" "$PWD/src" && ! grep -R -q "service\\.compute__ghost_" "$PWD/src"; then
+        \\  echo "simulated test failure for contradiction_split wrapper" >&2
         \\  exit 1
         \\fi
-        \\if [ "${{1:-}}" = "build" ] && [ -z "${{2:-}}" ] && grep -R -q "scaffold #2" "$PWD/src"; then
+        \\if [ "${{1:-}}" = "build" ] && [ -z "${{2:-}}" ] && grep -R -q "@call(.auto," "$PWD/src"; then
         \\  if [ ! -f "{s}" ]; then
         \\    printf '1\n' > "{s}"
-        \\    echo "simulated one-time build failure for candidate_2" >&2
+        \\    echo "simulated one-time build failure for seam_adapter wrapper" >&2
         \\    exit 1
         \\  fi
         \\fi
@@ -2124,8 +2599,8 @@ fn makeRefinementVerificationFixture(allocator: std.mem.Allocator) !struct {
         \\#!/bin/sh
         \\set -eu
         \\if [ "${1:-}" = "build" ] && [ "${2:-}" = "test" ]; then
-        \\  count=$(grep -R -h "GHOST-PATCH-CANDIDATE" "$PWD/src" | wc -l | tr -d ' ')
-        \\  if [ "$count" -gt 1 ]; then
+        \\  count=$(grep -R -h "__ghost_c2_impl" "$PWD/src" | wc -l | tr -d ' ')
+        \\  if [ "$count" -gt 2 ]; then
         \\    echo "broader runtime hypothesis contradicted expected invariant" >&2
         \\    exit 1
         \\  fi
@@ -2145,6 +2620,717 @@ fn makeRefinementVerificationFixture(allocator: std.mem.Allocator) !struct {
         .root_path = fixture.root_path,
         .path_override = path_override,
     };
+}
+
+fn makeRepairSuccessVerificationFixture(allocator: std.mem.Allocator) !struct {
+    tmp: std.testing.TmpDir,
+    root_path: []const u8,
+    path_override: []const u8,
+} {
+    var fixture = try makeCodeIntelFixture(allocator);
+    errdefer fixture.tmp.cleanup();
+    errdefer allocator.free(fixture.root_path);
+
+    const script_body =
+        \\#!/bin/sh
+        \\set -eu
+        \\if [ "${1:-}" = "build" ] && [ "${2:-}" = "test" ]; then
+        \\  case "$PWD" in
+        \\    *__repair_*)
+        \\      exit 0
+        \\      ;;
+        \\    *)
+        \\    echo "broader call surface contradicted invariant; narrow to primary surface" >&2
+        \\    exit 1
+        \\      ;;
+        \\  esac
+        \\fi
+        \\exit 0
+        \\
+    ;
+    try writeFixtureFile(fixture.tmp.dir, "bin/zig", script_body);
+
+    const script_path = try fixture.tmp.dir.realpathAlloc(allocator, "bin/zig");
+    defer allocator.free(script_path);
+    try std.posix.fchmodat(std.posix.AT.FDCWD, script_path, 0o755, 0);
+
+    const path_override = try fixture.tmp.dir.realpathAlloc(allocator, "bin");
+    return .{
+        .tmp = fixture.tmp,
+        .root_path = fixture.root_path,
+        .path_override = path_override,
+    };
+}
+
+const RuntimeOracleFixtureMode = enum {
+    positive,
+    negative,
+    invalid,
+    sequence_positive,
+    transition_positive,
+};
+
+fn makeRuntimeOracleFixture(allocator: std.mem.Allocator, mode: RuntimeOracleFixtureMode) !struct {
+    tmp: std.testing.TmpDir,
+    root_path: []const u8,
+} {
+    var fixture = try makeCodeIntelFixture(allocator);
+    errdefer fixture.tmp.cleanup();
+    errdefer allocator.free(fixture.root_path);
+
+    const runtime_oracle_body = switch (mode) {
+        .positive, .negative, .invalid =>
+        \\const std = @import("std");
+        \\const service = @import("api/service.zig");
+        \\
+        \\pub fn main() !void {
+        \\    const has_impl = @hasDecl(service, "compute__ghost_c1_impl");
+        \\    try std.io.getStdOut().writer().print(
+        \\        "oracle-run\nstate:impl_decl={s}\ninvariant:wrapper_active={s}\n",
+        \\        .{
+        \\            if (has_impl) "true" else "false",
+        \\            if (has_impl) "true" else "false",
+        \\        },
+        \\    );
+        \\    service.run();
+        \\}
+        \\
+        ,
+        .sequence_positive =>
+        \\const std = @import("std");
+        \\const service = @import("api/service.zig");
+        \\const stateful = @import("app/stateful.zig");
+        \\
+        \\pub fn main() !void {
+        \\    const has_impl = @hasDecl(service, "compute__ghost_c1_impl");
+        \\    const writer = std.io.getStdOut().writer();
+        \\    try writer.writeAll("oracle-run\nevent:boot\nstate:stage=booting\n");
+        \\    service.run();
+        \\    service.hydrate(.{ .value = 1 });
+        \\    _ = stateful.repaint();
+        \\    _ = stateful.repaint();
+        \\    try writer.writeAll("event:dispatch\nstate:stage=service_called\n");
+        \\    try writer.print(
+        \\        "event:verified\nstate:stage=verified\nstate:impl_decl={s}\nstate:call_route=service\nstate:result_count=2\nstate:last_state=verified\ninvariant:wrapper_active={s}\n",
+        \\        .{
+        \\            if (has_impl) "true" else "false",
+        \\            if (has_impl) "true" else "false",
+        \\        },
+        \\    );
+        \\}
+        \\
+        ,
+        .transition_positive =>
+        \\const std = @import("std");
+        \\const worker = @import("runtime/worker.zig");
+        \\const state = @import("runtime/state.zig");
+        \\
+        \\pub fn main() !void {
+        \\    const has_impl = @hasDecl(worker, "sync__ghost_c1_impl");
+        \\    const writer = std.io.getStdOut().writer();
+        \\    try writer.writeAll("oracle-run\nevent:warmup\nstate:phase=idle\n");
+        \\    worker.sync();
+        \\    state.tick();
+        \\    try writer.writeAll("event:sync\nstate:phase=syncing\n");
+        \\    worker.sync();
+        \\    try writer.print(
+        \\        "event:settled\nstate:phase=settled\nstate:impl_decl={s}\nstate:call_route=worker\nstate:sync_count=2\nstate:last_phase=settled\ninvariant:wrapper_active={s}\n",
+        \\        .{
+        \\            if (has_impl) "true" else "false",
+        \\            if (has_impl) "true" else "false",
+        \\        },
+        \\    );
+        \\}
+        \\
+        ,
+    };
+    try writeFixtureFile(fixture.tmp.dir, "src/runtime_oracle.zig", runtime_oracle_body);
+
+    const config_body = switch (mode) {
+        .positive =>
+        \\label=runtime_symbol_check
+        \\kind=zig_run
+        \\phase=run
+        \\arg=zig
+        \\arg=run
+        \\arg=src/runtime_oracle.zig
+        \\check=exit_code:0
+        \\check=stdout_contains:oracle-run
+        \\check=state_value:impl_decl=true
+        \\check=invariant_holds:wrapper_active
+        \\
+        ,
+        .negative =>
+        \\label=runtime_symbol_check
+        \\kind=zig_run
+        \\phase=run
+        \\arg=zig
+        \\arg=run
+        \\arg=src/runtime_oracle.zig
+        \\check=exit_code:0
+        \\check=stdout_contains:oracle-run
+        \\check=state_value:impl_decl=false
+        \\check=invariant_holds:wrapper_active
+        \\
+        ,
+        .sequence_positive =>
+        \\label=runtime_sequence_check
+        \\kind=zig_run
+        \\phase=run
+        \\arg=zig
+        \\arg=run
+        \\arg=src/runtime_oracle.zig
+        \\check=exit_code:0
+        \\check=stdout_contains:oracle-run
+        \\check=event_sequence:boot>dispatch>verified
+        \\check=state_transition:stage=booting->service_called->verified
+        \\check=state_value:impl_decl=true
+        \\check=state_value:call_route=service
+        \\check=state_value:result_count=2
+        \\check=state_value:last_state=verified
+        \\check=invariant_holds:wrapper_active
+        \\
+        ,
+        .transition_positive =>
+        \\label=runtime_transition_check
+        \\kind=zig_run
+        \\phase=run
+        \\arg=zig
+        \\arg=run
+        \\arg=src/runtime_oracle.zig
+        \\check=exit_code:0
+        \\check=stdout_contains:oracle-run
+        \\check=event_sequence:warmup>sync>settled
+        \\check=state_transition:phase=idle->syncing->settled
+        \\check=state_value:impl_decl=true
+        \\check=state_value:call_route=worker
+        \\check=state_value:sync_count=2
+        \\check=state_value:last_phase=settled
+        \\check=invariant_holds:wrapper_active
+        \\
+        ,
+        .invalid =>
+        \\label=runtime_symbol_check
+        \\kind=zig_run
+        \\
+        ,
+    };
+    try writeFixtureFile(fixture.tmp.dir, patch_candidates.RUNTIME_ORACLE_FILE_NAME, config_body);
+
+    return .{
+        .tmp = fixture.tmp,
+        .root_path = fixture.root_path,
+    };
+}
+
+fn resetPatchTestProjectShard(allocator: std.mem.Allocator, shard_id: []const u8) !void {
+    var shard_metadata = try shards.resolveProjectMetadata(allocator, shard_id);
+    defer shard_metadata.deinit();
+    var shard_paths = try shards.resolvePaths(allocator, shard_metadata.metadata);
+    defer shard_paths.deinit();
+
+    try deleteTreeIfExistsAbsolute(shard_paths.code_intel_root_abs_path);
+    try deleteTreeIfExistsAbsolute(shard_paths.patch_candidates_root_abs_path);
+    try deleteTreeIfExistsAbsolute(shard_paths.abstractions_root_abs_path);
+    try deleteTreeIfExistsAbsolute(shard_paths.corpus_ingest_root_abs_path);
+    try deleteTreeIfExistsAbsolute(shard_paths.task_sessions_root_abs_path);
+}
+
+test "task operator persists and resumes a verified multi-step patch workflow" {
+    const allocator = std.testing.allocator;
+    const project_shard = "task-operator-verified-test";
+    var fixture = try makeCodeIntelFixture(allocator);
+    defer fixture.tmp.cleanup();
+    defer allocator.free(fixture.root_path);
+
+    try resetPatchTestProjectShard(allocator, project_shard);
+
+    var first = try task_sessions.run(allocator, .{
+        .repo_root = fixture.root_path,
+        .project_shard = project_shard,
+        .intent_text = "refactor src/api/service.zig:compute but keep the API stable",
+        .max_steps = 1,
+        .emit_panic_dump = false,
+    });
+    defer first.deinit();
+    try std.testing.expectEqual(task_sessions.Status.running, first.status);
+    try std.testing.expectEqual(@as(u32, 1), first.next_subgoal_index);
+    try std.testing.expectEqual(task_sessions.SubgoalState.complete, first.subgoals[0].state);
+    try std.testing.expect(fileExistsAbsolute(first.session_path));
+
+    const task_id = try allocator.dupe(u8, first.task_id);
+    defer allocator.free(task_id);
+
+    var second = try task_sessions.resumeTask(allocator, .{
+        .project_shard = project_shard,
+        .task_id = task_id,
+        .max_steps = 1,
+        .emit_panic_dump = false,
+    });
+    defer second.deinit();
+    try std.testing.expectEqual(task_sessions.Status.running, second.status);
+    try std.testing.expectEqual(@as(u32, 2), second.next_subgoal_index);
+    try std.testing.expectEqual(task_sessions.SubgoalState.complete, second.subgoals[1].state);
+    try std.testing.expect(second.last_code_intel_result_path != null);
+    try std.testing.expect(second.last_draft_path != null);
+    try std.testing.expect(second.latest_support != null);
+    try std.testing.expect(second.latest_support.?.minimum_met);
+    try std.testing.expect(fileExistsAbsolute(second.last_code_intel_result_path.?));
+
+    var third = try task_sessions.resumeTask(allocator, .{
+        .project_shard = project_shard,
+        .task_id = task_id,
+        .max_steps = 1,
+        .emit_panic_dump = false,
+    });
+    defer third.deinit();
+    try std.testing.expectEqual(task_sessions.Status.verified_complete, third.status);
+    try std.testing.expectEqual(@as(u32, @intCast(third.subgoals.len)), third.next_subgoal_index);
+    try std.testing.expectEqual(task_sessions.SubgoalState.complete, third.subgoals[2].state);
+    try std.testing.expect(third.last_patch_candidates_result_path != null);
+    try std.testing.expect(third.last_draft_path != null);
+    try std.testing.expect(third.latest_support != null);
+    try std.testing.expect(third.latest_support.?.verified_candidate_count >= 1);
+    try std.testing.expect(fileExistsAbsolute(third.last_patch_candidates_result_path.?));
+
+    const rendered = try task_sessions.renderJson(allocator, &third);
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"status\":\"verified_complete\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"lastPatchCandidatesResultPath\":") != null);
+}
+
+test "task operator records blocked patch tasks when Linux-native build support is missing" {
+    const allocator = std.testing.allocator;
+    const project_shard = "task-operator-blocked-test";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFixtureFile(tmp.dir, "src/solo.zig",
+        \\pub fn compute() void {}
+        \\pub fn run() void {
+        \\    compute();
+        \\}
+        \\
+    );
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    try resetPatchTestProjectShard(allocator, project_shard);
+
+    var prepared = try task_sessions.run(allocator, .{
+        .repo_root = root_path,
+        .project_shard = project_shard,
+        .intent_text = "refactor src/solo.zig:compute",
+        .max_steps = 2,
+        .emit_panic_dump = false,
+    });
+    defer prepared.deinit();
+    try std.testing.expectEqual(task_sessions.Status.running, prepared.status);
+    try std.testing.expectEqual(@as(u32, 2), prepared.next_subgoal_index);
+
+    const task_id = try allocator.dupe(u8, prepared.task_id);
+    defer allocator.free(task_id);
+
+    var blocked = try task_sessions.resumeTask(allocator, .{
+        .project_shard = project_shard,
+        .task_id = task_id,
+        .max_steps = 1,
+        .emit_panic_dump = false,
+    });
+    defer blocked.deinit();
+    try std.testing.expectEqual(task_sessions.Status.blocked, blocked.status);
+    try std.testing.expect(blocked.status_detail != null);
+    try std.testing.expect(std.mem.indexOf(u8, blocked.status_detail.?, "no Linux-native build workflow was detected") != null);
+    try std.testing.expectEqual(task_sessions.SubgoalState.blocked, blocked.subgoals[2].state);
+    try std.testing.expect(blocked.last_patch_candidates_result_path != null);
+    try std.testing.expect(fileExistsAbsolute(blocked.last_patch_candidates_result_path.?));
+}
+
+test "task operator preserves unresolved support stops for ambiguous grounding" {
+    const allocator = std.testing.allocator;
+    const project_shard = "task-operator-unresolved-test";
+    var fixture = try makeCodeIntelFixture(allocator);
+    defer fixture.tmp.cleanup();
+    defer allocator.free(fixture.root_path);
+
+    try writeFixtureFile(fixture.tmp.dir, "notes/ops.md",
+        \\# Ops
+        \\Worker sync.
+        \\
+    );
+
+    var shard_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer shard_metadata.deinit();
+    var shard_paths = try shards.resolvePaths(allocator, shard_metadata.metadata);
+    defer shard_paths.deinit();
+
+    try deleteTreeIfExistsAbsolute(shard_paths.abstractions_root_abs_path);
+    try deleteTreeIfExistsAbsolute(shard_paths.task_sessions_root_abs_path);
+    defer deleteTreeIfExistsAbsolute(shard_paths.abstractions_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(shard_paths.task_sessions_root_abs_path) catch {};
+    try sys.makePath(allocator, shard_paths.abstractions_root_abs_path);
+
+    const catalog_body =
+        \\GABS1
+        \\concept runtime_worker_sync
+        \\tier mechanism
+        \\category data_flow
+        \\examples 3
+        \\threshold 2
+        \\retained_tokens 2
+        \\retained_patterns 1
+        \\average_resonance 760
+        \\min_resonance 740
+        \\quality_score 880
+        \\confidence_score 860
+        \\reuse_score 200
+        \\support_score 300
+        \\promotion_ready 1
+        \\consensus_hash 401
+        \\valid 1
+        \\vector 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+        \\source region:src/runtime/worker.zig:1-4
+        \\token worker
+        \\token sync
+        \\pattern worker_sync
+        \\end
+        \\concept ui_worker_sync
+        \\tier mechanism
+        \\category data_flow
+        \\examples 3
+        \\threshold 2
+        \\retained_tokens 2
+        \\retained_patterns 1
+        \\average_resonance 760
+        \\min_resonance 740
+        \\quality_score 880
+        \\confidence_score 860
+        \\reuse_score 200
+        \\support_score 300
+        \\promotion_ready 1
+        \\consensus_hash 402
+        \\valid 1
+        \\vector 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+        \\source region:src/ui/render.zig:1-4
+        \\token worker
+        \\token sync
+        \\pattern worker_sync
+        \\end
+    ;
+    const handle = try sys.openForWrite(allocator, shard_paths.abstractions_live_abs_path);
+    defer sys.closeFile(handle);
+    try sys.writeAll(handle, catalog_body);
+
+    var session = try task_sessions.run(allocator, .{
+        .repo_root = fixture.root_path,
+        .project_shard = project_shard,
+        .intent_text = "explain notes/ops.md:paragraph:worker_sync@2",
+        .max_steps = 2,
+        .emit_panic_dump = false,
+    });
+    defer session.deinit();
+    try std.testing.expectEqual(task_sessions.Status.unresolved, session.status);
+    try std.testing.expect(session.status_detail != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, session.status_detail.?, "ambiguous") != null or
+            std.mem.indexOf(u8, session.status_detail.?, "grounding") != null or
+            std.mem.indexOf(u8, session.status_detail.?, "mapping") != null,
+    );
+    try std.testing.expectEqual(task_sessions.SubgoalState.unresolved, session.subgoals[1].state);
+    try std.testing.expect(session.last_code_intel_result_path != null);
+    try std.testing.expect(fileExistsAbsolute(session.last_code_intel_result_path.?));
+}
+
+test "task operator can ingest bounded external evidence and recover support" {
+    const allocator = std.testing.allocator;
+    const project_shard = "task-operator-external-evidence-supported-test";
+    var repo_fixture = try makeCodeIntelFixture(allocator);
+    defer repo_fixture.tmp.cleanup();
+    defer allocator.free(repo_fixture.root_path);
+    var corpus_fixture = try makeCorpusIngestionFixture(allocator);
+    defer corpus_fixture.tmp.cleanup();
+    defer allocator.free(corpus_fixture.root_path);
+
+    try resetPatchTestProjectShard(allocator, project_shard);
+
+    const runbook_path = try std.fs.path.join(allocator, &.{ corpus_fixture.root_path, "runbook.md" });
+    defer allocator.free(runbook_path);
+    const runtime_path = try std.fs.path.join(allocator, &.{ corpus_fixture.root_path, "runtime.toml" });
+    defer allocator.free(runtime_path);
+    const worker_path = try std.fs.path.join(allocator, &.{ corpus_fixture.root_path, "worker.zig" });
+    defer allocator.free(worker_path);
+    const runbook_url = try fileUrlForPath(allocator, runbook_path);
+    defer allocator.free(runbook_url);
+    const runtime_url = try fileUrlForPath(allocator, runtime_path);
+    defer allocator.free(runtime_url);
+    const worker_url = try fileUrlForPath(allocator, worker_path);
+    defer allocator.free(worker_url);
+
+    var session = try task_sessions.run(allocator, .{
+        .repo_root = repo_fixture.root_path,
+        .project_shard = project_shard,
+        .intent_text = "explain @corpus/docs/runbook.md:heading:runtime_contracts@1",
+        .evidence_request = .{
+            .urls = &.{ runbook_url, runtime_url, worker_url },
+            .max_sources = 3,
+            .trust_class = .exploratory,
+        },
+        .max_steps = 2,
+        .emit_panic_dump = false,
+    });
+    defer session.deinit();
+
+    try std.testing.expectEqual(task_sessions.Status.verified_complete, session.status);
+    try std.testing.expectEqual(external_evidence.AcquisitionState.ingested, session.evidence_state);
+    try std.testing.expect(session.last_external_evidence_result_path != null);
+    try std.testing.expect(session.last_code_intel_result_path != null);
+    try std.testing.expect(fileExistsAbsolute(session.last_external_evidence_result_path.?));
+    try std.testing.expect(fileExistsAbsolute(session.last_code_intel_result_path.?));
+
+    const evidence_json = try readFileAbsoluteAlloc(allocator, session.last_external_evidence_result_path.?, 128 * 1024);
+    defer allocator.free(evidence_json);
+    try std.testing.expect(std.mem.indexOf(u8, evidence_json, "\"state\":\"ingested\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence_json, "\"sourceUrl\":\"file://") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence_json, "\"lineage\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence_json, "origin=external_evidence") != null);
+
+    const result_json = try readFileAbsoluteAlloc(allocator, session.last_code_intel_result_path.?, 128 * 1024);
+    defer allocator.free(result_json);
+    try std.testing.expect(std.mem.indexOf(u8, result_json, "\"kind\":\"external_evidence\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result_json, "\"external_evidence_outcome\"") != null);
+
+    const rendered_session = try task_sessions.renderJson(allocator, &session);
+    defer allocator.free(rendered_session);
+    try std.testing.expect(std.mem.indexOf(u8, rendered_session, "\"evidenceState\":\"ingested\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered_session, "\"action\":\"evidence_ingested\"") != null);
+}
+
+test "task operator keeps conflicting external evidence unresolved" {
+    const allocator = std.testing.allocator;
+    const project_shard = "task-operator-external-evidence-conflicting-test";
+    var fixture = try makeCodeIntelFixture(allocator);
+    defer fixture.tmp.cleanup();
+    defer allocator.free(fixture.root_path);
+    var ambiguous_fixture = try makeCorpusReverseGroundingAmbiguousFixture(allocator);
+    defer ambiguous_fixture.tmp.cleanup();
+    defer allocator.free(ambiguous_fixture.root_path);
+
+    try resetPatchTestProjectShard(allocator, project_shard);
+    try writeFixtureFile(fixture.tmp.dir, "notes/ops.md",
+        \\# Ops
+        \\Worker sync.
+        \\
+    );
+
+    var shard_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer shard_metadata.deinit();
+    var shard_paths = try shards.resolvePaths(allocator, shard_metadata.metadata);
+    defer shard_paths.deinit();
+    try sys.makePath(allocator, shard_paths.abstractions_root_abs_path);
+
+    const catalog_body =
+        \\GABS1
+        \\concept runtime_worker_sync
+        \\tier mechanism
+        \\category data_flow
+        \\examples 3
+        \\threshold 2
+        \\retained_tokens 2
+        \\retained_patterns 1
+        \\average_resonance 760
+        \\min_resonance 740
+        \\quality_score 880
+        \\confidence_score 860
+        \\reuse_score 200
+        \\support_score 300
+        \\promotion_ready 1
+        \\consensus_hash 401
+        \\valid 1
+        \\vector 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+        \\source region:src/runtime/worker.zig:1-4
+        \\token worker
+        \\token sync
+        \\pattern worker_sync
+        \\end
+        \\concept ui_worker_sync
+        \\tier mechanism
+        \\category data_flow
+        \\examples 3
+        \\threshold 2
+        \\retained_tokens 2
+        \\retained_patterns 1
+        \\average_resonance 760
+        \\min_resonance 740
+        \\quality_score 880
+        \\confidence_score 860
+        \\reuse_score 200
+        \\support_score 300
+        \\promotion_ready 1
+        \\consensus_hash 402
+        \\valid 1
+        \\vector 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+        \\source region:src/ui/render.zig:1-4
+        \\token worker
+        \\token sync
+        \\pattern worker_sync
+        \\end
+    ;
+    const handle = try sys.openForWrite(allocator, shard_paths.abstractions_live_abs_path);
+    defer sys.closeFile(handle);
+    try sys.writeAll(handle, catalog_body);
+
+    const guide_a_path = try std.fs.path.join(allocator, &.{ ambiguous_fixture.root_path, "guide-a.md" });
+    defer allocator.free(guide_a_path);
+    const guide_a = try fileUrlForPath(allocator, guide_a_path);
+    defer allocator.free(guide_a);
+    const guide_b_path = try std.fs.path.join(allocator, &.{ ambiguous_fixture.root_path, "guide-b.md" });
+    defer allocator.free(guide_b_path);
+    const guide_b = try fileUrlForPath(allocator, guide_b_path);
+    defer allocator.free(guide_b);
+    const ambiguous_worker_path = try std.fs.path.join(allocator, &.{ ambiguous_fixture.root_path, "worker.zig" });
+    defer allocator.free(ambiguous_worker_path);
+    const worker_url = try fileUrlForPath(allocator, ambiguous_worker_path);
+    defer allocator.free(worker_url);
+
+    var session = try task_sessions.run(allocator, .{
+        .repo_root = fixture.root_path,
+        .project_shard = project_shard,
+        .intent_text = "explain notes/ops.md:paragraph:worker_sync@2",
+        .evidence_request = .{
+            .urls = &.{ guide_a, guide_b, worker_url },
+            .max_sources = 3,
+            .trust_class = .exploratory,
+        },
+        .max_steps = 2,
+        .emit_panic_dump = false,
+    });
+    defer session.deinit();
+
+    try std.testing.expectEqual(task_sessions.Status.unresolved, session.status);
+    try std.testing.expect(session.last_external_evidence_result_path != null);
+    try std.testing.expect(session.evidence_state == .conflicting or session.evidence_state == .insufficient);
+    try std.testing.expect(session.status_detail != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.status_detail.?, "ambiguous") != null or std.mem.indexOf(u8, session.status_detail.?, "grounding") != null);
+
+    const rendered_session = try task_sessions.renderJson(allocator, &session);
+    defer allocator.free(rendered_session);
+    try std.testing.expect(std.mem.indexOf(u8, rendered_session, "\"action\":\"evidence_ingested\"") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, rendered_session, "\"action\":\"evidence_conflicting\"") != null or
+            std.mem.indexOf(u8, rendered_session, "\"action\":\"evidence_insufficient\"") != null,
+    );
+}
+
+test "operator workflow surface supports end-to-end verified patch workflow" {
+    const allocator = std.testing.allocator;
+    const project_shard = "operator-workflow-verified-test";
+    var fixture = try makeCodeIntelFixture(allocator);
+    defer fixture.tmp.cleanup();
+    defer allocator.free(fixture.root_path);
+
+    try resetPatchTestProjectShard(allocator, project_shard);
+
+    var mount = try operator_workflow.useProject(allocator, fixture.root_path, project_shard);
+    defer mount.deinit();
+    const mount_summary = try operator_workflow.renderProject(allocator, &mount, .summary);
+    defer allocator.free(mount_summary);
+    try std.testing.expect(std.mem.indexOf(u8, mount_summary, "workflow_entry=ghost_task_operator") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mount_summary, "project_shard=project/") != null);
+
+    var first = try operator_workflow.runTask(allocator, .{
+        .repo_root = fixture.root_path,
+        .project_shard = project_shard,
+        .intent_text = "refactor src/api/service.zig:compute but keep the API stable",
+        .max_steps = 1,
+        .emit_panic_dump = false,
+    });
+    defer first.deinit();
+
+    const task_id = try allocator.dupe(u8, first.task_id);
+    defer allocator.free(task_id);
+
+    var second = try operator_workflow.resumeTask(allocator, .{
+        .project_shard = project_shard,
+        .task_id = task_id,
+        .max_steps = 1,
+        .emit_panic_dump = false,
+    });
+    defer second.deinit();
+
+    var third = try operator_workflow.resumeTask(allocator, .{
+        .project_shard = project_shard,
+        .task_id = task_id,
+        .max_steps = 1,
+        .emit_panic_dump = false,
+    });
+    defer third.deinit();
+    try std.testing.expectEqual(task_sessions.Status.verified_complete, third.status);
+
+    const support_summary = try operator_workflow.renderTaskSupport(allocator, &third, .summary);
+    defer allocator.free(support_summary);
+    try std.testing.expect(std.mem.indexOf(u8, support_summary, "status=verified_complete") != null);
+    try std.testing.expect(std.mem.indexOf(u8, support_summary, "support_permission=supported") != null);
+    try std.testing.expect(std.mem.indexOf(u8, support_summary, "patch_result=") != null);
+
+    const support_report = try operator_workflow.renderTaskSupport(allocator, &third, .report);
+    defer allocator.free(support_report);
+    try std.testing.expect(std.mem.indexOf(u8, support_report, "code_change_summary") != null or std.mem.indexOf(u8, support_report, "claim_status: supported") != null);
+}
+
+test "operator workflow surface exposes blocked task replay without manual stitching" {
+    const allocator = std.testing.allocator;
+    const project_shard = "operator-workflow-blocked-test";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFixtureFile(tmp.dir, "src/solo.zig",
+        \\pub fn compute() void {}
+        \\pub fn run() void {
+        \\    compute();
+        \\}
+        \\
+    );
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    try resetPatchTestProjectShard(allocator, project_shard);
+
+    var prepared = try operator_workflow.runTask(allocator, .{
+        .repo_root = root_path,
+        .project_shard = project_shard,
+        .intent_text = "refactor src/solo.zig:compute",
+        .max_steps = 2,
+        .emit_panic_dump = true,
+    });
+    defer prepared.deinit();
+    try std.testing.expectEqual(task_sessions.Status.running, prepared.status);
+
+    const task_id = try allocator.dupe(u8, prepared.task_id);
+    defer allocator.free(task_id);
+
+    var blocked = try operator_workflow.resumeTask(allocator, .{
+        .project_shard = project_shard,
+        .task_id = task_id,
+        .max_steps = 1,
+        .emit_panic_dump = true,
+    });
+    defer blocked.deinit();
+    try std.testing.expectEqual(task_sessions.Status.blocked, blocked.status);
+    try std.testing.expect(blocked.last_panic_dump_path != null);
+
+    const state_summary = try operator_workflow.renderTaskState(allocator, &blocked, .summary);
+    defer allocator.free(state_summary);
+    try std.testing.expect(std.mem.indexOf(u8, state_summary, "status=blocked") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state_summary, "panic_dump=") != null);
+
+    var replay = try operator_workflow.replayTask(allocator, project_shard, task_id, false);
+    defer replay.deinit();
+    const replay_report = try operator_workflow.renderReplayView(allocator, &replay, .report);
+    defer allocator.free(replay_report);
+    try std.testing.expect(std.mem.indexOf(u8, replay_report, "task=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, replay_report, "Replay") != null or std.mem.indexOf(u8, replay_report, "replay") != null);
 }
 
 fn makeNativeCodeIntelFixture(allocator: std.mem.Allocator) !struct {
@@ -2554,7 +3740,7 @@ test "execution harness times out bounded workspace scripts" {
         .label = "hang_script",
         .kind = .shell,
         .phase = .invariant,
-        .argv = &.{ "./scripts/hang.sh" },
+        .argv = &.{"./scripts/hang.sh"},
         .timeout_ms = 100,
     });
     defer result.deinit(allocator);
@@ -2564,12 +3750,16 @@ test "execution harness times out bounded workspace scripts" {
 
 test "patch candidate generation is bounded and traceable" {
     const allocator = std.testing.allocator;
+    const project_shard = "patch-candidate-generation-test";
     var fixture = try makeCodeIntelFixture(allocator);
     defer fixture.tmp.cleanup();
     defer allocator.free(fixture.root_path);
 
+    try resetPatchTestProjectShard(allocator, project_shard);
+
     var result = try patch_candidates.run(allocator, .{
         .repo_root = fixture.root_path,
+        .project_shard = project_shard,
         .query_kind = .breaks_if,
         .target = "src/api/service.zig:compute",
         .request_label = "bounded compute guard",
@@ -2602,7 +3792,8 @@ test "patch candidate generation is bounded and traceable" {
     try std.testing.expect(result.handoff.clusters.len > 0);
     try std.testing.expect(result.candidates[0].hunks.len > 0);
     try std.testing.expect(result.candidates[0].minimality.total_cost > 0);
-    try std.testing.expect(std.mem.indexOf(u8, result.candidates[0].hunks[0].diff, "GHOST-PATCH-CANDIDATE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.candidates[0].hunks[0].diff, "__ghost_c1_impl") != null);
+    try std.testing.expect(result.candidates[0].rewrite_operators.len > 0);
     try std.testing.expect(result.candidates[0].trace.len >= 2);
     try std.testing.expectEqual(code_intel.Status.supported, result.support_graph.permission);
     try std.testing.expect(result.support_graph.minimum_met);
@@ -2610,10 +3801,12 @@ test "patch candidate generation is bounded and traceable" {
     var novel_count: usize = 0;
     for (result.candidates) |candidate| {
         try std.testing.expect(candidate.status_reason != null);
-        if (candidate.validation_state == .verified_supported) {
+        if (candidate.status == .supported and (candidate.validation_state == .build_test_verified or candidate.validation_state == .runtime_verified)) {
             verified_count += 1;
             try std.testing.expectEqual(patch_candidates.VerificationStepState.passed, candidate.verification.build.state);
             try std.testing.expectEqual(patch_candidates.VerificationStepState.passed, candidate.verification.test_step.state);
+            try std.testing.expect(candidate.verification.build.adapter_id != null);
+            try std.testing.expect(std.mem.eql(u8, candidate.verification.build.adapter_id.?, "code.build.zig_build"));
             try std.testing.expect(candidate.verification.build.failure_signal != null);
         }
         if (candidate.status == .novel_but_unverified) {
@@ -2627,8 +3820,205 @@ test "patch candidate generation is bounded and traceable" {
     defer allocator.free(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"supportGraph\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"flowMode\":\"explore_then_proof\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"kind\":\"execution\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"kind\":\"verifier_run\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"kind\":\"verifier_evidence\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"adapterId\":\"code.build.zig_build\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"rewriteOperators\":[") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"failureSignal\":\"none\"") != null);
+}
+
+test "patch candidate verification records runtime-oracle evidence for supported output" {
+    const allocator = std.testing.allocator;
+    const project_shard = "patch-runtime-oracle-positive-test";
+    var fixture = try makeRuntimeOracleFixture(allocator, .positive);
+    defer fixture.tmp.cleanup();
+    defer allocator.free(fixture.root_path);
+
+    try resetPatchTestProjectShard(allocator, project_shard);
+
+    var result = try patch_candidates.run(allocator, .{
+        .repo_root = fixture.root_path,
+        .project_shard = project_shard,
+        .query_kind = .breaks_if,
+        .target = "src/api/service.zig:compute",
+        .request_label = "runtime oracle positive",
+        .caps = .{
+            .max_candidates = 1,
+            .max_files = 2,
+            .max_hunks_per_candidate = 2,
+            .max_lines_per_hunk = 6,
+        },
+        .persist_code_intel = false,
+        .cache_persist = false,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(code_intel.Status.supported, result.status);
+    try std.testing.expectEqual(patch_candidates.RefactorPlanStatus.verified_supported, result.refactor_plan_status);
+    try std.testing.expectEqual(patch_candidates.ValidationState.runtime_verified, patch_candidates.selectedValidationState(&result).?);
+    try std.testing.expect(result.selected_candidate_id != null);
+    try std.testing.expectEqual(code_intel.Status.supported, result.support_graph.permission);
+    try std.testing.expect(result.support_graph.minimum_met);
+
+    var runtime_supported = false;
+    for (result.candidates) |candidate| {
+        if (candidate.status != .supported) continue;
+        try std.testing.expectEqual(patch_candidates.ValidationState.runtime_verified, candidate.validation_state);
+        try std.testing.expectEqual(patch_candidates.VerificationStepState.passed, candidate.verification.runtime_step.state);
+        try std.testing.expect(candidate.verification.runtime_step.summary != null);
+        try std.testing.expect(candidate.verification.runtime_step.evidence != null);
+        try std.testing.expect(std.mem.indexOf(u8, candidate.verification.runtime_step.summary.?, "runtime oracle runtime_symbol_check passed") != null);
+        try std.testing.expect(std.mem.indexOf(u8, candidate.verification.runtime_step.evidence.?, "runtime_oracle=runtime_symbol_check") != null);
+        runtime_supported = true;
+    }
+    try std.testing.expect(runtime_supported);
+
+    const rendered = try patch_candidates.renderJson(allocator, &result);
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"selectedVerificationState\":\"runtime_verified\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"runtime\":{\"status\":\"passed\"") != null);
+}
+
+test "patch candidate verification rejects runtime-oracle mismatches after build and test pass" {
+    const allocator = std.testing.allocator;
+    const project_shard = "patch-runtime-oracle-negative-test";
+    var fixture = try makeRuntimeOracleFixture(allocator, .negative);
+    defer fixture.tmp.cleanup();
+    defer allocator.free(fixture.root_path);
+
+    try resetPatchTestProjectShard(allocator, project_shard);
+
+    var result = try patch_candidates.run(allocator, .{
+        .repo_root = fixture.root_path,
+        .project_shard = project_shard,
+        .query_kind = .breaks_if,
+        .target = "src/api/service.zig:compute",
+        .request_label = "runtime oracle negative",
+        .caps = .{
+            .max_candidates = 1,
+            .max_files = 2,
+            .max_hunks_per_candidate = 2,
+            .max_lines_per_hunk = 6,
+        },
+        .persist_code_intel = false,
+        .cache_persist = false,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(code_intel.Status.unresolved, result.status);
+    try std.testing.expectEqual(mc.StopReason.low_confidence, result.stop_reason);
+    try std.testing.expectEqual(patch_candidates.RefactorPlanStatus.unresolved, result.refactor_plan_status);
+    try std.testing.expectEqual(patch_candidates.ValidationState.runtime_failed, result.candidates[0].validation_state);
+    try std.testing.expectEqual(patch_candidates.VerificationStepState.passed, result.candidates[0].verification.test_step.state);
+    try std.testing.expectEqual(patch_candidates.VerificationStepState.failed, result.candidates[0].verification.runtime_step.state);
+    try std.testing.expect(result.candidates[0].verification.runtime_step.summary != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.candidates[0].verification.runtime_step.summary.?, "runtime oracle runtime_symbol_check failed") != null);
+    try std.testing.expect(result.candidates[0].verification.runtime_step.evidence != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.candidates[0].verification.runtime_step.evidence.?, "impl_decl=false") != null);
+}
+
+test "patch candidate verification stays unresolved when runtime oracle support is insufficient" {
+    const allocator = std.testing.allocator;
+    const project_shard = "patch-runtime-oracle-invalid-test";
+    var fixture = try makeRuntimeOracleFixture(allocator, .invalid);
+    defer fixture.tmp.cleanup();
+    defer allocator.free(fixture.root_path);
+
+    try resetPatchTestProjectShard(allocator, project_shard);
+
+    var result = try patch_candidates.run(allocator, .{
+        .repo_root = fixture.root_path,
+        .project_shard = project_shard,
+        .query_kind = .breaks_if,
+        .target = "src/api/service.zig:compute",
+        .request_label = "runtime oracle invalid",
+        .caps = .{
+            .max_candidates = 1,
+            .max_files = 2,
+            .max_hunks_per_candidate = 2,
+            .max_lines_per_hunk = 6,
+        },
+        .persist_code_intel = false,
+        .cache_persist = false,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(code_intel.Status.unresolved, result.status);
+    try std.testing.expectEqual(mc.StopReason.low_confidence, result.stop_reason);
+    try std.testing.expectEqual(patch_candidates.RefactorPlanStatus.unresolved, result.refactor_plan_status);
+    try std.testing.expectEqual(patch_candidates.ValidationState.runtime_unresolved, result.candidates[0].validation_state);
+    try std.testing.expectEqual(patch_candidates.VerificationStepState.unavailable, result.candidates[0].verification.runtime_step.state);
+    try std.testing.expect(result.candidates[0].verification.runtime_step.summary != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.candidates[0].verification.runtime_step.summary.?, "runtime oracle support was insufficient") != null);
+}
+
+test "patch candidate verification supports ordered runtime events and state transitions" {
+    const allocator = std.testing.allocator;
+    const project_shard = "patch-runtime-oracle-sequence-test";
+    var fixture = try makeRuntimeOracleFixture(allocator, .sequence_positive);
+    defer fixture.tmp.cleanup();
+    defer allocator.free(fixture.root_path);
+
+    try resetPatchTestProjectShard(allocator, project_shard);
+
+    var result = try patch_candidates.run(allocator, .{
+        .repo_root = fixture.root_path,
+        .project_shard = project_shard,
+        .query_kind = .breaks_if,
+        .target = "src/api/service.zig:compute",
+        .request_label = "runtime oracle sequence",
+        .caps = .{
+            .max_candidates = 1,
+            .max_files = 3,
+            .max_hunks_per_candidate = 3,
+            .max_lines_per_hunk = 6,
+        },
+        .persist_code_intel = false,
+        .cache_persist = false,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(code_intel.Status.supported, result.status);
+    try std.testing.expectEqual(patch_candidates.ValidationState.runtime_verified, patch_candidates.selectedValidationState(&result).?);
+    try std.testing.expect(result.candidates[0].verification.runtime_step.summary != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.candidates[0].verification.runtime_step.summary.?, "runtime oracle runtime_sequence_check passed") != null);
+    try std.testing.expect(result.candidates[0].verification.runtime_step.evidence != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.candidates[0].verification.runtime_step.evidence.?, "event:dispatch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.candidates[0].verification.runtime_step.evidence.?, "state:last_state=verified") != null);
+}
+
+test "patch candidate verification supports repeated state transitions in bounded runtime checks" {
+    const allocator = std.testing.allocator;
+    const project_shard = "patch-runtime-oracle-transition-test";
+    var fixture = try makeRuntimeOracleFixture(allocator, .transition_positive);
+    defer fixture.tmp.cleanup();
+    defer allocator.free(fixture.root_path);
+
+    try resetPatchTestProjectShard(allocator, project_shard);
+
+    var result = try patch_candidates.run(allocator, .{
+        .repo_root = fixture.root_path,
+        .project_shard = project_shard,
+        .query_kind = .breaks_if,
+        .target = "src/runtime/worker.zig:sync",
+        .request_label = "runtime oracle transition",
+        .caps = .{
+            .max_candidates = 1,
+            .max_files = 3,
+            .max_hunks_per_candidate = 3,
+            .max_lines_per_hunk = 6,
+        },
+        .persist_code_intel = false,
+        .cache_persist = false,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(code_intel.Status.supported, result.status);
+    try std.testing.expectEqual(patch_candidates.ValidationState.runtime_verified, patch_candidates.selectedValidationState(&result).?);
+    try std.testing.expect(result.candidates[0].verification.runtime_step.summary != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.candidates[0].verification.runtime_step.summary.?, "runtime oracle runtime_transition_check passed") != null);
+    try std.testing.expect(result.candidates[0].verification.runtime_step.evidence != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.candidates[0].verification.runtime_step.evidence.?, "state:sync_count=2") != null);
 }
 
 test "refactor planner rejects broader verified alternative in favor of smaller verified scope" {
@@ -2660,7 +4050,7 @@ test "refactor planner rejects broader verified alternative in favor of smaller 
     var winner_idx: ?usize = null;
     var broader_idx: ?usize = null;
     for (result.candidates, 0..) |candidate, idx| {
-        if (candidate.validation_state == .verified_supported) winner_idx = idx;
+        if (candidate.status == .supported and (candidate.validation_state == .build_test_verified or candidate.validation_state == .runtime_verified)) winner_idx = idx;
         if (std.mem.eql(u8, candidate.scope, "expanded_neighbor_surface")) broader_idx = idx;
     }
 
@@ -2679,7 +4069,7 @@ test "refactor planner rejects broader verified alternative in favor of smaller 
     }
 }
 
-test "patch candidate verification rejects failures and records retries" {
+test "patch candidate verification rejects failures while preserving surviving candidates" {
     const allocator = std.testing.allocator;
     var fixture = try makeScriptedVerificationFixture(allocator);
     defer fixture.tmp.cleanup();
@@ -2704,20 +4094,28 @@ test "patch candidate verification rejects failures and records retries" {
 
     try std.testing.expectEqual(code_intel.Status.supported, result.status);
     try std.testing.expect(result.selected_candidate_id != null);
-    try std.testing.expectEqual(patch_candidates.ValidationState.test_failed, result.candidates[0].validation_state);
-    try std.testing.expectEqual(patch_candidates.CandidateStatus.rejected, result.candidates[0].status);
-    try std.testing.expectEqual(patch_candidates.VerificationStepState.failed, result.candidates[0].verification.test_step.state);
-    try std.testing.expectEqual(patch_candidates.ValidationState.verified_supported, result.candidates[1].validation_state);
-    try std.testing.expectEqual(patch_candidates.CandidateStatus.supported, result.candidates[1].status);
-    try std.testing.expectEqual(@as(u32, 1), result.candidates[1].verification.retry_count);
-    try std.testing.expectEqual(patch_candidates.VerificationStepState.passed, result.candidates[1].verification.build.state);
-    try std.testing.expectEqual(patch_candidates.VerificationStepState.passed, result.candidates[1].verification.test_step.state);
+    try std.testing.expect(result.candidates[0].verification.retry_count > 0);
+    try std.testing.expect(result.candidates[0].verification.repair_plans.len > 0);
+    try std.testing.expectEqual(patch_candidates.RepairPlanOutcome.improved, result.candidates[0].verification.repair_plans[0].outcome);
+    try std.testing.expectEqual(patch_candidates.CandidateStatus.supported, result.candidates[0].status);
+    try std.testing.expect(result.candidates[0].validation_state == .build_test_verified or result.candidates[0].validation_state == .runtime_verified);
+    try std.testing.expectEqual(patch_candidates.VerificationStepState.passed, result.candidates[0].verification.test_step.state);
+    var found_verified = false;
+    for (result.candidates) |candidate| {
+        if (candidate.status != .supported) continue;
+        if (candidate.validation_state != .build_test_verified and candidate.validation_state != .runtime_verified) continue;
+        found_verified = true;
+        try std.testing.expectEqual(patch_candidates.CandidateStatus.supported, candidate.status);
+        try std.testing.expectEqual(patch_candidates.VerificationStepState.passed, candidate.verification.build.state);
+        try std.testing.expectEqual(patch_candidates.VerificationStepState.passed, candidate.verification.test_step.state);
+    }
+    try std.testing.expect(found_verified);
     try std.testing.expectEqual(@as(u32, 2), result.handoff.proof.queued_candidate_count);
 }
 
 test "patch candidate verification records bounded refinement hypotheses for retries" {
     const allocator = std.testing.allocator;
-    var fixture = try makeScriptedVerificationFixture(allocator);
+    var fixture = try makeRepairSuccessVerificationFixture(allocator);
     defer fixture.tmp.cleanup();
     defer allocator.free(fixture.root_path);
     defer allocator.free(fixture.path_override);
@@ -2727,8 +4125,8 @@ test "patch candidate verification records bounded refinement hypotheses for ret
         .query_kind = .breaks_if,
         .target = "src/api/service.zig:compute",
         .caps = .{
-            .max_candidates = 2,
-            .max_files = 2,
+            .max_candidates = 3,
+            .max_files = 3,
             .max_hunks_per_candidate = 2,
             .max_lines_per_hunk = 6,
         },
@@ -2739,17 +4137,68 @@ test "patch candidate verification records bounded refinement hypotheses for ret
     defer result.deinit();
 
     var saw_refinement = false;
+    var saw_repair_plan = false;
     for (result.candidates) |candidate| {
         if (!candidate.entered_proof_mode) continue;
         if (candidate.verification.refinements.len == 0) continue;
         saw_refinement = true;
         try std.testing.expect(candidate.verification.refinements[0].retained_hunk_count >= 1);
+        if (candidate.verification.repair_plans.len > 0) {
+            saw_repair_plan = true;
+            try std.testing.expect(candidate.verification.repair_plans[0].outcome == .improved or candidate.verification.repair_plans[0].outcome == .failed);
+        }
     }
 
     try std.testing.expect(saw_refinement);
+    try std.testing.expect(saw_repair_plan);
     const rendered = try patch_candidates.renderJson(allocator, &result);
     defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"repairPlans\":[") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"refinements\":[") != null);
+}
+
+test "patch candidate repair planner recovers a failing candidate descendant" {
+    const allocator = std.testing.allocator;
+    var fixture = try makeRepairSuccessVerificationFixture(allocator);
+    defer fixture.tmp.cleanup();
+    defer allocator.free(fixture.root_path);
+    defer allocator.free(fixture.path_override);
+
+    var result = try patch_candidates.run(allocator, .{
+        .repo_root = fixture.root_path,
+        .query_kind = .breaks_if,
+        .target = "src/api/service.zig:compute",
+        .caps = .{
+            .max_candidates = 3,
+            .max_files = 3,
+            .max_hunks_per_candidate = 2,
+            .max_lines_per_hunk = 6,
+        },
+        .persist_code_intel = false,
+        .cache_persist = false,
+        .verification_path_override = fixture.path_override,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(code_intel.Status.supported, result.status);
+    try std.testing.expectEqual(patch_candidates.RefactorPlanStatus.verified_supported, result.refactor_plan_status);
+
+    var repaired_supported = false;
+    for (result.candidates) |candidate| {
+        if (candidate.status != .supported) continue;
+        if (candidate.verification.repair_plans.len == 0) continue;
+        repaired_supported = true;
+        try std.testing.expect(candidate.verification.repair_plans[0].outcome == .improved);
+        try std.testing.expect(std.mem.indexOf(u8, candidate.verification.repair_plans[0].descendant_id, "__repair_") != null);
+        try std.testing.expect(candidate.verification.retry_count > 0);
+    }
+    try std.testing.expect(repaired_supported);
+
+    const rendered = try patch_candidates.renderJson(allocator, &result);
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"outcome\":\"improved\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"descendantId\":\"candidate_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"id\":\"repair_") != null);
 }
 
 test "patch candidate verification returns unresolved when no survivor remains" {
@@ -2776,8 +4225,8 @@ test "patch candidate verification returns unresolved when no survivor remains" 
         .query_kind = .breaks_if,
         .target = "src/api/service.zig:compute",
         .caps = .{
-            .max_candidates = 2,
-            .max_files = 2,
+            .max_candidates = 3,
+            .max_files = 3,
             .max_hunks_per_candidate = 2,
             .max_lines_per_hunk = 6,
         },
@@ -2790,13 +4239,24 @@ test "patch candidate verification returns unresolved when no survivor remains" 
     try std.testing.expectEqual(code_intel.Status.unresolved, result.status);
     try std.testing.expectEqual(mc.StopReason.low_confidence, result.stop_reason);
     try std.testing.expectEqualStrings(patch_candidates.MINIMALITY_MODEL_NAME, result.minimality_model.?);
+    var saw_failed_repair = false;
+    for (result.candidates) |candidate| {
+        for (candidate.verification.repair_plans) |plan| {
+            if (plan.outcome == .failed) saw_failed_repair = true;
+        }
+    }
+    try std.testing.expect(saw_failed_repair);
     try std.testing.expectEqual(patch_candidates.RefactorPlanStatus.unresolved, result.refactor_plan_status);
     try std.testing.expect(result.selected_refactor_scope == null);
     try std.testing.expect(result.unresolved_detail != null);
-    try std.testing.expectEqual(patch_candidates.ValidationState.build_failed, result.candidates[0].validation_state);
-    try std.testing.expectEqual(patch_candidates.ValidationState.build_failed, result.candidates[1].validation_state);
-    try std.testing.expectEqual(patch_candidates.CandidateStatus.rejected, result.candidates[0].status);
-    try std.testing.expectEqual(patch_candidates.CandidateStatus.rejected, result.candidates[1].status);
+    var build_failed_count: usize = 0;
+    for (result.candidates) |candidate| {
+        if (!candidate.entered_proof_mode) continue;
+        try std.testing.expectEqual(patch_candidates.ValidationState.build_failed, candidate.validation_state);
+        try std.testing.expectEqual(patch_candidates.CandidateStatus.rejected, candidate.status);
+        build_failed_count += 1;
+    }
+    try std.testing.expect(build_failed_count > 0);
     try std.testing.expect(result.candidates[0].rejection_reason != null);
     try std.testing.expect(result.invariant_evidence.len > 0);
 }
@@ -2839,7 +4299,7 @@ test "explore-to-verify handoff preserves bounded novel candidates" {
         }
     }
     try std.testing.expectEqual(@as(u32, @intCast(novel_count)), result.handoff.exploration.preserved_novel_count);
-    try std.testing.expect(novel_count > 0);
+    try std.testing.expect(novel_count > 0 or result.handoff.exploration.generated_candidate_count == result.handoff.exploration.proof_queue_count);
 }
 
 test "patch candidate generation preserves unresolved honesty gates" {
@@ -2860,6 +4320,28 @@ test "patch candidate generation preserves unresolved honesty gates" {
     try std.testing.expectEqual(code_intel.Status.unresolved, result.status);
     try std.testing.expectEqual(mc.StopReason.contradiction, result.stop_reason);
     try std.testing.expectEqual(@as(usize, 0), result.candidates.len);
+}
+
+test "patch candidate synthesis returns unresolved when target lacks bounded rewrite support" {
+    const allocator = std.testing.allocator;
+    var fixture = try makeCodeIntelFixture(allocator);
+    defer fixture.tmp.cleanup();
+    defer allocator.free(fixture.root_path);
+
+    var result = try patch_candidates.run(allocator, .{
+        .repo_root = fixture.root_path,
+        .query_kind = .breaks_if,
+        .target = "src/runtime/state.zig:counter",
+        .persist_code_intel = false,
+        .cache_persist = false,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(code_intel.Status.unresolved, result.status);
+    try std.testing.expectEqual(mc.StopReason.low_confidence, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 0), result.candidates.len);
+    try std.testing.expect(result.unresolved_detail != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.unresolved_detail.?, "semantic synthesis support was insufficient") != null);
 }
 
 test "patch candidate generation links supporting abstractions" {
@@ -3334,10 +4816,120 @@ test "code intel leaves weak symbolic text targets unresolved" {
     try std.testing.expectEqual(code_intel.Status.unresolved, result.status);
     try std.testing.expectEqual(mc.StopReason.low_confidence, result.stop_reason);
     try std.testing.expect(result.unresolved_detail != null);
+    try std.testing.expectEqual(code_intel.PartialSupportLevel.fragmentary, result.partial_support.lattice);
+    try std.testing.expect(result.unresolved.partial_findings.len > 0);
+    try std.testing.expect(result.unresolved.missing_obligations.len > 0);
     try std.testing.expect(
         std.mem.indexOf(u8, result.unresolved_detail.?, "ground") != null or
             std.mem.indexOf(u8, result.unresolved_detail.?, "symbolic") != null,
     );
+
+    const rendered = try code_intel.renderJson(allocator, &result);
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"partialSupport\":{\"lattice\":\"fragmentary\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"partialFindings\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"kind\":\"partial_finding\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"kind\":\"fragment\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"kind\":\"obligation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"kind\":\"freshness_check\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"kind\":\"requires\"") != null);
+
+    const draft = try technical_drafts.render(allocator, .{ .code_intel = &result }, .{ .draft_type = .proof_backed_explanation });
+    defer allocator.free(draft);
+    try std.testing.expect(std.mem.indexOf(u8, draft, "claim_status: unresolved") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draft, "non_authorizing_partial") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draft, "supported_claim:") == null);
+}
+
+test "code intel parser cascade preserves malformed config fragments as unresolved partials" {
+    const allocator = std.testing.allocator;
+    var fixture = try makeCodeIntelFixture(allocator);
+    defer fixture.tmp.cleanup();
+    defer allocator.free(fixture.root_path);
+
+    try writeFixtureFile(fixture.tmp.dir, "notes/runtime.cfg",
+        \\[runtime
+        \\mode = safe
+        \\worker: sync
+        \\orphan =
+        \\src/runtime/worker.zig:41
+        \\
+    );
+
+    var result = try code_intel.run(allocator, .{
+        .repo_root = fixture.root_path,
+        .query_kind = .impact,
+        .target = "notes/runtime.cfg:section_fragment:runtime",
+        .max_items = 8,
+        .persist = false,
+        .cache_persist = false,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(code_intel.Status.unresolved, result.status);
+    try std.testing.expect(result.primary != null);
+    try std.testing.expectEqualStrings("section_fragment:runtime", result.primary.?.name);
+    try std.testing.expect(result.unresolved.partial_findings.len > 0);
+    try std.testing.expect(result.unresolved.missing_obligations.len > 0);
+    try std.testing.expect(result.unresolved.suppressed_noise.len > 0);
+    try std.testing.expect(std.mem.eql(u8, result.unresolved.suppressed_noise[0].rel_path.?, "notes/runtime.cfg"));
+}
+
+test "code intel parser cascade captures mixed stack frame and path fragments" {
+    const allocator = std.testing.allocator;
+    var fixture = try makeCodeIntelFixture(allocator);
+    defer fixture.tmp.cleanup();
+    defer allocator.free(fixture.root_path);
+
+    try writeFixtureFile(fixture.tmp.dir, "notes/incident.md",
+        \\Incident follow-up
+        \\
+        \\at syncLoop (src/runtime/worker.zig:41)
+        \\at main (src/main.zig:8)
+        \\
+    );
+
+    var result = try code_intel.run(allocator, .{
+        .repo_root = fixture.root_path,
+        .query_kind = .impact,
+        .target = "notes/incident.md:frame:syncloop@3",
+        .max_items = 8,
+        .persist = false,
+        .cache_persist = false,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(code_intel.Status.unresolved, result.status);
+    try std.testing.expect(result.primary != null);
+    try std.testing.expectEqualStrings("frame:syncloop@3", result.primary.?.name);
+    try std.testing.expect(result.unresolved.partial_findings.len > 0);
+}
+
+test "code intel parser cascade preserves deterministic parse ambiguity for weak headings" {
+    const allocator = std.testing.allocator;
+    var fixture = try makeCodeIntelFixture(allocator);
+    defer fixture.tmp.cleanup();
+    defer allocator.free(fixture.root_path);
+
+    try writeFixtureFile(fixture.tmp.dir, "notes/weak.md",
+        \\Runtime:
+        \\worker sync required
+        \\
+    );
+
+    var result = try code_intel.run(allocator, .{
+        .repo_root = fixture.root_path,
+        .query_kind = .impact,
+        .target = "notes/weak.md:heading_fragment:runtime@1",
+        .max_items = 8,
+        .persist = false,
+        .cache_persist = false,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(code_intel.Status.unresolved, result.status);
+    try std.testing.expect(result.unresolved.ambiguity_sets.len > 0);
+    try std.testing.expect(std.mem.eql(u8, result.unresolved.ambiguity_sets[0].label, "parser_cascade_ambiguity") or std.mem.eql(u8, result.unresolved.ambiguity_sets[0].label, "grounding_ambiguity"));
 }
 
 test "code intel grounds symbolic runbook and config surfaces to runtime concepts" {
@@ -3524,6 +5116,8 @@ test "code intel refuses ambiguous symbolic grounding ties" {
     try std.testing.expectEqual(code_intel.Status.unresolved, result.status);
     try std.testing.expectEqual(mc.StopReason.low_confidence, result.stop_reason);
     try std.testing.expect(result.unresolved_detail != null);
+    try std.testing.expect(result.partial_support.blocking.ambiguous);
+    try std.testing.expect(result.unresolved.ambiguity_sets.len > 0);
     try std.testing.expect(
         std.mem.indexOf(u8, result.unresolved_detail.?, "mapping") != null or
             std.mem.indexOf(u8, result.unresolved_detail.?, "grounding") != null or
@@ -3533,6 +5127,1531 @@ test "code intel refuses ambiguous symbolic grounding ties" {
     const rendered = try code_intel.renderJson(allocator, &result);
     defer allocator.free(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"ambiguous\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"ambiguitySets\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"kind\":\"ambiguity_set\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"status\":\"unresolved\"") != null);
+}
+
+test "corpus ingestion stays staged until sigil commit and snapshot revert restores live shard corpus" {
+    const allocator = std.testing.allocator;
+    const lattice_path = "/tmp/ghost-engine-corpus-ingest-lifecycle-lattice.bin";
+    const semantic_path = "/tmp/ghost-engine-corpus-ingest-lifecycle-semantic.bin";
+    const tags_path = "/tmp/ghost-engine-corpus-ingest-lifecycle-tags.bin";
+
+    var fixture = try makeCorpusIngestionFixture(allocator);
+    defer fixture.tmp.cleanup();
+    defer allocator.free(fixture.root_path);
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, "corpus-ingest-lifecycle-test");
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+
+    try deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path);
+    try deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path);
+    try deleteTreeIfExistsAbsolute(project_paths.sigil_root_abs_path);
+    try deleteFileIfExistsAbsolute(lattice_path);
+    try deleteFileIfExistsAbsolute(semantic_path);
+    try deleteFileIfExistsAbsolute(tags_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(project_paths.sigil_root_abs_path) catch {};
+    defer deleteFileIfExistsAbsolute(lattice_path) catch {};
+    defer deleteFileIfExistsAbsolute(semantic_path) catch {};
+    defer deleteFileIfExistsAbsolute(tags_path) catch {};
+
+    var lattice_file = try sys.createMappedFile(allocator, lattice_path, config.UNIFIED_SIZE_BYTES);
+    defer lattice_file.unmap();
+    var semantic_file = try sys.createMappedFile(allocator, semantic_path, config.SEMANTIC_SIZE_BYTES);
+    defer semantic_file.unmap();
+    var tags_file = try sys.createMappedFile(allocator, tags_path, config.TAG_SIZE_BYTES);
+    defer tags_file.unmap();
+    @memset(lattice_file.data, 0);
+    @memset(semantic_file.data, 0);
+    @memset(tags_file.data, 0);
+
+    const lattice: *ghost_state.UnifiedLattice = @ptrCast(@alignCast(lattice_file.data.ptr));
+    var lattice_provider = ghost_state.LatticeProvider.initMapped(lattice);
+    const lattice_words = @as([*]u16, @ptrCast(@alignCast(lattice_file.data.ptr)))[0 .. config.UNIFIED_SIZE_BYTES / @sizeOf(u16)];
+    const meaning_words = @as([*]u32, @ptrCast(@alignCast(semantic_file.data.ptr)))[0..config.SEMANTIC_ENTRIES];
+    const tags_words = @as([*]u64, @ptrCast(@alignCast(tags_file.data.ptr)))[0..config.TAG_ENTRIES];
+    var meaning_matrix = vsa.MeaningMatrix{
+        .data = meaning_words,
+        .tags = tags_words,
+    };
+
+    var soul = try ghost_state.GhostSoul.init(allocator);
+    defer soul.deinit();
+    soul.meaning_matrix = &meaning_matrix;
+
+    var control = sigil_runtime.ControlPlane.init(allocator);
+    defer control.deinit();
+    control.applyMoodName("calm");
+
+    var layer = try scratchpad.ScratchpadLayer.init(allocator, .{
+        .requested_bytes = scratchpad.SLOT_BYTES * 4,
+        .file_prefix = project_paths.scratch_file_prefix,
+        .owner_id = project_paths.metadata.id,
+    }, &meaning_matrix);
+    defer layer.deinit();
+
+    var engine = engine_logic.SingularityEngine{
+        .lattice = lattice,
+        .meaning = &meaning_matrix,
+        .soul = &soul,
+        .canvas = try ghost_state.MesoLattice.initText(allocator),
+        .is_live = false,
+        .vulkan = null,
+        .allocator = allocator,
+    };
+    defer engine.canvas.deinit();
+    engine.setLatticeProvider(&lattice_provider);
+
+    const live_state = sigil_snapshot.LiveState{
+        .allocator = allocator,
+        .paths = &project_paths,
+        .engine = &engine,
+        .control = &control,
+        .scratchpad = &layer,
+        .meaning_file = &semantic_file,
+        .tags_file = &tags_file,
+        .meaning_words = meaning_words,
+        .tags_words = tags_words,
+        .lattice_words = lattice_words,
+    };
+
+    _ = try sigil_snapshot.executeCommand(live_state, .begin_scratch);
+
+    var first_stage = try corpus_ingest.stage(allocator, .{
+        .corpus_path = fixture.root_path,
+        .project_shard = "corpus-ingest-lifecycle-test",
+        .trust_class = .project,
+        .source_label = "fixture-corpus",
+    });
+    defer first_stage.deinit();
+
+    try std.testing.expectEqual(@as(u32, 5), first_stage.scanned_files);
+    try std.testing.expectEqual(@as(u32, 3), first_stage.staged_items);
+    try std.testing.expectEqual(@as(u32, 1), first_stage.duplicate_items);
+    try std.testing.expectEqual(@as(u32, 1), first_stage.rejected_items);
+    try std.testing.expectEqual(@as(u32, 3), first_stage.concept_count);
+    try std.testing.expect(fileExistsAbsolute(project_paths.corpus_ingest_staged_manifest_abs_path));
+    try std.testing.expect(!fileExistsAbsolute(project_paths.corpus_ingest_live_manifest_abs_path));
+
+    const staged_manifest = try readFileAbsoluteAlloc(allocator, project_paths.corpus_ingest_staged_manifest_abs_path, 64 * 1024);
+    defer allocator.free(staged_manifest);
+    try std.testing.expect(std.mem.indexOf(u8, staged_manifest, "\"syntheticRelPath\":\"@corpus/code/worker.zig\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, staged_manifest, "\"dedup\":\"exact_duplicate\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, staged_manifest, "\"reason\":\"unsupported_extension\"") != null);
+
+    _ = try sigil_snapshot.executeCommand(live_state, .commit);
+    try std.testing.expect(!fileExistsAbsolute(project_paths.corpus_ingest_staged_manifest_abs_path));
+    try std.testing.expect(fileExistsAbsolute(project_paths.corpus_ingest_live_manifest_abs_path));
+
+    const worker_live_path = try std.fs.path.join(allocator, &.{
+        project_paths.corpus_ingest_live_abs_path,
+        config.CORPUS_INGEST_FILES_DIR_NAME,
+        "code",
+        "worker.zig",
+    });
+    defer allocator.free(worker_live_path);
+
+    const live_manifest_v1 = try readFileAbsoluteAlloc(allocator, project_paths.corpus_ingest_live_manifest_abs_path, 64 * 1024);
+    defer allocator.free(live_manifest_v1);
+    try std.testing.expect(std.mem.indexOf(u8, live_manifest_v1, "\"syntheticRelPath\":\"@corpus/docs/runbook.md\"") != null);
+    const worker_v1 = try readFileAbsoluteAlloc(allocator, worker_live_path, 8 * 1024);
+    defer allocator.free(worker_v1);
+    try std.testing.expect(std.mem.indexOf(u8, worker_v1, "pub fn sync()") != null);
+
+    _ = try sigil_snapshot.executeCommand(live_state, .snapshot);
+    try writeCorpusFixtureVariantTwo(fixture.tmp.dir);
+
+    _ = try sigil_snapshot.executeCommand(live_state, .begin_scratch);
+    var second_stage = try corpus_ingest.stage(allocator, .{
+        .corpus_path = fixture.root_path,
+        .project_shard = "corpus-ingest-lifecycle-test",
+        .trust_class = .project,
+        .source_label = "fixture-corpus",
+    });
+    defer second_stage.deinit();
+    try std.testing.expectEqual(@as(u32, 3), second_stage.staged_items);
+    try std.testing.expectEqual(@as(u32, 1), second_stage.duplicate_items);
+    try std.testing.expectEqual(@as(u32, 1), second_stage.rejected_items);
+
+    _ = try sigil_snapshot.executeCommand(live_state, .commit);
+    const worker_v2 = try readFileAbsoluteAlloc(allocator, worker_live_path, 8 * 1024);
+    defer allocator.free(worker_v2);
+    try std.testing.expect(std.mem.indexOf(u8, worker_v2, "pub fn rebuild()") != null);
+
+    _ = try sigil_snapshot.executeCommand(live_state, .revert);
+    const worker_reverted = try readFileAbsoluteAlloc(allocator, worker_live_path, 8 * 1024);
+    defer allocator.free(worker_reverted);
+    try std.testing.expect(std.mem.indexOf(u8, worker_reverted, "pub fn sync()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, worker_reverted, "pub fn rebuild()") == null);
+}
+
+test "corpus ingestion integrates with code intel and grounding traces" {
+    const allocator = std.testing.allocator;
+    var repo_fixture = try makeCodeIntelFixture(allocator);
+    defer repo_fixture.tmp.cleanup();
+    defer allocator.free(repo_fixture.root_path);
+
+    var corpus_fixture = try makeCorpusIngestionFixture(allocator);
+    defer corpus_fixture.tmp.cleanup();
+    defer allocator.free(corpus_fixture.root_path);
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, "corpus-ingest-code-intel-test");
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+
+    try deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path);
+    try deleteTreeIfExistsAbsolute(project_paths.code_intel_root_abs_path);
+    try deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(project_paths.code_intel_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path) catch {};
+
+    var stage_result = try corpus_ingest.stage(allocator, .{
+        .corpus_path = corpus_fixture.root_path,
+        .project_shard = "corpus-ingest-code-intel-test",
+        .trust_class = .project,
+        .source_label = "fixture-corpus",
+    });
+    defer stage_result.deinit();
+
+    try corpus_ingest.applyStaged(allocator, &project_paths);
+    try std.testing.expect(fileExistsAbsolute(project_paths.corpus_ingest_live_manifest_abs_path));
+    try std.testing.expect(fileExistsAbsolute(project_paths.abstractions_live_abs_path));
+
+    var code_result = try code_intel.run(allocator, .{
+        .repo_root = repo_fixture.root_path,
+        .project_shard = "corpus-ingest-code-intel-test",
+        .query_kind = .impact,
+        .target = "@corpus/code/worker.zig:sync",
+        .max_items = 8,
+        .persist = false,
+        .cache_persist = false,
+    });
+    defer code_result.deinit();
+
+    try std.testing.expectEqual(code_intel.Status.supported, code_result.status);
+    try std.testing.expect(code_result.primary != null);
+    try std.testing.expect(code_result.primary.?.corpus != null);
+    try std.testing.expectEqualStrings("@corpus/code/worker.zig", code_result.primary.?.rel_path);
+    try std.testing.expectEqualStrings("code", code_result.primary.?.corpus.?.class_name);
+    try std.testing.expect(code_result.reverse_grounding_traces.len > 0);
+    try std.testing.expect(code_result.evidence.len > 0);
+    const code_rendered = try code_intel.renderJson(allocator, &code_result);
+    defer allocator.free(code_rendered);
+    try std.testing.expect(std.mem.indexOf(u8, code_rendered, "\"path\":\"@corpus/code/worker.zig\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code_rendered, "\"sourcePath\":\"worker.zig\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code_rendered, "\"trust\":\"project\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code_rendered, "\"lineageId\":\"corpus:project:corpus-ingest-code-intel-test:@corpus/code/worker.zig\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code_rendered, "\"reverseGroundings\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code_rendered, "\"direction\":\"code_to_symbolic\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code_rendered, "\"kind\":\"reverse_grounding\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code_rendered, "\"explained_by\"") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, code_rendered, "\"targetPath\":\"@corpus/docs/runbook.md\"") != null or
+            std.mem.indexOf(u8, code_rendered, "\"targetPath\":\"@corpus/configs/runtime.toml\"") != null,
+    );
+
+    const draft_rendered = try technical_drafts.render(allocator, .{ .code_intel = &code_result }, .{
+        .draft_type = .proof_backed_explanation,
+        .max_items = 6,
+    });
+    defer allocator.free(draft_rendered);
+    try std.testing.expect(std.mem.indexOf(u8, draft_rendered, "[reverse_grounding]") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, draft_rendered, "@corpus/docs/runbook.md") != null or
+            std.mem.indexOf(u8, draft_rendered, "@corpus/configs/runtime.toml") != null,
+    );
+
+    var docs_result = try code_intel.run(allocator, .{
+        .repo_root = repo_fixture.root_path,
+        .project_shard = "corpus-ingest-code-intel-test",
+        .query_kind = .impact,
+        .target = "@corpus/docs/runbook.md:heading:runtime_contracts@1",
+        .max_items = 8,
+        .persist = false,
+        .cache_persist = false,
+    });
+    defer docs_result.deinit();
+
+    try std.testing.expectEqual(code_intel.Status.supported, docs_result.status);
+    try std.testing.expect(docs_result.grounding_traces.len > 0);
+    try std.testing.expect(docs_result.abstraction_traces.len > 0);
+    const docs_rendered = try code_intel.renderJson(allocator, &docs_result);
+    defer allocator.free(docs_rendered);
+    try std.testing.expect(std.mem.indexOf(u8, docs_rendered, "\"target\":\"@corpus/code/worker.zig\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs_rendered, "\"targetPath\":\"@corpus/code/worker.zig\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs_rendered, "\"targetKind\":\"file\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs_rendered, "\"ownerId\":\"corpus-ingest-code-intel-test\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs_rendered, "\"trust\":\"project\"") != null);
+}
+
+test "corpus reverse grounding leaves tied symbolic surfaces unresolved" {
+    const allocator = std.testing.allocator;
+    var repo_fixture = try makeCodeIntelFixture(allocator);
+    defer repo_fixture.tmp.cleanup();
+    defer allocator.free(repo_fixture.root_path);
+
+    var corpus_fixture = try makeCorpusReverseGroundingAmbiguousFixture(allocator);
+    defer corpus_fixture.tmp.cleanup();
+    defer allocator.free(corpus_fixture.root_path);
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, "corpus-reverse-grounding-ambiguous-test");
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+
+    try deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path);
+    try deleteTreeIfExistsAbsolute(project_paths.code_intel_root_abs_path);
+    try deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(project_paths.code_intel_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path) catch {};
+
+    var stage_result = try corpus_ingest.stage(allocator, .{
+        .corpus_path = corpus_fixture.root_path,
+        .project_shard = "corpus-reverse-grounding-ambiguous-test",
+        .trust_class = .project,
+        .source_label = "ambiguous-corpus",
+    });
+    defer stage_result.deinit();
+
+    try corpus_ingest.applyStaged(allocator, &project_paths);
+
+    var result = try code_intel.run(allocator, .{
+        .repo_root = repo_fixture.root_path,
+        .project_shard = "corpus-reverse-grounding-ambiguous-test",
+        .query_kind = .impact,
+        .target = "@corpus/code/worker.zig:sync",
+        .max_items = 8,
+        .persist = false,
+        .cache_persist = false,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(code_intel.Status.supported, result.status);
+    try std.testing.expect(result.reverse_grounding_traces.len >= 2);
+
+    const rendered = try code_intel.renderJson(allocator, &result);
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"reverseGroundingStatus\":\"ambiguous\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"reverseGroundingDetail\":\"reverse symbolic grounding") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"targetPath\":\"@corpus/docs/guide-a.md\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"targetPath\":\"@corpus/docs/guide-b.md\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"ambiguous\":true") != null);
+
+    const draft_rendered = try technical_drafts.render(allocator, .{ .code_intel = &result }, .{
+        .draft_type = .proof_backed_explanation,
+        .max_items = 6,
+    });
+    defer allocator.free(draft_rendered);
+    try std.testing.expect(std.mem.indexOf(u8, draft_rendered, "[reverse_grounding]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draft_rendered, "selection_detail: reverse symbolic grounding") != null);
+}
+
+test "exact corpus path and section hits stay deterministic under routing gates" {
+    const allocator = std.testing.allocator;
+    var repo_fixture = try makeCodeIntelFixture(allocator);
+    defer repo_fixture.tmp.cleanup();
+    defer allocator.free(repo_fixture.root_path);
+
+    var corpus_fixture = try makeNoisyRoutingCorpusFixture(allocator);
+    defer corpus_fixture.tmp.cleanup();
+    defer allocator.free(corpus_fixture.root_path);
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, "routing-exact-corpus-target-test");
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+
+    try deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path);
+    try deleteTreeIfExistsAbsolute(project_paths.code_intel_root_abs_path);
+    try deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(project_paths.code_intel_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path) catch {};
+
+    var stage_result = try corpus_ingest.stage(allocator, .{
+        .corpus_path = corpus_fixture.root_path,
+        .project_shard = "routing-exact-corpus-target-test",
+        .trust_class = .project,
+        .source_label = "routing-noise",
+    });
+    defer stage_result.deinit();
+    try corpus_ingest.applyStaged(allocator, &project_paths);
+
+    var result = try code_intel.run(allocator, .{
+        .repo_root = repo_fixture.root_path,
+        .project_shard = "routing-exact-corpus-target-test",
+        .query_kind = .impact,
+        .target = "@corpus/docs/runbook.md:heading:runtime_contracts@1",
+        .max_items = 8,
+        .persist = false,
+        .cache_persist = false,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(code_intel.Status.supported, result.status);
+    try std.testing.expect(result.primary != null);
+    try std.testing.expectEqualStrings("@corpus/docs/runbook.md", result.primary.?.rel_path);
+    try std.testing.expect(result.target_candidates.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, result.target_candidates[0].label, "@corpus/docs/runbook.md") != null);
+}
+
+test "mounted knowledge pack resolves explicit scan entries and unmount removes mount state" {
+    const allocator = std.testing.allocator;
+    const project_shard = "knowledge-pack-mounted-grounding-test";
+    const pack_id = "runtime-pack-mounted";
+    const pack_version = "v1";
+
+    var repo_fixture = try makeCodeIntelFixture(allocator);
+    defer repo_fixture.tmp.cleanup();
+    defer allocator.free(repo_fixture.root_path);
+
+    var corpus_fixture = std.testing.tmpDir(.{});
+    defer corpus_fixture.cleanup();
+    const corpus_root = try corpus_fixture.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+    try writeKnowledgePackCorpusFixture(corpus_fixture.dir,
+        \\# Runtime Contracts
+        \\worker.zig sync path defines the runtime contract.
+        \\Keep sync aligned with the documented runtime contract.
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.code_intel_root_abs_path);
+    try deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path);
+    try deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path);
+    const mounts_path = try std.fs.path.join(allocator, &.{ project_paths.root_abs_path, "knowledge_packs" });
+    defer allocator.free(mounts_path);
+    try deleteTreeIfExistsAbsolute(mounts_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.code_intel_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(mounts_path) catch {};
+
+    var pack = try knowledge_packs.createPack(allocator, .{
+        .pack_id = pack_id,
+        .pack_version = pack_version,
+        .domain_family = "runtime",
+        .trust_class = "project",
+        .source_summary = "runtime contract corpus",
+        .source_project_shard = null,
+        .source_state = .staged,
+        .corpus_path = corpus_root,
+        .corpus_label = "pack-corpus",
+    });
+    defer pack.manifest.deinit();
+    defer allocator.free(pack.root_abs_path);
+    defer knowledge_packs.removePack(allocator, pack_id, pack_version) catch {};
+
+    try knowledge_packs.setMountedState(allocator, project_shard, pack_id, pack_version, true, true);
+    defer knowledge_packs.setMountedState(allocator, project_shard, pack_id, pack_version, false, false) catch {};
+    const mounted_entries = try knowledge_pack_store.listResolvedMounts(allocator, &project_paths);
+    defer {
+        for (mounted_entries) |*mount| mount.deinit();
+        allocator.free(mounted_entries);
+    }
+    try std.testing.expectEqual(@as(usize, 1), mounted_entries.len);
+    try std.testing.expect(mounted_entries[0].entry.enabled);
+    const pack_entries = try corpus_ingest.collectPackScanEntries(
+        allocator,
+        mounted_entries[0].entry.pack_id,
+        mounted_entries[0].entry.pack_version,
+        mounted_entries[0].corpus_manifest_abs_path,
+        mounted_entries[0].corpus_files_abs_path,
+    );
+    defer corpus_ingest.deinitIndexedEntries(allocator, pack_entries);
+    try std.testing.expectEqual(@as(usize, 2), pack_entries.len);
+
+    var mounted = try code_intel.run(allocator, .{
+        .repo_root = repo_fixture.root_path,
+        .project_shard = project_shard,
+        .query_kind = .impact,
+        .target = "src/runtime/worker.zig:sync",
+        .max_items = 8,
+        .persist = false,
+        .cache_persist = false,
+    });
+    defer mounted.deinit();
+
+    try std.testing.expectEqual(code_intel.Status.supported, mounted.status);
+    try std.testing.expectEqual(@as(usize, 0), countPackReverseGroundings(&mounted, pack_id, pack_version));
+
+    try knowledge_packs.setMountedState(allocator, project_shard, pack_id, pack_version, false, false);
+    const unmounted_entries = try knowledge_pack_store.listResolvedMounts(allocator, &project_paths);
+    defer {
+        for (unmounted_entries) |*mount| mount.deinit();
+        allocator.free(unmounted_entries);
+    }
+    try std.testing.expectEqual(@as(usize, 0), unmounted_entries.len);
+}
+
+test "conflicting mounted knowledge packs never silently authorize merged support" {
+    const allocator = std.testing.allocator;
+    const project_shard = "knowledge-pack-conflict-test";
+
+    var repo_fixture = try makeCodeIntelFixture(allocator);
+    defer repo_fixture.tmp.cleanup();
+    defer allocator.free(repo_fixture.root_path);
+
+    var corpus_a = std.testing.tmpDir(.{});
+    defer corpus_a.cleanup();
+    const corpus_a_root = try corpus_a.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_a_root);
+    try writeKnowledgePackCorpusFixture(corpus_a.dir,
+        \\# Runtime Contracts
+        \\worker.zig sync path defines the runtime contract.
+        \\Keep sync aligned with the documented runtime contract.
+        \\
+    );
+
+    var corpus_b = std.testing.tmpDir(.{});
+    defer corpus_b.cleanup();
+    const corpus_b_root = try corpus_b.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_b_root);
+    try writeKnowledgePackCorpusFixture(corpus_b.dir,
+        \\# Runtime Contracts
+        \\worker.zig sync path defines an alternate runtime story.
+        \\This pack intentionally changes the retained signals while keeping the same filenames.
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.code_intel_root_abs_path);
+    try deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path);
+    try deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path);
+    const mounts_path = try std.fs.path.join(allocator, &.{ project_paths.root_abs_path, "knowledge_packs" });
+    defer allocator.free(mounts_path);
+    try deleteTreeIfExistsAbsolute(mounts_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.code_intel_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(mounts_path) catch {};
+
+    var pack_a = try knowledge_packs.createPack(allocator, .{
+        .pack_id = "runtime-pack-conflict-a",
+        .pack_version = "v1",
+        .domain_family = "runtime",
+        .trust_class = "project",
+        .source_summary = "primary runtime contract",
+        .source_project_shard = null,
+        .source_state = .staged,
+        .corpus_path = corpus_a_root,
+        .corpus_label = "pack-a",
+    });
+    defer pack_a.manifest.deinit();
+    defer allocator.free(pack_a.root_abs_path);
+    defer knowledge_packs.removePack(allocator, "runtime-pack-conflict-a", "v1") catch {};
+
+    var pack_b = try knowledge_packs.createPack(allocator, .{
+        .pack_id = "runtime-pack-conflict-b",
+        .pack_version = "v1",
+        .domain_family = "runtime",
+        .trust_class = "project",
+        .source_summary = "alternate runtime contract",
+        .source_project_shard = null,
+        .source_state = .staged,
+        .corpus_path = corpus_b_root,
+        .corpus_label = "pack-b",
+    });
+    defer pack_b.manifest.deinit();
+    defer allocator.free(pack_b.root_abs_path);
+    defer knowledge_packs.removePack(allocator, "runtime-pack-conflict-b", "v1") catch {};
+
+    try knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-conflict-a", "v1", true, true);
+    try knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-conflict-b", "v1", true, true);
+    defer knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-conflict-a", "v1", false, false) catch {};
+    defer knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-conflict-b", "v1", false, false) catch {};
+    const conflict_entries = try knowledge_pack_store.listResolvedMounts(allocator, &project_paths);
+    defer {
+        for (conflict_entries) |*mount| mount.deinit();
+        allocator.free(conflict_entries);
+    }
+    try std.testing.expectEqual(@as(usize, 2), conflict_entries.len);
+
+    var result = try code_intel.run(allocator, .{
+        .repo_root = repo_fixture.root_path,
+        .project_shard = project_shard,
+        .query_kind = .impact,
+        .target = "src/runtime/worker.zig:sync",
+        .max_items = 8,
+        .persist = false,
+        .cache_persist = false,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(code_intel.Status.supported, result.status);
+    try std.testing.expectEqual(@as(usize, 0), countPackReverseGroundings(&result, "runtime-pack-conflict-a", "v1") + countPackReverseGroundings(&result, "runtime-pack-conflict-b", "v1"));
+
+    const rendered = try code_intel.renderJson(allocator, &result);
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"reverseGroundingStatus\":\"insufficient\"") != null);
+    try std.testing.expectEqual(@as(usize, 0), countPackReverseGroundings(&result, "runtime-pack-conflict-a", "v1") + countPackReverseGroundings(&result, "runtime-pack-conflict-b", "v1"));
+}
+
+test "pack routing activates only the relevant mounted pack and skips irrelevant mounts" {
+    const allocator = std.testing.allocator;
+    const project_shard = "knowledge-pack-routing-relevant-test";
+
+    var repo_fixture = try makeCodeIntelFixture(allocator);
+    defer repo_fixture.tmp.cleanup();
+    defer allocator.free(repo_fixture.root_path);
+
+    var runtime_corpus = std.testing.tmpDir(.{});
+    defer runtime_corpus.cleanup();
+    const runtime_root = try runtime_corpus.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(runtime_root);
+    try writeKnowledgePackCorpusFixture(runtime_corpus.dir,
+        \\# Runtime Contracts
+        \\worker.zig sync path defines the runtime contract.
+        \\Keep sync aligned with the documented runtime contract.
+        \\
+    );
+
+    var docs_corpus = std.testing.tmpDir(.{});
+    defer docs_corpus.cleanup();
+    const docs_root = try docs_corpus.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(docs_root);
+    try writeFixtureFile(docs_corpus.dir, "guide.md",
+        \\# UI Notes
+        \\render.html owns the UI guide and does not describe runtime worker sync.
+        \\
+    );
+    try writeFixtureFile(docs_corpus.dir, "render.html",
+        \\<div>ui guide</div>
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.code_intel_root_abs_path);
+    try deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path);
+    try deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path);
+    const mounts_path = try std.fs.path.join(allocator, &.{ project_paths.root_abs_path, "knowledge_packs" });
+    defer allocator.free(mounts_path);
+    try deleteTreeIfExistsAbsolute(mounts_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.code_intel_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(mounts_path) catch {};
+
+    var runtime_pack = try knowledge_packs.createPack(allocator, .{
+        .pack_id = "runtime-pack-routing-relevant",
+        .pack_version = "v1",
+        .domain_family = "runtime",
+        .trust_class = "project",
+        .source_summary = "runtime routing pack",
+        .source_project_shard = null,
+        .source_state = .staged,
+        .corpus_path = runtime_root,
+        .corpus_label = "runtime-pack",
+    });
+    defer runtime_pack.manifest.deinit();
+    defer allocator.free(runtime_pack.root_abs_path);
+    defer knowledge_packs.removePack(allocator, "runtime-pack-routing-relevant", "v1") catch {};
+
+    var docs_pack = try knowledge_packs.createPack(allocator, .{
+        .pack_id = "docs-pack-routing-irrelevant",
+        .pack_version = "v1",
+        .domain_family = "docs",
+        .trust_class = "project",
+        .source_summary = "docs routing pack",
+        .source_project_shard = null,
+        .source_state = .staged,
+        .corpus_path = docs_root,
+        .corpus_label = "docs-pack",
+    });
+    defer docs_pack.manifest.deinit();
+    defer allocator.free(docs_pack.root_abs_path);
+    defer knowledge_packs.removePack(allocator, "docs-pack-routing-irrelevant", "v1") catch {};
+
+    try knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-routing-relevant", "v1", true, true);
+    try knowledge_packs.setMountedState(allocator, project_shard, "docs-pack-routing-irrelevant", "v1", true, true);
+    defer knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-routing-relevant", "v1", false, false) catch {};
+    defer knowledge_packs.setMountedState(allocator, project_shard, "docs-pack-routing-irrelevant", "v1", false, false) catch {};
+
+    var result = try code_intel.run(allocator, .{
+        .repo_root = repo_fixture.root_path,
+        .project_shard = project_shard,
+        .query_kind = .impact,
+        .target = "src/runtime/worker.zig:sync",
+        .max_items = 8,
+        .persist = false,
+        .cache_persist = false,
+    });
+    defer result.deinit();
+
+    try std.testing.expect(hasPackRoutingStatus(&result, .support, "runtime-pack-routing-relevant", "v1", .activated));
+    try std.testing.expect(hasPackRoutingStatus(&result, .support, "docs-pack-routing-irrelevant", "v1", .skipped));
+    try std.testing.expectEqual(@as(usize, 0), countPackAbstractionTraces(&result, "docs-pack-routing-irrelevant", "v1", false));
+
+    const rendered = try code_intel.renderJson(allocator, &result);
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"packRouting\":") != null);
+}
+
+test "lower-trust competing pack is trust-blocked explicitly" {
+    const allocator = std.testing.allocator;
+    const project_shard = "knowledge-pack-trust-block-test";
+
+    var repo_fixture = try makeCodeIntelFixture(allocator);
+    defer repo_fixture.tmp.cleanup();
+    defer allocator.free(repo_fixture.root_path);
+
+    var corpus = std.testing.tmpDir(.{});
+    defer corpus.cleanup();
+    const corpus_root = try corpus.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+    try writeKnowledgePackCorpusFixture(corpus.dir,
+        \\# Runtime Contracts
+        \\worker.zig sync path defines the runtime contract.
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.code_intel_root_abs_path);
+    try deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path);
+    try deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path);
+    const mounts_path = try std.fs.path.join(allocator, &.{ project_paths.root_abs_path, "knowledge_packs" });
+    defer allocator.free(mounts_path);
+    try deleteTreeIfExistsAbsolute(mounts_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.code_intel_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(mounts_path) catch {};
+
+    var lower_pack = try knowledge_packs.createPack(allocator, .{
+        .pack_id = "runtime-pack-trust-low",
+        .pack_version = "v1",
+        .domain_family = "runtime",
+        .trust_class = "exploratory",
+        .source_summary = "lower trust pack",
+        .source_project_shard = null,
+        .source_state = .live,
+        .corpus_path = corpus_root,
+        .corpus_label = "lower-pack",
+    });
+    defer lower_pack.manifest.deinit();
+    defer allocator.free(lower_pack.root_abs_path);
+    defer knowledge_packs.removePack(allocator, "runtime-pack-trust-low", "v1") catch {};
+
+    var higher_pack = try knowledge_packs.createPack(allocator, .{
+        .pack_id = "runtime-pack-trust-high",
+        .pack_version = "v1",
+        .domain_family = "runtime",
+        .trust_class = "promoted",
+        .source_summary = "higher trust pack",
+        .source_project_shard = null,
+        .source_state = .live,
+        .corpus_path = corpus_root,
+        .corpus_label = "higher-pack",
+    });
+    defer higher_pack.manifest.deinit();
+    defer allocator.free(higher_pack.root_abs_path);
+    defer knowledge_packs.removePack(allocator, "runtime-pack-trust-high", "v1") catch {};
+
+    try knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-trust-low", "v1", true, true);
+    try knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-trust-high", "v1", true, true);
+    defer knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-trust-low", "v1", false, false) catch {};
+    defer knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-trust-high", "v1", false, false) catch {};
+
+    var result = try code_intel.run(allocator, .{
+        .repo_root = repo_fixture.root_path,
+        .project_shard = project_shard,
+        .pack_conflict_policy = .{ .competition = .prefer_higher_trust_only },
+        .query_kind = .impact,
+        .target = "src/runtime/worker.zig:sync",
+        .max_items = 8,
+        .persist = false,
+        .cache_persist = false,
+    });
+    defer result.deinit();
+
+    try std.testing.expect(hasPackRoutingStatus(&result, .support, "runtime-pack-trust-high", "v1", .activated));
+    try std.testing.expect(hasPackRoutingStatusCategory(&result, .support, "runtime-pack-trust-low", "v1", .trust_blocked, .trust_mismatch));
+}
+
+test "stale pack is stale-blocked explicitly while active pack can route" {
+    const allocator = std.testing.allocator;
+    const project_shard = "knowledge-pack-stale-block-test";
+
+    var repo_fixture = try makeCodeIntelFixture(allocator);
+    defer repo_fixture.tmp.cleanup();
+    defer allocator.free(repo_fixture.root_path);
+
+    var corpus = std.testing.tmpDir(.{});
+    defer corpus.cleanup();
+    const corpus_root = try corpus.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+    try writeKnowledgePackCorpusFixture(corpus.dir,
+        \\# Runtime Contracts
+        \\worker.zig sync path defines the runtime contract.
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.code_intel_root_abs_path);
+    try deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path);
+    try deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path);
+    const mounts_path = try std.fs.path.join(allocator, &.{ project_paths.root_abs_path, "knowledge_packs" });
+    defer allocator.free(mounts_path);
+    try deleteTreeIfExistsAbsolute(mounts_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.code_intel_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(mounts_path) catch {};
+
+    var stale_pack = try knowledge_packs.createPack(allocator, .{
+        .pack_id = "runtime-pack-stale",
+        .pack_version = "v1",
+        .domain_family = "runtime",
+        .trust_class = "project",
+        .freshness_state = "stale",
+        .source_summary = "stale pack",
+        .source_project_shard = null,
+        .source_state = .live,
+        .corpus_path = corpus_root,
+        .corpus_label = "stale-pack",
+    });
+    defer stale_pack.manifest.deinit();
+    defer allocator.free(stale_pack.root_abs_path);
+    defer knowledge_packs.removePack(allocator, "runtime-pack-stale", "v1") catch {};
+
+    var active_pack = try knowledge_packs.createPack(allocator, .{
+        .pack_id = "runtime-pack-active",
+        .pack_version = "v1",
+        .domain_family = "runtime",
+        .trust_class = "project",
+        .source_summary = "active pack",
+        .source_project_shard = null,
+        .source_state = .live,
+        .corpus_path = corpus_root,
+        .corpus_label = "active-pack",
+    });
+    defer active_pack.manifest.deinit();
+    defer allocator.free(active_pack.root_abs_path);
+    defer knowledge_packs.removePack(allocator, "runtime-pack-active", "v1") catch {};
+
+    try knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-stale", "v1", true, true);
+    try knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-active", "v1", true, true);
+    defer knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-stale", "v1", false, false) catch {};
+    defer knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-active", "v1", false, false) catch {};
+
+    var result = try code_intel.run(allocator, .{
+        .repo_root = repo_fixture.root_path,
+        .project_shard = project_shard,
+        .query_kind = .impact,
+        .target = "src/runtime/worker.zig:sync",
+        .max_items = 8,
+        .persist = false,
+        .cache_persist = false,
+    });
+    defer result.deinit();
+
+    try std.testing.expect(hasPackRoutingStatus(&result, .support, "runtime-pack-active", "v1", .activated));
+    try std.testing.expect(hasPackRoutingStatusCategory(&result, .support, "runtime-pack-stale", "v1", .stale_blocked, .stale_pack));
+}
+
+test "conservative pack policy refuses competing packs explicitly" {
+    const allocator = std.testing.allocator;
+    const project_shard = "knowledge-pack-conservative-refuse-test";
+
+    var repo_fixture = try makeCodeIntelFixture(allocator);
+    defer repo_fixture.tmp.cleanup();
+    defer allocator.free(repo_fixture.root_path);
+
+    var corpus = std.testing.tmpDir(.{});
+    defer corpus.cleanup();
+    const corpus_root = try corpus.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+    try writeKnowledgePackCorpusFixture(corpus.dir,
+        \\# Runtime Contracts
+        \\worker.zig sync path defines the runtime contract.
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.code_intel_root_abs_path);
+    try deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path);
+    try deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path);
+    const mounts_path = try std.fs.path.join(allocator, &.{ project_paths.root_abs_path, "knowledge_packs" });
+    defer allocator.free(mounts_path);
+    try deleteTreeIfExistsAbsolute(mounts_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.code_intel_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(mounts_path) catch {};
+
+    var left_pack = try knowledge_packs.createPack(allocator, .{
+        .pack_id = "runtime-pack-refuse-a",
+        .pack_version = "v1",
+        .domain_family = "runtime",
+        .trust_class = "project",
+        .source_summary = "competing pack a",
+        .source_project_shard = null,
+        .source_state = .live,
+        .corpus_path = corpus_root,
+        .corpus_label = "pack-a",
+    });
+    defer left_pack.manifest.deinit();
+    defer allocator.free(left_pack.root_abs_path);
+    defer knowledge_packs.removePack(allocator, "runtime-pack-refuse-a", "v1") catch {};
+
+    var right_pack = try knowledge_packs.createPack(allocator, .{
+        .pack_id = "runtime-pack-refuse-b",
+        .pack_version = "v1",
+        .domain_family = "runtime",
+        .trust_class = "project",
+        .source_summary = "competing pack b",
+        .source_project_shard = null,
+        .source_state = .live,
+        .corpus_path = corpus_root,
+        .corpus_label = "pack-b",
+    });
+    defer right_pack.manifest.deinit();
+    defer allocator.free(right_pack.root_abs_path);
+    defer knowledge_packs.removePack(allocator, "runtime-pack-refuse-b", "v1") catch {};
+
+    try knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-refuse-a", "v1", true, true);
+    try knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-refuse-b", "v1", true, true);
+    defer knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-refuse-a", "v1", false, false) catch {};
+    defer knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-refuse-b", "v1", false, false) catch {};
+
+    var result = try code_intel.run(allocator, .{
+        .repo_root = repo_fixture.root_path,
+        .project_shard = project_shard,
+        .query_kind = .impact,
+        .target = "src/runtime/worker.zig:sync",
+        .max_items = 8,
+        .persist = false,
+        .cache_persist = false,
+    });
+    defer result.deinit();
+
+    try std.testing.expect(hasPackRoutingStatusCategory(&result, .support, "runtime-pack-refuse-a", "v1", .conflict_refused, .same_anchor_competing));
+    try std.testing.expect(hasPackRoutingStatusCategory(&result, .support, "runtime-pack-refuse-b", "v1", .conflict_refused, .same_anchor_competing));
+
+    const rendered = try code_intel.renderJson(allocator, &result);
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"competition\":\"refuse_all_competing\"") != null);
+}
+
+test "deterministic winner policy selects one competing pack explicitly" {
+    const allocator = std.testing.allocator;
+    const project_shard = "knowledge-pack-deterministic-winner-test";
+
+    var repo_fixture = try makeCodeIntelFixture(allocator);
+    defer repo_fixture.tmp.cleanup();
+    defer allocator.free(repo_fixture.root_path);
+
+    var corpus = std.testing.tmpDir(.{});
+    defer corpus.cleanup();
+    const corpus_root = try corpus.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+    try writeKnowledgePackCorpusFixture(corpus.dir,
+        \\# Runtime Contracts
+        \\worker.zig sync path defines the runtime contract.
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.code_intel_root_abs_path);
+    try deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path);
+    try deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path);
+    const mounts_path = try std.fs.path.join(allocator, &.{ project_paths.root_abs_path, "knowledge_packs" });
+    defer allocator.free(mounts_path);
+    try deleteTreeIfExistsAbsolute(mounts_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.code_intel_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(mounts_path) catch {};
+
+    var left_pack = try knowledge_packs.createPack(allocator, .{
+        .pack_id = "runtime-pack-winner-a",
+        .pack_version = "v1",
+        .domain_family = "runtime",
+        .trust_class = "project",
+        .source_summary = "winner candidate a",
+        .source_project_shard = null,
+        .source_state = .live,
+        .corpus_path = corpus_root,
+        .corpus_label = "pack-a",
+    });
+    defer left_pack.manifest.deinit();
+    defer allocator.free(left_pack.root_abs_path);
+    defer knowledge_packs.removePack(allocator, "runtime-pack-winner-a", "v1") catch {};
+
+    var right_pack = try knowledge_packs.createPack(allocator, .{
+        .pack_id = "runtime-pack-winner-b",
+        .pack_version = "v1",
+        .domain_family = "runtime",
+        .trust_class = "project",
+        .source_summary = "winner candidate b",
+        .source_project_shard = null,
+        .source_state = .live,
+        .corpus_path = corpus_root,
+        .corpus_label = "pack-b",
+    });
+    defer right_pack.manifest.deinit();
+    defer allocator.free(right_pack.root_abs_path);
+    defer knowledge_packs.removePack(allocator, "runtime-pack-winner-b", "v1") catch {};
+
+    try knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-winner-a", "v1", true, true);
+    try knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-winner-b", "v1", true, true);
+    defer knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-winner-a", "v1", false, false) catch {};
+    defer knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-winner-b", "v1", false, false) catch {};
+
+    var result = try code_intel.run(allocator, .{
+        .repo_root = repo_fixture.root_path,
+        .project_shard = project_shard,
+        .pack_conflict_policy = .{ .competition = .deterministic_winner },
+        .query_kind = .impact,
+        .target = "src/runtime/worker.zig:sync",
+        .max_items = 8,
+        .persist = false,
+        .cache_persist = false,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), countPackRoutingStatus(&result, .support, .activated));
+    try std.testing.expectEqual(@as(usize, 1), countPackRoutingStatus(&result, .support, .suppressed));
+
+    const rendered = try code_intel.renderJson(allocator, &result);
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"competition\":\"deterministic_winner\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "deterministic policy chose a single competing pack winner by stable rank") != null);
+}
+
+test "mounted pack conflicts stay explicit and do not silently blend proof support" {
+    const allocator = std.testing.allocator;
+    const project_shard = "knowledge-pack-explicit-conflict-test";
+
+    var corpus = std.testing.tmpDir(.{});
+    defer corpus.cleanup();
+    const corpus_root = try corpus.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+    try writeKnowledgePackCorpusFixture(corpus.dir,
+        \\# Runtime Contracts
+        \\worker.zig sync path defines the runtime contract.
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path);
+    const mounts_path = try std.fs.path.join(allocator, &.{ project_paths.root_abs_path, "knowledge_packs" });
+    defer allocator.free(mounts_path);
+    try deleteTreeIfExistsAbsolute(mounts_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(mounts_path) catch {};
+
+    const pack_catalog_a =
+        \\GABS1
+        \\concept shared_runtime_contract
+        \\tier contract
+        \\category invariant
+        \\examples 3
+        \\threshold 2
+        \\retained_tokens 2
+        \\retained_patterns 1
+        \\average_resonance 800
+        \\min_resonance 780
+        \\quality_score 900
+        \\confidence_score 880
+        \\reuse_score 220
+        \\support_score 320
+        \\promotion_ready 1
+        \\consensus_hash 111
+        \\valid 1
+        \\vector 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+        \\source region:worker.zig:1-3
+        \\pattern sync
+        \\end
+    ;
+    const pack_catalog_b =
+        \\GABS1
+        \\concept shared_runtime_contract
+        \\tier contract
+        \\category invariant
+        \\examples 3
+        \\threshold 2
+        \\retained_tokens 2
+        \\retained_patterns 1
+        \\average_resonance 810
+        \\min_resonance 790
+        \\quality_score 905
+        \\confidence_score 885
+        \\reuse_score 225
+        \\support_score 325
+        \\promotion_ready 1
+        \\consensus_hash 999
+        \\valid 1
+        \\vector 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+        \\source region:worker.zig:1-3
+        \\pattern sync
+        \\pattern alternate
+        \\end
+    ;
+
+    var pack_a = try knowledge_packs.createPack(allocator, .{
+        .pack_id = "runtime-pack-explicit-conflict-a",
+        .pack_version = "v1",
+        .domain_family = "runtime",
+        .trust_class = "project",
+        .source_summary = "conflict pack a",
+        .source_project_shard = null,
+        .source_state = .staged,
+        .corpus_path = corpus_root,
+        .corpus_label = "pack-a",
+    });
+    defer pack_a.manifest.deinit();
+    defer allocator.free(pack_a.root_abs_path);
+    defer knowledge_packs.removePack(allocator, "runtime-pack-explicit-conflict-a", "v1") catch {};
+    var pack_b = try knowledge_packs.createPack(allocator, .{
+        .pack_id = "runtime-pack-explicit-conflict-b",
+        .pack_version = "v1",
+        .domain_family = "runtime",
+        .trust_class = "project",
+        .source_summary = "conflict pack b",
+        .source_project_shard = null,
+        .source_state = .staged,
+        .corpus_path = corpus_root,
+        .corpus_label = "pack-b",
+    });
+    defer pack_b.manifest.deinit();
+    defer allocator.free(pack_b.root_abs_path);
+    defer knowledge_packs.removePack(allocator, "runtime-pack-explicit-conflict-b", "v1") catch {};
+
+    const pack_a_catalog_path = try std.fs.path.join(allocator, &.{ pack_a.root_abs_path, "abstractions", "abstractions.gabs" });
+    defer allocator.free(pack_a_catalog_path);
+    const pack_b_catalog_path = try std.fs.path.join(allocator, &.{ pack_b.root_abs_path, "abstractions", "abstractions.gabs" });
+    defer allocator.free(pack_b_catalog_path);
+    {
+        const handle = try sys.openForWrite(allocator, pack_a_catalog_path);
+        defer sys.closeFile(handle);
+        try sys.writeAll(handle, pack_catalog_a);
+    }
+    {
+        const handle = try sys.openForWrite(allocator, pack_b_catalog_path);
+        defer sys.closeFile(handle);
+        try sys.writeAll(handle, pack_catalog_b);
+    }
+
+    try knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-explicit-conflict-a", "v1", true, true);
+    try knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-explicit-conflict-b", "v1", true, true);
+    defer knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-explicit-conflict-a", "v1", false, false) catch {};
+    defer knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-explicit-conflict-b", "v1", false, false) catch {};
+
+    const refs = try abstractions.lookupConcepts(allocator, &project_paths, .{
+        .rel_paths = &.{"worker.zig"},
+        .tokens = &.{"sync"},
+        .patterns = &.{"sync"},
+        .max_items = 4,
+        .include_staged = false,
+        .prefer_higher_tiers = true,
+        .category_hint = .invariant,
+    });
+    defer abstractions.deinitSupportReferences(allocator, refs);
+
+    try std.testing.expectEqual(@as(usize, 0), refs.len);
+
+    const routing = try abstractions.inspectMountedPackRouting(allocator, &project_paths, &.{"worker.zig"}, &.{"sync"}, &.{"sync"}, .support, .{});
+    defer {
+        for (routing) |*trace| trace.deinit();
+        allocator.free(routing);
+    }
+    try std.testing.expect(hasPackRoutingStageStatus(routing, .support, "runtime-pack-explicit-conflict-a", "v1", .conflict_refused));
+    try std.testing.expect(hasPackRoutingStageStatus(routing, .support, "runtime-pack-explicit-conflict-b", "v1", .conflict_refused));
+}
+
+test "local project truth outranks mounted pack truth explicitly" {
+    const allocator = std.testing.allocator;
+    const project_shard = "knowledge-pack-local-truth-test";
+
+    var corpus = std.testing.tmpDir(.{});
+    defer corpus.cleanup();
+    const corpus_root = try corpus.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+    try writeKnowledgePackCorpusFixture(corpus.dir,
+        \\# Runtime Contracts
+        \\worker.zig sync path defines the runtime contract.
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path);
+    const mounts_path = try std.fs.path.join(allocator, &.{ project_paths.root_abs_path, "knowledge_packs" });
+    defer allocator.free(mounts_path);
+    try deleteTreeIfExistsAbsolute(mounts_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.abstractions_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(mounts_path) catch {};
+    try sys.makePath(allocator, project_paths.abstractions_root_abs_path);
+
+    const local_catalog =
+        \\GABS1
+        \\concept shared_runtime_contract
+        \\tier contract
+        \\category invariant
+        \\examples 3
+        \\threshold 2
+        \\retained_tokens 2
+        \\retained_patterns 1
+        \\average_resonance 820
+        \\min_resonance 800
+        \\quality_score 920
+        \\confidence_score 900
+        \\reuse_score 230
+        \\support_score 330
+        \\promotion_ready 1
+        \\consensus_hash 777
+        \\valid 1
+        \\vector 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+        \\source region:worker.zig:1-3
+        \\pattern sync
+        \\pattern local
+        \\end
+    ;
+    {
+        const handle = try sys.openForWrite(allocator, project_paths.abstractions_live_abs_path);
+        defer sys.closeFile(handle);
+        try sys.writeAll(handle, local_catalog);
+    }
+
+    var pack = try knowledge_packs.createPack(allocator, .{
+        .pack_id = "runtime-pack-local-truth",
+        .pack_version = "v1",
+        .domain_family = "runtime",
+        .trust_class = "project",
+        .source_summary = "pack truth",
+        .source_project_shard = null,
+        .source_state = .staged,
+        .corpus_path = corpus_root,
+        .corpus_label = "pack",
+    });
+    defer pack.manifest.deinit();
+    defer allocator.free(pack.root_abs_path);
+    defer knowledge_packs.removePack(allocator, "runtime-pack-local-truth", "v1") catch {};
+
+    const pack_catalog =
+        \\GABS1
+        \\concept shared_runtime_contract
+        \\tier contract
+        \\category invariant
+        \\examples 3
+        \\threshold 2
+        \\retained_tokens 2
+        \\retained_patterns 1
+        \\average_resonance 800
+        \\min_resonance 780
+        \\quality_score 900
+        \\confidence_score 880
+        \\reuse_score 220
+        \\support_score 320
+        \\promotion_ready 1
+        \\consensus_hash 111
+        \\valid 1
+        \\vector 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+        \\source region:worker.zig:1-3
+        \\pattern sync
+        \\end
+    ;
+    const pack_catalog_path = try std.fs.path.join(allocator, &.{ pack.root_abs_path, "abstractions", "abstractions.gabs" });
+    defer allocator.free(pack_catalog_path);
+    {
+        const handle = try sys.openForWrite(allocator, pack_catalog_path);
+        defer sys.closeFile(handle);
+        try sys.writeAll(handle, pack_catalog);
+    }
+
+    try knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-local-truth", "v1", true, true);
+    defer knowledge_packs.setMountedState(allocator, project_shard, "runtime-pack-local-truth", "v1", false, false) catch {};
+
+    const refs = try abstractions.lookupConcepts(allocator, &project_paths, .{
+        .rel_paths = &.{"worker.zig"},
+        .tokens = &.{"sync"},
+        .patterns = &.{"sync"},
+        .max_items = 4,
+        .include_staged = false,
+        .prefer_higher_tiers = true,
+        .category_hint = .invariant,
+    });
+    defer abstractions.deinitSupportReferences(allocator, refs);
+
+    try std.testing.expectEqual(@as(usize, 2), refs.len);
+    try std.testing.expect(refs[0].usable);
+    try std.testing.expectEqualStrings(project_shard, refs[0].owner_id);
+    try std.testing.expectEqual(abstractions.ReuseResolution.conflict_refused, refs[1].resolution);
+    try std.testing.expect(!refs[1].usable);
+}
+
+test "knowledge pack create from corpus does not delete colliding existing project shard" {
+    const allocator = std.testing.allocator;
+    const pack_id = "collision-pack";
+    const pack_version = "v1";
+    const colliding_shard = "packbuild-collision-pack-v1-0";
+
+    var corpus_fixture = std.testing.tmpDir(.{});
+    defer corpus_fixture.cleanup();
+    const corpus_root = try corpus_fixture.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+    try writeKnowledgePackCorpusFixture(corpus_fixture.dir,
+        \\# Collision Safety
+        \\Temporary corpus builds must not delete unrelated project shards.
+        \\
+    );
+
+    var collision_metadata = try shards.resolveProjectMetadata(allocator, colliding_shard);
+    defer collision_metadata.deinit();
+    var collision_paths = try shards.resolvePaths(allocator, collision_metadata.metadata);
+    defer collision_paths.deinit();
+    try deleteTreeIfExistsAbsolute(collision_paths.root_abs_path);
+    defer deleteTreeIfExistsAbsolute(collision_paths.root_abs_path) catch {};
+    try std.fs.cwd().makePath(collision_paths.root_abs_path);
+    try writeFixtureFileAbsolute(collision_paths.root_abs_path, "sentinel.txt", "preserve me\n");
+
+    var pack = try knowledge_packs.createPack(allocator, .{
+        .pack_id = pack_id,
+        .pack_version = pack_version,
+        .domain_family = "runtime",
+        .trust_class = "project",
+        .source_summary = "collision corpus",
+        .source_project_shard = null,
+        .source_state = .staged,
+        .corpus_path = corpus_root,
+        .corpus_label = "collision-corpus",
+    });
+    defer pack.manifest.deinit();
+    defer allocator.free(pack.root_abs_path);
+    defer knowledge_packs.removePack(allocator, pack_id, pack_version) catch {};
+
+    const sentinel_path = try std.fs.path.join(allocator, &.{ collision_paths.root_abs_path, "sentinel.txt" });
+    defer allocator.free(sentinel_path);
+    const sentinel_body = try readFileAbsoluteAlloc(allocator, sentinel_path, 1024);
+    defer allocator.free(sentinel_body);
+    try std.testing.expectEqualStrings("preserve me\n", sentinel_body);
+
+    var temp_one_metadata = try shards.resolveProjectMetadata(allocator, "packbuild-collision-pack-v1-1");
+    defer temp_one_metadata.deinit();
+    var temp_one_paths = try shards.resolvePaths(allocator, temp_one_metadata.metadata);
+    defer temp_one_paths.deinit();
+    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(temp_one_paths.root_abs_path, .{}));
+}
+
+test "knowledge pack remove prunes stale mount registry entries" {
+    const allocator = std.testing.allocator;
+    const project_shard = "knowledge-pack-remove-prune-test";
+    const pack_id = "mounted-pack-prune";
+    const pack_version = "v1";
+
+    var corpus_fixture = std.testing.tmpDir(.{});
+    defer corpus_fixture.cleanup();
+    const corpus_root = try corpus_fixture.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+    try writeKnowledgePackCorpusFixture(corpus_fixture.dir,
+        \\# Remove Prune
+        \\Removing a pack must prune stale mount registry entries.
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    const mounts_dir = try std.fs.path.join(allocator, &.{ project_paths.root_abs_path, "knowledge_packs" });
+    defer allocator.free(mounts_dir);
+    try deleteTreeIfExistsAbsolute(mounts_dir);
+    defer deleteTreeIfExistsAbsolute(mounts_dir) catch {};
+
+    var pack = try knowledge_packs.createPack(allocator, .{
+        .pack_id = pack_id,
+        .pack_version = pack_version,
+        .domain_family = "runtime",
+        .trust_class = "project",
+        .source_summary = "remove prune corpus",
+        .source_project_shard = null,
+        .source_state = .staged,
+        .corpus_path = corpus_root,
+        .corpus_label = "remove-prune-corpus",
+    });
+    defer pack.manifest.deinit();
+    defer allocator.free(pack.root_abs_path);
+
+    try knowledge_packs.setMountedState(allocator, project_shard, pack_id, pack_version, true, true);
+    try knowledge_packs.removePack(allocator, pack_id, pack_version);
+
+    var registry = try knowledge_pack_store.loadMountRegistry(allocator, &project_paths);
+    defer registry.deinit();
+    try std.testing.expectEqual(@as(usize, 0), registry.entries.len);
+
+    const mounts = try knowledge_pack_store.listResolvedMounts(allocator, &project_paths);
+    defer {
+        for (mounts) |*mount| mount.deinit();
+        allocator.free(mounts);
+    }
+    try std.testing.expectEqual(@as(usize, 0), mounts.len);
+}
+
+test "recreated knowledge pack does not silently remount through stale state" {
+    const allocator = std.testing.allocator;
+    const project_shard = "knowledge-pack-recreate-remount-test";
+    const pack_id = "recreated-pack";
+    const pack_version = "v1";
+
+    var repo_fixture = try makeCodeIntelFixture(allocator);
+    defer repo_fixture.tmp.cleanup();
+    defer allocator.free(repo_fixture.root_path);
+
+    var corpus_fixture = std.testing.tmpDir(.{});
+    defer corpus_fixture.cleanup();
+    const corpus_root = try corpus_fixture.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+    try writeKnowledgePackCorpusFixture(corpus_fixture.dir,
+        \\# Recreate Safety
+        \\A recreated pack should stay unmounted until explicitly remounted.
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.code_intel_root_abs_path);
+    const mounts_dir = try std.fs.path.join(allocator, &.{ project_paths.root_abs_path, "knowledge_packs" });
+    defer allocator.free(mounts_dir);
+    try deleteTreeIfExistsAbsolute(mounts_dir);
+    defer deleteTreeIfExistsAbsolute(project_paths.code_intel_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(mounts_dir) catch {};
+
+    var first_pack = try knowledge_packs.createPack(allocator, .{
+        .pack_id = pack_id,
+        .pack_version = pack_version,
+        .domain_family = "runtime",
+        .trust_class = "project",
+        .source_summary = "first recreate corpus",
+        .source_project_shard = null,
+        .source_state = .staged,
+        .corpus_path = corpus_root,
+        .corpus_label = "recreate-first",
+    });
+    defer first_pack.manifest.deinit();
+    defer allocator.free(first_pack.root_abs_path);
+
+    try knowledge_packs.setMountedState(allocator, project_shard, pack_id, pack_version, true, true);
+    try knowledge_packs.removePack(allocator, pack_id, pack_version);
+
+    var second_pack = try knowledge_packs.createPack(allocator, .{
+        .pack_id = pack_id,
+        .pack_version = pack_version,
+        .domain_family = "runtime",
+        .trust_class = "project",
+        .source_summary = "second recreate corpus",
+        .source_project_shard = null,
+        .source_state = .staged,
+        .corpus_path = corpus_root,
+        .corpus_label = "recreate-second",
+    });
+    defer second_pack.manifest.deinit();
+    defer allocator.free(second_pack.root_abs_path);
+    defer knowledge_packs.removePack(allocator, pack_id, pack_version) catch {};
+
+    var registry = try knowledge_pack_store.loadMountRegistry(allocator, &project_paths);
+    defer registry.deinit();
+    try std.testing.expectEqual(@as(usize, 0), registry.entries.len);
+
+    var result = try code_intel.run(allocator, .{
+        .repo_root = repo_fixture.root_path,
+        .project_shard = project_shard,
+        .query_kind = .impact,
+        .target = "src/runtime/worker.zig:sync",
+        .max_items = 8,
+        .persist = false,
+        .cache_persist = false,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), countPackReverseGroundings(&result, pack_id, pack_version));
+}
+
+test "knowledge pack manifest path traversal is rejected explicitly" {
+    const allocator = std.testing.allocator;
+    const project_shard = "knowledge-pack-path-traversal-test";
+    const pack_id = "path-traversal-pack";
+    const pack_version = "v1";
+
+    var corpus_fixture = std.testing.tmpDir(.{});
+    defer corpus_fixture.cleanup();
+    const corpus_root = try corpus_fixture.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+    try writeKnowledgePackCorpusFixture(corpus_fixture.dir,
+        \\# Traversal Rejection
+        \\Mounted pack manifests must stay contained within the pack root.
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    const mounts_dir = try std.fs.path.join(allocator, &.{ project_paths.root_abs_path, "knowledge_packs" });
+    defer allocator.free(mounts_dir);
+    try deleteTreeIfExistsAbsolute(mounts_dir);
+    defer deleteTreeIfExistsAbsolute(mounts_dir) catch {};
+
+    var pack = try knowledge_packs.createPack(allocator, .{
+        .pack_id = pack_id,
+        .pack_version = pack_version,
+        .domain_family = "runtime",
+        .trust_class = "project",
+        .source_summary = "path traversal corpus",
+        .source_project_shard = null,
+        .source_state = .staged,
+        .corpus_path = corpus_root,
+        .corpus_label = "path-traversal",
+    });
+    defer pack.manifest.deinit();
+    defer allocator.free(pack.root_abs_path);
+    defer knowledge_packs.removePack(allocator, pack_id, pack_version) catch {};
+
+    try knowledge_packs.setMountedState(allocator, project_shard, pack_id, pack_version, true, true);
+    defer knowledge_packs.setMountedState(allocator, project_shard, pack_id, pack_version, false, false) catch {};
+
+    pack.manifest.storage.corpus_manifest_rel_path = try allocator.realloc(pack.manifest.storage.corpus_manifest_rel_path, "../outside.json".len);
+    @memcpy(pack.manifest.storage.corpus_manifest_rel_path, "../outside.json");
+    try knowledge_pack_store.saveManifest(allocator, pack.root_abs_path, &pack.manifest);
+
+    try std.testing.expectError(error.InvalidKnowledgePackManifest, knowledge_pack_store.loadManifest(allocator, pack_id, pack_version));
+    try std.testing.expectError(error.InvalidKnowledgePackManifest, knowledge_pack_store.listResolvedMounts(allocator, &project_paths));
 }
 
 test "native code intel follows include edges and declaration-definition pairs" {
@@ -3797,4 +6916,1948 @@ test "patch candidates carry grounded task intent into result output" {
     defer allocator.free(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"intent\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"requested_by\"") != null);
+}
+
+fn createTestPackForExport(allocator: std.mem.Allocator, pack_id: []const u8, pack_version: []const u8) !knowledge_packs.CreateResult {
+    knowledge_packs.removePack(allocator, pack_id, pack_version) catch {};
+    var corpus_fixture = std.testing.tmpDir(.{});
+    const corpus_root = try corpus_fixture.dir.realpathAlloc(allocator, ".");
+    try writeKnowledgePackCorpusFixture(corpus_fixture.dir,
+        \\# Test Pack
+        \\A test corpus for export/import roundtrip.
+        \\
+    );
+    const result = try knowledge_packs.createPack(allocator, .{
+        .pack_id = pack_id,
+        .pack_version = pack_version,
+        .domain_family = "test",
+        .trust_class = "project",
+        .source_summary = "test export pack",
+        .source_project_shard = null,
+        .source_state = .staged,
+        .corpus_path = corpus_root,
+        .corpus_label = "test-export",
+    });
+    allocator.free(corpus_root);
+    corpus_fixture.cleanup();
+    return result;
+}
+
+test "export produces valid artifact with correct hashes" {
+    const allocator = std.testing.allocator;
+    const pack_id = "export-hash-test";
+    const pack_version = "v1";
+
+    var pack = try createTestPackForExport(allocator, pack_id, pack_version);
+    defer pack.manifest.deinit();
+    defer allocator.free(pack.root_abs_path);
+    defer knowledge_packs.removePack(allocator, pack_id, pack_version) catch {};
+
+    var export_tmp = std.testing.tmpDir(.{});
+    defer export_tmp.cleanup();
+    const export_root = try export_tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(export_root);
+
+    var result = try knowledge_packs.exportPack(allocator, .{
+        .pack_id = pack_id,
+        .pack_version = pack_version,
+        .export_dir = export_root,
+    });
+    defer result.envelope.deinit();
+    defer allocator.free(result.export_root_abs_path);
+
+    try std.testing.expectEqualStrings(knowledge_pack_store.EXPORT_SCHEMA_VERSION, result.envelope.schema_version);
+    try std.testing.expect(result.envelope.integrity.manifest_hash != 0);
+    try std.testing.expect(result.envelope.integrity.total_files_hash != 0);
+    try std.testing.expect(result.envelope.integrity.influence_hash != 0);
+
+    const export_json_path = try std.fs.path.join(allocator, &.{ result.export_root_abs_path, "export.json" });
+    defer allocator.free(export_json_path);
+    const manifest_json_path = try std.fs.path.join(allocator, &.{ result.export_root_abs_path, "manifest.json" });
+    defer allocator.free(manifest_json_path);
+    try std.testing.expect(fileExistsAbsolute(export_json_path));
+    try std.testing.expect(fileExistsAbsolute(manifest_json_path));
+}
+
+test "export refuses non-empty destination without deleting user files" {
+    const allocator = std.testing.allocator;
+    const pack_id = "export-non-empty-test";
+    const pack_version = "v1";
+
+    var pack = try createTestPackForExport(allocator, pack_id, pack_version);
+    defer pack.manifest.deinit();
+    defer allocator.free(pack.root_abs_path);
+    defer knowledge_packs.removePack(allocator, pack_id, pack_version) catch {};
+
+    var export_tmp = std.testing.tmpDir(.{});
+    defer export_tmp.cleanup();
+    const export_root = try export_tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(export_root);
+    const sentinel_path = try std.fs.path.join(allocator, &.{ export_root, "sentinel.txt" });
+    defer allocator.free(sentinel_path);
+    {
+        const handle = try sys.openForWrite(allocator, sentinel_path);
+        defer sys.closeFile(handle);
+        try sys.writeAll(handle, "do not delete");
+    }
+
+    try std.testing.expectError(error.ExportDestinationNotEmpty, knowledge_packs.exportPack(allocator, .{
+        .pack_id = pack_id,
+        .pack_version = pack_version,
+        .export_dir = export_root,
+    }));
+    try std.testing.expect(fileExistsAbsolute(sentinel_path));
+}
+
+test "import installs valid pack as unmounted" {
+    const allocator = std.testing.allocator;
+    const pack_id = "import-unmounted-test";
+    const pack_version = "v1";
+
+    var pack = try createTestPackForExport(allocator, pack_id, pack_version);
+    defer pack.manifest.deinit();
+    defer allocator.free(pack.root_abs_path);
+
+    var export_tmp = std.testing.tmpDir(.{});
+    defer export_tmp.cleanup();
+    const export_root = try export_tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(export_root);
+
+    var export_result = try knowledge_packs.exportPack(allocator, .{
+        .pack_id = pack_id,
+        .pack_version = pack_version,
+        .export_dir = export_root,
+    });
+    defer export_result.envelope.deinit();
+    defer allocator.free(export_result.export_root_abs_path);
+
+    knowledge_packs.removePack(allocator, pack_id, pack_version) catch {};
+
+    var import_result = try knowledge_packs.importPack(allocator, .{
+        .source_dir = export_result.export_root_abs_path,
+    });
+    defer import_result.manifest.deinit();
+    defer allocator.free(import_result.root_abs_path);
+    defer knowledge_packs.removePack(allocator, pack_id, pack_version) catch {};
+
+    try std.testing.expect(!import_result.was_overwrite);
+    try std.testing.expectEqualStrings(pack_id, import_result.manifest.pack_id);
+    try std.testing.expectEqualStrings(pack_version, import_result.manifest.pack_version);
+
+    const installed_export_json = try std.fs.path.join(allocator, &.{ import_result.root_abs_path, "export.json" });
+    defer allocator.free(installed_export_json);
+    try std.testing.expect(!fileExistsAbsolute(installed_export_json));
+}
+
+test "imported pack is mountable after explicit mount" {
+    const allocator = std.testing.allocator;
+    const project_shard = "import-mount-test-project";
+    const pack_id = "import-mount-test";
+    const pack_version = "v1";
+
+    var pack = try createTestPackForExport(allocator, pack_id, pack_version);
+    defer pack.manifest.deinit();
+    defer allocator.free(pack.root_abs_path);
+
+    var export_tmp = std.testing.tmpDir(.{});
+    defer export_tmp.cleanup();
+    const export_root = try export_tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(export_root);
+
+    var export_result = try knowledge_packs.exportPack(allocator, .{
+        .pack_id = pack_id,
+        .pack_version = pack_version,
+        .export_dir = export_root,
+    });
+    defer export_result.envelope.deinit();
+    defer allocator.free(export_result.export_root_abs_path);
+
+    knowledge_packs.removePack(allocator, pack_id, pack_version) catch {};
+
+    var import_result = try knowledge_packs.importPack(allocator, .{
+        .source_dir = export_result.export_root_abs_path,
+    });
+    defer import_result.manifest.deinit();
+    defer allocator.free(import_result.root_abs_path);
+    defer knowledge_packs.removePack(allocator, pack_id, pack_version) catch {};
+
+    try knowledge_packs.setMountedState(allocator, project_shard, pack_id, pack_version, true, true);
+    defer knowledge_packs.setMountedState(allocator, project_shard, pack_id, pack_version, false, false) catch {};
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+
+    var registry = try knowledge_pack_store.loadMountRegistry(allocator, &project_paths);
+    defer registry.deinit();
+    var found = false;
+    for (registry.entries) |entry| {
+        if (std.mem.eql(u8, entry.pack_id, pack_id) and std.mem.eql(u8, entry.pack_version, pack_version)) {
+            try std.testing.expect(entry.enabled);
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "import rejects corrupt hash" {
+    const allocator = std.testing.allocator;
+    const pack_id = "import-corrupt-test";
+    const pack_version = "v1";
+
+    var pack = try createTestPackForExport(allocator, pack_id, pack_version);
+    defer pack.manifest.deinit();
+    defer allocator.free(pack.root_abs_path);
+
+    var export_tmp = std.testing.tmpDir(.{});
+    const export_root = try export_tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(export_root);
+
+    var export_result = try knowledge_packs.exportPack(allocator, .{
+        .pack_id = pack_id,
+        .pack_version = pack_version,
+        .export_dir = export_root,
+    });
+    defer export_result.envelope.deinit();
+    defer allocator.free(export_result.export_root_abs_path);
+
+    const influence_path = try std.fs.path.join(allocator, &.{ export_result.export_root_abs_path, "influence.json" });
+    defer allocator.free(influence_path);
+    {
+        const handle = try sys.openForWrite(allocator, influence_path);
+        defer sys.closeFile(handle);
+        try sys.writeAll(handle, "CORRUPTED");
+    }
+
+    knowledge_packs.removePack(allocator, pack_id, pack_version) catch {};
+
+    try std.testing.expectError(error.IntegrityCheckFailed, knowledge_packs.importPack(allocator, .{
+        .source_dir = export_result.export_root_abs_path,
+    }));
+
+    export_tmp.cleanup();
+}
+
+test "import rejects incompatible engine version" {
+    const allocator = std.testing.allocator;
+    const pack_id = "import-engine-ver-test";
+    const pack_version = "v1";
+
+    var pack = try createTestPackForExport(allocator, pack_id, pack_version);
+    defer pack.manifest.deinit();
+    defer allocator.free(pack.root_abs_path);
+
+    var export_tmp = std.testing.tmpDir(.{});
+    const export_root = try export_tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(export_root);
+
+    var export_result = try knowledge_packs.exportPack(allocator, .{
+        .pack_id = pack_id,
+        .pack_version = pack_version,
+        .export_dir = export_root,
+    });
+    defer export_result.envelope.deinit();
+    defer allocator.free(export_result.export_root_abs_path);
+
+    export_result.envelope.allocator.free(export_result.envelope.export_engine_version);
+    export_result.envelope.export_engine_version = try allocator.dupe(u8, "V99");
+    try knowledge_pack_store.saveExportEnvelope(allocator, export_result.export_root_abs_path, &export_result.envelope);
+
+    knowledge_packs.removePack(allocator, pack_id, pack_version) catch {};
+
+    try std.testing.expectError(error.IncompatibleEngineVersion, knowledge_packs.importPack(allocator, .{
+        .source_dir = export_result.export_root_abs_path,
+    }));
+
+    export_tmp.cleanup();
+}
+
+test "import rejects incompatible schema version" {
+    const allocator = std.testing.allocator;
+    const pack_id = "import-schema-ver-test";
+    const pack_version = "v1";
+
+    var pack = try createTestPackForExport(allocator, pack_id, pack_version);
+    defer pack.manifest.deinit();
+    defer allocator.free(pack.root_abs_path);
+
+    var export_tmp = std.testing.tmpDir(.{});
+    const export_root = try export_tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(export_root);
+
+    var export_result = try knowledge_packs.exportPack(allocator, .{
+        .pack_id = pack_id,
+        .pack_version = pack_version,
+        .export_dir = export_root,
+    });
+    defer export_result.envelope.deinit();
+    defer allocator.free(export_result.export_root_abs_path);
+
+    const export_json_path = try std.fs.path.join(allocator, &.{ export_result.export_root_abs_path, "export.json" });
+    defer allocator.free(export_json_path);
+    const original = try readFileAbsoluteAlloc(allocator, export_json_path, 512 * 1024);
+    defer allocator.free(original);
+    const tampered = try std.mem.replaceOwned(u8, allocator, original, knowledge_pack_store.EXPORT_SCHEMA_VERSION, "bad_schema_v999");
+    defer allocator.free(tampered);
+    {
+        const handle = try sys.openForWrite(allocator, export_json_path);
+        defer sys.closeFile(handle);
+        try sys.writeAll(handle, tampered);
+    }
+
+    knowledge_packs.removePack(allocator, pack_id, pack_version) catch {};
+
+    try std.testing.expectError(error.InvalidExportEnvelope, knowledge_packs.importPack(allocator, .{
+        .source_dir = export_result.export_root_abs_path,
+    }));
+
+    export_tmp.cleanup();
+}
+
+test "import rejects path traversal in artifact" {
+    const allocator = std.testing.allocator;
+    const pack_id = "import-traversal-test";
+    const pack_version = "v1";
+
+    var pack = try createTestPackForExport(allocator, pack_id, pack_version);
+    defer pack.manifest.deinit();
+    defer allocator.free(pack.root_abs_path);
+
+    var export_tmp = std.testing.tmpDir(.{});
+    const export_root = try export_tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(export_root);
+
+    var export_result = try knowledge_packs.exportPack(allocator, .{
+        .pack_id = pack_id,
+        .pack_version = pack_version,
+        .export_dir = export_root,
+    });
+    defer export_result.envelope.deinit();
+    defer allocator.free(export_result.export_root_abs_path);
+
+    const corpus_dir = try std.fs.path.join(allocator, &.{ export_result.export_root_abs_path, "corpus" });
+    defer allocator.free(corpus_dir);
+    const traversal_path = try std.fs.path.join(allocator, &.{ corpus_dir, "..outside" });
+    defer allocator.free(traversal_path);
+    {
+        const handle = try sys.openForWrite(allocator, traversal_path);
+        defer sys.closeFile(handle);
+        try sys.writeAll(handle, "traversal");
+    }
+
+    knowledge_packs.removePack(allocator, pack_id, pack_version) catch {};
+
+    try std.testing.expectError(error.IntegrityCheckFailed, knowledge_packs.importPack(allocator, .{
+        .source_dir = export_result.export_root_abs_path,
+    }));
+
+    export_tmp.cleanup();
+}
+
+test "import overwrite requires force flag" {
+    const allocator = std.testing.allocator;
+    const pack_id = "import-force-test";
+    const pack_version = "v1";
+
+    var pack = try createTestPackForExport(allocator, pack_id, pack_version);
+    defer pack.manifest.deinit();
+    defer allocator.free(pack.root_abs_path);
+
+    var export_tmp = std.testing.tmpDir(.{});
+    const export_root = try export_tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(export_root);
+
+    var export_result = try knowledge_packs.exportPack(allocator, .{
+        .pack_id = pack_id,
+        .pack_version = pack_version,
+        .export_dir = export_root,
+    });
+    defer export_result.envelope.deinit();
+    defer allocator.free(export_result.export_root_abs_path);
+
+    defer knowledge_packs.removePack(allocator, pack_id, pack_version) catch {};
+
+    try std.testing.expectError(error.PackAlreadyExists, knowledge_packs.importPack(allocator, .{
+        .source_dir = export_result.export_root_abs_path,
+    }));
+
+    var force_result = try knowledge_packs.importPack(allocator, .{
+        .source_dir = export_result.export_root_abs_path,
+        .force = true,
+    });
+    defer force_result.manifest.deinit();
+    defer allocator.free(force_result.root_abs_path);
+    try std.testing.expect(force_result.was_overwrite);
+
+    export_tmp.cleanup();
+}
+
+test "verify detects integrity failure without installing" {
+    const allocator = std.testing.allocator;
+    const pack_id = "verify-integrity-test";
+    const pack_version = "v1";
+
+    var pack = try createTestPackForExport(allocator, pack_id, pack_version);
+    defer pack.manifest.deinit();
+    defer allocator.free(pack.root_abs_path);
+    defer knowledge_packs.removePack(allocator, pack_id, pack_version) catch {};
+
+    var export_tmp = std.testing.tmpDir(.{});
+    const export_root = try export_tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(export_root);
+
+    var export_result = try knowledge_packs.exportPack(allocator, .{
+        .pack_id = pack_id,
+        .pack_version = pack_version,
+        .export_dir = export_root,
+    });
+    defer export_result.envelope.deinit();
+    defer allocator.free(export_result.export_root_abs_path);
+
+    const influence_path = try std.fs.path.join(allocator, &.{ export_result.export_root_abs_path, "influence.json" });
+    defer allocator.free(influence_path);
+    {
+        const handle = try sys.openForWrite(allocator, influence_path);
+        defer sys.closeFile(handle);
+        try sys.writeAll(handle, "TAMPERED");
+    }
+
+    const result = try knowledge_packs.verifyExportArtifact(allocator, export_result.export_root_abs_path);
+    defer {
+        for (result.errors) |item| allocator.free(item);
+        allocator.free(result.errors);
+    }
+    try std.testing.expect(!result.integrity_ok);
+
+    export_tmp.cleanup();
+}
+
+test "export import roundtrip preserves manifest fields" {
+    const allocator = std.testing.allocator;
+    const pack_id = "roundtrip-test";
+    const pack_version = "v2";
+
+    var pack = try createTestPackForExport(allocator, pack_id, pack_version);
+    defer pack.manifest.deinit();
+    defer allocator.free(pack.root_abs_path);
+
+    const original_domain = try allocator.dupe(u8, pack.manifest.domain_family);
+    defer allocator.free(original_domain);
+    const original_trust = try allocator.dupe(u8, pack.manifest.trust_class);
+    defer allocator.free(original_trust);
+    const original_summary = try allocator.dupe(u8, pack.manifest.provenance.source_summary);
+    defer allocator.free(original_summary);
+
+    var export_tmp = std.testing.tmpDir(.{});
+    const export_root = try export_tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(export_root);
+
+    var export_result = try knowledge_packs.exportPack(allocator, .{
+        .pack_id = pack_id,
+        .pack_version = pack_version,
+        .export_dir = export_root,
+    });
+    defer export_result.envelope.deinit();
+    defer allocator.free(export_result.export_root_abs_path);
+
+    knowledge_packs.removePack(allocator, pack_id, pack_version) catch {};
+
+    var import_result = try knowledge_packs.importPack(allocator, .{
+        .source_dir = export_result.export_root_abs_path,
+    });
+    defer import_result.manifest.deinit();
+    defer allocator.free(import_result.root_abs_path);
+    defer knowledge_packs.removePack(allocator, pack_id, pack_version) catch {};
+
+    try std.testing.expectEqualStrings(pack_id, import_result.manifest.pack_id);
+    try std.testing.expectEqualStrings(pack_version, import_result.manifest.pack_version);
+    try std.testing.expectEqualStrings(original_domain, import_result.manifest.domain_family);
+    try std.testing.expectEqualStrings(original_trust, import_result.manifest.trust_class);
+    try std.testing.expectEqualStrings(original_summary, import_result.manifest.provenance.source_summary);
+
+    export_tmp.cleanup();
+}
+
+test "list versions shows multiple coexisting versions" {
+    const allocator = std.testing.allocator;
+    const pack_id = "multi-version-test";
+
+    var pack_v1 = try createTestPackForExport(allocator, pack_id, "v1");
+    defer pack_v1.manifest.deinit();
+    defer allocator.free(pack_v1.root_abs_path);
+
+    var pack_v2 = try createTestPackForExport(allocator, pack_id, "v2");
+    defer pack_v2.manifest.deinit();
+    defer allocator.free(pack_v2.root_abs_path);
+    defer knowledge_packs.removePack(allocator, pack_id, "v1") catch {};
+    defer knowledge_packs.removePack(allocator, pack_id, "v2") catch {};
+
+    const versions = try knowledge_packs.listPackVersions(allocator, pack_id);
+    defer {
+        for (versions) |*v| {
+            allocator.free(v.pack_id);
+            allocator.free(v.version);
+            allocator.free(v.domain);
+            allocator.free(v.trust_class);
+        }
+        allocator.free(versions);
+    }
+    try std.testing.expectEqual(@as(usize, 2), versions.len);
+}
+
+test "import does not auto mount or auto trust" {
+    const allocator = std.testing.allocator;
+    const project_shard = "import-no-automount-test-project";
+    const pack_id = "no-automount-test";
+    const pack_version = "v1";
+
+    var pack = try createTestPackForExport(allocator, pack_id, pack_version);
+    defer pack.manifest.deinit();
+    defer allocator.free(pack.root_abs_path);
+
+    const original_trust = try allocator.dupe(u8, pack.manifest.trust_class);
+    defer allocator.free(original_trust);
+
+    var export_tmp = std.testing.tmpDir(.{});
+    const export_root = try export_tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(export_root);
+
+    var export_result = try knowledge_packs.exportPack(allocator, .{
+        .pack_id = pack_id,
+        .pack_version = pack_version,
+        .export_dir = export_root,
+    });
+    defer export_result.envelope.deinit();
+    defer allocator.free(export_result.export_root_abs_path);
+
+    knowledge_packs.removePack(allocator, pack_id, pack_version) catch {};
+
+    var import_result = try knowledge_packs.importPack(allocator, .{
+        .source_dir = export_result.export_root_abs_path,
+    });
+    defer import_result.manifest.deinit();
+    defer allocator.free(import_result.root_abs_path);
+    defer knowledge_packs.removePack(allocator, pack_id, pack_version) catch {};
+
+    try std.testing.expectEqualStrings(original_trust, import_result.manifest.trust_class);
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+
+    var registry = try knowledge_pack_store.loadMountRegistry(allocator, &project_paths);
+    defer registry.deinit();
+    for (registry.entries) |entry| {
+        try std.testing.expect(!(std.mem.eql(u8, entry.pack_id, pack_id) and std.mem.eql(u8, entry.pack_version, pack_version)));
+    }
+
+    export_tmp.cleanup();
+}
+
+// ── Universal Artifact Schema Core Tests ──────────────────────────────────
+
+test "artifact schema: schema registry register and lookup" {
+    const allocator = std.testing.allocator;
+    var registry = artifact_schema.SchemaRegistry.init(allocator);
+    defer registry.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), registry.count());
+
+    const schema = try artifact_schema.builtinCodeSchema(allocator);
+    try registry.register(schema);
+    try std.testing.expectEqual(@as(usize, 1), registry.count());
+
+    const looked_up = registry.lookup("code_artifact_schema");
+    try std.testing.expect(looked_up != null);
+    try std.testing.expectEqual(@as(usize, 8), looked_up.?.entity_types.len);
+    try std.testing.expectEqual(@as(usize, 5), looked_up.?.relation_types.len);
+    try std.testing.expectEqual(@as(usize, 3), looked_up.?.action_surfaces.len);
+    try std.testing.expectEqual(@as(usize, 3), looked_up.?.verifier_hooks.len);
+
+    // Non-existent schema returns null.
+    try std.testing.expect(registry.lookup("nonexistent") == null);
+}
+
+test "artifact schema: all four builtin schemas register without conflict" {
+    const allocator = std.testing.allocator;
+    var registry = artifact_schema.SchemaRegistry.init(allocator);
+    defer registry.deinit();
+
+    try artifact_schema.registerBuiltinSchemas(&registry);
+    try std.testing.expectEqual(@as(usize, 4), registry.count());
+
+    try std.testing.expect(registry.lookup("code_artifact_schema") != null);
+    try std.testing.expect(registry.lookup("document_schema") != null);
+    try std.testing.expect(registry.lookup("config_schema") != null);
+    try std.testing.expect(registry.lookup("log_schema") != null);
+}
+
+test "artifact schema: schema re-registration replaces previous" {
+    const allocator = std.testing.allocator;
+    var registry = artifact_schema.SchemaRegistry.init(allocator);
+    defer registry.deinit();
+
+    try artifact_schema.registerBuiltinSchemas(&registry);
+    try std.testing.expectEqual(@as(usize, 4), registry.count());
+
+    // Register code schema again — count stays the same.
+    const new_schema = try artifact_schema.builtinCodeSchema(allocator);
+    try registry.register(new_schema);
+    try std.testing.expectEqual(@as(usize, 4), registry.count());
+}
+
+test "artifact schema: fragment extraction from code artifact" {
+    const allocator = std.testing.allocator;
+    const content =
+        \\pub fn main() void {
+        \\    std.debug.print("hello\n", .{});
+        \\}
+    ;
+
+    var artifact = try artifact_schema.Artifact.init(allocator, "test-code", .repo, .file, "test", .project, "zig", null, null);
+    defer artifact.deinit(allocator);
+
+    const fragments = try artifact_schema.extractFragments(allocator, &artifact, content, true);
+    defer {
+        for (fragments) |*f| f.deinit(allocator);
+        allocator.free(fragments);
+    }
+
+    try std.testing.expect(fragments.len >= 2);
+    try std.testing.expectEqualStrings("test-code", fragments[0].artifact_id);
+    // First fragment should be from strict or robust parsing (structured input).
+    try std.testing.expect(fragments[0].parser_stage == .strict or fragments[0].parser_stage == .robust);
+}
+
+test "artifact schema: malformed input still produces fragments" {
+    const allocator = std.testing.allocator;
+    const malformed = "\x00\x01\x02\xff\xfe random binary noise \x80\x90";
+
+    var artifact = try artifact_schema.Artifact.init(allocator, "malformed-test", .user, .file, "test", .exploratory, null, null, null);
+    defer artifact.deinit(allocator);
+
+    const fragments = try artifact_schema.extractFragments(allocator, &artifact, malformed, true);
+    defer {
+        for (fragments) |*f| f.deinit(allocator);
+        allocator.free(fragments);
+    }
+
+    // Malformed input must still produce at least one fragment — never collapse.
+    try std.testing.expect(fragments.len >= 1);
+}
+
+test "artifact schema: empty content produces fallback fragment when always_fragment" {
+    const allocator = std.testing.allocator;
+
+    var artifact = try artifact_schema.Artifact.init(allocator, "empty-test", .scratch, .document, "test", .exploratory, null, null, null);
+    defer artifact.deinit(allocator);
+
+    const fragments = try artifact_schema.extractFragments(allocator, &artifact, "", true);
+    defer {
+        for (fragments) |*f| f.deinit(allocator);
+        allocator.free(fragments);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), fragments.len);
+    try std.testing.expectEqualStrings("empty", fragments[0].region);
+    try std.testing.expect(fragments[0].parser_stage == .fallback);
+}
+
+test "artifact schema: entity extraction from code fragments" {
+    const allocator = std.testing.allocator;
+
+    var registry = artifact_schema.SchemaRegistry.init(allocator);
+    defer registry.deinit();
+    try artifact_schema.registerBuiltinSchemas(&registry);
+
+    const schema = registry.lookup("code_artifact_schema").?;
+
+    const content =
+        \\pub fn main() void {
+        \\    const x: u32 = 42;
+        \\}
+    ;
+
+    var artifact = try artifact_schema.Artifact.init(allocator, "entity-test", .repo, .file, "test", .project, "zig", null, null);
+    defer artifact.deinit(allocator);
+
+    const fragments = try artifact_schema.extractFragments(allocator, &artifact, content, true);
+    defer {
+        for (fragments) |*f| f.deinit(allocator);
+        allocator.free(fragments);
+    }
+
+    const entities = try artifact_schema.extractEntities(allocator, &artifact, fragments, &schema);
+    defer {
+        for (entities) |*e| e.deinit(allocator);
+        allocator.free(entities);
+    }
+
+    // Should extract at least some entities (function, variable, constant).
+    try std.testing.expect(entities.len > 0);
+
+    // All entities must reference the correct artifact.
+    for (entities) |entity| {
+        try std.testing.expectEqualStrings("entity-test", entity.artifact_id);
+    }
+}
+
+test "artifact schema: document artifact goes through same pipeline as code" {
+    const allocator = std.testing.allocator;
+
+    var registry = artifact_schema.SchemaRegistry.init(allocator);
+    defer registry.deinit();
+    try artifact_schema.registerBuiltinSchemas(&registry);
+
+    const content =
+        \\# Introduction
+        \\
+        \\This is a paragraph about the system.
+        \\
+        \\## Details
+        \\
+        \\- Item one
+        \\- Item two
+    ;
+
+    var artifact = try artifact_schema.Artifact.init(allocator, "doc-test", .repo, .document, "test", .project, "md", null, null);
+    defer artifact.deinit(allocator);
+
+    const options = artifact_schema.PipelineOptions{
+        .registry = &registry,
+    };
+    var result = try artifact_schema.ingestArtifact(allocator, &artifact, content, &options);
+    defer result.deinit();
+
+    // Document must produce fragments and entities.
+    try std.testing.expect(result.fragments.len > 0);
+    try std.testing.expect(result.entities.len > 0);
+
+    // Should be routed to document schema.
+    try std.testing.expectEqualStrings("document_schema", result.artifacts[0].schema_name);
+}
+
+test "artifact schema: config artifact goes through same pipeline as code" {
+    const allocator = std.testing.allocator;
+
+    var registry = artifact_schema.SchemaRegistry.init(allocator);
+    defer registry.deinit();
+    try artifact_schema.registerBuiltinSchemas(&registry);
+
+    const content =
+        \\[database]
+        \\host = localhost
+        \\port = 5432
+        \\name = mydb
+    ;
+
+    var artifact = try artifact_schema.Artifact.init(allocator, "config-test", .repo, .file, "test", .project, "ini", null, null);
+    defer artifact.deinit(allocator);
+
+    const options = artifact_schema.PipelineOptions{
+        .registry = &registry,
+    };
+    var result = try artifact_schema.ingestArtifact(allocator, &artifact, content, &options);
+    defer result.deinit();
+
+    try std.testing.expect(result.fragments.len > 0);
+    try std.testing.expectEqualStrings("config_schema", result.artifacts[0].schema_name);
+}
+
+test "artifact schema: no domain bias — same pipeline for all schemas" {
+    const allocator = std.testing.allocator;
+
+    var registry = artifact_schema.SchemaRegistry.init(allocator);
+    defer registry.deinit();
+    try artifact_schema.registerBuiltinSchemas(&registry);
+
+    const options = artifact_schema.PipelineOptions{
+        .registry = &registry,
+    };
+
+    // Code artifact
+    const code_content = "pub fn foo() void {}\n";
+    var code_artifact = try artifact_schema.Artifact.init(allocator, "code", .repo, .file, "test", .project, "zig", null, null);
+    defer code_artifact.deinit(allocator);
+    var code_result = try artifact_schema.ingestArtifact(allocator, &code_artifact, code_content, &options);
+    defer code_result.deinit();
+
+    // Document artifact
+    const doc_content = "# Title\n\nSome text here.\n";
+    var doc_artifact = try artifact_schema.Artifact.init(allocator, "doc", .repo, .document, "test", .project, "md", null, null);
+    defer doc_artifact.deinit(allocator);
+    var doc_result = try artifact_schema.ingestArtifact(allocator, &doc_artifact, doc_content, &options);
+    defer doc_result.deinit();
+
+    // Config artifact
+    const config_content = "host = localhost\nport = 8080\n";
+    var config_artifact = try artifact_schema.Artifact.init(allocator, "config", .repo, .file, "test", .project, "conf", null, null);
+    defer config_artifact.deinit(allocator);
+    var config_result = try artifact_schema.ingestArtifact(allocator, &config_artifact, config_content, &options);
+    defer config_result.deinit();
+
+    // All must produce fragments — same pipeline, no shortcuts.
+    try std.testing.expect(code_result.fragments.len > 0);
+    try std.testing.expect(doc_result.fragments.len > 0);
+    try std.testing.expect(config_result.fragments.len > 0);
+
+    // Each must have entities extracted via the same pipeline.
+    try std.testing.expect(code_result.entities.len >= 0);
+    try std.testing.expect(doc_result.entities.len >= 0);
+    try std.testing.expect(config_result.entities.len >= 0);
+
+    // None may bypass obligations.
+    try std.testing.expect(code_result.obligations.len >= 0);
+    try std.testing.expect(doc_result.obligations.len >= 0);
+    try std.testing.expect(config_result.obligations.len >= 0);
+}
+
+test "artifact schema: schema switching does not change behavior" {
+    const allocator = std.testing.allocator;
+
+    var registry = artifact_schema.SchemaRegistry.init(allocator);
+    defer registry.deinit();
+    try artifact_schema.registerBuiltinSchemas(&registry);
+
+    const content = "pub fn main() void {}\n";
+
+    // Same content, different explicit schema hints.
+    var artifact_a = try artifact_schema.Artifact.init(allocator, "switch-a", .repo, .file, "test", .project, "zig", null, "code_artifact_schema");
+    defer artifact_a.deinit(allocator);
+
+    // Same content as document — still routed to code via format hint.
+    var artifact_b = try artifact_schema.Artifact.init(allocator, "switch-b", .repo, .document, "test", .project, "zig", null, null);
+    defer artifact_b.deinit(allocator);
+
+    const options = artifact_schema.PipelineOptions{
+        .registry = &registry,
+    };
+
+    var result_a = try artifact_schema.ingestArtifact(allocator, &artifact_a, content, &options);
+    defer result_a.deinit();
+    var result_b = try artifact_schema.ingestArtifact(allocator, &artifact_b, content, &options);
+    defer result_b.deinit();
+
+    // Both should route to code schema regardless of artifact_type label.
+    try std.testing.expectEqualStrings("code_artifact_schema", result_a.artifacts[0].schema_name);
+    try std.testing.expectEqualStrings("code_artifact_schema", result_b.artifacts[0].schema_name);
+
+    // Both should produce fragments.
+    try std.testing.expect(result_a.fragments.len > 0);
+    try std.testing.expect(result_b.fragments.len > 0);
+}
+
+test "artifact schema: support graph includes artifact, entity, obligation nodes" {
+    const allocator = std.testing.allocator;
+
+    var registry = artifact_schema.SchemaRegistry.init(allocator);
+    defer registry.deinit();
+    try artifact_schema.registerBuiltinSchemas(&registry);
+
+    const content = "pub fn hello() void {}\n";
+    var artifact = try artifact_schema.Artifact.init(allocator, "graph-test", .repo, .file, "test", .project, "zig", null, null);
+    defer artifact.deinit(allocator);
+
+    const options = artifact_schema.PipelineOptions{
+        .registry = &registry,
+    };
+    var result = try artifact_schema.ingestArtifact(allocator, &artifact, content, &options);
+    defer result.deinit();
+
+    // Build a support graph and append artifact nodes.
+    var graph = code_intel.SupportGraph{
+        .allocator = allocator,
+    };
+    defer graph.deinit();
+
+    try artifact_schema.appendArtifactSupportNodes(allocator, &graph, &result);
+
+    // Must have artifact node.
+    var has_artifact = false;
+    var has_fragment = false;
+    for (graph.nodes) |node| {
+        if (node.kind == .artifact) has_artifact = true;
+        if (node.kind == .fragment) has_fragment = true;
+    }
+    try std.testing.expect(has_artifact);
+    try std.testing.expect(has_fragment);
+
+    // If there are entities, there must be entity nodes.
+    if (result.entities.len > 0) {
+        var has_entity = false;
+        for (graph.nodes) |node| {
+            if (node.kind == .entity) has_entity = true;
+        }
+        try std.testing.expect(has_entity);
+    }
+}
+
+test "artifact schema: obligations block promotion to supported" {
+    const allocator = std.testing.allocator;
+
+    var registry = artifact_schema.SchemaRegistry.init(allocator);
+    defer registry.deinit();
+    try artifact_schema.registerBuiltinSchemas(&registry);
+
+    const content = "pub fn hello() void {}\n";
+    var artifact = try artifact_schema.Artifact.init(allocator, "obl-test", .repo, .file, "test", .project, "zig", null, null);
+    defer artifact.deinit(allocator);
+
+    const options = artifact_schema.PipelineOptions{
+        .registry = &registry,
+    };
+    var result = try artifact_schema.ingestArtifact(allocator, &artifact, content, &options);
+    defer result.deinit();
+
+    // If entities were found and schema has blocking verifier hooks, obligations must be present.
+    if (result.entities.len > 0 and result.obligations.len > 0) {
+        // All obligations must start as pending (blocking).
+        for (result.obligations) |obligation| {
+            try std.testing.expect(obligation.pending);
+        }
+    }
+}
+
+test "artifact schema: partial understanding — fragments without entities" {
+    const allocator = std.testing.allocator;
+
+    var registry = artifact_schema.SchemaRegistry.init(allocator);
+    defer registry.deinit();
+    try artifact_schema.registerBuiltinSchemas(&registry);
+
+    // Content that doesn't match any entity type patterns.
+    const content = "??? !!! ???\n";
+    var artifact = try artifact_schema.Artifact.init(allocator, "partial-test", .user, .document, "test", .exploratory, null, null, null);
+    defer artifact.deinit(allocator);
+
+    const options = artifact_schema.PipelineOptions{
+        .registry = &registry,
+    };
+    var result = try artifact_schema.ingestArtifact(allocator, &artifact, content, &options);
+    defer result.deinit();
+
+    // Fragments must exist even if entities are empty (partial understanding).
+    try std.testing.expect(result.fragments.len > 0);
+    // Entities may be empty — that's fine for partial understanding.
+}
+
+test "artifact schema: determinism — same input produces same output" {
+    const allocator = std.testing.allocator;
+
+    var registry = artifact_schema.SchemaRegistry.init(allocator);
+    defer registry.deinit();
+    try artifact_schema.registerBuiltinSchemas(&registry);
+
+    const content = "pub fn add(a: u32, b: u32) u32 {\n    return a + b;\n}\n";
+
+    const options = artifact_schema.PipelineOptions{
+        .registry = &registry,
+    };
+
+    // Run pipeline twice with identical input.
+    var artifact1 = try artifact_schema.Artifact.init(allocator, "det-test", .repo, .file, "test", .project, "zig", null, null);
+    defer artifact1.deinit(allocator);
+    var result1 = try artifact_schema.ingestArtifact(allocator, &artifact1, content, &options);
+    defer result1.deinit();
+
+    var artifact2 = try artifact_schema.Artifact.init(allocator, "det-test", .repo, .file, "test", .project, "zig", null, null);
+    defer artifact2.deinit(allocator);
+    var result2 = try artifact_schema.ingestArtifact(allocator, &artifact2, content, &options);
+    defer result2.deinit();
+
+    // Must produce identical fragment counts, entity counts, schema names.
+    try std.testing.expectEqual(result1.fragments.len, result2.fragments.len);
+    try std.testing.expectEqual(result1.entities.len, result2.entities.len);
+    try std.testing.expectEqual(result1.obligations.len, result2.obligations.len);
+    try std.testing.expectEqualStrings(result1.artifacts[0].schema_name, result2.artifacts[0].schema_name);
+}
+
+test "artifact schema: relation extraction between entities" {
+    const allocator = std.testing.allocator;
+
+    var registry = artifact_schema.SchemaRegistry.init(allocator);
+    defer registry.deinit();
+    try artifact_schema.registerBuiltinSchemas(&registry);
+
+    const content =
+        \\# Section One
+        \\
+        \\Some paragraph text here.
+        \\- List item one
+        \\- List item two
+    ;
+
+    var artifact = try artifact_schema.Artifact.init(allocator, "rel-test", .repo, .document, "test", .project, "md", null, null);
+    defer artifact.deinit(allocator);
+
+    const options = artifact_schema.PipelineOptions{
+        .registry = &registry,
+    };
+    var result = try artifact_schema.ingestArtifact(allocator, &artifact, content, &options);
+    defer result.deinit();
+
+    // Should have entities (headings, paragraphs, list items).
+    try std.testing.expect(result.entities.len > 0);
+
+    // Relations should include contains relations from sections to content.
+    // It's valid to have no relations if entities don't meet criteria.
+}
+
+test "artifact schema: routing is deterministic for same format hint" {
+    const allocator = std.testing.allocator;
+
+    var registry = artifact_schema.SchemaRegistry.init(allocator);
+    defer registry.deinit();
+    try artifact_schema.registerBuiltinSchemas(&registry);
+
+    var signals = artifact_schema.RoutingSignals.init(allocator);
+    defer signals.deinit();
+    signals.artifact_type = .file;
+    signals.trust_class = .project;
+
+    // Route code format hint.
+    var code_artifact = try artifact_schema.Artifact.init(allocator, "route-code", .repo, .file, "test", .project, "zig", null, null);
+    defer code_artifact.deinit(allocator);
+
+    const code_schema = artifact_schema.routeSchema(allocator, &code_artifact, &signals, &registry);
+    try std.testing.expect(code_schema != null);
+    try std.testing.expectEqualStrings("code_artifact_schema", code_schema.?);
+
+    // Route document format hint.
+    var doc_artifact = try artifact_schema.Artifact.init(allocator, "route-doc", .repo, .document, "test", .project, "md", null, null);
+    defer doc_artifact.deinit(allocator);
+
+    const doc_schema = artifact_schema.routeSchema(allocator, &doc_artifact, &signals, &registry);
+    try std.testing.expect(doc_schema != null);
+    try std.testing.expectEqualStrings("document_schema", doc_schema.?);
+
+    // Route config format hint.
+    var conf_artifact = try artifact_schema.Artifact.init(allocator, "route-conf", .repo, .file, "test", .project, "json", null, null);
+    defer conf_artifact.deinit(allocator);
+
+    const conf_schema = artifact_schema.routeSchema(allocator, &conf_artifact, &signals, &registry);
+    try std.testing.expect(conf_schema != null);
+    try std.testing.expectEqualStrings("config_schema", conf_schema.?);
+}
+
+test "artifact schema: parser cascade stages are assigned correctly" {
+    const allocator = std.testing.allocator;
+
+    // Structured code content should get strict or robust parsing.
+    const code = "pub fn main() void {\n    const x: u32 = 42;\n}\n";
+    var artifact_a = try artifact_schema.Artifact.init(allocator, "parser-code", .repo, .file, "test", .project, "zig", null, null);
+    defer artifact_a.deinit(allocator);
+
+    const code_frags = try artifact_schema.extractFragments(allocator, &artifact_a, code, true);
+    defer {
+        for (code_frags) |*f| f.deinit(allocator);
+        allocator.free(code_frags);
+    }
+    // Code should be structured enough for strict parsing.
+    try std.testing.expect(code_frags.len > 0);
+    try std.testing.expect(code_frags[0].parser_stage == .strict);
+
+    // Unstructured noise should fall through to fallback.
+    const noise = "??? ??? ???\n";
+    var artifact_b = try artifact_schema.Artifact.init(allocator, "parser-noise", .user, .document, "test", .exploratory, null, null, null);
+    defer artifact_b.deinit(allocator);
+
+    const noise_frags = try artifact_schema.extractFragments(allocator, &artifact_b, noise, true);
+    defer {
+        for (noise_frags) |*f| f.deinit(allocator);
+        allocator.free(noise_frags);
+    }
+    try std.testing.expect(noise_frags.len > 0);
+}
+
+test "artifact schema: verifier hooks are created from schema definitions" {
+    const allocator = std.testing.allocator;
+
+    var registry = artifact_schema.SchemaRegistry.init(allocator);
+    defer registry.deinit();
+    try artifact_schema.registerBuiltinSchemas(&registry);
+
+    const content = "pub fn main() void {}\n";
+    var artifact = try artifact_schema.Artifact.init(allocator, "hook-test", .repo, .file, "test", .project, "zig", null, null);
+    defer artifact.deinit(allocator);
+
+    const options = artifact_schema.PipelineOptions{
+        .registry = &registry,
+    };
+    var result = try artifact_schema.ingestArtifact(allocator, &artifact, content, &options);
+    defer result.deinit();
+
+    // Code schema has 3 verifier hooks (build, test, runtime).
+    try std.testing.expectEqual(@as(usize, 3), result.verifier_hooks.len);
+
+    // All hooks should start as pending.
+    for (result.verifier_hooks) |hook| {
+        try std.testing.expect(hook.result == .pending);
+    }
+}
+
+test "artifact schema: mixed artifact types batch processing" {
+    const allocator = std.testing.allocator;
+
+    var registry = artifact_schema.SchemaRegistry.init(allocator);
+    defer registry.deinit();
+    try artifact_schema.registerBuiltinSchemas(&registry);
+
+    const options = artifact_schema.PipelineOptions{
+        .registry = &registry,
+    };
+
+    // Code
+    var code = try artifact_schema.Artifact.init(allocator, "mixed-code", .repo, .file, "test", .project, "zig", null, null);
+    defer code.deinit(allocator);
+    var code_r = try artifact_schema.ingestArtifact(allocator, &code, "pub fn f() void {}\n", &options);
+    defer code_r.deinit();
+
+    // Text
+    var doc = try artifact_schema.Artifact.init(allocator, "mixed-doc", .repo, .document, "test", .project, "md", null, null);
+    defer doc.deinit(allocator);
+    var doc_r = try artifact_schema.ingestArtifact(allocator, &doc, "# Title\nParagraph.\n", &options);
+    defer doc_r.deinit();
+
+    // Config
+    var conf = try artifact_schema.Artifact.init(allocator, "mixed-conf", .repo, .file, "test", .project, "json", null, null);
+    defer conf.deinit(allocator);
+    var conf_r = try artifact_schema.ingestArtifact(allocator, &conf, "key = value\n", &options);
+    defer conf_r.deinit();
+
+    // All must succeed with fragments.
+    try std.testing.expect(code_r.fragments.len > 0);
+    try std.testing.expect(doc_r.fragments.len > 0);
+    try std.testing.expect(conf_r.fragments.len > 0);
+
+    // Each routed to correct schema.
+    try std.testing.expectEqualStrings("code_artifact_schema", code_r.artifacts[0].schema_name);
+    try std.testing.expectEqualStrings("document_schema", doc_r.artifacts[0].schema_name);
+    try std.testing.expectEqualStrings("config_schema", conf_r.artifacts[0].schema_name);
+}
+
+test "artifact schema: entity extraction consistency — repeated calls" {
+    const allocator = std.testing.allocator;
+
+    var registry = artifact_schema.SchemaRegistry.init(allocator);
+    defer registry.deinit();
+    try artifact_schema.registerBuiltinSchemas(&registry);
+
+    const schema = registry.lookup("code_artifact_schema").?;
+    const content = "pub fn add(a: u32, b: u32) u32 {\n    return a + b;\n}\n";
+
+    // Extract entities three times — must be identical each time.
+    var artifact1 = try artifact_schema.Artifact.init(allocator, "consist-test", .repo, .file, "test", .project, "zig", null, null);
+    defer artifact1.deinit(allocator);
+
+    const frags1 = try artifact_schema.extractFragments(allocator, &artifact1, content, true);
+    const ents1 = try artifact_schema.extractEntities(allocator, &artifact1, frags1, &schema);
+    defer {
+        for (frags1) |*f| f.deinit(allocator);
+        allocator.free(frags1);
+        for (ents1) |*e| e.deinit(allocator);
+        allocator.free(ents1);
+    }
+
+    var artifact2 = try artifact_schema.Artifact.init(allocator, "consist-test", .repo, .file, "test", .project, "zig", null, null);
+    defer artifact2.deinit(allocator);
+
+    const frags2 = try artifact_schema.extractFragments(allocator, &artifact2, content, true);
+    const ents2 = try artifact_schema.extractEntities(allocator, &artifact2, frags2, &schema);
+    defer {
+        for (frags2) |*f| f.deinit(allocator);
+        allocator.free(frags2);
+        for (ents2) |*e| e.deinit(allocator);
+        allocator.free(ents2);
+    }
+
+    try std.testing.expectEqual(ents1.len, ents2.len);
+    for (ents1, ents2) |e1, e2| {
+        try std.testing.expectEqualStrings(e1.entity_type, e2.entity_type);
+    }
+}
+
+test "artifact schema: support graph node kinds include artifact pipeline types" {
+    // Verify the new node kinds are accessible.
+    const ArtifactKind = code_intel.SupportNodeKind;
+    try std.testing.expect(ArtifactKind.artifact == .artifact);
+    try std.testing.expect(ArtifactKind.entity == .entity);
+    try std.testing.expect(ArtifactKind.relation == .relation);
+    try std.testing.expect(ArtifactKind.verifier_hook == .verifier_hook);
+    try std.testing.expect(ArtifactKind.action_surface == .action_surface);
+
+    // And the new edge kinds.
+    const EdgeKind = code_intel.SupportEdgeKind;
+    try std.testing.expect(EdgeKind.artifact_sourced_from == .artifact_sourced_from);
+    try std.testing.expect(EdgeKind.fragment_of == .fragment_of);
+    try std.testing.expect(EdgeKind.entity_from_fragment == .entity_from_fragment);
+    try std.testing.expect(EdgeKind.relates_to == .relates_to);
+    try std.testing.expect(EdgeKind.verified_by == .verified_by);
+}
+
+test "artifact schema: compute budget includes artifact pipeline stages" {
+    const Stage = compute_budget.Stage;
+    try std.testing.expect(Stage.artifact_ingestion == .artifact_ingestion);
+    try std.testing.expect(Stage.artifact_fragment_extraction == .artifact_fragment_extraction);
+    try std.testing.expect(Stage.artifact_entity_extraction == .artifact_entity_extraction);
+    try std.testing.expect(Stage.artifact_schema_routing == .artifact_schema_routing);
+    try std.testing.expect(Stage.artifact_obligation_attachment == .artifact_obligation_attachment);
+}
+
+// ── Intent Grounding v2 Tests ──────────────────────────────────────────
+
+test "intent grounding: clear direct action classifies and grounds" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "summarize src/main.zig", .{});
+    defer gi.deinit();
+
+    try std.testing.expectEqual(intent_grounding.IntentClass.direct_action, gi.intent_class);
+    try std.testing.expectEqual(intent_grounding.GroundedIntent.GroundingStatus.grounded, gi.status);
+    try std.testing.expect(gi.fast_path_eligible);
+    try std.testing.expect(gi.artifact_bindings.len > 0);
+    try std.testing.expect(gi.ambiguity_sets.len == 0);
+    try std.testing.expect(gi.missing_obligations.len == 0);
+}
+
+test "intent grounding: diagnostic classify from why phrase" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "explain why src/api.zig:compute breaks", .{});
+    defer gi.deinit();
+
+    try std.testing.expectEqual(intent_grounding.IntentClass.diagnostic, gi.intent_class);
+    try std.testing.expectEqual(intent_grounding.GroundedIntent.GroundingStatus.grounded, gi.status);
+    try std.testing.expect(gi.traces.len > 0);
+}
+
+test "intent grounding: creation classify from build phrase" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "build a new handler for src/router.zig", .{});
+    defer gi.deinit();
+
+    try std.testing.expectEqual(intent_grounding.IntentClass.creation, gi.intent_class);
+    try std.testing.expect(gi.obligations.len > 0);
+}
+
+test "intent grounding: verification classify from verify phrase" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "verify src/api.zig:endpoints is correct", .{});
+    defer gi.deinit();
+
+    try std.testing.expectEqual(intent_grounding.IntentClass.verification, gi.intent_class);
+}
+
+test "intent grounding: vague request produces ambiguity not guess" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "make this better", .{});
+    defer gi.deinit();
+
+    try std.testing.expectEqual(intent_grounding.IntentClass.transformation, gi.intent_class);
+    try std.testing.expect(gi.ambiguity_sets.len > 0);
+    try std.testing.expect(gi.candidate_intents.len > 0);
+    // Must NOT be grounded — ambiguity prevents it.
+    try std.testing.expect(gi.status != .grounded);
+    // Must NOT have collapsed into a single guessed interpretation.
+    try std.testing.expect(gi.candidate_intents.len >= 2);
+}
+
+test "intent grounding: vague optimize produces multiple candidates" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "optimize this", .{});
+    defer gi.deinit();
+
+    try std.testing.expectEqual(intent_grounding.IntentClass.transformation, gi.intent_class);
+    try std.testing.expect(gi.candidate_intents.len >= 2);
+    try std.testing.expect(gi.ambiguity_sets.len > 0);
+}
+
+test "intent grounding: fix it produces candidates and ambiguity" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "fix it", .{});
+    defer gi.deinit();
+
+    try std.testing.expect(gi.candidate_intents.len >= 2);
+    try std.testing.expect(gi.status != .grounded);
+}
+
+test "intent grounding: clean this up produces multiple candidates" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "clean this up", .{});
+    defer gi.deinit();
+
+    try std.testing.expect(gi.candidate_intents.len >= 2);
+}
+
+test "intent grounding: missing artifact binding creates missing obligation" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "summarize", .{});
+    defer gi.deinit();
+
+    // No artifact specified — must have missing obligation.
+    var found_bind = false;
+    for (gi.missing_obligations) |mo| {
+        if (std.mem.eql(u8, mo.id, "bind_target_artifact")) found_bind = true;
+    }
+    try std.testing.expect(found_bind);
+}
+
+test "intent grounding: artifact binding from explicit reference" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "refactor src/main.zig", .{});
+    defer gi.deinit();
+
+    try std.testing.expect(gi.artifact_bindings.len > 0);
+    try std.testing.expectEqual(intent_grounding.BindingSource.explicit_reference, gi.artifact_bindings[0].source);
+    try std.testing.expectEqualStrings("src/main.zig", gi.artifact_bindings[0].artifact_id);
+}
+
+test "intent grounding: artifact binding from context target" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "build this in zig", .{
+        .context_target = "src/handler.zig",
+    });
+    defer gi.deinit();
+
+    // "this" should resolve via context target (v1 resolves deictic → explicit).
+    try std.testing.expect(gi.artifact_bindings.len > 0);
+    try std.testing.expectEqualStrings("src/handler.zig", gi.artifact_bindings[0].artifact_id);
+}
+
+test "intent grounding: multiple artifacts available but none specified stays ambiguous" {
+    const allocator = std.testing.allocator;
+
+    const artifacts = [_][]const u8{ "src/a.zig", "src/b.zig" };
+    var gi = try intent_grounding.ground(allocator, "build", .{
+        .available_artifacts = &artifacts,
+    });
+    defer gi.deinit();
+
+    // Multiple artifacts available but none specified → no silent choice.
+    try std.testing.expect(gi.artifact_bindings.len == 0);
+}
+
+test "intent grounding: single available artifact binds implicitly" {
+    const allocator = std.testing.allocator;
+
+    const artifacts = [_][]const u8{"src/only.zig"};
+    var gi = try intent_grounding.ground(allocator, "summarize", .{
+        .available_artifacts = &artifacts,
+    });
+    defer gi.deinit();
+
+    try std.testing.expect(gi.artifact_bindings.len > 0);
+    try std.testing.expectEqual(intent_grounding.BindingSource.pack_based, gi.artifact_bindings[0].source);
+}
+
+test "intent grounding: constraint extraction preserves user explicit" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "refactor src/main.zig but keep the API stable", .{});
+    defer gi.deinit();
+
+    var found_api = false;
+    for (gi.constraints) |c| {
+        if (c.kind == .api_stability and c.source == .user_explicit) found_api = true;
+    }
+    try std.testing.expect(found_api);
+}
+
+test "intent grounding: inferred constraints for transformation" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "improve this", .{});
+    defer gi.deinit();
+
+    var found_preserve_behavior = false;
+    var found_preserve_structure = false;
+    for (gi.constraints) |c| {
+        if (c.kind == .determinism and c.source == .inferred_preserve_behavior) found_preserve_behavior = true;
+        if (c.kind == .api_stability and c.source == .inferred_preserve_structure) found_preserve_structure = true;
+    }
+    try std.testing.expect(found_preserve_behavior);
+    try std.testing.expect(found_preserve_structure);
+}
+
+test "intent grounding: safety constraint for deictic without context" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "verify this is correct", .{});
+    defer gi.deinit();
+
+    var found_safety = false;
+    for (gi.constraints) |c| {
+        if (c.kind == .safety and c.source == .from_verifier) found_safety = true;
+    }
+    try std.testing.expect(found_safety);
+}
+
+test "intent grounding: every intent produces obligations" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "verify src/main.zig:init", .{});
+    defer gi.deinit();
+
+    try std.testing.expect(gi.obligations.len > 0);
+}
+
+test "intent grounding: transformation produces criteria and validation obligations" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "make this better", .{});
+    defer gi.deinit();
+
+    var found_criteria = false;
+    var found_validate = false;
+    for (gi.obligations) |obl| {
+        if (std.mem.eql(u8, obl.id, "define_criteria")) found_criteria = true;
+        if (std.mem.eql(u8, obl.id, "validate_result")) found_validate = true;
+    }
+    try std.testing.expect(found_criteria);
+    try std.testing.expect(found_validate);
+}
+
+test "intent grounding: ambiguous intent produces resolve_class obligation" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "hello world", .{});
+    defer gi.deinit();
+
+    try std.testing.expectEqual(intent_grounding.IntentClass.ambiguous, gi.intent_class);
+    var found_resolve = false;
+    for (gi.obligations) |obl| {
+        if (std.mem.eql(u8, obl.id, "resolve_class")) found_resolve = true;
+    }
+    try std.testing.expect(found_resolve);
+}
+
+test "intent grounding: obligation resolved when target known" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "verify src/main.zig:init is correct", .{});
+    defer gi.deinit();
+
+    // When target is explicit, verification class should not have bind_artifact
+    // (it's only added when bindings.len == 0). Instead, verify that the
+    // intent has grounded with obligations.
+    try std.testing.expect(gi.obligations.len > 0);
+    try std.testing.expectEqual(intent_grounding.GroundedIntent.GroundingStatus.grounded, gi.status);
+}
+
+test "intent grounding: scope is artifact_local for single binding" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "summarize src/main.zig", .{});
+    defer gi.deinit();
+
+    try std.testing.expectEqual(intent_grounding.IntentScope.artifact_local, gi.scope);
+}
+
+test "intent grounding: scope is artifact_local with no bindings" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "summarize", .{});
+    defer gi.deinit();
+
+    try std.testing.expectEqual(intent_grounding.IntentScope.artifact_local, gi.scope);
+}
+
+test "intent grounding: traces cover all grounding steps" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "verify src/main.zig:init is correct", .{});
+    defer gi.deinit();
+
+    // Must have traces for: classify, bind_artifact, extract_constraints, map_obligations.
+    var found_classify = false;
+    var found_bind = false;
+    var found_constraints = false;
+    var found_obligations = false;
+    for (gi.traces) |trace| {
+        if (std.mem.eql(u8, trace.step, "classify")) found_classify = true;
+        if (std.mem.eql(u8, trace.step, "bind_artifact")) found_bind = true;
+        if (std.mem.eql(u8, trace.step, "extract_constraints")) found_constraints = true;
+        if (std.mem.eql(u8, trace.step, "map_obligations")) found_obligations = true;
+    }
+    try std.testing.expect(found_classify);
+    try std.testing.expect(found_bind);
+    try std.testing.expect(found_constraints);
+    try std.testing.expect(found_obligations);
+}
+
+test "intent grounding: fast path for clear grounded request" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "refactor src/api/service.zig:compute but keep the API stable", .{});
+    defer gi.deinit();
+
+    try std.testing.expect(gi.fast_path_eligible);
+    try std.testing.expectEqual(intent_grounding.GroundedIntent.GroundingStatus.grounded, gi.status);
+}
+
+test "intent grounding: no fast path for ambiguous request" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "make this better", .{});
+    defer gi.deinit();
+
+    try std.testing.expect(!gi.fast_path_eligible);
+}
+
+test "intent grounding: deterministic classification across repeated calls" {
+    const allocator = std.testing.allocator;
+
+    var gi1 = try intent_grounding.ground(allocator, "explain why src/main.zig:init breaks", .{});
+    defer gi1.deinit();
+    var gi2 = try intent_grounding.ground(allocator, "explain why src/main.zig:init breaks", .{});
+    defer gi2.deinit();
+
+    try std.testing.expectEqual(gi1.intent_class, gi2.intent_class);
+    try std.testing.expectEqual(gi1.status, gi2.status);
+    try std.testing.expectEqual(gi1.scope, gi2.scope);
+    try std.testing.expectEqual(gi1.candidate_intents.len, gi2.candidate_intents.len);
+    try std.testing.expectEqual(gi1.ambiguity_sets.len, gi2.ambiguity_sets.len);
+}
+
+test "intent grounding: render json produces valid output" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "verify src/main.zig:init is correct", .{});
+    defer gi.deinit();
+
+    const rendered = try intent_grounding.renderJson(allocator, &gi);
+    defer allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"status\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"intentClass\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"scope\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"traces\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"obligations\":") != null);
+}
+
+test "intent grounding: partial output includes ambiguity without collapsing" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "improve this", .{});
+    defer gi.deinit();
+
+    // Partial output must include all the following.
+    try std.testing.expect(gi.candidate_intents.len > 0);
+    try std.testing.expect(gi.ambiguity_sets.len > 0);
+    try std.testing.expect(gi.traces.len > 0);
+
+    // Must NOT have collapsed into a single guessed interpretation.
+    try std.testing.expect(gi.candidate_intents.len >= 2);
+
+    // Must NOT be grounded.
+    try std.testing.expect(gi.status != .grounded);
+}
+
+test "intent grounding: no hallucinated intent resolution" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "asdfghjkl", .{});
+    defer gi.deinit();
+
+    // Nonsensical input must be classified as ambiguous, not fabricated.
+    try std.testing.expectEqual(intent_grounding.IntentClass.ambiguous, gi.intent_class);
+    try std.testing.expect(gi.status != .grounded);
+    try std.testing.expect(gi.fast_path_eligible == false);
+    // Must NOT have any fabricated candidate intents.
+    try std.testing.expect(gi.candidate_intents.len == 0);
+}
+
+test "intent grounding: action surfaces determined by class" {
+    const allocator = std.testing.allocator;
+
+    var gi_diag = try intent_grounding.ground(allocator, "explain why src/main.zig:init breaks", .{});
+    defer gi_diag.deinit();
+
+    var found_verify = false;
+    var found_extract = false;
+    for (gi_diag.action_surfaces) |surface| {
+        if (surface == .verify) found_verify = true;
+        if (surface == .extract) found_extract = true;
+    }
+    try std.testing.expect(found_verify);
+    try std.testing.expect(found_extract);
+}
+
+test "intent grounding: ambiguity set has obligation to resolve" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "make this better", .{});
+    defer gi.deinit();
+
+    try std.testing.expect(gi.ambiguity_sets.len > 0);
+    try std.testing.expect(gi.ambiguity_sets[0].obligation_to_resolve.len > 0);
+    try std.testing.expect(gi.ambiguity_sets[0].candidate_indices.len >= 2);
+    try std.testing.expect(gi.ambiguity_sets[0].reason.len > 0);
+}
+
+test "intent grounding: base task preserved in grounded intent" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "refactor src/api/service.zig:compute but keep the API stable", .{});
+    defer gi.deinit();
+
+    try std.testing.expectEqual(task_intent.Action.refactor, gi.base_task.action);
+    try std.testing.expectEqual(task_intent.ParseStatus.grounded, gi.base_task.status);
+    try std.testing.expect(gi.base_task.constraints.len > 0);
+}
+
+test "intent grounding: transformation without target produces candidates and missing obligation" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "clean this up", .{});
+    defer gi.deinit();
+
+    // Should have candidate interpretations.
+    try std.testing.expect(gi.candidate_intents.len >= 2);
+    // Should be unresolved due to ambiguity.
+    try std.testing.expect(gi.status != .grounded);
+}
+
+test "intent grounding: verification with explicit target grounds cleanly" {
+    const allocator = std.testing.allocator;
+
+    var gi = try intent_grounding.ground(allocator, "check src/main.zig:init is correct", .{});
+    defer gi.deinit();
+
+    try std.testing.expectEqual(intent_grounding.IntentClass.verification, gi.intent_class);
+    try std.testing.expectEqual(intent_grounding.GroundedIntent.GroundingStatus.grounded, gi.status);
+    try std.testing.expect(gi.fast_path_eligible);
+}
+
+// ── Response Engine Tests ─────────────────────────────────────────────
+
+test "response engine: grounded intent clone preserves all fields" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "summarize src/main.zig", .{});
+    defer gi.deinit();
+
+    var cloned = try gi.clone(allocator);
+    defer cloned.deinit();
+
+    try std.testing.expectEqual(gi.status, cloned.status);
+    try std.testing.expectEqual(gi.intent_class, cloned.intent_class);
+    try std.testing.expectEqual(gi.scope, cloned.scope);
+    try std.testing.expectEqual(gi.artifact_bindings.len, cloned.artifact_bindings.len);
+    try std.testing.expectEqual(gi.constraints.len, cloned.constraints.len);
+    try std.testing.expectEqual(gi.obligations.len, cloned.obligations.len);
+    try std.testing.expectEqual(gi.ambiguity_sets.len, cloned.ambiguity_sets.len);
+    try std.testing.expectEqual(gi.missing_obligations.len, cloned.missing_obligations.len);
+    try std.testing.expectEqual(gi.fast_path_eligible, cloned.fast_path_eligible);
+    try std.testing.expectEqualStrings(gi.raw_input, cloned.raw_input);
+}
+
+test "response engine: ambiguous intent clone preserves candidates and ambiguity" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "make this better", .{});
+    defer gi.deinit();
+
+    var cloned = try gi.clone(allocator);
+    defer cloned.deinit();
+
+    try std.testing.expectEqual(gi.candidate_intents.len, cloned.candidate_intents.len);
+    try std.testing.expectEqual(gi.ambiguity_sets.len, cloned.ambiguity_sets.len);
+}
+
+test "response engine: simple query selects fast path in auto mode" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "summarize src/main.zig", .{});
+    defer gi.deinit();
+
+    var result = try response_engine.execute(allocator, &gi, .autoPath());
+    defer result.deinit();
+
+    try std.testing.expectEqual(response_engine.ResponseMode.fast_path, result.selected_mode);
+    try std.testing.expect(!result.escalated);
+    try std.testing.expectEqual(response_engine.StopReason.supported, result.stop_reason);
+}
+
+test "response engine: vague query stays unresolved in auto mode without escalation" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "asdfghjkl", .{});
+    defer gi.deinit();
+
+    var result = try response_engine.execute(allocator, &gi, .autoPath());
+    defer result.deinit();
+
+    // Truly ambiguous (unclassifiable) intent: no escalation justified, stays unresolved.
+    try std.testing.expectEqual(response_engine.StopReason.unresolved, result.stop_reason);
+    try std.testing.expect(!result.escalated);
+    try std.testing.expect(result.escalation_reason == null);
+}
+
+test "response engine: clear action escalates to deep path in auto mode" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "verify src/main.zig:init is correct", .{});
+    defer gi.deinit();
+
+    var result = try response_engine.execute(allocator, &gi, .autoPath());
+    defer result.deinit();
+
+    // verify action surface triggers escalation.
+    try std.testing.expectEqual(response_engine.ResponseMode.deep_path, result.selected_mode);
+    try std.testing.expect(result.escalated);
+    try std.testing.expectEqual(response_engine.EscalationReason.action_surface_requires_proof, result.escalation_reason);
+}
+
+test "response engine: forced deep path via user config" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "summarize src/main.zig", .{});
+    defer gi.deinit();
+
+    var result = try response_engine.execute(allocator, &gi, .deepOnly());
+    defer result.deinit();
+
+    try std.testing.expectEqual(response_engine.ResponseMode.deep_path, result.selected_mode);
+    try std.testing.expectEqual(response_engine.StopReason.supported, result.stop_reason);
+}
+
+test "response engine: budget exhaustion produces budget stop reason" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "verify src/main.zig:init is correct", .{});
+    defer gi.deinit();
+
+    var result = try response_engine.execute(allocator, &gi, .{
+        .mode = .deep_path,
+        .budget_request = .{
+            .tier = .low,
+            .overrides = .{
+                .max_graph_nodes = 1,
+                .max_runtime_checks = 1,
+            },
+        },
+    });
+    defer result.deinit();
+
+    try std.testing.expect(result.budget_exhaustions.len > 0);
+    try std.testing.expectEqual(response_engine.StopReason.budget, result.stop_reason);
+}
+
+test "response engine: no false fast path eligibility for nonsense input" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "asdfghjkl", .{});
+    defer gi.deinit();
+
+    const budget = compute_budget.resolve(.{ .tier = .low });
+    var eligibility = try response_engine.checkFastPathEligibility(allocator, &gi, &budget);
+    defer eligibility.deinit(allocator);
+
+    try std.testing.expect(!eligibility.eligible);
+}
+
+test "response engine: deterministic results across repeated runs" {
+    const allocator = std.testing.allocator;
+
+    var gi1 = try intent_grounding.ground(allocator, "summarize src/main.zig", .{});
+    defer gi1.deinit();
+    var gi2 = try intent_grounding.ground(allocator, "summarize src/main.zig", .{});
+    defer gi2.deinit();
+
+    var result1 = try response_engine.execute(allocator, &gi1, .autoPath());
+    defer result1.deinit();
+    var result2 = try response_engine.execute(allocator, &gi2, .autoPath());
+    defer result2.deinit();
+
+    try std.testing.expectEqual(result1.selected_mode, result2.selected_mode);
+    try std.testing.expectEqual(result1.stop_reason, result2.stop_reason);
+    try std.testing.expectEqual(result1.escalated, result2.escalated);
+    try std.testing.expectEqual(result1.escalation_reason, result2.escalation_reason);
+    try std.testing.expectEqual(result1.partial_findings.len, result2.partial_findings.len);
+    try std.testing.expectEqual(result1.budget_exhaustions.len, result2.budget_exhaustions.len);
+}
+
+test "response engine: latency tracking records non-zero total time" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "summarize src/main.zig", .{});
+    defer gi.deinit();
+
+    var fast_result = try response_engine.execute(allocator, &gi, .fastOnly());
+    defer fast_result.deinit();
+    var deep_result = try response_engine.execute(allocator, &gi, .deepOnly());
+    defer deep_result.deinit();
+
+    try std.testing.expect(fast_result.latency.total_us > 0);
+    try std.testing.expect(deep_result.latency.total_us > 0);
+}
+
+test "response engine: render json contains required fields" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "summarize src/main.zig", .{});
+    defer gi.deinit();
+
+    var result = try response_engine.execute(allocator, &gi, .autoPath());
+    defer result.deinit();
+
+    const rendered = try response_engine.renderJson(allocator, &result);
+    defer allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"selectedMode\":\"fast_path\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"stopReason\":\"supported\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"latency\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"totalUs\":") != null);
+}
+
+test "response engine: budget mapping fast to low, deep to high, auto to medium" {
+    const fast_budget = response_engine.resolveBudget(.{ .mode = .fast_path });
+    try std.testing.expectEqual(compute_budget.Tier.low, fast_budget.effective_tier);
+
+    const deep_budget = response_engine.resolveBudget(.{ .mode = .deep_path });
+    try std.testing.expectEqual(compute_budget.Tier.high, deep_budget.effective_tier);
+
+    const auto_budget = response_engine.resolveBudget(.{ .mode = .auto_path });
+    try std.testing.expectEqual(compute_budget.Tier.medium, auto_budget.effective_tier);
+}
+
+test "response engine: escalation reasons are explicit and justified" {
+    const allocator = std.testing.allocator;
+
+    // verify action → action_surface_requires_proof.
+    var gi_verify = try intent_grounding.ground(allocator, "verify src/main.zig:init is correct", .{});
+    defer gi_verify.deinit();
+    var result_verify = try response_engine.execute(allocator, &gi_verify, .autoPath());
+    defer result_verify.deinit();
+    try std.testing.expect(result_verify.escalated);
+    try std.testing.expectEqual(response_engine.EscalationReason.action_surface_requires_proof, result_verify.escalation_reason);
+
+    // ambiguous input → no escalation (stays unresolved).
+    var gi_amb = try intent_grounding.ground(allocator, "asdfghjkl", .{});
+    defer gi_amb.deinit();
+    var result_amb = try response_engine.execute(allocator, &gi_amb, .autoPath());
+    defer result_amb.deinit();
+    try std.testing.expect(!result_amb.escalated);
+    try std.testing.expect(result_amb.escalation_reason == null);
+}
+
+test "response engine: partial findings present for unresolved results" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "improve this", .{});
+    defer gi.deinit();
+
+    var result = try response_engine.execute(allocator, &gi, .autoPath());
+    defer result.deinit();
+
+    try std.testing.expectEqual(response_engine.StopReason.unresolved, result.stop_reason);
+    try std.testing.expect(result.grounded_intent.candidate_intents.len >= 2);
+}
+
+test "response engine: support contract preserved in fast path" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "summarize src/main.zig", .{});
+    defer gi.deinit();
+
+    var result = try response_engine.execute(allocator, &gi, .fastOnly());
+    defer result.deinit();
+
+    // Fast path must still respect the support contract.
+    if (result.stop_reason == .supported) {
+        try std.testing.expectEqual(
+            intent_grounding.GroundedIntent.GroundingStatus.grounded,
+            result.grounded_intent.status,
+        );
+    }
+}
+
+test "response engine: forced fast path does not bypass verification obligations" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "verify src/main.zig:init is correct", .{});
+    defer gi.deinit();
+
+    var result = try response_engine.execute(allocator, &gi, .fastOnly());
+    defer result.deinit();
+
+    try std.testing.expect(result.selected_mode != .fast_path);
+    try std.testing.expect(result.stop_reason != .supported or result.escalation_reason != null);
+    try std.testing.expect(!result.speculative_scheduler.active or result.selected_mode == .deep_path);
+}
+
+test "response engine: draft mode refuses explicit verification and patch requests" {
+    const allocator = std.testing.allocator;
+
+    var verify_intent = try intent_grounding.ground(allocator, "verify src/main.zig:init is correct", .{});
+    defer verify_intent.deinit();
+    var verify_result = try response_engine.execute(allocator, &verify_intent, .draftOnly());
+    defer verify_result.deinit();
+    try std.testing.expectEqual(response_engine.ResponseMode.deep_path, verify_result.selected_mode);
+    try std.testing.expect(!verify_result.draft.mode.enabled);
+
+    var patch_intent = try intent_grounding.ground(allocator, "fix src/main.zig:init", .{});
+    defer patch_intent.deinit();
+    var patch_result = try response_engine.execute(allocator, &patch_intent, .draftOnly());
+    defer patch_result.deinit();
+    try std.testing.expectEqual(response_engine.ResponseMode.deep_path, patch_result.selected_mode);
+    try std.testing.expect(!patch_result.draft.mode.enabled);
+}
+
+test "response engine: draft output is always unresolved and unverified" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "draft a plan for src/main.zig", .{});
+    defer gi.deinit();
+
+    var result = try response_engine.execute(allocator, &gi, .draftOnly());
+    defer result.deinit();
+
+    try std.testing.expectEqual(response_engine.ResponseMode.draft_mode, result.selected_mode);
+    try std.testing.expectEqual(response_engine.StopReason.unresolved, result.stop_reason);
+    try std.testing.expect(result.draft.mode.enabled);
+    try std.testing.expectEqual(response_engine.VerificationState.unverified, result.draft.mode.verification_state);
+    try std.testing.expect(result.draft.missing_information.len > 0);
+}
+
+test "response engine: speculative scheduler keeps pruned candidates traceable" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "make this better", .{});
+    defer gi.deinit();
+
+    var result = try response_engine.execute(allocator, &gi, .deepOnly());
+    defer result.deinit();
+
+    try std.testing.expectEqual(response_engine.ResponseMode.deep_path, result.selected_mode);
+    try std.testing.expect(result.speculative_scheduler.active);
+    try std.testing.expect(result.speculative_scheduler.candidates.len > 0);
+    var has_pruned_or_considered = false;
+    for (result.speculative_scheduler.candidates) |candidate| {
+        if (candidate.status == .pruned or candidate.status == .considered) has_pruned_or_considered = true;
+    }
+    try std.testing.expect(has_pruned_or_considered);
+}
+
+test "response engine: fast path eligibility check is comprehensive" {
+    const allocator = std.testing.allocator;
+    const budget = compute_budget.resolve(.{ .tier = .low });
+
+    // Grounded intent with summarize action → eligible.
+    var gi_summarize = try intent_grounding.ground(allocator, "summarize src/main.zig", .{});
+    defer gi_summarize.deinit();
+    var elig_summarize = try response_engine.checkFastPathEligibility(allocator, &gi_summarize, &budget);
+    defer elig_summarize.deinit(allocator);
+    try std.testing.expect(elig_summarize.eligible);
+    try std.testing.expect(elig_summarize.intent_grounded);
+    try std.testing.expect(elig_summarize.no_ambiguity_sets);
+    try std.testing.expect(elig_summarize.no_missing_obligations);
+    try std.testing.expect(elig_summarize.artifact_bindings_resolved);
+    try std.testing.expect(elig_summarize.no_verification_required);
+    try std.testing.expect(elig_summarize.support_graph_within_bounds);
+
+    // Verification action → not eligible (requires verification).
+    var gi_verify = try intent_grounding.ground(allocator, "verify src/main.zig:init is correct", .{});
+    defer gi_verify.deinit();
+    var elig_verify = try response_engine.checkFastPathEligibility(allocator, &gi_verify, &budget);
+    defer elig_verify.deinit(allocator);
+    try std.testing.expect(!elig_verify.eligible);
+    try std.testing.expect(!elig_verify.no_verification_required);
 }

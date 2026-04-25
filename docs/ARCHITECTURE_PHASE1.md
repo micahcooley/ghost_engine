@@ -10,5 +10,5 @@ Use [README.md](../README.md), [ARCHITECTURE.md](../ARCHITECTURE.md), [GUIDE_ARC
 - Expand the code-intel pilot beyond the current bounded `impact`, `breaks-if`, and `contradicts` queries without weakening honesty guarantees
 - Add a first-party panic dump reader instead of relying on raw binary inspection
 - Add richer shard administration and operator tooling around project creation, seeding, and snapshot management
-- Add a positive runtime-verified patch fixture so the serious-workflow runtime-pass metric becomes non-empty
+- Expand the bounded runtime oracle model beyond the current stdout/state/invariant checks without weakening honesty guarantees
 - Revisit non-Linux packaging and runtime docs after the Linux-first stack stops moving

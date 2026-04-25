@@ -66,6 +66,14 @@ pub const Paths = struct {
     code_intel_cache_abs_path: []u8,
     patch_candidates_root_abs_path: []u8,
     patch_candidates_staged_abs_path: []u8,
+    task_sessions_root_abs_path: []u8,
+    corpus_ingest_root_abs_path: []u8,
+    corpus_ingest_staged_abs_path: []u8,
+    corpus_ingest_staged_files_abs_path: []u8,
+    corpus_ingest_staged_manifest_abs_path: []u8,
+    corpus_ingest_live_abs_path: []u8,
+    corpus_ingest_live_files_abs_path: []u8,
+    corpus_ingest_live_manifest_abs_path: []u8,
     scratch_file_prefix: []u8,
 
     pub fn deinit(self: *Paths) void {
@@ -87,6 +95,14 @@ pub const Paths = struct {
         self.allocator.free(self.code_intel_cache_abs_path);
         self.allocator.free(self.patch_candidates_root_abs_path);
         self.allocator.free(self.patch_candidates_staged_abs_path);
+        self.allocator.free(self.task_sessions_root_abs_path);
+        self.allocator.free(self.corpus_ingest_root_abs_path);
+        self.allocator.free(self.corpus_ingest_staged_abs_path);
+        self.allocator.free(self.corpus_ingest_staged_files_abs_path);
+        self.allocator.free(self.corpus_ingest_staged_manifest_abs_path);
+        self.allocator.free(self.corpus_ingest_live_abs_path);
+        self.allocator.free(self.corpus_ingest_live_files_abs_path);
+        self.allocator.free(self.corpus_ingest_live_manifest_abs_path);
         self.allocator.free(self.scratch_file_prefix);
         self.* = undefined;
     }
@@ -272,6 +288,22 @@ pub fn resolvePaths(allocator: std.mem.Allocator, metadata: Metadata) !Paths {
     defer allocator.free(patch_candidates_root_rel);
     const patch_candidates_staged_rel = try std.fs.path.join(allocator, &.{ patch_candidates_root_rel, config.PATCH_CANDIDATE_STAGED_FILE_NAME });
     defer allocator.free(patch_candidates_staged_rel);
+    const task_sessions_root_rel = try std.fs.path.join(allocator, &.{ metadata.rel_root, config.TASK_SESSION_REL_DIR_NAME });
+    defer allocator.free(task_sessions_root_rel);
+    const corpus_ingest_root_rel = try std.fs.path.join(allocator, &.{ metadata.rel_root, config.CORPUS_INGEST_REL_DIR_NAME });
+    defer allocator.free(corpus_ingest_root_rel);
+    const corpus_ingest_staged_rel = try std.fs.path.join(allocator, &.{ corpus_ingest_root_rel, config.CORPUS_INGEST_STAGED_DIR_NAME });
+    defer allocator.free(corpus_ingest_staged_rel);
+    const corpus_ingest_staged_files_rel = try std.fs.path.join(allocator, &.{ corpus_ingest_staged_rel, config.CORPUS_INGEST_FILES_DIR_NAME });
+    defer allocator.free(corpus_ingest_staged_files_rel);
+    const corpus_ingest_staged_manifest_rel = try std.fs.path.join(allocator, &.{ corpus_ingest_staged_rel, config.CORPUS_INGEST_MANIFEST_FILE_NAME });
+    defer allocator.free(corpus_ingest_staged_manifest_rel);
+    const corpus_ingest_live_rel = try std.fs.path.join(allocator, &.{ corpus_ingest_root_rel, config.CORPUS_INGEST_LIVE_DIR_NAME });
+    defer allocator.free(corpus_ingest_live_rel);
+    const corpus_ingest_live_files_rel = try std.fs.path.join(allocator, &.{ corpus_ingest_live_rel, config.CORPUS_INGEST_FILES_DIR_NAME });
+    defer allocator.free(corpus_ingest_live_files_rel);
+    const corpus_ingest_live_manifest_rel = try std.fs.path.join(allocator, &.{ corpus_ingest_live_rel, config.CORPUS_INGEST_MANIFEST_FILE_NAME });
+    defer allocator.free(corpus_ingest_live_manifest_rel);
 
     const scratch_prefix = try std.fmt.allocPrint(allocator, "ghost-scratch-{s}-{s}", .{
         @tagName(metadata.kind),
@@ -311,6 +343,14 @@ pub fn resolvePaths(allocator: std.mem.Allocator, metadata: Metadata) !Paths {
         .code_intel_cache_abs_path = try config.getPath(allocator, code_intel_cache_rel),
         .patch_candidates_root_abs_path = try config.getPath(allocator, patch_candidates_root_rel),
         .patch_candidates_staged_abs_path = try config.getPath(allocator, patch_candidates_staged_rel),
+        .task_sessions_root_abs_path = try config.getPath(allocator, task_sessions_root_rel),
+        .corpus_ingest_root_abs_path = try config.getPath(allocator, corpus_ingest_root_rel),
+        .corpus_ingest_staged_abs_path = try config.getPath(allocator, corpus_ingest_staged_rel),
+        .corpus_ingest_staged_files_abs_path = try config.getPath(allocator, corpus_ingest_staged_files_rel),
+        .corpus_ingest_staged_manifest_abs_path = try config.getPath(allocator, corpus_ingest_staged_manifest_rel),
+        .corpus_ingest_live_abs_path = try config.getPath(allocator, corpus_ingest_live_rel),
+        .corpus_ingest_live_files_abs_path = try config.getPath(allocator, corpus_ingest_live_files_rel),
+        .corpus_ingest_live_manifest_abs_path = try config.getPath(allocator, corpus_ingest_live_manifest_rel),
         .scratch_file_prefix = scratch_prefix,
     };
 }

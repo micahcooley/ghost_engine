@@ -1,5 +1,7 @@
 const std = @import("std");
+const abstractions = @import("abstractions.zig");
 const code_intel = @import("code_intel.zig");
+const knowledge_pack_store = @import("knowledge_pack_store.zig");
 const mc = @import("inference.zig");
 const patch_candidates = @import("patch_candidates.zig");
 
@@ -197,6 +199,10 @@ fn renderCodeIntelExplanation(writer: anytype, result: *const code_intel.Result,
     if (result.invariant_model) |model| try writer.print("- invariant_model: {s}\n", .{model});
 
     try writeEvidenceSection(writer, "evidence", result.evidence, max_items);
+    try writeGroundingSection(writer, "grounding", result.grounding_traces, null, max_items);
+    try writeGroundingSection(writer, "reverse_grounding", result.reverse_grounding_traces, result.reverse_grounding_detail, max_items);
+    try writeCodeIntelPackInfluenceSection(writer, result, max_items);
+    try writePartialSupportSection(writer, result.partial_support, result.unresolved, max_items);
     try writeSubsystemSection(writer, result.affected_subsystems);
     try writeUnresolvedSection(writer, result.unresolved_detail);
 }
@@ -225,6 +231,8 @@ fn renderCodeIntelRefactorPlan(writer: anytype, result: *const code_intel.Result
     }
 
     try writeEvidenceSection(writer, "supporting_evidence", result.evidence, max_items);
+    try writeGroundingSection(writer, "reverse_grounding", result.reverse_grounding_traces, result.reverse_grounding_detail, max_items);
+    try writePartialSupportSection(writer, result.partial_support, result.unresolved, max_items);
     try writeUnresolvedSection(writer, result.unresolved_detail);
 }
 
@@ -254,6 +262,8 @@ fn renderCodeIntelContradictionReport(writer: anytype, result: *const code_intel
     }
 
     try writeEvidenceSection(writer, "supporting_evidence", result.evidence, max_items);
+    try writeGroundingSection(writer, "reverse_grounding", result.reverse_grounding_traces, result.reverse_grounding_detail, max_items);
+    try writePartialSupportSection(writer, result.partial_support, result.unresolved, max_items);
     try writeUnresolvedSection(writer, result.unresolved_detail);
 }
 
@@ -287,6 +297,7 @@ fn renderCodeIntelAlternatives(writer: anytype, result: *const code_intel.Result
 
 fn renderPatchExplanation(writer: anytype, result: *const patch_candidates.Result, status: ClaimStatus, max_items: usize) !void {
     const candidate = selectedSupportedCandidate(result);
+    const selected_validation = patch_candidates.selectedValidationState(result);
 
     try writer.writeAll("\n[summary]\n");
     if (status == .supported and candidate != null) {
@@ -297,6 +308,7 @@ fn renderPatchExplanation(writer: anytype, result: *const patch_candidates.Resul
     try writer.print("- refactor_plan_status: {s}\n", .{@tagName(result.refactor_plan_status)});
     try writer.print("- confidence: {d}\n", .{result.confidence});
     try writer.print("- stop_reason: {s}\n", .{@tagName(result.stop_reason)});
+    if (selected_validation) |state| try writer.print("- selected_verification_state: {s}\n", .{@tagName(state)});
     if (result.selected_strategy) |strategy| try writer.print("- selected_strategy: {s}\n", .{strategy});
     if (result.selected_scope) |scope| try writer.print("- selected_scope: {s}\n", .{scope});
     if (result.selected_refactor_scope) |scope| try writer.print("- selected_refactor_scope: {s}\n", .{scope});
@@ -309,18 +321,25 @@ fn renderPatchExplanation(writer: anytype, result: *const patch_candidates.Resul
 
     try writeSupportTraceSection(writer, "invariant_evidence", result.invariant_evidence, max_items);
     try writeSupportTraceSection(writer, "contradiction_evidence", result.contradiction_evidence, max_items);
+    try writePatchPackInfluenceSection(writer, result, max_items);
+    try writePartialSupportSection(writer, result.partial_support, result.unresolved, max_items);
     try writeUnresolvedSection(writer, result.unresolved_detail);
 }
 
 fn renderPatchRefactorPlan(writer: anytype, result: *const patch_candidates.Result, status: ClaimStatus, max_items: usize) !void {
     const candidate = selectedSupportedCandidate(result) orelse preferredCandidate(result);
+    const selected_validation = patch_candidates.selectedValidationState(result);
 
     try writer.writeAll("\n[summary]\n");
     switch (status) {
-        .supported => try writer.writeAll("- supported_plan: the selected plan passed bounded proof verification on Linux.\n"),
+        .supported => if (selected_validation == .runtime_verified)
+            try writer.writeAll("- supported_plan: the selected plan passed bounded build/test verification and runtime oracle verification on Linux.\n")
+        else
+            try writer.writeAll("- supported_plan: the selected plan passed bounded build/test verification on Linux.\n"),
         .novel_but_unverified => try writer.writeAll("- exploratory_plan: the selected plan is a bounded draft candidate and is not verified fact.\n"),
         else => try writer.writeAll("- unresolved_plan: no bounded plan survived to a supportable final output.\n"),
     }
+    if (selected_validation) |state| try writer.print("- selected_verification_state: {s}\n", .{@tagName(state)});
     if (candidate) |item| {
         try writer.print("- candidate_id: {s}\n", .{item.id});
         try writer.print("- strategy: {s}\n", .{item.strategy});
@@ -353,6 +372,7 @@ fn renderPatchRefactorPlan(writer: anytype, result: *const patch_candidates.Resu
         try writeVerification(writer, item);
     }
 
+    try writePartialSupportSection(writer, result.partial_support, result.unresolved, max_items);
     try writeUnresolvedSection(writer, result.unresolved_detail);
 }
 
@@ -368,6 +388,7 @@ fn renderPatchContradictionReport(writer: anytype, result: *const patch_candidat
 
     try writeSupportTraceSection(writer, "contradictions", result.contradiction_evidence, max_items);
     try writeSupportTraceSection(writer, "invariant_context", result.invariant_evidence, max_items);
+    try writePartialSupportSection(writer, result.partial_support, result.unresolved, max_items);
     try writeUnresolvedSection(writer, result.unresolved_detail);
 }
 
@@ -418,6 +439,7 @@ fn renderPatchCodeChangeSummary(writer: anytype, result: *const patch_candidates
         try writer.writeAll("\n[verification]\n");
         try writeVerification(writer, item);
     }
+    try writePartialSupportSection(writer, result.partial_support, result.unresolved, max_items);
     try writeUnresolvedSection(writer, result.unresolved_detail);
 }
 
@@ -465,6 +487,45 @@ fn writeEvidenceSection(writer: anytype, section_name: []const u8, items: []cons
     }
 }
 
+fn writeGroundingSection(
+    writer: anytype,
+    section_name: []const u8,
+    items: []const code_intel.GroundingTrace,
+    detail: ?[]const u8,
+    max_items: usize,
+) !void {
+    try writer.print("\n[{s}]\n", .{section_name});
+    if (items.len == 0) {
+        try writer.writeAll("- none\n");
+        if (detail) |value| try writer.print("- detail: {s}\n", .{value});
+        return;
+    }
+
+    const count = @min(items.len, max_items);
+    for (items[0..count]) |item| {
+        const target = item.target_label orelse "unresolved";
+        const target_path = item.target_rel_path orelse item.source_spec;
+        try writer.print(
+            "- {s} -> {s}; relation={s}; score={d}; trust={s}; usable={s}; ambiguous={s}\n",
+            .{
+                item.surface,
+                target,
+                item.relation,
+                item.mapping_score,
+                abstractions.trustClassName(item.trust_class),
+                if (item.usable) "true" else "false",
+                if (item.ambiguous) "true" else "false",
+            },
+        );
+        try writer.print("- target_path: {s}\n", .{target_path});
+        try writer.print("- source: {s}\n", .{item.source_spec});
+        if (item.matched_source_spec) |matched_source_spec| try writer.print("- matched_source: {s}\n", .{matched_source_spec});
+        try writer.print("- lineage: {s}@{d}\n", .{ item.lineage_id, item.lineage_version });
+        if (item.detail) |item_detail| try writer.print("- detail: {s}\n", .{item_detail});
+    }
+    if (detail) |value| try writer.print("- selection_detail: {s}\n", .{value});
+}
+
 fn writeSupportTraceSection(writer: anytype, section_name: []const u8, items: []const patch_candidates.SupportTrace, max_items: usize) !void {
     try writer.print("\n[{s}]\n", .{section_name});
     if (items.len == 0) {
@@ -510,6 +571,96 @@ fn writeSupportTraceSection(writer: anytype, section_name: []const u8, items: []
     }
 }
 
+fn writeCodeIntelPackInfluenceSection(writer: anytype, result: *const code_intel.Result, max_items: usize) !void {
+    const stats = code_intel.collectPackInfluenceStats(result.evidence, result.abstraction_traces, result.pack_routing_traces, result.grounding_traces, result.reverse_grounding_traces);
+    try writer.writeAll("\n[pack_influence]\n");
+    try writer.print(
+        "- considered={d} activated={d} skipped={d} suppressed={d} conflict_refused={d} trust_blocked={d} stale_blocked={d}\n",
+        .{
+            stats.considered_count,
+            stats.activated_count,
+            stats.skipped_count,
+            stats.suppressed_count,
+            stats.conflict_refused_count,
+            stats.trust_blocked_count,
+            stats.stale_blocked_count,
+        },
+    );
+    try writer.print(
+        "- pack_derived evidence={d} abstractions={d} groundings={d} reverse_groundings={d} candidate_surfaces={d}\n",
+        .{
+            stats.evidence_count,
+            stats.abstraction_count,
+            stats.grounding_count,
+            stats.reverse_grounding_count,
+            stats.candidate_surface_count,
+        },
+    );
+    const count = @min(result.pack_routing_traces.len, max_items);
+    if (count == 0) {
+        try writer.writeAll("- none\n");
+        return;
+    }
+    for (result.pack_routing_traces[0..count]) |item| {
+        try writer.print(
+            "- {s}; status={s}; trust={s}; freshness={s}; category={s}; reason={s}\n",
+            .{
+                item.owner_id,
+                abstractions.packRoutingStatusName(item.status),
+                abstractions.trustClassName(item.trust_class),
+                knowledge_pack_store.packFreshnessName(item.freshness_state),
+                abstractions.packConflictCategoryName(item.conflict_category),
+                item.reason,
+            },
+        );
+    }
+}
+
+fn writePatchPackInfluenceSection(writer: anytype, result: *const patch_candidates.Result, max_items: usize) !void {
+    const stats = code_intel.collectPackInfluenceStats(result.source_pack_evidence, result.source_abstraction_traces, result.pack_routing_traces, result.grounding_traces, result.reverse_grounding_traces);
+    try writer.writeAll("\n[pack_influence]\n");
+    try writer.print(
+        "- considered={d} activated={d} skipped={d} suppressed={d} conflict_refused={d} trust_blocked={d} stale_blocked={d}\n",
+        .{
+            stats.considered_count,
+            stats.activated_count,
+            stats.skipped_count,
+            stats.suppressed_count,
+            stats.conflict_refused_count,
+            stats.trust_blocked_count,
+            stats.stale_blocked_count,
+        },
+    );
+    try writer.print(
+        "- pack_derived evidence={d} abstractions={d} groundings={d} reverse_groundings={d} candidate_surfaces={d}\n",
+        .{
+            stats.evidence_count,
+            stats.abstraction_count,
+            stats.grounding_count,
+            stats.reverse_grounding_count,
+            stats.candidate_surface_count,
+        },
+    );
+    const count = @min(result.pack_routing_traces.len, max_items);
+    if (count == 0) {
+        try writer.writeAll("- none\n");
+        return;
+    }
+    for (result.pack_routing_traces[0..count]) |item| {
+        try writer.print(
+            "- {s}; status={s}; trust={s}; freshness={s}; category={s}; reason={s}\n",
+            .{
+                item.owner_id,
+                abstractions.packRoutingStatusName(item.status),
+                abstractions.trustClassName(item.trust_class),
+                knowledge_pack_store.packFreshnessName(item.freshness_state),
+                abstractions.packConflictCategoryName(item.conflict_category),
+                item.reason,
+            },
+        );
+    }
+}
+
 fn writeSubsystemSection(writer: anytype, subsystems: anytype) !void {
     try writer.writeAll("\n[affected_subsystems]\n");
     if (subsystems.len == 0) {
@@ -517,6 +668,57 @@ fn writeSubsystemSection(writer: anytype, subsystems: anytype) !void {
         return;
     }
     for (subsystems) |item| try writer.print("- {s}\n", .{@tagName(item)});
+}
+
+fn writePartialSupportSection(
+    writer: anytype,
+    partial_support: code_intel.PartialSupport,
+    unresolved: code_intel.UnresolvedSupport,
+    max_items: usize,
+) !void {
+    try writer.writeAll("\n[partial_support]\n");
+    try writer.print("- lattice: {s}\n", .{@tagName(partial_support.lattice)});
+    try writer.writeAll("- non_authorizing: true\n");
+    try writer.print(
+        "- blocking: ambiguous={s} contradicted={s} insufficient={s} stale={s} out_of_scope={s}\n",
+        .{
+            if (partial_support.blocking.ambiguous) "true" else "false",
+            if (partial_support.blocking.contradicted) "true" else "false",
+            if (partial_support.blocking.insufficient) "true" else "false",
+            if (partial_support.blocking.stale) "true" else "false",
+            if (partial_support.blocking.out_of_scope) "true" else "false",
+        },
+    );
+
+    try writer.writeAll("\n[partial_findings]\n");
+    if (unresolved.partial_findings.len == 0) {
+        try writer.writeAll("- none\n");
+    } else {
+        const count = @min(unresolved.partial_findings.len, max_items);
+        try writer.writeAll("- non_authorizing_partial: bounded partial findings are preserved as data only and must not be summarized as final conclusions.\n");
+        for (unresolved.partial_findings[0..count]) |item| {
+            try writer.print("- {s}; kind={s}; scope={s}; provenance={s}\n", .{
+                item.label,
+                @tagName(item.kind),
+                item.scope,
+                item.provenance,
+            });
+        }
+    }
+
+    try writer.writeAll("\n[missing_obligations]\n");
+    if (unresolved.missing_obligations.len == 0) {
+        try writer.writeAll("- none\n");
+    } else {
+        const count = @min(unresolved.missing_obligations.len, max_items);
+        for (unresolved.missing_obligations[0..count]) |item| {
+            if (item.detail) |detail| {
+                try writer.print("- {s}; scope={s}; detail={s}\n", .{ item.label, item.scope, detail });
+            } else {
+                try writer.print("- {s}; scope={s}\n", .{ item.label, item.scope });
+            }
+        }
+    }
 }
 
 fn writeUnresolvedSection(writer: anytype, detail: ?[]const u8) !void {
@@ -539,6 +741,16 @@ fn writeCandidateSummary(writer: anytype, candidate: *const patch_candidates.Can
     if (candidate.status_reason) |reason| try writer.print("- status_reason: {s}\n", .{reason});
     if (candidate.verification.proof_reason) |reason| try writer.print("- proof_reason: {s}\n", .{reason});
 
+    try writer.writeAll("\n[selected_candidate_rewrite_operators]\n");
+    if (candidate.rewrite_operators.len == 0) {
+        try writer.writeAll("- none\n");
+    } else {
+        const operator_count = @min(candidate.rewrite_operators.len, max_items);
+        for (candidate.rewrite_operators[0..operator_count]) |operator_kind| {
+            try writer.print("- {s}\n", .{patch_candidates.rewriteOperatorName(operator_kind)});
+        }
+    }
+
     try writer.writeAll("\n[selected_candidate_files]\n");
     if (candidate.files.len == 0) {
         try writer.writeAll("- none\n");
@@ -549,6 +761,7 @@ fn writeCandidateSummary(writer: anytype, candidate: *const patch_candidates.Can
 }
 
 fn writeVerification(writer: anytype, candidate: *const patch_candidates.Candidate) !void {
+    try writer.print("- validation_state: {s}\n", .{@tagName(candidate.validation_state)});
     try writer.print("- build_state: {s}\n", .{@tagName(candidate.verification.build.state)});
     if (candidate.verification.build.command) |command| try writer.print("- build_command: {s}\n", .{command});
     if (candidate.verification.build.summary) |summary| try writer.print("- build_summary: {s}\n", .{summary});
@@ -558,6 +771,14 @@ fn writeVerification(writer: anytype, candidate: *const patch_candidates.Candida
     try writer.print("- runtime_state: {s}\n", .{@tagName(candidate.verification.runtime_step.state)});
     if (candidate.verification.runtime_step.command) |command| try writer.print("- runtime_command: {s}\n", .{command});
     if (candidate.verification.runtime_step.summary) |summary| try writer.print("- runtime_summary: {s}\n", .{summary});
+    if (candidate.verification.repair_plans.len > 0) {
+        const first_plan = candidate.verification.repair_plans[0];
+        try writer.print("- repair_plan_count: {d}\n", .{candidate.verification.repair_plans.len});
+        try writer.print("- first_repair_strategy: {s}\n", .{patch_candidates.repairStrategyName(first_plan.strategy)});
+        try writer.print("- first_repair_expected_target: {s}\n", .{@tagName(first_plan.expected_verification_target)});
+        try writer.print("- first_repair_lineage: {s} -> {s}\n", .{ first_plan.lineage_parent_id, first_plan.descendant_id });
+        try writer.print("- first_repair_outcome: {s}\n", .{patch_candidates.repairPlanOutcomeName(first_plan.outcome)});
+    }
     if (candidate.verification.refinements.len > 0) {
         try writer.print("- refinement_count: {d}\n", .{candidate.verification.refinements.len});
         const first = candidate.verification.refinements[0];
@@ -646,10 +867,6 @@ test "code_intel exploratory alternatives stay labeled novel_but_unverified" {
     const allocator = std.testing.allocator;
 
     var target_candidates = try allocator.alloc(code_intel.CandidateTrace, 1);
-    defer {
-        allocator.free(target_candidates[0].label);
-        allocator.free(target_candidates);
-    }
     target_candidates[0] = .{
         .label = try allocator.dupe(u8, "src/engine.zig"),
         .score = 210,
@@ -695,11 +912,13 @@ test "patch candidate refactor plan exposes proof-backed support" {
     var candidates = try allocator.alloc(patch_candidates.Candidate, 1);
     candidates[0] = .{
         .id = try allocator.dupe(u8, "cand-1"),
+        .source_intent = try allocator.dupe(u8, "technical_drafts"),
+        .action_surface = try allocator.dupe(u8, "seam_adapter"),
         .summary = try allocator.dupe(u8, "Add deterministic draft renderer"),
         .strategy = try allocator.dupe(u8, "seam_adapter"),
         .scope = try allocator.dupe(u8, "focused_single_surface"),
         .status = .supported,
-        .validation_state = .verified_supported,
+        .validation_state = .build_test_verified,
         .exploration_rank = 1,
         .score = 260,
         .files = files,
@@ -741,5 +960,76 @@ test "patch candidate refactor plan exposes proof-backed support" {
 
     try std.testing.expect(std.mem.indexOf(u8, rendered, "claim_status: supported") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "supported_plan") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "selected_verification_state: build_test_verified") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "edit src/technical_drafts.zig:40-48") != null);
+}
+
+test "patch candidate refactor plan labels runtime verified outcomes explicitly" {
+    const allocator = std.testing.allocator;
+
+    var files = try allocator.alloc([]u8, 1);
+    files[0] = try allocator.dupe(u8, "src/patch_candidates.zig");
+
+    var hunks = try allocator.alloc(patch_candidates.PatchHunk, 1);
+    hunks[0] = .{
+        .rel_path = try allocator.dupe(u8, "src/patch_candidates.zig"),
+        .anchor_line = 100,
+        .start_line = 98,
+        .end_line = 104,
+        .diff = try allocator.dupe(u8, "@@"),
+    };
+
+    var candidates = try allocator.alloc(patch_candidates.Candidate, 1);
+    candidates[0] = .{
+        .id = try allocator.dupe(u8, "cand-runtime"),
+        .source_intent = try allocator.dupe(u8, "patch_candidates"),
+        .action_surface = try allocator.dupe(u8, "local_guard"),
+        .summary = try allocator.dupe(u8, "Runtime oracle verified wrapper activation"),
+        .strategy = try allocator.dupe(u8, "local_guard"),
+        .scope = try allocator.dupe(u8, "focused_single_surface"),
+        .status = .supported,
+        .validation_state = .runtime_verified,
+        .exploration_rank = 1,
+        .score = 280,
+        .files = files,
+        .hunks = hunks,
+        .verification = .{
+            .build = .{ .state = .passed, .summary = try allocator.dupe(u8, "zig build passed") },
+            .test_step = .{ .state = .passed, .summary = try allocator.dupe(u8, "zig build test passed") },
+            .runtime_step = .{ .state = .passed, .summary = try allocator.dupe(u8, "runtime oracle runtime_symbol_check passed") },
+            .proof_score = 280,
+            .proof_confidence = 280,
+            .proof_reason = try allocator.dupe(u8, "proof mode selected this runtime-verified survivor"),
+        },
+    };
+
+    var result = patch_candidates.Result{
+        .allocator = allocator,
+        .status = .supported,
+        .query_kind = .breaks_if,
+        .target = try allocator.dupe(u8, "patch_candidates"),
+        .request_label = try allocator.dupe(u8, "runtime oracle plan"),
+        .repo_root = try allocator.dupe(u8, "/repo"),
+        .shard_id = try allocator.dupe(u8, "core"),
+        .shard_root = try allocator.dupe(u8, "/repo/platforms/linux/x86_64/state/shards/core/core"),
+        .shard_kind = .core,
+        .stop_reason = .none,
+        .confidence = 280,
+        .refactor_plan_status = .verified_supported,
+        .selected_strategy = try allocator.dupe(u8, "local_guard"),
+        .selected_scope = try allocator.dupe(u8, "focused_single_surface"),
+        .selected_refactor_scope = try allocator.dupe(u8, "focused_single_surface"),
+        .selected_candidate_id = try allocator.dupe(u8, "cand-runtime"),
+        .code_intel_result_path = try allocator.dupe(u8, "/repo/last_result.json"),
+        .caps = .{},
+        .candidates = candidates,
+    };
+    defer result.deinit();
+
+    const rendered = try render(allocator, .{ .patch_candidates = &result }, .{ .draft_type = .refactor_plan });
+    defer allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "runtime oracle verification on Linux") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "selected_verification_state: runtime_verified") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "runtime_state: passed") != null);
 }

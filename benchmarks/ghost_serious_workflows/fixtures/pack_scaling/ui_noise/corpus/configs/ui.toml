@@ -1,0 +1,4 @@
+[ui]
+theme = "light"
+palette = "coastal"
+refresh_ms = 16

@@ -281,6 +281,7 @@ fn crystallizeStateAndExit() noreturn {
         global_scratchpad = null;
         sys.printOut("[TEARDOWN] Scratchpad released.\n");
     }
+    panic_dump.clearRuntimeContext();
 
     if (global_state_shard) |*state_shard| {
         state_shard.deinit();
@@ -418,6 +419,12 @@ pub fn main_wrapped(allocator: std.mem.Allocator) !void {
 
     try executeBootSigil(allocator, &sigil_control, meaning_matrix, &soul);
     sys.print("[REASONING] Active mode: {s}\n", .{sigil_runtime.reasoningModeName(sigil_control.snapshot().reasoning_mode)});
+    panic_dump.noteRuntimeContext(
+        global_state_shard.?.paths.metadata.kind,
+        global_state_shard.?.paths.metadata.id,
+        global_state_shard.?.paths.root_abs_path,
+        sigil_control.snapshot().reasoning_mode,
+    );
     try global_state_shard.?.paged_lattice.setCacheCap(selectedLatticeCacheCap(&sigil_control));
 
     global_lattice_provider = ghost_state.LatticeProvider.initPaged(&global_state_shard.?.paged_lattice);

@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 if [ "${1:-}" = "build" ] && [ "${2:-}" = "test" ]; then
-  count=$(grep -R -h "GHOST-PATCH-CANDIDATE" "$PWD/src" | wc -l | tr -d ' ')
-  if [ "$count" -gt 1 ]; then
+  count=$(grep -R -h "__ghost_c2_impl" "$PWD/src" | wc -l | tr -d ' ')
+  if [ "$count" -gt 2 ]; then
     echo "broader runtime hypothesis contradicted expected invariant" >&2
     exit 1
   fi

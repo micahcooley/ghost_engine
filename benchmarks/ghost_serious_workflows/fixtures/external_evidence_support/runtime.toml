@@ -1,0 +1,4 @@
+[runtime]
+mode = "safe"
+worker_file = "worker.zig"
+

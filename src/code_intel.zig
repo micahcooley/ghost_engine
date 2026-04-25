@@ -1,7 +1,13 @@
 const std = @import("std");
 const mc = @import("inference.zig");
+const compute_budget = @import("compute_budget.zig");
+const knowledge_pack_store = @import("knowledge_pack_store.zig");
 const abstractions = @import("abstractions.zig");
+const corpus_ingest = @import("corpus_ingest.zig");
+const external_evidence = @import("external_evidence.zig");
+const panic_dump = @import("panic_dump.zig");
 const shards = @import("shards.zig");
+const support_routing = @import("support_routing.zig");
 const sys = @import("sys.zig");
 const task_intent = @import("task_intent.zig");
 
@@ -15,6 +21,9 @@ pub const Options = struct {
     repo_root: []const u8,
     project_shard: ?[]const u8 = null,
     reasoning_mode: mc.ReasoningMode = .proof,
+    compute_budget_request: compute_budget.Request = .{},
+    effective_budget: compute_budget.Effective = compute_budget.resolve(.{}),
+    pack_conflict_policy: abstractions.PackConflictPolicy = .{},
     query_kind: QueryKind,
     target: []const u8,
     other_target: ?[]const u8 = null,
@@ -35,7 +44,7 @@ pub const CacheLifecycle = enum {
     warm_refresh,
 };
 
-const CACHE_MAGIC = "GCIDX3";
+const CACHE_MAGIC = "GCIDX4";
 const CACHE_INDEX_FILE_NAME = "index_v1.gcix";
 const MAX_INDEXED_FILE_BYTES = 2 * 1024 * 1024;
 const INVARIANT_MODEL_NAME = "bounded_semantic_invariants_v1";
@@ -49,7 +58,36 @@ const MAX_SYMBOLIC_LOOKUP_TOKENS: usize = 8;
 const MAX_GROUNDING_PATTERNS: usize = 8;
 const MAX_GROUNDING_DECLS: usize = 8;
 const MAX_GROUNDING_TRACES: usize = 6;
+const MAX_SYMBOLIC_PARSE_STAGES: usize = 4;
+const MAX_SYMBOLIC_FRAGMENTS_PER_LINE: usize = 4;
+const MAX_SYMBOLIC_PARSE_AMBIGUITY_OPTIONS: usize = 4;
+const MAX_SYMBOLIC_NOISE_PER_FILE: usize = 24;
+const MAX_UNRESOLVED_SYMBOLIC_NOISE: usize = 4;
+const MAX_ROUTING_SUPPRESSIONS: usize = 12;
+const MAX_REVERSE_GROUNDING_DUPLICATES: usize = 8;
+const MAX_REINFORCEMENT_EVENTS_PER_RUN: usize = 8;
+const MAX_REINFORCEMENT_RECORDS_PER_RUN: usize = 4;
 const MIN_GROUNDING_SCORE: u32 = 280;
+const MIN_REVERSE_GROUNDING_SCORE: u32 = 260;
+const REINFORCED_GROUNDING_BONUS: u32 = 160;
+
+const SourceFamily = enum {
+    code,
+    docs,
+    config,
+    logs,
+    tests,
+    other,
+};
+
+const FamilyQuota = struct {
+    code: usize = 3,
+    docs: usize = 2,
+    config: usize = 2,
+    logs: usize = 1,
+    tests: usize = 1,
+    other: usize = 1,
+};
 
 const DeclKind = enum {
     function,
@@ -105,6 +143,17 @@ const SymbolicClass = enum {
     config_like,
     markup_like,
     dsl_like,
+};
+
+const SymbolicParseStage = enum {
+    strict_structured,
+    robust_structured,
+    delimiter_structured,
+    fallback_fragment,
+};
+
+const ParserCascadePlan = struct {
+    prefer_robust: bool = false,
 };
 
 const TargetKind = enum {
@@ -243,6 +292,26 @@ const CachedDeferredEdgeRecord = struct {
     }
 };
 
+const CachedSuppressedNoiseRecord = struct {
+    label: []u8,
+    reason: []u8,
+    line: u32,
+
+    fn clone(self: CachedSuppressedNoiseRecord, allocator: std.mem.Allocator) !CachedSuppressedNoiseRecord {
+        return .{
+            .label = try allocator.dupe(u8, self.label),
+            .reason = try allocator.dupe(u8, self.reason),
+            .line = self.line,
+        };
+    }
+
+    fn deinit(self: *CachedSuppressedNoiseRecord, allocator: std.mem.Allocator) void {
+        allocator.free(self.label);
+        allocator.free(self.reason);
+        self.* = undefined;
+    }
+};
+
 const CachedFileRecord = struct {
     allocator: std.mem.Allocator,
     rel_path: []u8,
@@ -255,6 +324,7 @@ const CachedFileRecord = struct {
     references: std.ArrayList(CachedReferenceRecord),
     semantic_edges: std.ArrayList(CachedSemanticEdgeRecord),
     deferred_edges: std.ArrayList(CachedDeferredEdgeRecord),
+    suppressed_noise: std.ArrayList(CachedSuppressedNoiseRecord),
 
     fn init(allocator: std.mem.Allocator, rel_path: []u8, subsystem: Subsystem, size_bytes: u64, mtime_ns: i128) CachedFileRecord {
         return .{
@@ -269,6 +339,7 @@ const CachedFileRecord = struct {
             .references = std.ArrayList(CachedReferenceRecord).init(allocator),
             .semantic_edges = std.ArrayList(CachedSemanticEdgeRecord).init(allocator),
             .deferred_edges = std.ArrayList(CachedDeferredEdgeRecord).init(allocator),
+            .suppressed_noise = std.ArrayList(CachedSuppressedNoiseRecord).init(allocator),
         };
     }
 
@@ -287,6 +358,7 @@ const CachedFileRecord = struct {
         for (self.references.items) |item| try out.references.append(try item.clone(allocator));
         for (self.semantic_edges.items) |item| try out.semantic_edges.append(try item.clone(allocator));
         for (self.deferred_edges.items) |item| try out.deferred_edges.append(try item.clone(allocator));
+        for (self.suppressed_noise.items) |item| try out.suppressed_noise.append(try item.clone(allocator));
         return out;
     }
 
@@ -296,12 +368,14 @@ const CachedFileRecord = struct {
         for (self.references.items) |*item| item.deinit(self.allocator);
         for (self.semantic_edges.items) |*item| item.deinit(self.allocator);
         for (self.deferred_edges.items) |*item| item.deinit(self.allocator);
+        for (self.suppressed_noise.items) |*item| item.deinit(self.allocator);
         self.allocator.free(self.rel_path);
         self.imports.deinit();
         self.declarations.deinit();
         self.references.deinit();
         self.semantic_edges.deinit();
         self.deferred_edges.deinit();
+        self.suppressed_noise.deinit();
         self.* = undefined;
     }
 };
@@ -311,10 +385,12 @@ const RepoScanEntry = struct {
     abs_path: []u8,
     size_bytes: u64,
     mtime_ns: i128,
+    corpus_meta: ?corpus_ingest.CorpusMeta = null,
 
     fn deinit(self: *RepoScanEntry, allocator: std.mem.Allocator) void {
         allocator.free(self.rel_path);
         allocator.free(self.abs_path);
+        if (self.corpus_meta) |*meta| meta.deinit();
         self.* = undefined;
     }
 };
@@ -377,6 +453,13 @@ const ReferenceRecord = struct {
     line: u32,
 };
 
+const IndexedSuppressedNoise = struct {
+    rel_path: []u8,
+    label: []u8,
+    reason: []u8,
+    line: u32,
+};
+
 const SemanticEdge = struct {
     kind: SemanticEdgeKind,
     source_file_index: u32,
@@ -392,6 +475,8 @@ const RepoIndex = struct {
     declarations: std.ArrayList(DeclRecord),
     references: std.ArrayList(ReferenceRecord),
     semantic_edges: std.ArrayList(SemanticEdge),
+    symbolic_noise: std.ArrayList(IndexedSuppressedNoise),
+    corpus_meta: std.StringHashMap(corpus_ingest.CorpusMeta),
 
     fn fromCache(allocator: std.mem.Allocator, repo_root: []const u8, cached_files: []const CachedFileRecord) !RepoIndex {
         var index = RepoIndex{
@@ -401,6 +486,8 @@ const RepoIndex = struct {
             .declarations = std.ArrayList(DeclRecord).init(allocator),
             .references = std.ArrayList(ReferenceRecord).init(allocator),
             .semantic_edges = std.ArrayList(SemanticEdge).init(allocator),
+            .symbolic_noise = std.ArrayList(IndexedSuppressedNoise).init(allocator),
+            .corpus_meta = std.StringHashMap(corpus_ingest.CorpusMeta).init(allocator),
         };
         errdefer index.deinit();
 
@@ -435,6 +522,15 @@ const RepoIndex = struct {
                     .name = try allocator.dupe(u8, reference.name),
                     .file_index = file_index,
                     .line = reference.line,
+                });
+            }
+
+            for (cached_file.suppressed_noise.items) |noise| {
+                try index.symbolic_noise.append(.{
+                    .rel_path = try allocator.dupe(u8, cached_file.rel_path),
+                    .label = try allocator.dupe(u8, noise.label),
+                    .reason = try allocator.dupe(u8, noise.reason),
+                    .line = noise.line,
                 });
             }
 
@@ -482,10 +578,22 @@ const RepoIndex = struct {
         for (self.files.items) |*file| file.deinit(self.allocator);
         for (self.declarations.items) |decl| self.allocator.free(decl.name);
         for (self.references.items) |reference| self.allocator.free(reference.name);
+        for (self.symbolic_noise.items) |item| {
+            self.allocator.free(item.rel_path);
+            self.allocator.free(item.label);
+            self.allocator.free(item.reason);
+        }
         self.files.deinit();
         self.declarations.deinit();
         self.references.deinit();
         self.semantic_edges.deinit();
+        self.symbolic_noise.deinit();
+        var corpus_it = self.corpus_meta.iterator();
+        while (corpus_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit();
+        }
+        self.corpus_meta.deinit();
         self.allocator.free(self.repo_root);
     }
 };
@@ -553,6 +661,7 @@ pub const CandidateTrace = struct {
 
 pub const AbstractionTrace = struct {
     label: []const u8,
+    family: abstractions.Family,
     source_spec: []const u8,
     tier: abstractions.Tier,
     category: abstractions.Category,
@@ -565,6 +674,9 @@ pub const AbstractionTrace = struct {
     lookup_score: u16,
     direct_support_count: u16,
     lineage_support_count: u16,
+    trust_class: abstractions.TrustClass,
+    lineage_id: []const u8,
+    lineage_version: u32,
     consensus_hash: u64,
     usable: bool,
     reuse_decision: abstractions.ReuseDecision,
@@ -573,20 +685,32 @@ pub const AbstractionTrace = struct {
     conflict_concept: ?[]const u8 = null,
     conflict_owner_id: ?[]const u8 = null,
     conflict_owner_kind: ?shards.Kind = null,
+    pack_outcome: abstractions.PackRoutingStatus = .skipped,
+    pack_conflict_category: abstractions.PackConflictCategory = .none,
     supporting_concept: ?[]const u8 = null,
     parent_concept: ?[]const u8 = null,
 };
 
+pub const SymbolicLinkDirection = enum {
+    symbolic_to_code,
+    code_to_symbolic,
+};
+
 pub const GroundingTrace = struct {
+    direction: SymbolicLinkDirection,
     surface: []const u8,
     concept: []const u8,
     source_spec: []const u8,
+    matched_source_spec: ?[]const u8 = null,
     selection_mode: abstractions.SelectionMode,
     owner_kind: shards.Kind,
     owner_id: []const u8,
     relation: []const u8,
     lookup_score: u16,
     confidence_score: u16,
+    trust_class: abstractions.TrustClass,
+    lineage_id: []const u8,
+    lineage_version: u32,
     token_support_count: u16,
     pattern_support_count: u16,
     source_support_count: u16,
@@ -602,20 +726,50 @@ pub const GroundingTrace = struct {
     detail: ?[]const u8 = null,
 };
 
+pub const CorpusTrace = struct {
+    class_name: []const u8,
+    source_rel_path: []const u8,
+    source_label: []const u8,
+    provenance: []const u8,
+    trust_class: abstractions.TrustClass,
+    lineage_id: []const u8,
+    lineage_version: u32,
+};
+
 pub const SupportNodeKind = enum {
     output,
     shard,
+    pack,
     intent,
     reasoning,
     execution,
+    rewrite_operator,
     target_candidate,
     query_hypothesis,
     evidence,
     contradiction,
     abstraction,
     grounding,
+    reverse_grounding,
+    external_evidence,
     handoff,
     gap,
+    fragment,
+    scoped_claim,
+    obligation,
+    ambiguity_set,
+    partial_finding,
+    freshness_check,
+    artifact,
+    entity,
+    relation,
+    verifier_hook,
+    verifier_adapter,
+    verifier_run,
+    verifier_evidence,
+    verifier_failure,
+    action_surface,
+    routing_candidate,
 };
 
 pub const SupportEdgeKind = enum {
@@ -627,8 +781,175 @@ pub const SupportEdgeKind = enum {
     supported_by,
     checked_by,
     grounded_by,
+    explained_by,
     handoff_from,
     blocked_by,
+    contains,
+    scoped_by,
+    requires,
+    suppressed_by,
+    freshness_checked_by,
+    artifact_sourced_from,
+    fragment_of,
+    entity_from_fragment,
+    relates_to,
+    verified_by,
+    required_by,
+    verifies,
+    discharges,
+    failed_by,
+    produced_evidence,
+};
+
+pub const PartialSupportLevel = enum {
+    void,
+    fragmentary,
+    scoped,
+    locally_verified,
+};
+
+pub const BlockingFlags = struct {
+    ambiguous: bool = false,
+    contradicted: bool = false,
+    insufficient: bool = false,
+    stale: bool = false,
+    out_of_scope: bool = false,
+
+    pub fn any(self: BlockingFlags) bool {
+        return self.ambiguous or self.contradicted or self.insufficient or self.stale or self.out_of_scope;
+    }
+};
+
+pub const PartialSupport = struct {
+    lattice: PartialSupportLevel = .void,
+    blocking: BlockingFlags = .{},
+    non_authorizing: bool = true,
+};
+
+pub const PartialFindingKind = enum {
+    fragment,
+    scoped_claim,
+    locally_verified,
+};
+
+pub const PartialFinding = struct {
+    kind: PartialFindingKind,
+    label: []const u8,
+    scope: []const u8,
+    provenance: []const u8,
+    rel_path: ?[]const u8 = null,
+    line: u32 = 0,
+    detail: ?[]const u8 = null,
+    non_authorizing: bool = true,
+
+    pub fn deinit(self: *PartialFinding, allocator: std.mem.Allocator) void {
+        allocator.free(self.label);
+        allocator.free(self.scope);
+        allocator.free(self.provenance);
+        if (self.rel_path) |rel_path| allocator.free(rel_path);
+        if (self.detail) |detail| allocator.free(detail);
+        self.* = undefined;
+    }
+};
+
+pub const AmbiguityOption = struct {
+    label: []const u8,
+    rel_path: ?[]const u8 = null,
+    line: u32 = 0,
+    detail: ?[]const u8 = null,
+
+    pub fn deinit(self: *AmbiguityOption, allocator: std.mem.Allocator) void {
+        allocator.free(self.label);
+        if (self.rel_path) |rel_path| allocator.free(rel_path);
+        if (self.detail) |detail| allocator.free(detail);
+        self.* = undefined;
+    }
+};
+
+pub const AmbiguitySet = struct {
+    label: []const u8,
+    scope: []const u8,
+    reason: ?[]const u8 = null,
+    options: []AmbiguityOption = &.{},
+
+    pub fn deinit(self: *AmbiguitySet, allocator: std.mem.Allocator) void {
+        allocator.free(self.label);
+        allocator.free(self.scope);
+        if (self.reason) |reason| allocator.free(reason);
+        for (self.options) |*option| option.deinit(allocator);
+        allocator.free(self.options);
+        self.* = undefined;
+    }
+};
+
+pub const MissingObligation = struct {
+    label: []const u8,
+    scope: []const u8,
+    detail: ?[]const u8 = null,
+
+    pub fn deinit(self: *MissingObligation, allocator: std.mem.Allocator) void {
+        allocator.free(self.label);
+        allocator.free(self.scope);
+        if (self.detail) |detail| allocator.free(detail);
+        self.* = undefined;
+    }
+};
+
+pub const SuppressedNoise = struct {
+    label: []const u8,
+    reason: []const u8,
+    rel_path: ?[]const u8 = null,
+    line: u32 = 0,
+
+    pub fn deinit(self: *SuppressedNoise, allocator: std.mem.Allocator) void {
+        allocator.free(self.label);
+        allocator.free(self.reason);
+        if (self.rel_path) |rel_path| allocator.free(rel_path);
+        self.* = undefined;
+    }
+};
+
+pub const FreshnessState = enum {
+    not_needed,
+    pending,
+    stale,
+};
+
+pub const FreshnessCheck = struct {
+    label: []const u8,
+    scope: []const u8,
+    state: FreshnessState = .not_needed,
+    detail: ?[]const u8 = null,
+
+    pub fn deinit(self: *FreshnessCheck, allocator: std.mem.Allocator) void {
+        allocator.free(self.label);
+        allocator.free(self.scope);
+        if (self.detail) |detail| allocator.free(detail);
+        self.* = undefined;
+    }
+};
+
+pub const UnresolvedSupport = struct {
+    allocator: std.mem.Allocator,
+    partial_findings: []PartialFinding = &.{},
+    ambiguity_sets: []AmbiguitySet = &.{},
+    missing_obligations: []MissingObligation = &.{},
+    suppressed_noise: []SuppressedNoise = &.{},
+    freshness_checks: []FreshnessCheck = &.{},
+
+    pub fn deinit(self: *UnresolvedSupport) void {
+        for (self.partial_findings) |*item| item.deinit(self.allocator);
+        if (self.partial_findings.len != 0) self.allocator.free(self.partial_findings);
+        for (self.ambiguity_sets) |*item| item.deinit(self.allocator);
+        if (self.ambiguity_sets.len != 0) self.allocator.free(self.ambiguity_sets);
+        for (self.missing_obligations) |*item| item.deinit(self.allocator);
+        if (self.missing_obligations.len != 0) self.allocator.free(self.missing_obligations);
+        for (self.suppressed_noise) |*item| item.deinit(self.allocator);
+        if (self.suppressed_noise.len != 0) self.allocator.free(self.suppressed_noise);
+        for (self.freshness_checks) |*item| item.deinit(self.allocator);
+        if (self.freshness_checks.len != 0) self.allocator.free(self.freshness_checks);
+        self.* = undefined;
+    }
 };
 
 pub const SupportGraphNode = struct {
@@ -652,6 +973,7 @@ pub const SupportGraph = struct {
     allocator: std.mem.Allocator,
     permission: Status = .unresolved,
     minimum_met: bool = false,
+    partial_support: PartialSupport = .{},
     flow_mode: []const u8 = "",
     unresolved_reason: ?[]const u8 = null,
     nodes: []SupportGraphNode = &.{},
@@ -670,10 +992,17 @@ pub const SupportGraph = struct {
         }
         if (self.flow_mode.len > 0) self.allocator.free(self.flow_mode);
         if (self.unresolved_reason) |reason| self.allocator.free(reason);
-        self.allocator.free(self.nodes);
-        self.allocator.free(self.edges);
+        if (self.nodes.len != 0) self.allocator.free(self.nodes);
+        if (self.edges.len != 0) self.allocator.free(self.edges);
         self.* = undefined;
     }
+};
+
+pub const ExternalEvidenceOutcome = struct {
+    state: external_evidence.AcquisitionState,
+    considered_reason: []const u8,
+    improved_support: bool,
+    unresolved_detail: ?[]const u8 = null,
 };
 
 pub const Subject = struct {
@@ -682,6 +1011,7 @@ pub const Subject = struct {
     line: u32,
     kind_name: []const u8,
     subsystem: []const u8,
+    corpus: ?CorpusTrace = null,
 };
 
 pub const Evidence = struct {
@@ -689,6 +1019,8 @@ pub const Evidence = struct {
     line: u32,
     reason: []const u8,
     subsystem: []const u8,
+    routing: ?[]const u8 = null,
+    corpus: ?CorpusTrace = null,
 };
 
 pub const ContradictionTrace = struct {
@@ -732,25 +1064,50 @@ pub const Result = struct {
     target_candidates: []CandidateTrace = &.{},
     query_hypotheses: []CandidateTrace = &.{},
     abstraction_traces: []AbstractionTrace = &.{},
+    pack_routing_traces: []abstractions.PackRoutingTrace = &.{},
+    pack_routing_caps: abstractions.PackRoutingCaps = .{},
+    pack_conflict_policy: abstractions.PackConflictPolicy = .{},
+    routing_trace: support_routing.Trace = .{ .allocator = undefined },
+    effective_budget: compute_budget.Effective = compute_budget.resolve(.{}),
+    budget_exhaustion: ?compute_budget.Exhaustion = null,
     grounding_traces: []GroundingTrace = &.{},
+    reverse_grounding_traces: []GroundingTrace = &.{},
+    reverse_grounding_state: GroundingState = .none,
+    reverse_grounding_detail: ?[]const u8 = null,
+    routing_suppressed: []SuppressedNoise = &.{},
+    partial_support: PartialSupport = .{},
+    unresolved: UnresolvedSupport = .{ .allocator = undefined },
     support_graph: SupportGraph = .{ .allocator = undefined },
+    profile: Profile = .{},
 
     pub fn deinit(self: *Result) void {
         if (self.primary) |subject| {
             self.allocator.free(subject.name);
             self.allocator.free(subject.rel_path);
+            if (subject.corpus) |corpus| deinitCorpusTrace(self.allocator, corpus);
         }
         if (self.secondary) |subject| {
             self.allocator.free(subject.name);
             self.allocator.free(subject.rel_path);
+            if (subject.corpus) |corpus| deinitCorpusTrace(self.allocator, corpus);
         }
-        for (self.evidence) |item| self.allocator.free(item.rel_path);
+        for (self.evidence) |item| {
+            self.allocator.free(item.rel_path);
+            if (item.routing) |routing| self.allocator.free(routing);
+            if (item.corpus) |corpus| deinitCorpusTrace(self.allocator, corpus);
+        }
         for (self.contradiction_traces) |item| {
             self.allocator.free(item.rel_path);
             if (item.owner) |owner| self.allocator.free(owner);
         }
-        for (self.refactor_path) |item| self.allocator.free(item.rel_path);
-        for (self.overlap) |item| self.allocator.free(item.rel_path);
+        for (self.refactor_path) |item| {
+            self.allocator.free(item.rel_path);
+            if (item.corpus) |corpus| deinitCorpusTrace(self.allocator, corpus);
+        }
+        for (self.overlap) |item| {
+            self.allocator.free(item.rel_path);
+            if (item.corpus) |corpus| deinitCorpusTrace(self.allocator, corpus);
+        }
         self.allocator.free(self.evidence);
         self.allocator.free(self.contradiction_traces);
         self.allocator.free(self.refactor_path);
@@ -762,26 +1119,28 @@ pub const Result = struct {
             self.allocator.free(trace.label);
             self.allocator.free(trace.source_spec);
             self.allocator.free(trace.owner_id);
+            self.allocator.free(trace.lineage_id);
             if (trace.conflict_concept) |conflict_concept| self.allocator.free(conflict_concept);
             if (trace.conflict_owner_id) |conflict_owner_id| self.allocator.free(conflict_owner_id);
             if (trace.supporting_concept) |supporting_concept| self.allocator.free(supporting_concept);
             if (trace.parent_concept) |parent_concept| self.allocator.free(parent_concept);
         }
+        for (self.pack_routing_traces) |*trace| trace.deinit();
+        self.routing_trace.deinit();
+        if (self.budget_exhaustion) |*exhaustion| exhaustion.deinit();
         for (self.grounding_traces) |trace| {
-            self.allocator.free(trace.surface);
-            self.allocator.free(trace.concept);
-            self.allocator.free(trace.source_spec);
-            self.allocator.free(trace.owner_id);
-            self.allocator.free(trace.relation);
-            if (trace.target_label) |target_label| self.allocator.free(target_label);
-            if (trace.target_rel_path) |target_rel_path| self.allocator.free(target_rel_path);
-            if (trace.target_kind) |target_kind| self.allocator.free(target_kind);
-            if (trace.detail) |detail| self.allocator.free(detail);
+            deinitGroundingTrace(self.allocator, trace);
         }
+        for (self.reverse_grounding_traces) |trace| deinitGroundingTrace(self.allocator, trace);
         self.allocator.free(self.target_candidates);
         self.allocator.free(self.query_hypotheses);
         self.allocator.free(self.abstraction_traces);
-        self.allocator.free(self.grounding_traces);
+        self.allocator.free(self.pack_routing_traces);
+        if (self.grounding_traces.len != 0) self.allocator.free(self.grounding_traces);
+        if (self.reverse_grounding_traces.len != 0) self.allocator.free(self.reverse_grounding_traces);
+        for (self.routing_suppressed) |*item| item.deinit(self.allocator);
+        if (self.routing_suppressed.len != 0) self.allocator.free(self.routing_suppressed);
+        self.unresolved.deinit();
         self.support_graph.deinit();
         self.allocator.free(self.query_target);
         if (self.query_other_target) |other| self.allocator.free(other);
@@ -789,51 +1148,106 @@ pub const Result = struct {
         self.allocator.free(self.shard_root);
         self.allocator.free(self.shard_id);
         if (self.unresolved_detail) |detail| self.allocator.free(detail);
+        if (self.reverse_grounding_detail) |detail| self.allocator.free(detail);
         if (self.intent) |*intent| intent.deinit();
         self.* = undefined;
     }
+};
+
+pub const Profile = struct {
+    repo_scan_ms: u64 = 0,
+    cache_refresh_ms: u64 = 0,
+    index_materialize_ms: u64 = 0,
+    support_graph_ms: u64 = 0,
+    json_render_ms: u64 = 0,
+    persist_ms: u64 = 0,
+    panic_dump_ms: u64 = 0,
+    pack_mount_resolve_ms: u64 = 0,
+    pack_manifest_preview_load_ms: u64 = 0,
+    pack_routing_ms: u64 = 0,
+    pack_catalog_load_ms: u64 = 0,
+    routing_index_build_ms: u64 = 0,
 };
 
 const IndexLoadResult = struct {
     index: RepoIndex,
     lifecycle: CacheLifecycle,
     changed_files: u32,
+    repo_scan_ms: u64 = 0,
+    cache_refresh_ms: u64 = 0,
+    index_materialize_ms: u64 = 0,
 };
 
 pub fn run(allocator: std.mem.Allocator, options: Options) !Result {
-    const repo_root = try normalizeRootPath(allocator, options.repo_root);
-    errdefer allocator.free(repo_root);
+    var effective_options = options;
+    effective_options.effective_budget = compute_budget.resolve(options.compute_budget_request);
+
+    var repo_root_owned: ?[]u8 = try normalizeRootPath(allocator, options.repo_root);
+    errdefer if (repo_root_owned) |repo_root| allocator.free(repo_root);
 
     var shard_paths = try resolveSelectedShardPaths(allocator, options.project_shard);
     defer shard_paths.deinit();
 
-    var loaded = try loadRepoIndex(allocator, repo_root, &shard_paths, options.cache_persist);
+    var loaded = try loadRepoIndex(allocator, repo_root_owned.?, &shard_paths, options.cache_persist);
     defer loaded.index.deinit();
 
+    abstractions.resetLookupProfile();
     var result = try switch (options.query_kind) {
-        .impact => queryImpact(allocator, &loaded.index, &shard_paths, options),
-        .breaks_if => queryBreaksIf(allocator, &loaded.index, &shard_paths, options),
-        .contradicts => queryContradicts(allocator, &loaded.index, &shard_paths, options),
+        .impact => queryImpact(allocator, &loaded.index, &shard_paths, effective_options),
+        .breaks_if => queryBreaksIf(allocator, &loaded.index, &shard_paths, effective_options),
+        .contradicts => queryContradicts(allocator, &loaded.index, &shard_paths, effective_options),
     };
     errdefer result.deinit();
 
-    result.repo_root = repo_root;
+    result.repo_root = repo_root_owned.?;
+    repo_root_owned = null;
     result.shard_root = try allocator.dupe(u8, shard_paths.root_abs_path);
     result.shard_id = try allocator.dupe(u8, shard_paths.metadata.id);
     result.shard_kind = shard_paths.metadata.kind;
     result.cache_lifecycle = loaded.lifecycle;
     result.cache_changed_files = loaded.changed_files;
+    result.profile.repo_scan_ms = loaded.repo_scan_ms;
+    result.profile.cache_refresh_ms = loaded.cache_refresh_ms;
+    result.profile.index_materialize_ms = loaded.index_materialize_ms;
+    const lookup_profile = abstractions.readLookupProfile();
+    result.profile.pack_mount_resolve_ms = lookup_profile.pack_mount_resolve_ms;
+    result.profile.pack_manifest_preview_load_ms = lookup_profile.pack_manifest_preview_load_ms;
+    result.profile.pack_routing_ms = lookup_profile.pack_routing_ms;
+    result.profile.pack_catalog_load_ms = lookup_profile.pack_catalog_load_ms;
     result.reasoning_mode = options.reasoning_mode;
+    result.pack_conflict_policy = options.pack_conflict_policy;
+    result.effective_budget = effective_options.effective_budget;
+    result.pack_routing_caps = packRoutingCapsFromBudget(effective_options.effective_budget);
     result.layer1_file_count = @intCast(loaded.index.files.items.len);
     result.layer1_decl_count = @intCast(loaded.index.declarations.items.len);
     if (options.intent) |intent| result.intent = try intent.clone(allocator);
     try enforceSupportPermission(allocator, &result);
+    try deriveCodeIntelPartialSupport(allocator, &loaded.index, &result);
+    const support_graph_started = sys.getMilliTick();
     result.support_graph = try buildCodeIntelSupportGraph(allocator, &result);
+    result.profile.support_graph_ms = sys.getMilliTick() - support_graph_started;
+    try enforceBudgetBounds(allocator, &result);
+    _ = try applyProgressiveReinforcement(allocator, &loaded.index, &shard_paths, &result);
+
+    const panic_artifact_path = if (options.persist)
+        try std.fs.path.join(allocator, &.{ shard_paths.code_intel_root_abs_path, "last_result.json" })
+    else
+        null;
+    defer if (panic_artifact_path) |path| allocator.free(path);
+    defer {
+        const panic_started = sys.getMilliTick();
+        panic_dump.captureCodeIntelResult(allocator, &result, panic_artifact_path) catch {};
+        result.profile.panic_dump_ms = sys.getMilliTick() - panic_started;
+    }
 
     if (options.persist) {
+        const render_started = sys.getMilliTick();
         const rendered = try renderJson(allocator, &result);
+        result.profile.json_render_ms = sys.getMilliTick() - render_started;
         defer allocator.free(rendered);
+        const persist_started = sys.getMilliTick();
         try persistResult(allocator, &shard_paths, options, rendered);
+        result.profile.persist_ms = sys.getMilliTick() - persist_started;
     }
 
     return result;
@@ -843,11 +1257,12 @@ fn reasoningPolicy(mode: mc.ReasoningMode) mc.ReasoningPolicy {
     return mc.policyForMode(mode);
 }
 
-fn reasoningBranchCap(mode: mc.ReasoningMode) usize {
-    return switch (mode) {
+fn reasoningBranchCap(mode: mc.ReasoningMode, budget: compute_budget.Effective) usize {
+    const mode_cap: usize = switch (mode) {
         .proof => 5,
         .exploratory => 8,
     };
+    return @min(mode_cap, budget.max_branches);
 }
 
 fn codeIntelLayer3Config(mode: mc.ReasoningMode, min_score: u32, max_branches: u32) mc.Layer3Config {
@@ -857,6 +1272,104 @@ fn codeIntelLayer3Config(mode: mc.ReasoningMode, min_score: u32, max_branches: u
         .max_branches = max_branches,
         .policy = reasoningPolicy(mode),
     };
+}
+
+fn packRoutingCapsFromBudget(budget: compute_budget.Effective) abstractions.PackRoutingCaps {
+    return .{
+        .max_considered_per_query = budget.max_mounted_packs_considered,
+        .max_activated_per_query = budget.max_packs_activated,
+        .max_candidate_surfaces_per_query = budget.max_pack_candidate_surfaces,
+    };
+}
+
+fn setBudgetExhaustion(
+    allocator: std.mem.Allocator,
+    result: *Result,
+    limit: compute_budget.Limit,
+    stage: compute_budget.Stage,
+    used: u64,
+    limit_value: u64,
+    detail: []const u8,
+    skipped: []const u8,
+) !void {
+    if (result.budget_exhaustion != null) return;
+    result.status = .unresolved;
+    result.stop_reason = .budget;
+    if (result.unresolved_detail) |existing| allocator.free(existing);
+    result.unresolved_detail = try std.fmt.allocPrint(
+        allocator,
+        "compute budget exhausted: {s} hit during {s}; {s}",
+        .{ compute_budget.limitName(limit), compute_budget.stageName(stage), detail },
+    );
+    result.budget_exhaustion = try compute_budget.Exhaustion.init(
+        allocator,
+        limit,
+        stage,
+        used,
+        limit_value,
+        detail,
+        skipped,
+    );
+}
+
+fn enforceBudgetBounds(allocator: std.mem.Allocator, result: *Result) !void {
+    if (result.stop_reason == .budget) return;
+
+    if (routingTraceHitConsideredBudget(result.routing_trace)) {
+        try setBudgetExhaustion(
+            allocator,
+            result,
+            .max_routing_entries_considered,
+            .support_aware_routing_index,
+            result.routing_trace.considered_count + result.routing_trace.skipped_count,
+            result.effective_budget.max_routing_entries_considered,
+            "support-aware routing index hit the visible considered-candidate cap",
+            "lower-bound routing candidates were preserved in trace and skipped before deeper reasoning",
+        );
+    }
+    if (result.unresolved.ambiguity_sets.len > result.effective_budget.max_ambiguity_sets) {
+        try setBudgetExhaustion(
+            allocator,
+            result,
+            .max_ambiguity_sets,
+            .code_intel_unresolved_support,
+            result.unresolved.ambiguity_sets.len,
+            result.effective_budget.max_ambiguity_sets,
+            "unresolved ambiguity tracking exceeded the visible compute tier",
+            "remaining ambiguity sets were not authorized for output",
+        );
+    }
+    if (result.unresolved.missing_obligations.len > result.effective_budget.max_graph_obligations) {
+        try setBudgetExhaustion(
+            allocator,
+            result,
+            .max_graph_obligations,
+            .code_intel_unresolved_support,
+            result.unresolved.missing_obligations.len,
+            result.effective_budget.max_graph_obligations,
+            "missing obligation growth exceeded the selected compute budget",
+            "remaining obligations were skipped and output stayed unresolved",
+        );
+    }
+    if (result.support_graph.nodes.len > result.effective_budget.max_graph_nodes) {
+        try setBudgetExhaustion(
+            allocator,
+            result,
+            .max_graph_nodes,
+            .code_intel_support_graph,
+            result.support_graph.nodes.len,
+            result.effective_budget.max_graph_nodes,
+            "support graph expansion exceeded the selected compute tier",
+            "remaining support nodes and edges were skipped",
+        );
+    }
+}
+
+fn routingTraceHitConsideredBudget(trace: support_routing.Trace) bool {
+    for (trace.entries) |entry| {
+        if (entry.skip_reason == .considered_budget) return true;
+    }
+    return false;
 }
 
 const BranchBiasMap = struct {
@@ -972,6 +1485,7 @@ fn buildAbstractionTraces(allocator: std.mem.Allocator, refs: []const abstractio
             allocator.free(trace.label);
             allocator.free(trace.source_spec);
             allocator.free(trace.owner_id);
+            allocator.free(trace.lineage_id);
             if (trace.conflict_concept) |conflict_concept| allocator.free(conflict_concept);
             if (trace.conflict_owner_id) |conflict_owner_id| allocator.free(conflict_owner_id);
             if (trace.supporting_concept) |supporting_concept| allocator.free(supporting_concept);
@@ -983,6 +1497,7 @@ fn buildAbstractionTraces(allocator: std.mem.Allocator, refs: []const abstractio
     for (refs, 0..) |reference, idx| {
         out[idx] = .{
             .label = try allocator.dupe(u8, reference.concept_id),
+            .family = reference.family,
             .source_spec = try allocator.dupe(u8, reference.source_spec),
             .tier = reference.tier,
             .category = reference.category,
@@ -995,6 +1510,9 @@ fn buildAbstractionTraces(allocator: std.mem.Allocator, refs: []const abstractio
             .lookup_score = reference.lookup_score,
             .direct_support_count = reference.direct_support_count,
             .lineage_support_count = reference.lineage_support_count,
+            .trust_class = reference.trust_class,
+            .lineage_id = try allocator.dupe(u8, reference.lineage_id),
+            .lineage_version = reference.lineage_version,
             .consensus_hash = reference.consensus_hash,
             .usable = reference.usable,
             .reuse_decision = reference.reuse_decision,
@@ -1003,6 +1521,8 @@ fn buildAbstractionTraces(allocator: std.mem.Allocator, refs: []const abstractio
             .conflict_concept = if (reference.conflict_concept_id) |conflict_concept_id| try allocator.dupe(u8, conflict_concept_id) else null,
             .conflict_owner_id = if (reference.conflict_owner_id) |conflict_owner_id| try allocator.dupe(u8, conflict_owner_id) else null,
             .conflict_owner_kind = reference.conflict_owner_kind,
+            .pack_outcome = reference.pack_outcome,
+            .pack_conflict_category = reference.pack_conflict_category,
             .supporting_concept = if (reference.supporting_concept_id) |supporting_concept_id| try allocator.dupe(u8, supporting_concept_id) else null,
             .parent_concept = if (reference.parent_concept_id) |parent_concept_id| try allocator.dupe(u8, parent_concept_id) else null,
         };
@@ -1025,6 +1545,10 @@ const GroundingRegion = struct {
     end_line: u32,
 };
 
+const GroundingFile = struct {
+    rel_path: []const u8,
+};
+
 const GroundingTargetAggregate = struct {
     target: ResolvedTarget,
     best_ref_index: usize,
@@ -1032,30 +1556,98 @@ const GroundingTargetAggregate = struct {
     support_count: u16 = 0,
 };
 
+const GroundingTargetMatch = struct {
+    target: ?ResolvedTarget = null,
+    ambiguous: bool = false,
+};
+
+fn deinitGroundingTrace(allocator: std.mem.Allocator, trace: GroundingTrace) void {
+    allocator.free(trace.surface);
+    allocator.free(trace.concept);
+    allocator.free(trace.source_spec);
+    if (trace.matched_source_spec) |matched_source_spec| allocator.free(matched_source_spec);
+    allocator.free(trace.owner_id);
+    allocator.free(trace.relation);
+    allocator.free(trace.lineage_id);
+    if (trace.target_label) |target_label| allocator.free(target_label);
+    if (trace.target_rel_path) |target_rel_path| allocator.free(target_rel_path);
+    if (trace.target_kind) |target_kind| allocator.free(target_kind);
+    if (trace.detail) |detail| allocator.free(detail);
+}
+
 const GroundingOutcome = struct {
     traces: []GroundingTrace = &.{},
     selected_target: ?ResolvedTarget = null,
     biases: BranchBiasMap = .{},
     state: GroundingState = .none,
     detail: ?[]const u8 = null,
+    suppressed_noise: []SuppressedNoise = &.{},
 
     fn deinit(self: *GroundingOutcome, allocator: std.mem.Allocator) void {
-        for (self.traces) |trace| {
-            allocator.free(trace.surface);
-            allocator.free(trace.concept);
-            allocator.free(trace.source_spec);
-            allocator.free(trace.owner_id);
-            allocator.free(trace.relation);
-            if (trace.target_label) |target_label| allocator.free(target_label);
-            if (trace.target_rel_path) |target_rel_path| allocator.free(target_rel_path);
-            if (trace.target_kind) |target_kind| allocator.free(target_kind);
-            if (trace.detail) |detail| allocator.free(detail);
-        }
-        allocator.free(self.traces);
+        for (self.traces) |trace| deinitGroundingTrace(allocator, trace);
+        if (self.traces.len != 0) allocator.free(self.traces);
+        for (self.suppressed_noise) |*item| item.deinit(allocator);
+        if (self.suppressed_noise.len != 0) allocator.free(self.suppressed_noise);
         if (self.detail) |detail| allocator.free(detail);
         self.* = .{};
     }
 };
+
+const ReverseGroundingOutcome = struct {
+    traces: []GroundingTrace = &.{},
+    state: GroundingState = .none,
+    detail: ?[]const u8 = null,
+    suppressed_noise: []SuppressedNoise = &.{},
+
+    fn deinit(self: *ReverseGroundingOutcome, allocator: std.mem.Allocator) void {
+        for (self.traces) |trace| deinitGroundingTrace(allocator, trace);
+        if (self.traces.len != 0) allocator.free(self.traces);
+        for (self.suppressed_noise) |*item| item.deinit(allocator);
+        if (self.suppressed_noise.len != 0) allocator.free(self.suppressed_noise);
+        if (self.detail) |detail| allocator.free(detail);
+        self.* = .{};
+    }
+};
+
+const RoutedEvidence = struct {
+    seeds: []EvidenceSeed = &.{},
+    routing_labels: [][]u8 = &.{},
+    suppressed_noise: []SuppressedNoise = &.{},
+    routing_trace: support_routing.Trace = .{ .allocator = undefined },
+
+    fn deinit(self: *RoutedEvidence, allocator: std.mem.Allocator) void {
+        allocator.free(self.seeds);
+        for (self.routing_labels) |item| allocator.free(item);
+        allocator.free(self.routing_labels);
+        for (self.suppressed_noise) |*item| item.deinit(allocator);
+        allocator.free(self.suppressed_noise);
+        self.routing_trace.deinit();
+        self.* = .{};
+    }
+};
+
+fn groundingStateName(state: GroundingState) []const u8 {
+    return @tagName(state);
+}
+
+fn mergeGroundingStates(left: GroundingState, right: GroundingState) GroundingState {
+    if (left == .ambiguous or right == .ambiguous) return .ambiguous;
+    if (left == .selected or right == .selected) return .selected;
+    if (left == .insufficient or right == .insufficient) return .insufficient;
+    return .none;
+}
+
+fn mergeGroundingDetail(allocator: std.mem.Allocator, left: ?[]const u8, right: ?[]const u8) !?[]u8 {
+    if (left == null and right == null) return null;
+    if (left) |value| {
+        if (right) |other| {
+            if (std.mem.eql(u8, value, other)) return try allocator.dupe(u8, value);
+            return try std.fmt.allocPrint(allocator, "{s} | {s}", .{ value, other });
+        }
+        return try allocator.dupe(u8, value);
+    }
+    return try allocator.dupe(u8, right.?);
+}
 
 fn lookupSymbolicGrounding(
     allocator: std.mem.Allocator,
@@ -1063,6 +1655,8 @@ fn lookupSymbolicGrounding(
     paths: *const shards.Paths,
     query_kind: QueryKind,
     target: ResolvedTarget,
+    budget: compute_budget.Effective,
+    pack_routing: ?*abstractions.PackRoutingCollector,
 ) !GroundingOutcome {
     if (!isSymbolicTarget(index, target)) return .{};
 
@@ -1083,10 +1677,13 @@ fn lookupSymbolicGrounding(
         .rel_paths = &rel_paths,
         .tokens = signal_tokens.items,
         .patterns = signal_patterns.items,
-        .max_items = MAX_GROUNDING_TRACES,
+        .max_items = @min(MAX_GROUNDING_TRACES, budget.max_pack_candidate_surfaces),
         .include_staged = false,
         .prefer_higher_tiers = true,
         .category_hint = abstractionCategoryHint(query_kind),
+        .pack_routing_stage = .grounding,
+        .pack_routing = pack_routing,
+        .pack_routing_caps = packRoutingCapsFromBudget(budget),
     });
     defer abstractions.deinitSupportReferences(allocator, grounding_refs);
 
@@ -1105,17 +1702,7 @@ fn lookupSymbolicGrounding(
     defer aggregates.deinit();
     var traces = std.ArrayList(GroundingTrace).init(allocator);
     errdefer {
-        for (traces.items) |trace| {
-            allocator.free(trace.surface);
-            allocator.free(trace.concept);
-            allocator.free(trace.source_spec);
-            allocator.free(trace.owner_id);
-            allocator.free(trace.relation);
-            if (trace.target_label) |target_label| allocator.free(target_label);
-            if (trace.target_rel_path) |target_rel_path| allocator.free(target_rel_path);
-            if (trace.target_kind) |target_kind| allocator.free(target_kind);
-            if (trace.detail) |detail| allocator.free(detail);
-        }
+        for (traces.items) |trace| deinitGroundingTrace(allocator, trace);
         traces.deinit();
     }
 
@@ -1124,8 +1711,16 @@ fn lookupSymbolicGrounding(
 
     for (grounding_refs, 0..) |reference, ref_index| {
         const target_match = resolveGroundingTarget(index, signal_tokens.items, reference.source_spec);
-        const mapping_score = if (target_match.target != null and reference.usable) computeGroundingMappingScore(index, signal_tokens.items, reference, target_match.target.?) else 0;
+        const reinforcement_bonus = if (target_match.target != null and reference.usable)
+            try groundingReinforcementBonus(allocator, paths, .symbolic_to_code, reference.concept_id, target_match.target.?, null)
+        else
+            0;
+        const mapping_score = if (target_match.target != null and reference.usable)
+            computeGroundingMappingScore(index, signal_tokens.items, reference, target_match.target.?) + reinforcement_bonus
+        else
+            0;
         try traces.append(.{
+            .direction = .symbolic_to_code,
             .surface = try allocator.dupe(u8, surface_label),
             .concept = try allocator.dupe(u8, reference.concept_id),
             .source_spec = try allocator.dupe(u8, reference.source_spec),
@@ -1135,6 +1730,9 @@ fn lookupSymbolicGrounding(
             .relation = try allocator.dupe(u8, groundingRelationName(target)),
             .lookup_score = reference.lookup_score,
             .confidence_score = reference.confidence_score,
+            .trust_class = reference.trust_class,
+            .lineage_id = try allocator.dupe(u8, reference.lineage_id),
+            .lineage_version = reference.lineage_version,
             .token_support_count = reference.token_support_count,
             .pattern_support_count = reference.pattern_support_count,
             .source_support_count = reference.source_support_count,
@@ -1193,9 +1791,423 @@ fn lookupSymbolicGrounding(
     }
 
     markAmbiguousGroundingTraces(traces.items, outcome.state == .ambiguous, if (aggregates.items.len > 0) aggregates.items[0].score else 0, 24);
+    if (traces.items.len > MAX_GROUNDING_TRACES) {
+        var idx = MAX_GROUNDING_TRACES;
+        while (idx < traces.items.len) : (idx += 1) {
+            deinitGroundingTrace(allocator, traces.items[idx]);
+        }
+        traces.shrinkRetainingCapacity(MAX_GROUNDING_TRACES);
+    }
     outcome.traces = try traces.toOwnedSlice();
-    if (outcome.traces.len > MAX_GROUNDING_TRACES) outcome.traces.len = MAX_GROUNDING_TRACES;
     return outcome;
+}
+
+fn lookupReverseSymbolicGrounding(
+    allocator: std.mem.Allocator,
+    index: *const RepoIndex,
+    paths: *const shards.Paths,
+    query_kind: QueryKind,
+    target: ResolvedTarget,
+    budget: compute_budget.Effective,
+    pack_routing: ?*abstractions.PackRoutingCollector,
+) !ReverseGroundingOutcome {
+    if (isSymbolicTarget(index, target)) return .{};
+
+    var signal_tokens = std.ArrayList([]const u8).init(allocator);
+    defer signal_tokens.deinit();
+    var signal_patterns = std.ArrayList([]const u8).init(allocator);
+    defer signal_patterns.deinit();
+    try collectReverseGroundingSignals(index, target, &signal_tokens, &signal_patterns);
+
+    const rel_paths = [_][]const u8{index.files.items[target.file_index].rel_path};
+    const reverse_refs = try abstractions.lookupReverseSymbolicLinks(allocator, paths, .{
+        .rel_paths = &rel_paths,
+        .tokens = signal_tokens.items,
+        .patterns = signal_patterns.items,
+        .max_items = @min(MAX_GROUNDING_TRACES * 3, budget.max_pack_candidate_surfaces * 3),
+        .include_staged = false,
+        .prefer_higher_tiers = true,
+        .category_hint = abstractionCategoryHint(query_kind),
+        .pack_routing_stage = .reverse_grounding,
+        .pack_routing = pack_routing,
+        .pack_routing_caps = packRoutingCapsFromBudget(budget),
+    });
+    defer abstractions.deinitReverseLinkReferences(allocator, reverse_refs);
+
+    var outcome = ReverseGroundingOutcome{};
+    errdefer outcome.deinit(allocator);
+
+    if (reverse_refs.len == 0) {
+        outcome.state = .insufficient;
+        outcome.detail = try allocator.dupe(u8, "no symbolic abstraction source explained the selected code/runtime target strongly enough");
+        return outcome;
+    }
+
+    var aggregates = std.ArrayList(GroundingTargetAggregate).init(allocator);
+    defer aggregates.deinit();
+    var traces = std.ArrayList(GroundingTrace).init(allocator);
+    errdefer {
+        for (traces.items) |trace| deinitGroundingTrace(allocator, trace);
+        traces.deinit();
+    }
+    var suppressed = std.ArrayList(SuppressedNoise).init(allocator);
+    errdefer {
+        for (suppressed.items) |*item| item.deinit(allocator);
+        suppressed.deinit();
+    }
+    var family_counts = FamilyQuota{ .code = 0, .docs = 0, .config = 0, .logs = 0, .tests = 0, .other = 0 };
+    const family_limits = FamilyQuota{};
+    var seen_consensus = std.AutoHashMap(u64, void).init(allocator);
+    defer seen_consensus.deinit();
+    const trust_floor = targetTrustClass(index, target);
+
+    const surface_label = try makeSubjectLabel(allocator, index, target);
+    defer allocator.free(surface_label);
+
+    for (reverse_refs, 0..) |reference, ref_index| {
+        const target_match = resolveReverseGroundingTarget(index, signal_tokens.items, signal_patterns.items, reference.symbolic_source_spec);
+        const reinforcement_bonus = if (target_match.target != null and reference.usable)
+            try groundingReinforcementBonus(allocator, paths, .code_to_symbolic, reference.concept_id, target_match.target.?, reference.symbolic_source_spec)
+        else
+            0;
+        const mapping_score = if (target_match.target != null and reference.usable)
+            computeReverseGroundingMappingScore(index, signal_tokens.items, signal_patterns.items, reference, target_match.target.?) + reinforcement_bonus
+        else
+            0;
+        const resolved_target = target_match.target;
+        const symbolic_rel_path = if (resolved_target) |resolved| index.files.items[resolved.file_index].rel_path else null;
+        const family = if (symbolic_rel_path) |rel_path| sourceFamilyForPath(index, rel_path) else .other;
+        const matched_source_anchor = std.mem.indexOf(u8, reference.matched_source_spec, std.fs.path.basename(index.files.items[target.file_index].rel_path)) != null or
+            (target.target_kind == .declaration and std.mem.indexOf(u8, reference.matched_source_spec, index.declarations.items[target.decl_index.?].name) != null);
+        const exact_anchor = matched_source_anchor or if (resolved_target) |resolved| symbolicTargetHasExactAnchor(index, resolved, signal_tokens.items, signal_patterns.items) else false;
+        const family_ok = if (resolved_target) |resolved|
+            targetFamilyCompatible(sourceFamilyForPath(index, index.files.items[target.file_index].rel_path), sourceFamilyForPath(index, index.files.items[resolved.file_index].rel_path)) or exact_anchor
+        else
+            false;
+        const trust_ok = trustClassAtLeast(reference.trust_class, trust_floor);
+        const duplicate = reference.consensus_hash != 0 and seen_consensus.contains(reference.consensus_hash);
+        const quota_exceeded = familyCount(family_counts, family) >= quotaForFamily(family_limits, family);
+
+        const detail = if (reference.conflict_kind != .none)
+            try allocator.dupe(u8, "reverse symbolic link was refused by a trust or cross-shard conflict")
+        else if (target_match.ambiguous)
+            try allocator.dupe(u8, "symbolic provenance mapped to multiple bounded symbolic surfaces")
+        else if (target_match.target == null)
+            try allocator.dupe(u8, "symbolic provenance did not resolve to an indexed symbolic surface")
+        else if (!trust_ok)
+            try allocator.dupe(u8, "reverse grounding was suppressed by the trust envelope")
+        else if (!family_ok)
+            try allocator.dupe(u8, "reverse grounding was suppressed by target-family compatibility gating")
+        else if (!exact_anchor)
+            try allocator.dupe(u8, "reverse grounding stayed exploratory because it did not attach to an exact path/symbol/section/key anchor")
+        else if (duplicate)
+            try allocator.dupe(u8, "reverse grounding duplicate was suppressed after an equivalent anchored source already survived")
+        else if (quota_exceeded)
+            try allocator.dupe(u8, "reverse grounding was suppressed by per-source-family routing quota")
+        else if (mapping_score < MIN_REVERSE_GROUNDING_SCORE)
+            try allocator.dupe(u8, "reverse grounding support stayed below the deterministic score floor")
+        else
+            null;
+
+        if (detail != null and symbolic_rel_path != null and suppressed.items.len < MAX_ROUTING_SUPPRESSIONS) {
+            try appendSuppressedNoiseBounded(allocator, &suppressed, symbolic_rel_path.?, detail.?, symbolic_rel_path, if (resolved_target) |resolved| subjectLine(index, resolved) else 0);
+        }
+
+        try traces.append(.{
+            .direction = .code_to_symbolic,
+            .surface = try allocator.dupe(u8, surface_label),
+            .concept = try allocator.dupe(u8, reference.concept_id),
+            .source_spec = try allocator.dupe(u8, reference.symbolic_source_spec),
+            .matched_source_spec = try allocator.dupe(u8, reference.matched_source_spec),
+            .selection_mode = reference.selection_mode,
+            .owner_kind = reference.owner_kind,
+            .owner_id = try allocator.dupe(u8, reference.owner_id),
+            .relation = try allocator.dupe(u8, reverseGroundingRelationName(target_match.target)),
+            .lookup_score = reference.lookup_score,
+            .confidence_score = reference.confidence_score,
+            .trust_class = reference.trust_class,
+            .lineage_id = try allocator.dupe(u8, reference.lineage_id),
+            .lineage_version = reference.lineage_version,
+            .token_support_count = reference.token_support_count,
+            .pattern_support_count = reference.pattern_support_count,
+            .source_support_count = reference.source_support_count,
+            .mapping_score = mapping_score,
+            .usable = reference.usable and
+                target_match.target != null and
+                !target_match.ambiguous and
+                trust_ok and
+                family_ok and
+                exact_anchor and
+                !duplicate and
+                !quota_exceeded and
+                mapping_score >= MIN_REVERSE_GROUNDING_SCORE,
+            .ambiguous = target_match.ambiguous,
+            .resolution = reference.resolution,
+            .conflict_kind = reference.conflict_kind,
+            .target_label = if (target_match.target) |resolved| try makeSubjectLabel(allocator, index, resolved) else null,
+            .target_rel_path = if (target_match.target) |resolved| try allocator.dupe(u8, index.files.items[resolved.file_index].rel_path) else null,
+            .target_line = if (target_match.target) |resolved| subjectLine(index, resolved) else 0,
+            .target_kind = if (target_match.target) |resolved| try allocator.dupe(u8, groundedTargetKindName(index, resolved)) else null,
+            .detail = detail,
+        });
+
+        if (!reference.usable or target_match.target == null or target_match.ambiguous or !trust_ok or !family_ok or !exact_anchor or duplicate or quota_exceeded or mapping_score < MIN_REVERSE_GROUNDING_SCORE) continue;
+        if (reference.consensus_hash != 0 and seen_consensus.count() < MAX_REVERSE_GROUNDING_DUPLICATES) try seen_consensus.put(reference.consensus_hash, {});
+        incrementFamilyCount(&family_counts, family);
+        try upsertGroundingAggregate(&aggregates, .{
+            .target = target_match.target.?,
+            .best_ref_index = ref_index,
+            .score = mapping_score,
+            .support_count = reference.token_support_count +| reference.pattern_support_count +| reference.source_support_count,
+        });
+    }
+
+    std.sort.heap(GroundingTargetAggregate, aggregates.items, index, lessThanGroundingAggregate);
+    if (aggregates.items.len == 0) {
+        outcome.state = .insufficient;
+        if (findAmbiguousGroundingTrace(traces.items)) {
+            outcome.state = .ambiguous;
+            outcome.detail = try allocator.dupe(u8, "reverse symbolic grounding tied across multiple symbolic surfaces");
+        } else if (hasConflictGroundingTrace(traces.items)) {
+            outcome.detail = try allocator.dupe(u8, "reverse symbolic grounding was blocked by a cross-shard conflict or trust refusal");
+        } else {
+            outcome.detail = try allocator.dupe(u8, "reverse symbolic grounding did not reach a deterministic symbolic mapping");
+        }
+    } else {
+        const top = aggregates.items[0];
+        if (hasEquivalentGroundingSupport(traces.items)) {
+            outcome.state = .ambiguous;
+            outcome.detail = try allocator.dupe(u8, "reverse symbolic grounding had equally supported symbolic surfaces");
+        } else if (aggregates.items.len > 1 and
+            top.score -| aggregates.items[1].score <= 24 and
+            !resolvedTargetsEqual(top.target, aggregates.items[1].target))
+        {
+            outcome.state = .ambiguous;
+            outcome.detail = try allocator.dupe(u8, "reverse symbolic grounding tied across multiple symbolic surfaces");
+        } else {
+            outcome.state = .selected;
+        }
+    }
+
+    markAmbiguousGroundingTraces(traces.items, outcome.state == .ambiguous, if (aggregates.items.len > 0) aggregates.items[0].score else 0, 24);
+    if (traces.items.len > MAX_GROUNDING_TRACES) {
+        var idx = MAX_GROUNDING_TRACES;
+        while (idx < traces.items.len) : (idx += 1) {
+            deinitGroundingTrace(allocator, traces.items[idx]);
+        }
+        traces.shrinkRetainingCapacity(MAX_GROUNDING_TRACES);
+    }
+    outcome.traces = try traces.toOwnedSlice();
+    outcome.suppressed_noise = try suppressed.toOwnedSlice();
+    return outcome;
+}
+
+fn collectReverseGroundingSignals(
+    index: *const RepoIndex,
+    target: ResolvedTarget,
+    tokens: *std.ArrayList([]const u8),
+    patterns: *std.ArrayList([]const u8),
+) !void {
+    const rel_path = index.files.items[target.file_index].rel_path;
+    try appendUniqueSignal(patterns, std.fs.path.stem(std.fs.path.basename(rel_path)), MAX_GROUNDING_PATTERNS);
+
+    switch (target.target_kind) {
+        .file => {
+            for (index.references.items) |reference| {
+                if (reference.file_index != target.file_index) continue;
+                try appendUniqueSignal(tokens, reference.name, MAX_SYMBOLIC_LOOKUP_TOKENS);
+                if (tokens.items.len >= MAX_SYMBOLIC_LOOKUP_TOKENS) break;
+            }
+        },
+        .declaration => {
+            const decl = index.declarations.items[target.decl_index.?];
+            if (decl.kind == .symbolic_unit) return;
+            try appendUniqueSignal(tokens, nativeLeafName(decl.name), MAX_SYMBOLIC_LOOKUP_TOKENS);
+            try appendUniqueSignal(patterns, nativeLeafName(decl.name), MAX_GROUNDING_PATTERNS);
+            try collectLineSignals(index, target.file_index, decl.line, tokens, MAX_SYMBOLIC_LOOKUP_TOKENS);
+        },
+    }
+}
+
+fn resolveReverseGroundingTarget(
+    index: *const RepoIndex,
+    signal_tokens: []const []const u8,
+    signal_patterns: []const []const u8,
+    source_spec: []const u8,
+) GroundingTargetMatch {
+    if (parseGroundingFile(source_spec)) |file_spec| {
+        const file_index = findFileIndexByRelPath(index, file_spec.rel_path) orelse return .{};
+        return resolveBestReverseSymbolicTargetInFile(index, file_index, signal_tokens, signal_patterns);
+    }
+
+    const region = parseGroundingRegion(source_spec) orelse return .{};
+    const file_index = findFileIndexByRelPath(index, region.rel_path) orelse return .{};
+
+    var best_decl: ?u32 = null;
+    var best_score: u32 = 0;
+    var ambiguous = false;
+    for (index.files.items[file_index].declaration_indexes.items) |decl_index| {
+        const decl = index.declarations.items[decl_index];
+        if (decl.kind != .symbolic_unit) continue;
+        if (decl.line < region.start_line or decl.line > region.end_line) continue;
+        const score = reverseSymbolicSurfaceScore(index, decl_index, signal_tokens, signal_patterns);
+        if (best_decl == null or score > best_score) {
+            best_decl = decl_index;
+            best_score = score;
+            ambiguous = false;
+        } else if (score == best_score and best_decl.? != decl_index) {
+            ambiguous = true;
+        }
+    }
+
+    if (best_decl) |decl_index| {
+        return .{
+            .target = .{
+                .target_kind = .declaration,
+                .file_index = file_index,
+                .decl_index = decl_index,
+                .confidence = best_score,
+            },
+            .ambiguous = ambiguous and best_score > 0,
+        };
+    }
+
+    return .{
+        .target = .{
+            .target_kind = .file,
+            .file_index = file_index,
+            .confidence = reverseFileSurfaceScore(index, file_index, signal_tokens, signal_patterns),
+        },
+    };
+}
+
+fn resolveBestReverseSymbolicTargetInFile(
+    index: *const RepoIndex,
+    file_index: u32,
+    signal_tokens: []const []const u8,
+    signal_patterns: []const []const u8,
+) GroundingTargetMatch {
+    var best_decl: ?u32 = null;
+    var best_score: u32 = 0;
+    var ambiguous = false;
+    var symbolic_decl_count: usize = 0;
+
+    for (index.files.items[file_index].declaration_indexes.items) |decl_index| {
+        const decl = index.declarations.items[decl_index];
+        if (decl.kind != .symbolic_unit) continue;
+        symbolic_decl_count += 1;
+        const score = reverseSymbolicSurfaceScore(index, decl_index, signal_tokens, signal_patterns);
+        if (best_decl == null or score > best_score) {
+            best_decl = decl_index;
+            best_score = score;
+            ambiguous = false;
+        } else if (score == best_score and best_decl.? != decl_index) {
+            ambiguous = true;
+        }
+    }
+
+    if (best_decl) |decl_index| {
+        if (ambiguous and best_score < 64 and symbolic_decl_count > 1) return .{ .ambiguous = true };
+        return .{
+            .target = .{
+                .target_kind = .declaration,
+                .file_index = file_index,
+                .decl_index = decl_index,
+                .confidence = best_score,
+            },
+            .ambiguous = ambiguous and best_score > 0,
+        };
+    }
+
+    return .{
+        .target = .{
+            .target_kind = .file,
+            .file_index = file_index,
+            .confidence = reverseFileSurfaceScore(index, file_index, signal_tokens, signal_patterns),
+        },
+    };
+}
+
+fn reverseSymbolicSurfaceScore(
+    index: *const RepoIndex,
+    decl_index: u32,
+    signal_tokens: []const []const u8,
+    signal_patterns: []const []const u8,
+) u32 {
+    const decl = index.declarations.items[decl_index];
+    if (decl.kind != .symbolic_unit) return 0;
+
+    var score: u32 = 140;
+    const leaf = symbolicLeafName(decl.name);
+    for (signal_patterns) |pattern| {
+        if (pattern.len == 0) continue;
+        if (std.mem.eql(u8, leaf, pattern)) {
+            score += 110;
+            continue;
+        }
+        if (std.mem.indexOf(u8, decl.name, pattern) != null or std.mem.indexOf(u8, leaf, pattern) != null) score += 28;
+    }
+    for (signal_tokens) |token| {
+        if (token.len < 2) continue;
+        if (std.mem.eql(u8, leaf, token)) {
+            score += 80;
+            continue;
+        }
+        if (std.mem.indexOf(u8, decl.name, token) != null or std.mem.indexOf(u8, leaf, token) != null) score += 24;
+    }
+    for (index.references.items) |reference| {
+        if (reference.file_index != index.declarations.items[decl_index].file_index or reference.line != decl.line) continue;
+        for (signal_tokens) |token| {
+            if (!std.mem.eql(u8, reference.name, token)) continue;
+            score += 36;
+            break;
+        }
+    }
+
+    if (std.mem.startsWith(u8, decl.name, "heading:")) score += 16;
+    if (std.mem.startsWith(u8, decl.name, "section:")) score += 18;
+    if (std.mem.startsWith(u8, decl.name, "item:")) score += 12;
+    if (std.mem.startsWith(u8, decl.name, "paragraph:")) score += 10;
+    return score;
+}
+
+fn reverseFileSurfaceScore(
+    index: *const RepoIndex,
+    file_index: u32,
+    signal_tokens: []const []const u8,
+    signal_patterns: []const []const u8,
+) u32 {
+    const rel_path = index.files.items[file_index].rel_path;
+    const stem = std.fs.path.stem(std.fs.path.basename(rel_path));
+    var score: u32 = 180;
+    for (signal_patterns) |pattern| {
+        if (std.mem.eql(u8, stem, pattern)) score += 60;
+    }
+    for (signal_tokens) |token| {
+        if (std.mem.eql(u8, stem, token)) score += 40;
+    }
+    return score;
+}
+
+fn computeReverseGroundingMappingScore(
+    index: *const RepoIndex,
+    signal_tokens: []const []const u8,
+    signal_patterns: []const []const u8,
+    reference: abstractions.ReverseLinkReference,
+    target: ResolvedTarget,
+) u32 {
+    return @as(u32, reference.lookup_score) + switch (target.target_kind) {
+        .file => reverseFileSurfaceScore(index, target.file_index, signal_tokens, signal_patterns),
+        .declaration => reverseSymbolicSurfaceScore(index, target.decl_index.?, signal_tokens, signal_patterns),
+    };
+}
+
+fn reverseGroundingRelationName(target: ?ResolvedTarget) []const u8 {
+    const resolved = target orelse return "internal_concept_to_symbolic_surface";
+    return switch (resolved.target_kind) {
+        .file => "internal_concept_to_symbolic_file",
+        .declaration => "internal_concept_to_symbolic_unit",
+    };
 }
 
 fn collectGroundingSignals(
@@ -1204,6 +2216,16 @@ fn collectGroundingSignals(
     tokens: *std.ArrayList([]const u8),
     patterns: *std.ArrayList([]const u8),
 ) !void {
+    if (target.target_kind == .file) {
+        const rel_path = index.files.items[target.file_index].rel_path;
+        try appendUniqueSignal(patterns, std.fs.path.stem(std.fs.path.basename(rel_path)), MAX_GROUNDING_PATTERNS);
+        for (index.references.items) |reference| {
+            if (reference.file_index != target.file_index) continue;
+            try appendUniqueSignal(tokens, reference.name, MAX_SYMBOLIC_LOOKUP_TOKENS);
+            if (tokens.items.len >= MAX_SYMBOLIC_LOOKUP_TOKENS) break;
+        }
+        return;
+    }
     if (target.target_kind != .declaration) return;
     const target_decl_index = target.decl_index.?;
     const decl = index.declarations.items[target_decl_index];
@@ -1242,7 +2264,17 @@ fn appendUniqueSignal(out: *std.ArrayList([]const u8), value: []const u8, max_it
     try out.append(value);
 }
 
-fn resolveGroundingTarget(index: *const RepoIndex, signal_tokens: []const []const u8, source_spec: []const u8) struct { target: ?ResolvedTarget = null, ambiguous: bool = false } {
+fn resolveGroundingTarget(index: *const RepoIndex, signal_tokens: []const []const u8, source_spec: []const u8) GroundingTargetMatch {
+    if (parseGroundingFile(source_spec)) |file_spec| {
+        const file_index = findFileIndexByRelPath(index, file_spec.rel_path) orelse return .{};
+        return .{
+            .target = .{
+                .target_kind = .file,
+                .file_index = file_index,
+                .confidence = 240,
+            },
+        };
+    }
     const region = parseGroundingRegion(source_spec) orelse return .{};
     const file_index = findFileIndexByRelPath(index, region.rel_path) orelse return .{};
 
@@ -1303,6 +2335,38 @@ fn computeGroundingMappingScore(
         groundingDeclSignalBonus(signal_tokens, index.declarations.items[decl_index].name);
 }
 
+fn groundingReinforcementBonus(
+    allocator: std.mem.Allocator,
+    paths: *const shards.Paths,
+    direction: SymbolicLinkDirection,
+    concept_id: []const u8,
+    target: ResolvedTarget,
+    source_spec: ?[]const u8,
+) !u32 {
+    var patterns_buf = std.ArrayList([]const u8).init(allocator);
+    defer patterns_buf.deinit();
+    try patterns_buf.append(concept_id);
+    try patterns_buf.append(switch (direction) {
+        .symbolic_to_code => "direction:symbolic_to_code",
+        .code_to_symbolic => "direction:code_to_symbolic",
+    });
+    if (source_spec) |value| try patterns_buf.append(value);
+    const target_kind = switch (target.target_kind) {
+        .file => "target_kind:file",
+        .declaration => "target_kind:declaration",
+    };
+    try patterns_buf.append(target_kind);
+
+    const refs = try abstractions.lookupFamilyConcepts(allocator, paths, .{
+        .family = .grounding_schema,
+        .patterns = patterns_buf.items,
+        .max_items = 1,
+    });
+    defer abstractions.deinitSupportReferences(allocator, refs);
+    if (refs.len == 0 or !refs[0].usable) return 0;
+    return REINFORCED_GROUNDING_BONUS;
+}
+
 fn groundingRelationName(target: ResolvedTarget) []const u8 {
     return switch (target.target_kind) {
         .file => "symbolic_file_to_internal_concept",
@@ -1345,13 +2409,48 @@ fn parseGroundingRegion(spec: []const u8) ?GroundingRegion {
     };
 }
 
+fn parseGroundingFile(spec: []const u8) ?GroundingFile {
+    if (!std.mem.startsWith(u8, spec, "file:")) return null;
+    const rel_path = std.mem.trim(u8, spec["file:".len..], " \r\n\t");
+    if (rel_path.len == 0) return null;
+    return .{ .rel_path = rel_path };
+}
+
 fn findFileIndexByRelPath(index: *const RepoIndex, rel_path: []const u8) ?u32 {
     for (index.files.items, 0..) |file, file_idx| {
-        if (std.mem.eql(u8, file.rel_path, rel_path) or std.mem.endsWith(u8, file.rel_path, rel_path)) {
+        if (std.mem.eql(u8, file.rel_path, rel_path) or
+            std.mem.endsWith(u8, file.rel_path, rel_path) or
+            corpusSourceAliasMatch(index, file.rel_path, rel_path, true) or
+            corpusSourceAliasMatch(index, file.rel_path, rel_path, false))
+        {
             return @intCast(file_idx);
         }
     }
     return null;
+}
+
+fn corpusSourceAliasMatch(index: *const RepoIndex, file_rel_path: []const u8, raw_path: []const u8, exact_only: bool) bool {
+    if (!std.mem.startsWith(u8, file_rel_path, corpus_ingest.CORPUS_REL_PREFIX)) return false;
+    const meta = lookupCorpusMeta(index, file_rel_path) orelse return false;
+
+    if (std.mem.eql(u8, meta.source_rel_path, raw_path)) return true;
+    if (!exact_only and std.mem.endsWith(u8, meta.source_rel_path, raw_path)) return true;
+
+    const alias_tail = corpusAliasTail(file_rel_path, raw_path) orelse return false;
+    if (std.mem.eql(u8, alias_tail, meta.source_rel_path)) return true;
+    if (!exact_only and std.mem.endsWith(u8, meta.source_rel_path, alias_tail)) return true;
+    return false;
+}
+
+fn corpusAliasTail(file_rel_path: []const u8, raw_path: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, raw_path, corpus_ingest.CORPUS_REL_PREFIX ++ "/")) return null;
+
+    const file_tail = file_rel_path[(corpus_ingest.CORPUS_REL_PREFIX.len + 1)..];
+    const raw_tail = raw_path[(corpus_ingest.CORPUS_REL_PREFIX.len + 1)..];
+    const file_slash = std.mem.indexOfScalar(u8, file_tail, '/') orelse return null;
+    const raw_slash = std.mem.indexOfScalar(u8, raw_tail, '/') orelse return null;
+    if (!std.mem.eql(u8, file_tail[0..file_slash], raw_tail[0..raw_slash])) return null;
+    return raw_tail[raw_slash + 1 ..];
 }
 
 fn upsertGroundingAggregate(out: *std.ArrayList(GroundingTargetAggregate), next: GroundingTargetAggregate) !void {
@@ -1381,6 +2480,13 @@ fn lessThanGroundingAggregate(index: *const RepoIndex, lhs: GroundingTargetAggre
 fn findAmbiguousGroundingTrace(items: []const GroundingTrace) bool {
     for (items) |item| {
         if (item.ambiguous) return true;
+    }
+    return false;
+}
+
+fn hasConflictGroundingTrace(items: []const GroundingTrace) bool {
+    for (items) |item| {
+        if (item.conflict_kind != .none) return true;
     }
     return false;
 }
@@ -1464,20 +2570,113 @@ fn appendUniqueRelPath(out: *std.ArrayList([]const u8), rel_path: []const u8, ma
     try out.append(rel_path);
 }
 
+const QueryAbstractionSignals = struct {
+    tokens: [][]u8,
+    patterns: [][]u8,
+
+    fn deinit(self: *QueryAbstractionSignals, allocator: std.mem.Allocator) void {
+        for (self.tokens) |item| allocator.free(item);
+        allocator.free(self.tokens);
+        for (self.patterns) |item| allocator.free(item);
+        allocator.free(self.patterns);
+        self.* = undefined;
+    }
+};
+
+fn buildQueryAbstractionSignals(
+    allocator: std.mem.Allocator,
+    target: []const u8,
+    other_target: ?[]const u8,
+    rel_paths: []const []const u8,
+) !QueryAbstractionSignals {
+    var tokens = std.ArrayList([]u8).init(allocator);
+    errdefer {
+        for (tokens.items) |item| allocator.free(item);
+        tokens.deinit();
+    }
+    var patterns = std.ArrayList([]u8).init(allocator);
+    errdefer {
+        for (patterns.items) |item| allocator.free(item);
+        patterns.deinit();
+    }
+
+    try collectQuerySignalParts(allocator, target, &tokens, &patterns);
+    if (other_target) |value| try collectQuerySignalParts(allocator, value, &tokens, &patterns);
+    for (rel_paths) |rel_path| {
+        try appendUniqueOwnedSignal(allocator, &tokens, std.fs.path.basename(rel_path));
+    }
+
+    return .{
+        .tokens = try tokens.toOwnedSlice(),
+        .patterns = try patterns.toOwnedSlice(),
+    };
+}
+
+fn collectQuerySignalParts(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    tokens: *std.ArrayList([]u8),
+    patterns: *std.ArrayList([]u8),
+) !void {
+    if (text.len == 0) return;
+    var split = std.mem.splitScalar(u8, text, ':');
+    const path_part = split.next() orelse text;
+    try appendUniqueOwnedSignal(allocator, tokens, std.fs.path.basename(path_part));
+    try appendUniqueOwnedSignal(allocator, patterns, path_part);
+    while (split.next()) |part| {
+        try appendUniqueOwnedSignal(allocator, tokens, part);
+        try appendUniqueOwnedSignal(allocator, patterns, part);
+    }
+}
+
+fn appendUniqueOwnedSignal(allocator: std.mem.Allocator, out: *std.ArrayList([]u8), value: []const u8) !void {
+    const trimmed = std.mem.trim(u8, value, " \r\n\t");
+    if (trimmed.len < 3) return;
+    for (out.items) |existing| {
+        if (std.mem.eql(u8, existing, trimmed)) return;
+    }
+    try out.append(try allocator.dupe(u8, trimmed));
+}
+
 fn lookupQueryAbstractions(
     allocator: std.mem.Allocator,
     paths: *const shards.Paths,
     query_kind: QueryKind,
     rel_paths: []const []const u8,
+    tokens: []const []const u8,
+    patterns: []const []const u8,
+    pack_routing: ?*abstractions.PackRoutingCollector,
+    pack_conflict_policy: abstractions.PackConflictPolicy,
+    budget: compute_budget.Effective,
     max_items: usize,
 ) ![]abstractions.SupportReference {
     return abstractions.lookupConcepts(allocator, paths, .{
         .rel_paths = rel_paths,
-        .max_items = @min(max_items, 4),
+        .tokens = tokens,
+        .patterns = patterns,
+        .max_items = @min(max_items, budget.max_pack_candidate_surfaces),
         .include_staged = false,
         .prefer_higher_tiers = true,
         .category_hint = abstractionCategoryHint(query_kind),
+        .pack_routing_stage = .support,
+        .pack_routing = pack_routing,
+        .pack_conflict_policy = pack_conflict_policy,
+        .pack_routing_caps = packRoutingCapsFromBudget(budget),
     });
+}
+
+fn routingCapsFromBudget(budget: compute_budget.Effective, max_items: usize) support_routing.Caps {
+    return .{
+        .max_considered = budget.max_routing_entries_considered,
+        .max_selected = @min(max_items, budget.max_routing_entries_selected),
+        .max_suppressed_traces = budget.max_routing_suppressed_traces,
+        .max_code = budget.max_routing_code_family,
+        .max_docs = budget.max_routing_docs_family,
+        .max_config = budget.max_routing_config_family,
+        .max_logs = budget.max_routing_logs_family,
+        .max_tests = budget.max_routing_tests_family,
+        .max_other = budget.max_routing_other_family,
+    };
 }
 
 fn countUsableAbstractionTraces(items: []const AbstractionTrace) usize {
@@ -1502,7 +2701,8 @@ fn supportEvidenceCount(result: *const Result) usize {
         result.overlap.len +
         result.contradiction_traces.len +
         countUsableAbstractionTraces(result.abstraction_traces) +
-        countUsableGroundingTraces(result.grounding_traces);
+        countUsableGroundingTraces(result.grounding_traces) +
+        countUsableGroundingTraces(result.reverse_grounding_traces);
 }
 
 fn supportDecisionCount(result: *const Result) usize {
@@ -1514,7 +2714,7 @@ fn buildMinimumSupportReason(allocator: std.mem.Allocator, result: *const Result
         return allocator.dupe(u8, "supported output lacked target or hypothesis selection traces");
     }
     if (supportEvidenceCount(result) == 0) {
-        return allocator.dupe(u8, "supported output lacked evidence, contradiction checks, abstraction support, or grounding support");
+        return allocator.dupe(u8, "supported output lacked evidence, contradiction checks, abstraction support, grounding support, or reverse-grounding support");
     }
     return allocator.dupe(u8, "supported output lacked the minimum bounded support required for final permission");
 }
@@ -1526,6 +2726,211 @@ fn enforceSupportPermission(allocator: std.mem.Allocator, result: *Result) !void
     result.stop_reason = .low_confidence;
     if (result.unresolved_detail) |detail| allocator.free(detail);
     result.unresolved_detail = try buildMinimumSupportReason(allocator, result);
+}
+
+fn applyProgressiveReinforcement(
+    allocator: std.mem.Allocator,
+    index: *const RepoIndex,
+    paths: *const shards.Paths,
+    result: *const Result,
+) !usize {
+    if (result.status != .supported or result.stop_reason != .none) return 0;
+
+    var events = std.ArrayList(abstractions.ReinforcementEvent).init(allocator);
+    defer {
+        for (events.items) |event| deinitOwnedReinforcementEvent(allocator, event);
+        events.deinit();
+    }
+
+    try collectParserSketchEvents(allocator, result, &events);
+    try collectGroundingSchemaEvents(allocator, result, &events);
+    try collectRouteSuppressorEvents(allocator, index, result, &events);
+    try collectClaimTemplateEvents(result, &events);
+
+    return abstractions.applyReinforcementEvents(allocator, paths, events.items, .{
+        .max_events = MAX_REINFORCEMENT_EVENTS_PER_RUN,
+        .max_new_records = MAX_REINFORCEMENT_RECORDS_PER_RUN,
+    });
+}
+
+fn appendOwnedReinforcementEvent(
+    allocator: std.mem.Allocator,
+    events: *std.ArrayList(abstractions.ReinforcementEvent),
+    event: abstractions.ReinforcementEvent,
+) !void {
+    try events.append(.{
+        .family = event.family,
+        .key = try allocator.dupe(u8, event.key),
+        .case_id = try allocator.dupe(u8, event.case_id),
+        .tier = event.tier,
+        .category = event.category,
+        .outcome = event.outcome,
+        .source_specs = try cloneOwnedStringSliceConst(allocator, event.source_specs),
+        .tokens = try cloneOwnedStringSliceConst(allocator, event.tokens),
+        .patterns = try cloneOwnedStringSliceConst(allocator, event.patterns),
+        .detail = if (event.detail) |detail| try allocator.dupe(u8, detail) else null,
+    });
+}
+
+fn cloneOwnedStringSliceConst(
+    allocator: std.mem.Allocator,
+    items: []const []const u8,
+) ![]const []const u8 {
+    const out = try allocator.alloc([]u8, items.len);
+    var copied: usize = 0;
+    errdefer {
+        for (out[0..copied]) |item| allocator.free(item);
+        allocator.free(out);
+    }
+    for (items, 0..) |item, idx| {
+        out[idx] = try allocator.dupe(u8, item);
+        copied += 1;
+    }
+    return out;
+}
+
+fn deinitOwnedReinforcementEvent(allocator: std.mem.Allocator, event: abstractions.ReinforcementEvent) void {
+    allocator.free(event.key);
+    allocator.free(event.case_id);
+    freeOwnedStringSliceConst(allocator, event.source_specs);
+    freeOwnedStringSliceConst(allocator, event.tokens);
+    freeOwnedStringSliceConst(allocator, event.patterns);
+    if (event.detail) |detail| allocator.free(detail);
+}
+
+fn freeOwnedStringSliceConst(allocator: std.mem.Allocator, items: []const []const u8) void {
+    for (items) |item| allocator.free(item);
+    allocator.free(@constCast(items));
+}
+
+fn collectParserSketchEvents(
+    allocator: std.mem.Allocator,
+    result: *const Result,
+    events: *std.ArrayList(abstractions.ReinforcementEvent),
+) !void {
+    for (result.reverse_grounding_traces) |trace| {
+        if (!trace.usable or trace.target_rel_path == null or trace.target_kind == null) continue;
+        if (!std.mem.eql(u8, trace.target_kind.?, "symbolic_unit")) continue;
+        if (std.mem.indexOf(u8, trace.target_label orelse "", "_fragment") == null) continue;
+        const rel_path = trace.target_rel_path.?;
+        const ext = std.fs.path.extension(rel_path);
+        const class = symbolicClassName(classifySymbolicClass(rel_path, ""));
+        const class_pattern = try std.fmt.allocPrint(allocator, "class:{s}", .{class});
+        defer allocator.free(class_pattern);
+        const ext_pattern = try std.fmt.allocPrint(allocator, "ext:{s}", .{if (ext.len > 0) ext else "<none>"});
+        defer allocator.free(ext_pattern);
+        const patterns = [_][]const u8{ class_pattern, ext_pattern, "stage:robust_structured", trace.target_label.? };
+        const sources = [_][]const u8{rel_path};
+        try appendOwnedReinforcementEvent(allocator, events, .{
+            .family = .parser_sketch,
+            .key = trace.target_label.?,
+            .case_id = rel_path,
+            .tier = .pattern,
+            .category = .syntax,
+            .outcome = .success,
+            .source_specs = &sources,
+            .patterns = &patterns,
+        });
+        break;
+    }
+}
+
+fn collectGroundingSchemaEvents(
+    allocator: std.mem.Allocator,
+    result: *const Result,
+    events: *std.ArrayList(abstractions.ReinforcementEvent),
+) !void {
+    for (result.grounding_traces) |trace| {
+        if (!trace.usable or trace.target_rel_path == null or trace.target_kind == null) continue;
+        const dir = "direction:symbolic_to_code";
+        const kind = try std.fmt.allocPrint(allocator, "target_kind:{s}", .{trace.target_kind.?});
+        defer allocator.free(kind);
+        const patterns = [_][]const u8{ trace.concept, dir, kind, trace.target_rel_path.? };
+        const sources = [_][]const u8{trace.source_spec};
+        try appendOwnedReinforcementEvent(allocator, events, .{
+            .family = .grounding_schema,
+            .key = trace.concept,
+            .case_id = trace.surface,
+            .tier = .idiom,
+            .category = .interface,
+            .outcome = .success,
+            .source_specs = &sources,
+            .patterns = &patterns,
+        });
+        break;
+    }
+    for (result.reverse_grounding_traces) |trace| {
+        if (!trace.usable or trace.target_rel_path == null) continue;
+        const dir = "direction:code_to_symbolic";
+        const kind = if (trace.target_kind) |value|
+            try std.fmt.allocPrint(allocator, "target_kind:{s}", .{value})
+        else
+            try allocator.dupe(u8, "target_kind:file");
+        defer allocator.free(kind);
+        const patterns = [_][]const u8{ trace.concept, dir, kind, trace.source_spec };
+        const sources = [_][]const u8{trace.target_rel_path.?};
+        try appendOwnedReinforcementEvent(allocator, events, .{
+            .family = .grounding_schema,
+            .key = trace.concept,
+            .case_id = trace.surface,
+            .tier = .idiom,
+            .category = .interface,
+            .outcome = .success,
+            .source_specs = &sources,
+            .patterns = &patterns,
+        });
+        break;
+    }
+}
+
+fn collectRouteSuppressorEvents(
+    allocator: std.mem.Allocator,
+    index: *const RepoIndex,
+    result: *const Result,
+    events: *std.ArrayList(abstractions.ReinforcementEvent),
+) !void {
+    const target_family = if (result.primary) |subject|
+        sourceFamilyForPath(index, subject.rel_path)
+    else
+        .other;
+    for (result.routing_suppressed) |item| {
+        const rel_path = item.rel_path orelse continue;
+        const candidate_family = sourceFamilyForPath(index, rel_path);
+        const family_pattern = try std.fmt.allocPrint(allocator, "candidate_family:{s}", .{@tagName(candidate_family)});
+        defer allocator.free(family_pattern);
+        const target_pattern = try std.fmt.allocPrint(allocator, "target_family:{s}", .{@tagName(target_family)});
+        defer allocator.free(target_pattern);
+        const patterns = [_][]const u8{ family_pattern, target_pattern, "anchor:targeted" };
+        const sources = [_][]const u8{rel_path};
+        try appendOwnedReinforcementEvent(allocator, events, .{
+            .family = .route_suppressor,
+            .key = item.reason,
+            .case_id = rel_path,
+            .tier = .pattern,
+            .category = .control_flow,
+            .outcome = if (std.mem.indexOf(u8, item.reason, "ambiguous") != null) .ambiguous else .success,
+            .source_specs = &sources,
+            .patterns = &patterns,
+        });
+        if (events.items.len >= MAX_REINFORCEMENT_EVENTS_PER_RUN) break;
+    }
+}
+
+fn collectClaimTemplateEvents(result: *const Result, events: *std.ArrayList(abstractions.ReinforcementEvent)) !void {
+    for (result.unresolved.partial_findings) |item| {
+        const patterns = [_][]const u8{ partialFindingKindName(item.kind), item.provenance, item.label };
+        try appendOwnedReinforcementEvent(result.allocator, events, .{
+            .family = .claim_template,
+            .key = item.label,
+            .case_id = item.scope,
+            .tier = .pattern,
+            .category = .invariant,
+            .outcome = .success,
+            .source_specs = if (item.rel_path) |path| &[_][]const u8{path} else &.{},
+            .patterns = &patterns,
+        });
+        if (events.items.len >= MAX_REINFORCEMENT_EVENTS_PER_RUN) break;
+    }
 }
 
 fn appendSupportGraphNode(
@@ -1564,6 +2969,706 @@ fn appendSupportGraphEdge(
         .to_id = try allocator.dupe(u8, to_id),
         .kind = kind,
     });
+}
+
+fn blockingFlagsFromCodeIntel(result: *const Result) BlockingFlags {
+    return .{
+        .ambiguous = hasAmbiguousGrounding(result) or stringContains(result.unresolved_detail, "ambiguous"),
+        .contradicted = result.contradiction_traces.len > 0 or result.contradiction_kind != null,
+        .insufficient = result.status != .supported and (supportDecisionCount(result) == 0 or supportEvidenceCount(result) == 0),
+        .stale = stringContains(result.unresolved_detail, "stale"),
+        .out_of_scope = stringContains(result.unresolved_detail, "out of scope") or stringContains(result.unresolved_detail, "unsupported"),
+    };
+}
+
+fn hasAmbiguousGrounding(result: *const Result) bool {
+    for (result.grounding_traces) |item| {
+        if (item.ambiguous) return true;
+    }
+    for (result.reverse_grounding_traces) |item| {
+        if (item.ambiguous) return true;
+    }
+    return false;
+}
+
+fn stringContains(text: ?[]const u8, needle: []const u8) bool {
+    const value = text orelse return false;
+    return std.mem.indexOf(u8, value, needle) != null;
+}
+
+fn partialSupportLevelForCodeIntel(result: *const Result, blocking: BlockingFlags) PartialSupportLevel {
+    if (blocking.ambiguous or blocking.contradicted) return .scoped;
+    if (countUsableGroundingTraces(result.grounding_traces) > 0 or countUsableGroundingTraces(result.reverse_grounding_traces) > 0) return .scoped;
+    if (result.evidence.len > 0 or result.refactor_path.len > 0 or result.overlap.len > 0 or countUsableAbstractionTraces(result.abstraction_traces) > 0) {
+        return .scoped;
+    }
+    if (supportDecisionCount(result) > 0 or result.query_target.len > 0) return .fragmentary;
+    return .void;
+}
+
+fn appendPartialFinding(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(PartialFinding),
+    kind: PartialFindingKind,
+    label: []const u8,
+    scope: []const u8,
+    provenance: []const u8,
+    rel_path: ?[]const u8,
+    line: u32,
+    detail: ?[]const u8,
+) !void {
+    try out.append(.{
+        .kind = kind,
+        .label = try allocator.dupe(u8, label),
+        .scope = try allocator.dupe(u8, scope),
+        .provenance = try allocator.dupe(u8, provenance),
+        .rel_path = if (rel_path) |path| try allocator.dupe(u8, path) else null,
+        .line = line,
+        .detail = if (detail) |value| try allocator.dupe(u8, value) else null,
+    });
+}
+
+fn appendMissingObligation(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(MissingObligation),
+    label: []const u8,
+    scope: []const u8,
+    detail: ?[]const u8,
+) !void {
+    try out.append(.{
+        .label = try allocator.dupe(u8, label),
+        .scope = try allocator.dupe(u8, scope),
+        .detail = if (detail) |value| try allocator.dupe(u8, value) else null,
+    });
+}
+
+fn appendSuppressedNoiseBounded(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(SuppressedNoise),
+    label: []const u8,
+    reason: []const u8,
+    rel_path: ?[]const u8,
+    line: u32,
+) !void {
+    if (out.items.len >= MAX_ROUTING_SUPPRESSIONS) return;
+    for (out.items) |existing| {
+        if (!std.mem.eql(u8, existing.label, label)) continue;
+        if (!std.mem.eql(u8, existing.reason, reason)) continue;
+        if (existing.line != line) continue;
+        if ((existing.rel_path == null) != (rel_path == null)) continue;
+        if (existing.rel_path) |existing_path| {
+            if (!std.mem.eql(u8, existing_path, rel_path.?)) continue;
+        }
+        return;
+    }
+    try out.append(.{
+        .label = try allocator.dupe(u8, label),
+        .reason = try allocator.dupe(u8, reason),
+        .rel_path = if (rel_path) |path| try allocator.dupe(u8, path) else null,
+        .line = line,
+    });
+}
+
+fn cloneSuppressedNoiseList(allocator: std.mem.Allocator, items: []const SuppressedNoise) ![]SuppressedNoise {
+    const out = try allocator.alloc(SuppressedNoise, items.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |*item| item.deinit(allocator);
+        allocator.free(out);
+    }
+    for (items, 0..) |item, idx| {
+        out[idx] = .{
+            .label = try allocator.dupe(u8, item.label),
+            .reason = try allocator.dupe(u8, item.reason),
+            .rel_path = if (item.rel_path) |path| try allocator.dupe(u8, path) else null,
+            .line = item.line,
+        };
+        built += 1;
+    }
+    return out;
+}
+
+fn mergeSuppressedNoiseLists(
+    allocator: std.mem.Allocator,
+    existing: []const SuppressedNoise,
+    next: []const SuppressedNoise,
+) ![]SuppressedNoise {
+    var merged = std.ArrayList(SuppressedNoise).init(allocator);
+    errdefer {
+        for (merged.items) |*item| item.deinit(allocator);
+        merged.deinit();
+    }
+    for (existing) |item| {
+        try appendSuppressedNoiseBounded(allocator, &merged, item.label, item.reason, item.rel_path, item.line);
+    }
+    for (next) |item| {
+        try appendSuppressedNoiseBounded(allocator, &merged, item.label, item.reason, item.rel_path, item.line);
+    }
+    return merged.toOwnedSlice();
+}
+
+fn sourceFamilyForPath(index: *const RepoIndex, rel_path: []const u8) SourceFamily {
+    if (lookupCorpusMeta(index, rel_path)) |meta| {
+        return switch (meta.class) {
+            .code => .code,
+            .docs, .specs => .docs,
+            .configs => .config,
+            .symbolic => .other,
+        };
+    }
+    if (std.mem.indexOf(u8, rel_path, "/tests") != null or std.mem.endsWith(u8, rel_path, "tests.zig")) return .tests;
+    if (std.mem.indexOf(u8, rel_path, "/docs/") != null or std.mem.endsWith(u8, rel_path, ".md") or std.mem.endsWith(u8, rel_path, ".txt")) return .docs;
+    if (std.mem.endsWith(u8, rel_path, ".toml") or std.mem.endsWith(u8, rel_path, ".yaml") or std.mem.endsWith(u8, rel_path, ".yml") or std.mem.endsWith(u8, rel_path, ".json") or std.mem.endsWith(u8, rel_path, ".cfg")) return .config;
+    if (std.mem.endsWith(u8, rel_path, ".log")) return .logs;
+    if (std.mem.endsWith(u8, rel_path, ".zig") or std.mem.endsWith(u8, rel_path, ".c") or std.mem.endsWith(u8, rel_path, ".cpp") or std.mem.endsWith(u8, rel_path, ".h")) return .code;
+    return .other;
+}
+
+fn quotaForFamily(quota: FamilyQuota, family: SourceFamily) usize {
+    return switch (family) {
+        .code => quota.code,
+        .docs => quota.docs,
+        .config => quota.config,
+        .logs => quota.logs,
+        .tests => quota.tests,
+        .other => quota.other,
+    };
+}
+
+fn familyCount(quota: FamilyQuota, family: SourceFamily) usize {
+    return switch (family) {
+        .code => quota.code,
+        .docs => quota.docs,
+        .config => quota.config,
+        .logs => quota.logs,
+        .tests => quota.tests,
+        .other => quota.other,
+    };
+}
+
+fn incrementFamilyCount(quota: *FamilyQuota, family: SourceFamily) void {
+    switch (family) {
+        .code => quota.code += 1,
+        .docs => quota.docs += 1,
+        .config => quota.config += 1,
+        .logs => quota.logs += 1,
+        .tests => quota.tests += 1,
+        .other => quota.other += 1,
+    }
+}
+
+fn targetFamilyCompatible(target_family: SourceFamily, candidate_family: SourceFamily) bool {
+    if (target_family == candidate_family) return true;
+    return switch (target_family) {
+        .code => candidate_family == .tests,
+        .docs => candidate_family == .config,
+        .config => candidate_family == .docs,
+        .tests => candidate_family == .code,
+        .logs, .other => false,
+    };
+}
+
+fn trustClassAtLeast(value: abstractions.TrustClass, floor: abstractions.TrustClass) bool {
+    return @intFromEnum(value) >= @intFromEnum(floor);
+}
+
+fn targetTrustClass(index: *const RepoIndex, target: ResolvedTarget) abstractions.TrustClass {
+    const rel_path = index.files.items[target.file_index].rel_path;
+    if (lookupCorpusMeta(index, rel_path)) |meta| return meta.trust_class;
+    return .project;
+}
+
+fn routingFamilyFromSourceFamily(family: SourceFamily) support_routing.SourceFamily {
+    return switch (family) {
+        .code => .code,
+        .docs => .docs,
+        .config => .config,
+        .logs => .logs,
+        .tests => .tests,
+        .other => .other,
+    };
+}
+
+fn routingTrustFromAbstractionTrust(trust: abstractions.TrustClass) support_routing.TrustClass {
+    return switch (trust) {
+        .exploratory => .exploratory,
+        .project => .project,
+        .promoted => .promoted,
+        .core => .core,
+    };
+}
+
+fn routingArtifactTypeFromFamily(family: SourceFamily) support_routing.ArtifactType {
+    return switch (family) {
+        .code => .code_file,
+        .docs => .doc,
+        .config => .config,
+        .logs => .log,
+        .tests => .unit_test,
+        .other => .unknown,
+    };
+}
+
+fn shouldApplyReinforcedRouteSuppressor(
+    allocator: std.mem.Allocator,
+    paths: *const shards.Paths,
+    target_family: SourceFamily,
+    candidate_family: SourceFamily,
+    rel_path: []const u8,
+    raw_target: []const u8,
+    exact_path: bool,
+    exact_symbol: bool,
+) !bool {
+    if (exact_path or exact_symbol) return false;
+    const family_pattern = try std.fmt.allocPrint(allocator, "candidate_family:{s}", .{@tagName(candidate_family)});
+    defer allocator.free(family_pattern);
+    const target_pattern = try std.fmt.allocPrint(allocator, "target_family:{s}", .{@tagName(target_family)});
+    defer allocator.free(target_pattern);
+    const anchor_pattern = if (std.mem.indexOfScalar(u8, raw_target, ':') != null) "anchor:targeted" else "anchor:file";
+    const patterns = [_][]const u8{ family_pattern, target_pattern, anchor_pattern };
+    const rel_paths = [_][]const u8{rel_path};
+    const refs = try abstractions.lookupFamilyConcepts(allocator, paths, .{
+        .family = .route_suppressor,
+        .rel_paths = &rel_paths,
+        .patterns = &patterns,
+        .max_items = 1,
+    });
+    defer abstractions.deinitSupportReferences(allocator, refs);
+    return refs.len > 0 and refs[0].usable;
+}
+
+fn candidatePathMatchesExactAnchor(index: *const RepoIndex, rel_path: []const u8, raw_target: []const u8) bool {
+    return std.mem.eql(u8, rel_path, raw_target) or
+        std.mem.endsWith(u8, rel_path, raw_target) or
+        corpusSourceAliasMatch(index, rel_path, raw_target, true);
+}
+
+fn extractTargetPath(raw_target: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, raw_target, ':')) |colon| return raw_target[0..colon];
+    return raw_target;
+}
+
+fn extractTargetSymbol(raw_target: []const u8) ?[]const u8 {
+    const colon = std.mem.indexOfScalar(u8, raw_target, ':') orelse return null;
+    const remainder = raw_target[colon + 1 ..];
+    if (remainder.len == 0) return null;
+    if (std.mem.lastIndexOfScalar(u8, remainder, ':')) |last_colon| {
+        const tail = remainder[last_colon + 1 ..];
+        const at = std.mem.indexOfScalar(u8, tail, '@') orelse tail.len;
+        if (at > 0) return tail[0..at];
+    }
+    const at = std.mem.indexOfScalar(u8, remainder, '@') orelse remainder.len;
+    if (at > 0) return remainder[0..at];
+    return null;
+}
+
+fn fileHasExactSymbolAnchor(index: *const RepoIndex, file_index: u32, raw_target: []const u8) bool {
+    const exact_symbol = extractTargetSymbol(raw_target) orelse return false;
+    for (index.files.items[file_index].declaration_indexes.items) |decl_index| {
+        const decl = index.declarations.items[decl_index];
+        if (std.mem.eql(u8, decl.name, exact_symbol) or
+            std.mem.eql(u8, nativeLeafName(decl.name), exact_symbol) or
+            std.mem.eql(u8, symbolicLeafName(decl.name), exact_symbol))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn symbolicTargetHasExactAnchor(
+    index: *const RepoIndex,
+    target: ResolvedTarget,
+    signal_tokens: []const []const u8,
+    signal_patterns: []const []const u8,
+) bool {
+    const rel_path = index.files.items[target.file_index].rel_path;
+    const stem = std.fs.path.stem(std.fs.path.basename(rel_path));
+    for (signal_patterns) |pattern| {
+        if (std.mem.eql(u8, stem, pattern)) return true;
+    }
+    for (signal_tokens) |token| {
+        if (std.mem.eql(u8, stem, token)) return true;
+    }
+    if (target.target_kind != .declaration) return false;
+    const decl = index.declarations.items[target.decl_index.?];
+    const leaf = symbolicLeafName(decl.name);
+    for (signal_patterns) |pattern| {
+        if (std.mem.eql(u8, leaf, pattern) or std.mem.eql(u8, decl.name, pattern)) return true;
+    }
+    for (signal_tokens) |token| {
+        if (std.mem.eql(u8, leaf, token) or std.mem.eql(u8, decl.name, token)) return true;
+    }
+    for (index.references.items) |reference| {
+        if (reference.file_index != target.file_index or reference.line != decl.line) continue;
+        for (signal_tokens) |token| {
+            if (std.mem.eql(u8, reference.name, token)) return true;
+        }
+    }
+    return false;
+}
+
+fn deriveCodeIntelPartialSupport(allocator: std.mem.Allocator, index: *const RepoIndex, result: *Result) !void {
+    const blocking = blockingFlagsFromCodeIntel(result);
+    result.partial_support = .{
+        .lattice = partialSupportLevelForCodeIntel(result, blocking),
+        .blocking = blocking,
+    };
+
+    if (result.status == .supported) return;
+
+    var partial_findings = std.ArrayList(PartialFinding).init(allocator);
+    errdefer {
+        for (partial_findings.items) |*item| item.deinit(allocator);
+        partial_findings.deinit();
+    }
+    var ambiguity_sets = std.ArrayList(AmbiguitySet).init(allocator);
+    errdefer {
+        for (ambiguity_sets.items) |*item| item.deinit(allocator);
+        ambiguity_sets.deinit();
+    }
+    var missing_obligations = std.ArrayList(MissingObligation).init(allocator);
+    errdefer {
+        for (missing_obligations.items) |*item| item.deinit(allocator);
+        missing_obligations.deinit();
+    }
+    var suppressed_noise = std.ArrayList(SuppressedNoise).init(allocator);
+    errdefer {
+        for (suppressed_noise.items) |*item| item.deinit(allocator);
+        suppressed_noise.deinit();
+    }
+    var freshness_checks = std.ArrayList(FreshnessCheck).init(allocator);
+    errdefer {
+        for (freshness_checks.items) |*item| item.deinit(allocator);
+        freshness_checks.deinit();
+    }
+
+    for (result.target_candidates, 0..) |item, idx| {
+        if (idx < 2) {
+            const detail = try std.fmt.allocPrint(allocator, "target candidate score={d}", .{item.score});
+            defer allocator.free(detail);
+            try appendPartialFinding(allocator, &partial_findings, .fragment, item.label, result.query_target, "target_candidate", null, 0, detail);
+        } else {
+            try suppressed_noise.append(.{
+                .label = try allocator.dupe(u8, item.label),
+                .reason = try allocator.dupe(u8, "extra target candidate suppressed from final unresolved summary"),
+            });
+        }
+    }
+    for (result.query_hypotheses, 0..) |item, idx| {
+        if (idx < 2) {
+            const detail = try std.fmt.allocPrint(allocator, "query hypothesis score={d}", .{item.score});
+            defer allocator.free(detail);
+            try appendPartialFinding(allocator, &partial_findings, .fragment, item.label, result.query_target, "query_hypothesis", null, 0, detail);
+        } else {
+            try suppressed_noise.append(.{
+                .label = try allocator.dupe(u8, item.label),
+                .reason = try allocator.dupe(u8, "extra query hypothesis suppressed from final unresolved summary"),
+            });
+        }
+    }
+    for (result.grounding_traces, 0..) |item, idx| {
+        if (idx >= 2) break;
+        const scope = item.target_label orelse item.source_spec;
+        const provenance = try std.fmt.allocPrint(allocator, "grounding:{s}/{s}", .{ item.owner_id, item.lineage_id });
+        defer allocator.free(provenance);
+        try appendPartialFinding(
+            allocator,
+            &partial_findings,
+            .scoped_claim,
+            item.concept,
+            scope,
+            provenance,
+            item.target_rel_path,
+            item.target_line,
+            item.detail,
+        );
+    }
+
+    if (result.primary) |subject| {
+        if (std.mem.eql(u8, subject.kind_name, "symbolic_unit")) {
+            try appendPartialFinding(
+                allocator,
+                &partial_findings,
+                .fragment,
+                subject.name,
+                subject.name,
+                "symbolic_ingest",
+                subject.rel_path,
+                subject.line,
+                "resolved symbolic fragment remains non-authorizing until deterministic grounding succeeds",
+            );
+        }
+    }
+
+    if (partial_findings.items.len == 0 and result.query_target.len > 0) {
+        try appendPartialFinding(
+            allocator,
+            &partial_findings,
+            .fragment,
+            result.query_target,
+            result.query_target,
+            "query_target_literal",
+            null,
+            0,
+            "input preserved as a bounded unresolved fragment",
+        );
+    }
+
+    if (blocking.ambiguous) {
+        var options = std.ArrayList(AmbiguityOption).init(allocator);
+        errdefer {
+            for (options.items) |*item| item.deinit(allocator);
+            options.deinit();
+        }
+        for (result.grounding_traces) |item| {
+            if (!item.ambiguous) continue;
+            if (options.items.len >= 4) break;
+            try options.append(.{
+                .label = try allocator.dupe(u8, item.target_label orelse item.source_spec),
+                .rel_path = if (item.target_rel_path) |path| try allocator.dupe(u8, path) else null,
+                .line = item.target_line,
+                .detail = if (item.detail) |detail| try allocator.dupe(u8, detail) else null,
+            });
+        }
+        if (options.items.len == 0) {
+            for (result.target_candidates) |item| {
+                if (options.items.len >= 4) break;
+                try options.append(.{ .label = try allocator.dupe(u8, item.label) });
+            }
+        }
+        try ambiguity_sets.append(.{
+            .label = try allocator.dupe(u8, "grounding_ambiguity"),
+            .scope = try allocator.dupe(u8, result.query_target),
+            .reason = if (result.unresolved_detail) |detail| try allocator.dupe(u8, detail) else null,
+            .options = try options.toOwnedSlice(),
+        });
+    }
+
+    try appendParserCascadeAmbiguitySet(allocator, index, result, &ambiguity_sets);
+
+    if (supportDecisionCount(result) == 0) {
+        try appendMissingObligation(allocator, &missing_obligations, "resolve_target_or_hypothesis", result.query_target, "no deterministic target or hypothesis selection survived bounded analysis");
+    }
+    if (supportEvidenceCount(result) == 0) {
+        try appendMissingObligation(allocator, &missing_obligations, "collect_provenance_backed_evidence", result.query_target, "partial findings remain non-authorizing until provenance-backed support exists");
+    }
+    if (blocking.ambiguous) {
+        try appendMissingObligation(allocator, &missing_obligations, "disambiguate_competing_mappings", result.query_target, "ambiguity must be resolved before any supported output is allowed");
+    }
+    if (blocking.stale) {
+        try appendMissingObligation(allocator, &missing_obligations, "refresh_stale_support", result.query_target, "stale partial support cannot authorize final output");
+    }
+    if (blocking.out_of_scope) {
+        try appendMissingObligation(allocator, &missing_obligations, "narrow_request_scope", result.query_target, "the current request exceeded bounded support scope");
+    }
+    if (result.primary) |subject| {
+        if (std.mem.eql(u8, subject.kind_name, "symbolic_unit")) {
+            try appendMissingObligation(
+                allocator,
+                &missing_obligations,
+                "ground_symbolic_fragment",
+                subject.name,
+                "weakly structured symbolic fragments remain non-authorizing until a deterministic code/runtime grounding survives proof gating",
+            );
+        }
+    }
+
+    try appendIndexedSuppressedNoise(allocator, index, result, &suppressed_noise);
+    for (result.routing_suppressed) |item| {
+        try appendSuppressedNoiseBounded(allocator, &suppressed_noise, item.label, item.reason, item.rel_path, item.line);
+    }
+
+    if (partial_findings.items.len > 0) {
+        try freshness_checks.append(.{
+            .label = try allocator.dupe(u8, "workspace_freshness"),
+            .scope = try allocator.dupe(u8, result.query_target),
+            .state = if (blocking.stale) .stale else .not_needed,
+            .detail = try allocator.dupe(
+                u8,
+                if (blocking.stale)
+                    "partial findings reference stale support and remain unresolved"
+                else
+                    "partial findings reference the current bounded workspace snapshot only",
+            ),
+        });
+    }
+
+    result.unresolved = .{
+        .allocator = allocator,
+        .partial_findings = try partial_findings.toOwnedSlice(),
+        .ambiguity_sets = try ambiguity_sets.toOwnedSlice(),
+        .missing_obligations = try missing_obligations.toOwnedSlice(),
+        .suppressed_noise = try suppressed_noise.toOwnedSlice(),
+        .freshness_checks = try freshness_checks.toOwnedSlice(),
+    };
+}
+
+fn appendParserCascadeAmbiguitySet(
+    allocator: std.mem.Allocator,
+    index: *const RepoIndex,
+    result: *const Result,
+    out: *std.ArrayList(AmbiguitySet),
+) !void {
+    const subject = result.primary orelse return;
+    if (!std.mem.eql(u8, subject.kind_name, "symbolic_unit")) return;
+
+    const file_index = findFileIndexByRelPathForAmbiguity(index, subject.rel_path) orelse return;
+    var options = std.ArrayList(AmbiguityOption).init(allocator);
+    errdefer {
+        for (options.items) |*item| item.deinit(allocator);
+        options.deinit();
+    }
+
+    for (index.files.items[file_index].declaration_indexes.items) |decl_index| {
+        const decl = index.declarations.items[decl_index];
+        if (decl.kind != .symbolic_unit or decl.line != subject.line) continue;
+        if (options.items.len >= MAX_SYMBOLIC_PARSE_AMBIGUITY_OPTIONS) break;
+        try options.append(.{
+            .label = try allocator.dupe(u8, decl.name),
+            .rel_path = try allocator.dupe(u8, subject.rel_path),
+            .line = decl.line,
+            .detail = try allocator.dupe(u8, "multiple bounded parser stages produced distinct symbolic fragments for the same line"),
+        });
+    }
+
+    if (options.items.len < 2) {
+        for (options.items) |*item| item.deinit(allocator);
+        options.deinit();
+        return;
+    }
+
+    try out.append(.{
+        .label = try allocator.dupe(u8, "parser_cascade_ambiguity"),
+        .scope = try allocator.dupe(u8, subject.name),
+        .reason = try allocator.dupe(u8, "multiple deterministic weak-structure parses survived for the same bounded line"),
+        .options = try options.toOwnedSlice(),
+    });
+}
+
+fn appendIndexedSuppressedNoise(
+    allocator: std.mem.Allocator,
+    index: *const RepoIndex,
+    result: *const Result,
+    out: *std.ArrayList(SuppressedNoise),
+) !void {
+    const subject = result.primary orelse return;
+    if (!std.mem.eql(u8, subject.kind_name, "symbolic_unit")) return;
+    for (index.symbolic_noise.items) |item| {
+        if (!std.mem.eql(u8, item.rel_path, subject.rel_path)) continue;
+        if (out.items.len >= MAX_UNRESOLVED_SYMBOLIC_NOISE) break;
+        try out.append(.{
+            .label = try allocator.dupe(u8, item.label),
+            .reason = try allocator.dupe(u8, item.reason),
+            .rel_path = try allocator.dupe(u8, item.rel_path),
+            .line = item.line,
+        });
+    }
+}
+
+fn findFileIndexByRelPathForAmbiguity(index: *const RepoIndex, rel_path: []const u8) ?u32 {
+    for (index.files.items, 0..) |file, idx| {
+        if (std.mem.eql(u8, file.rel_path, rel_path)) return @intCast(idx);
+    }
+    return null;
+}
+
+const ParsedExternalEvidence = struct {
+    source_url: []const u8,
+    considered_reason: ?[]const u8 = null,
+    fetch_time_ms: ?[]const u8 = null,
+    content_hash: ?[]const u8 = null,
+    query_text: ?[]const u8 = null,
+};
+
+fn parseExternalEvidenceProvenance(provenance: []const u8) ?ParsedExternalEvidence {
+    if (!std.mem.startsWith(u8, provenance, "origin=external_evidence|")) return null;
+    var parsed: ParsedExternalEvidence = .{ .source_url = "" };
+    var parts = std.mem.splitScalar(u8, provenance, '|');
+    while (parts.next()) |part| {
+        if (std.mem.startsWith(u8, part, "source_url=")) parsed.source_url = part["source_url=".len..];
+        if (std.mem.startsWith(u8, part, "reason=")) parsed.considered_reason = part["reason=".len..];
+        if (std.mem.startsWith(u8, part, "fetch_time_ms=")) parsed.fetch_time_ms = part["fetch_time_ms=".len..];
+        if (std.mem.startsWith(u8, part, "content_hash=")) parsed.content_hash = part["content_hash=".len..];
+        if (std.mem.startsWith(u8, part, "query=")) parsed.query_text = part["query=".len..];
+    }
+    if (parsed.source_url.len == 0) return null;
+    return parsed;
+}
+
+fn appendExternalEvidenceNode(
+    allocator: std.mem.Allocator,
+    nodes: *std.ArrayList(SupportGraphNode),
+    edges: *std.ArrayList(SupportGraphEdge),
+    from_id: []const u8,
+    node_id: []const u8,
+    corpus: CorpusTrace,
+) !void {
+    const parsed = parseExternalEvidenceProvenance(corpus.provenance) orelse return;
+    const query_suffix = if (parsed.query_text) |query_text|
+        try std.fmt.allocPrint(allocator, "; query={s}", .{query_text})
+    else
+        try allocator.dupe(u8, "");
+    defer allocator.free(query_suffix);
+    const detail = try std.fmt.allocPrint(
+        allocator,
+        "reason={s}; fetch_time_ms={s}; content_hash={s}{s}",
+        .{
+            parsed.considered_reason orelse "external evidence requested",
+            parsed.fetch_time_ms orelse "unknown",
+            parsed.content_hash orelse "unknown",
+            query_suffix,
+        },
+    );
+    defer allocator.free(detail);
+    try appendSupportGraphNode(allocator, nodes, node_id, .external_evidence, parsed.source_url, corpus.source_rel_path, 0, 0, true, detail);
+    try appendSupportGraphEdge(allocator, edges, from_id, node_id, .sourced_from);
+}
+
+pub fn appendExternalEvidenceOutcome(allocator: std.mem.Allocator, graph: *SupportGraph, outcome: ExternalEvidenceOutcome) !void {
+    const detail = if (outcome.unresolved_detail) |unresolved_detail|
+        try std.fmt.allocPrint(
+            allocator,
+            "considered_reason={s}; acquisition_state={s}; outcome={s}; detail={s}",
+            .{
+                outcome.considered_reason,
+                external_evidence.acquisitionStateName(outcome.state),
+                if (outcome.improved_support) "improved_support" else "unresolved_after_ingest",
+                unresolved_detail,
+            },
+        )
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            "considered_reason={s}; acquisition_state={s}; outcome={s}",
+            .{
+                outcome.considered_reason,
+                external_evidence.acquisitionStateName(outcome.state),
+                if (outcome.improved_support) "improved_support" else "unresolved_after_ingest",
+            },
+        );
+    defer allocator.free(detail);
+    const next_nodes = try allocator.alloc(SupportGraphNode, graph.nodes.len + 1);
+    for (graph.nodes, 0..) |item, idx| next_nodes[idx] = item;
+    if (graph.nodes.len > 0) allocator.free(graph.nodes);
+    graph.nodes = next_nodes;
+    graph.nodes[graph.nodes.len - 1] = .{
+        .id = try allocator.dupe(u8, "external_evidence_outcome"),
+        .kind = .handoff,
+        .label = try allocator.dupe(u8, "external_evidence"),
+        .detail = try allocator.dupe(u8, detail),
+        .usable = outcome.improved_support,
+    };
+
+    const next_edges = try allocator.alloc(SupportGraphEdge, graph.edges.len + 1);
+    for (graph.edges, 0..) |item, idx| next_edges[idx] = item;
+    if (graph.edges.len > 0) allocator.free(graph.edges);
+    graph.edges = next_edges;
+    graph.edges[graph.edges.len - 1] = .{
+        .from_id = try allocator.dupe(u8, "output"),
+        .to_id = try allocator.dupe(u8, "external_evidence_outcome"),
+        .kind = .handoff_from,
+    };
 }
 
 fn buildCodeIntelSupportGraph(allocator: std.mem.Allocator, result: *const Result) !SupportGraph {
@@ -1610,6 +3715,9 @@ fn buildCodeIntelSupportGraph(allocator: std.mem.Allocator, result: *const Resul
     if (result.primary) |subject| {
         try appendSupportGraphNode(allocator, &nodes, "target_primary", .target_candidate, subject.name, subject.rel_path, subject.line, if (result.target_candidates.len > 0) result.target_candidates[0].score else 0, true, subject.kind_name);
         try appendSupportGraphEdge(allocator, &edges, "output", "target_primary", .selected_from);
+        if (subject.corpus) |corpus| {
+            try appendExternalEvidenceNode(allocator, &nodes, &edges, "target_primary", "external_evidence_primary", corpus);
+        }
     }
 
     for (result.target_candidates, 0..) |item, idx| {
@@ -1630,8 +3738,25 @@ fn buildCodeIntelSupportGraph(allocator: std.mem.Allocator, result: *const Resul
         if (idx >= 4) break;
         const node_id = try std.fmt.allocPrint(allocator, "evidence_{d}", .{idx + 1});
         defer allocator.free(node_id);
-        try appendSupportGraphNode(allocator, &nodes, node_id, .evidence, item.reason, item.rel_path, item.line, 0, true, item.subsystem);
+        const detail = if (item.routing) |routing|
+            try std.fmt.allocPrint(allocator, "{s}; route={s}", .{ item.subsystem, routing })
+        else
+            try allocator.dupe(u8, item.subsystem);
+        defer allocator.free(detail);
+        try appendSupportGraphNode(allocator, &nodes, node_id, .evidence, item.reason, item.rel_path, item.line, 0, true, detail);
         try appendSupportGraphEdge(allocator, &edges, "output", node_id, .supported_by);
+        if (item.corpus) |corpus| {
+            const evidence_source_id = try std.fmt.allocPrint(allocator, "external_evidence_{d}", .{idx + 1});
+            defer allocator.free(evidence_source_id);
+            try appendExternalEvidenceNode(allocator, &nodes, &edges, node_id, evidence_source_id, corpus);
+        }
+    }
+    for (result.routing_suppressed, 0..) |item, idx| {
+        if (idx >= 4) break;
+        const node_id = try std.fmt.allocPrint(allocator, "routing_suppressed_{d}", .{idx + 1});
+        defer allocator.free(node_id);
+        try appendSupportGraphNode(allocator, &nodes, node_id, .gap, item.label, item.rel_path, item.line, 0, false, item.reason);
+        try appendSupportGraphEdge(allocator, &edges, "output", node_id, .suppressed_by);
     }
     for (result.contradiction_traces, 0..) |item, idx| {
         if (idx >= 4) break;
@@ -1644,16 +3769,56 @@ fn buildCodeIntelSupportGraph(allocator: std.mem.Allocator, result: *const Resul
         if (idx >= 4) break;
         const node_id = try std.fmt.allocPrint(allocator, "abstraction_{d}", .{idx + 1});
         defer allocator.free(node_id);
-        const detail = try std.fmt.allocPrint(allocator, "{s}/{s} {s}; provenance {s}/{s}", .{
+        const detail = try std.fmt.allocPrint(allocator, "{s}/{s} {s}; provenance {s}/{s}; pack_outcome={s}; pack_conflict={s}", .{
             abstractions.tierName(item.tier),
             abstractions.categoryName(item.category),
             abstractions.selectionModeName(item.selection_mode),
             @tagName(item.owner_kind),
             item.owner_id,
+            abstractions.packRoutingStatusName(item.pack_outcome),
+            abstractions.packConflictCategoryName(item.pack_conflict_category),
         });
         defer allocator.free(detail);
         try appendSupportGraphNode(allocator, &nodes, node_id, .abstraction, item.label, null, 0, item.lookup_score, item.usable, detail);
         try appendSupportGraphEdge(allocator, &edges, "output", node_id, .supported_by);
+    }
+    for (result.pack_routing_traces, 0..) |item, idx| {
+        if (idx >= 6) break;
+        const node_id = try std.fmt.allocPrint(allocator, "pack_{d}", .{idx + 1});
+        defer allocator.free(node_id);
+        const detail = try std.fmt.allocPrint(allocator, "{s}; policy={s}; trust={s}; freshness={s}; category={s}; score={d}; considered={d}; activated={d}; candidates={d}/{d}", .{
+            item.reason,
+            abstractions.packCompetitionPolicyName(item.policy.competition),
+            abstractions.trustClassName(item.trust_class),
+            knowledge_pack_store.packFreshnessName(item.freshness_state),
+            abstractions.packConflictCategoryName(item.conflict_category),
+            item.score,
+            item.considered_rank,
+            item.activation_rank,
+            item.candidate_surfaces,
+            item.suppressed_candidates,
+        });
+        defer allocator.free(detail);
+        try appendSupportGraphNode(allocator, &nodes, node_id, .pack, item.owner_id, null, 0, item.score, item.status == .activated, detail);
+        try appendSupportGraphEdge(allocator, &edges, "reasoning", node_id, if (item.status == .activated) .selected_by else .suppressed_by);
+    }
+    for (result.routing_trace.entries, 0..) |item, idx| {
+        if (idx >= 8) break;
+        const node_id = try std.fmt.allocPrint(allocator, "routing_{d}", .{idx + 1});
+        defer allocator.free(node_id);
+        const detail = try std.fmt.allocPrint(
+            allocator,
+            "source_kind={s}; family={s}; status={s}; skip_reason={s}; non_authorizing=true",
+            .{
+                support_routing.sourceKindName(item.source_kind),
+                support_routing.sourceFamilyName(item.source_family),
+                support_routing.statusName(item.status),
+                support_routing.skipReasonName(item.skip_reason),
+            },
+        );
+        defer allocator.free(detail);
+        try appendSupportGraphNode(allocator, &nodes, node_id, .routing_candidate, item.id, null, 0, item.support_potential_upper_bound, item.status == .selected, detail);
+        try appendSupportGraphEdge(allocator, &edges, "reasoning", node_id, if (item.status == .selected) .selected_by else .suppressed_by);
     }
     for (result.grounding_traces, 0..) |item, idx| {
         if (idx >= 4) break;
@@ -1662,22 +3827,114 @@ fn buildCodeIntelSupportGraph(allocator: std.mem.Allocator, result: *const Resul
         try appendSupportGraphNode(allocator, &nodes, node_id, .grounding, item.concept, item.target_rel_path, item.target_line, item.mapping_score, item.usable and !item.ambiguous, item.detail);
         try appendSupportGraphEdge(allocator, &edges, "output", node_id, .grounded_by);
     }
+    for (result.reverse_grounding_traces, 0..) |item, idx| {
+        if (idx >= 4) break;
+        const node_id = try std.fmt.allocPrint(allocator, "reverse_grounding_{d}", .{idx + 1});
+        defer allocator.free(node_id);
+        const label = item.target_label orelse item.source_spec;
+        const rel_path = item.target_rel_path orelse item.source_spec;
+        try appendSupportGraphNode(
+            allocator,
+            &nodes,
+            node_id,
+            .reverse_grounding,
+            label,
+            rel_path,
+            item.target_line,
+            item.mapping_score,
+            item.usable and !item.ambiguous,
+            item.detail,
+        );
+        try appendSupportGraphEdge(allocator, &edges, "output", node_id, .explained_by);
+    }
 
     const minimum_met = result.status == .supported and supportDecisionCount(result) > 0 and supportEvidenceCount(result) > 0;
     if (!minimum_met and result.unresolved_detail != null) {
         try appendSupportGraphNode(allocator, &nodes, "gap", .gap, "support_gap", null, 0, 0, false, result.unresolved_detail);
         try appendSupportGraphEdge(allocator, &edges, "output", "gap", .blocked_by);
     }
+    try appendUnresolvedSupportGraph(allocator, &nodes, &edges, "output", result.partial_support, &result.unresolved);
 
     return .{
         .allocator = allocator,
         .permission = result.status,
         .minimum_met = minimum_met,
+        .partial_support = result.partial_support,
         .flow_mode = try allocator.dupe(u8, mc.reasoningModeName(result.reasoning_mode)),
         .unresolved_reason = if (result.unresolved_detail) |detail| try allocator.dupe(u8, detail) else null,
         .nodes = try nodes.toOwnedSlice(),
         .edges = try edges.toOwnedSlice(),
     };
+}
+
+pub fn appendUnresolvedSupportGraph(
+    allocator: std.mem.Allocator,
+    nodes: *std.ArrayList(SupportGraphNode),
+    edges: *std.ArrayList(SupportGraphEdge),
+    parent_id: []const u8,
+    partial_support: PartialSupport,
+    unresolved: *const UnresolvedSupport,
+) !void {
+    for (unresolved.partial_findings, 0..) |item, idx| {
+        if (idx >= 4) break;
+        const partial_id = try std.fmt.allocPrint(allocator, "partial_{d}", .{idx + 1});
+        defer allocator.free(partial_id);
+        const scope_id = try std.fmt.allocPrint(allocator, "partial_scope_{d}", .{idx + 1});
+        defer allocator.free(scope_id);
+        const kind: SupportNodeKind = switch (item.kind) {
+            .fragment => .fragment,
+            .scoped_claim, .locally_verified => .scoped_claim,
+        };
+        const detail = try std.fmt.allocPrint(allocator, "scope={s}; provenance={s}; non_authorizing={s}", .{
+            item.scope,
+            item.provenance,
+            if (item.non_authorizing) "true" else "false",
+        });
+        defer allocator.free(detail);
+        try appendSupportGraphNode(allocator, nodes, partial_id, .partial_finding, item.label, item.rel_path, item.line, 0, false, detail);
+        try appendSupportGraphEdge(allocator, edges, parent_id, partial_id, .explained_by);
+        try appendSupportGraphNode(allocator, nodes, scope_id, kind, item.scope, item.rel_path, item.line, 0, partial_support.lattice != .void, item.detail);
+        try appendSupportGraphEdge(allocator, edges, partial_id, scope_id, if (item.kind == .fragment) .contains else .scoped_by);
+    }
+
+    for (unresolved.ambiguity_sets, 0..) |item, idx| {
+        if (idx >= 2) break;
+        const node_id = try std.fmt.allocPrint(allocator, "ambiguity_{d}", .{idx + 1});
+        defer allocator.free(node_id);
+        const detail = if (item.reason) |reason|
+            try std.fmt.allocPrint(allocator, "scope={s}; options={d}; reason={s}", .{ item.scope, item.options.len, reason })
+        else
+            try std.fmt.allocPrint(allocator, "scope={s}; options={d}", .{ item.scope, item.options.len });
+        defer allocator.free(detail);
+        try appendSupportGraphNode(allocator, nodes, node_id, .ambiguity_set, item.label, null, 0, @intCast(item.options.len), false, detail);
+        try appendSupportGraphEdge(allocator, edges, parent_id, node_id, .blocked_by);
+    }
+
+    for (unresolved.missing_obligations, 0..) |item, idx| {
+        if (idx >= 4) break;
+        const node_id = try std.fmt.allocPrint(allocator, "obligation_{d}", .{idx + 1});
+        defer allocator.free(node_id);
+        const detail = if (item.detail) |detail|
+            try std.fmt.allocPrint(allocator, "scope={s}; {s}", .{ item.scope, detail })
+        else
+            try std.fmt.allocPrint(allocator, "scope={s}", .{item.scope});
+        defer allocator.free(detail);
+        try appendSupportGraphNode(allocator, nodes, node_id, .obligation, item.label, null, 0, 0, false, detail);
+        try appendSupportGraphEdge(allocator, edges, parent_id, node_id, .requires);
+    }
+
+    for (unresolved.freshness_checks, 0..) |item, idx| {
+        if (idx >= 2) break;
+        const node_id = try std.fmt.allocPrint(allocator, "freshness_{d}", .{idx + 1});
+        defer allocator.free(node_id);
+        const detail = if (item.detail) |detail|
+            try std.fmt.allocPrint(allocator, "scope={s}; state={s}; {s}", .{ item.scope, freshnessStateName(item.state), detail })
+        else
+            try std.fmt.allocPrint(allocator, "scope={s}; state={s}", .{ item.scope, freshnessStateName(item.state) });
+        defer allocator.free(detail);
+        try appendSupportGraphNode(allocator, nodes, node_id, .freshness_check, item.label, null, 0, 0, item.state != .stale, detail);
+        try appendSupportGraphEdge(allocator, edges, parent_id, node_id, .freshness_checked_by);
+    }
 }
 
 pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
@@ -1706,6 +3963,8 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
     try writeJsonFieldString(writer, "stopReason", @tagName(result.stop_reason), true);
     try writer.print(",\"confidence\":{d}", .{result.confidence});
     try writer.writeAll("}");
+    try writer.writeAll(",\"computeBudget\":");
+    try writeComputeBudgetJson(writer, result.effective_budget, result.budget_exhaustion);
     if (result.intent) |intent| {
         const rendered_intent = try task_intent.renderJson(allocator, &intent);
         defer allocator.free(rendered_intent);
@@ -1717,6 +3976,8 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
     if (result.selected_scope) |scope| try writeOptionalStringField(writer, "selectedScope", scope);
     if (result.contradiction_kind) |kind| try writeOptionalStringField(writer, "contradictionKind", kind);
     if (result.unresolved_detail) |detail| try writeOptionalStringField(writer, "detail", detail);
+    try writeOptionalStringField(writer, "reverseGroundingStatus", groundingStateName(result.reverse_grounding_state));
+    if (result.reverse_grounding_detail) |detail| try writeOptionalStringField(writer, "reverseGroundingDetail", detail);
 
     if (result.primary) |subject| {
         try writer.writeAll(",\"primary\":");
@@ -1740,8 +4001,14 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
     try writeCandidateTraceArray(writer, result.query_hypotheses);
     try writer.writeAll(",\"abstractions\":");
     try writeAbstractionTraceArray(writer, result.abstraction_traces);
+    try writer.writeAll(",\"packRouting\":");
+    try writePackRoutingJson(writer, result.pack_routing_traces, result.pack_routing_caps, result.pack_conflict_policy);
+    try writer.writeAll(",\"supportRouting\":");
+    try writeSupportRoutingTraceJson(writer, result.routing_trace);
     try writer.writeAll(",\"groundings\":");
     try writeGroundingTraceArray(writer, result.grounding_traces);
+    try writer.writeAll(",\"reverseGroundings\":");
+    try writeGroundingTraceArray(writer, result.reverse_grounding_traces);
     try writer.writeAll("}");
     try writer.writeAll(",\"layer3\":{");
     try writeJsonFieldString(writer, "mode", mc.reasoningModeName(result.reasoning_mode), true);
@@ -1754,6 +4021,8 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
 
     try writer.writeAll(",\"evidence\":");
     try writeEvidenceArray(writer, result.evidence);
+    try writer.writeAll(",\"routingSuppressed\":");
+    try writeSuppressedNoiseArray(writer, result.routing_suppressed);
     try writer.writeAll(",\"contradictionTraces\":");
     try writeContradictionTraceArray(writer, result.contradiction_traces);
     try writer.writeAll(",\"refactorPath\":");
@@ -1762,6 +4031,12 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
     try writeEvidenceArray(writer, result.overlap);
     try writer.writeAll(",\"affectedSubsystems\":");
     try writeSubsystemArray(writer, result.affected_subsystems);
+    try writer.writeAll(",\"partialSupport\":");
+    try writePartialSupportJson(writer, result.partial_support);
+    try writer.writeAll(",\"unresolved\":");
+    try writeUnresolvedSupportJson(writer, result.unresolved);
+    try writer.writeAll(",\"packInfluence\":");
+    try writePackInfluenceJson(writer, result.evidence, result.abstraction_traces, result.pack_routing_traces, result.grounding_traces, result.reverse_grounding_traces);
     try writer.writeAll(",\"supportGraph\":");
     try writeSupportGraphJson(writer, result.support_graph);
     try writer.writeAll("}");
@@ -1788,15 +4063,54 @@ fn writeReasoningPolicyJson(writer: anytype, policy: mc.ReasoningPolicy) !void {
     );
 }
 
+fn writeComputeBudgetJson(writer: anytype, budget: compute_budget.Effective, exhaustion: ?compute_budget.Exhaustion) !void {
+    try writer.writeAll("{\"requestedTier\":");
+    try writeJsonString(writer, compute_budget.tierName(budget.requested_tier));
+    try writer.writeAll(",\"effectiveTier\":");
+    try writeJsonString(writer, compute_budget.tierName(budget.effective_tier));
+    try writer.print(
+        ",\"limits\":{{\"maxBranches\":{d},\"maxProofQueueSize\":{d},\"maxRepairs\":{d},\"maxMountedPacksConsidered\":{d},\"maxPacksActivated\":{d},\"maxPackCandidateSurfaces\":{d},\"maxRoutingEntriesConsidered\":{d},\"maxRoutingEntriesSelected\":{d},\"maxRoutingSuppressedTraces\":{d},\"maxGraphNodes\":{d},\"maxGraphObligations\":{d},\"maxAmbiguitySets\":{d},\"maxRuntimeChecks\":{d},\"maxWallTimeMs\":{d},\"maxTempWorkBytes\":{d}}}",
+        .{
+            budget.max_branches,
+            budget.max_proof_queue_size,
+            budget.max_repairs,
+            budget.max_mounted_packs_considered,
+            budget.max_packs_activated,
+            budget.max_pack_candidate_surfaces,
+            budget.max_routing_entries_considered,
+            budget.max_routing_entries_selected,
+            budget.max_routing_suppressed_traces,
+            budget.max_graph_nodes,
+            budget.max_graph_obligations,
+            budget.max_ambiguity_sets,
+            budget.max_runtime_checks,
+            budget.max_wall_time_ms,
+            budget.max_temp_work_bytes,
+        },
+    );
+    if (exhaustion) |value| {
+        try writer.writeAll(",\"exhaustion\":{");
+        try writeJsonFieldString(writer, "limit", compute_budget.limitName(value.limit), true);
+        try writeJsonFieldString(writer, "stage", compute_budget.stageName(value.stage), false);
+        try writer.print(",\"used\":{d},\"limitValue\":{d}", .{ value.used, value.limit_value });
+        try writeOptionalStringField(writer, "detail", value.detail);
+        try writeOptionalStringField(writer, "skipped", value.skipped);
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("}");
+}
+
 fn queryImpact(allocator: std.mem.Allocator, index: *const RepoIndex, paths: *const shards.Paths, options: Options) !Result {
     var result = try initResult(allocator, options);
     errdefer result.deinit();
     result.invariant_model = INVARIANT_MODEL_NAME;
+    var pack_routing = abstractions.PackRoutingCollector.init(allocator);
+    defer pack_routing.deinit();
 
     var target_candidates = std.ArrayList(CandidateTrace).init(allocator);
     defer freeCandidateTraceList(allocator, &target_candidates);
 
-    const resolved = try resolveTarget(allocator, index, options.target, options.reasoning_mode, &target_candidates);
+    const resolved = try resolveTarget(allocator, index, options.target, options.reasoning_mode, options.effective_budget, &target_candidates);
     result.target_candidates = try target_candidates.toOwnedSlice();
 
     if (resolved.stop_reason != .none) {
@@ -1825,7 +4139,7 @@ fn queryImpact(allocator: std.mem.Allocator, index: *const RepoIndex, paths: *co
     defer import_surface.deinit();
     try collectReverseImportSurface(index, target.file_index, 2, &import_surface);
 
-    var grounding = try lookupSymbolicGrounding(allocator, index, paths, options.query_kind, target);
+    var grounding = try lookupSymbolicGrounding(allocator, index, paths, options.query_kind, target, options.effective_budget, &pack_routing);
     defer grounding.deinit(allocator);
     result.grounding_traces = grounding.traces;
     grounding.traces = &.{};
@@ -1837,6 +4151,14 @@ fn queryImpact(allocator: std.mem.Allocator, index: *const RepoIndex, paths: *co
         }
         try collectReverseImportSurface(index, grounded_target.file_index, 2, &import_surface);
     }
+
+    var reverse_grounding = try lookupReverseSymbolicGrounding(allocator, index, paths, options.query_kind, target, options.effective_budget, &pack_routing);
+    defer reverse_grounding.deinit(allocator);
+    result.reverse_grounding_traces = reverse_grounding.traces;
+    reverse_grounding.traces = &.{};
+    result.reverse_grounding_state = reverse_grounding.state;
+    if (reverse_grounding.detail) |detail| result.reverse_grounding_detail = try allocator.dupe(u8, detail);
+    result.routing_suppressed = try cloneSuppressedNoiseList(allocator, reverse_grounding.suppressed_noise);
 
     const invariants = try collectCombinedTargetInvariants(allocator, index, target, grounding.selected_target);
     defer allocator.free(invariants);
@@ -1851,9 +4173,23 @@ fn queryImpact(allocator: std.mem.Allocator, index: *const RepoIndex, paths: *co
     try collectEvidenceSeedPaths(&abstraction_paths, index, dependency_surface.items, options.max_items);
     try collectEvidenceSeedPaths(&abstraction_paths, index, import_surface.items, options.max_items);
     try collectContradictionPaths(&abstraction_paths, index, contradiction_seeds, options.max_items);
-    const abstraction_refs = try lookupQueryAbstractions(allocator, paths, options.query_kind, abstraction_paths.items, options.max_items);
+    var abstraction_signals = try buildQueryAbstractionSignals(allocator, options.target, options.other_target, abstraction_paths.items);
+    defer abstraction_signals.deinit(allocator);
+    const abstraction_refs = try lookupQueryAbstractions(
+        allocator,
+        paths,
+        options.query_kind,
+        abstraction_paths.items,
+        abstraction_signals.tokens,
+        abstraction_signals.patterns,
+        &pack_routing,
+        options.pack_conflict_policy,
+        options.effective_budget,
+        options.max_items,
+    );
     defer abstractions.deinitSupportReferences(allocator, abstraction_refs);
     result.abstraction_traces = try buildAbstractionTraces(allocator, abstraction_refs);
+    result.pack_routing_traces = try pack_routing.toOwnedSlice();
     var branch_biases = buildBranchBiases(options.query_kind, abstraction_refs);
     branch_biases.merge(grounding.biases);
 
@@ -1889,7 +4225,7 @@ fn queryImpact(allocator: std.mem.Allocator, index: *const RepoIndex, paths: *co
             contradiction_scores.items,
             1,
             @intCast(contradiction_branch_ids.items.len),
-            codeIntelLayer3Config(options.reasoning_mode, 170, 6),
+            codeIntelLayer3Config(options.reasoning_mode, 170, @min(@as(u32, 6), options.effective_budget.max_branches)),
         );
         result.confidence = decision.confidence;
         result.stop_reason = decision.stop_reason;
@@ -1903,6 +4239,12 @@ fn queryImpact(allocator: std.mem.Allocator, index: *const RepoIndex, paths: *co
         result.status = .supported;
         result.selected_scope = "bounded_invariant_impact";
         result.contradiction_kind = contradictionCategoryName(selected_category);
+        const routing_started = sys.getMilliTick();
+        var routed = try routeContradictionEvidence(allocator, index, paths, options.target, target, contradiction_seeds, selected_category, options.max_items, options.effective_budget);
+        result.profile.routing_index_build_ms += sys.getMilliTick() - routing_started;
+        defer routed.deinit(allocator);
+        result.routing_trace = routed.routing_trace;
+        routed.routing_trace = .{ .allocator = allocator };
         result.evidence = try buildEvidenceFromContradictions(allocator, index, contradiction_seeds, selected_category, options.max_items);
         result.affected_subsystems = try collectSubsystemsFromContradictions(allocator, index, contradiction_seeds, selected_category);
         return result;
@@ -1961,7 +4303,7 @@ fn queryImpact(allocator: std.mem.Allocator, index: *const RepoIndex, paths: *co
     }
 
     result.query_hypotheses = try hypotheses.toOwnedSlice();
-    const decision = mc.decideFromScores(branch_ids.items, scores.items, 1, @intCast(branch_ids.items.len), codeIntelLayer3Config(options.reasoning_mode, 150, 5));
+    const decision = mc.decideFromScores(branch_ids.items, scores.items, 1, @intCast(branch_ids.items.len), codeIntelLayer3Config(options.reasoning_mode, 150, @min(@as(u32, 5), options.effective_budget.max_branches)));
     result.confidence = decision.confidence;
     result.stop_reason = decision.stop_reason;
     if (decision.stop_reason != .none) {
@@ -1995,8 +4337,18 @@ fn queryImpact(allocator: std.mem.Allocator, index: *const RepoIndex, paths: *co
         else => {},
     }
 
-    result.evidence = try buildEvidence(allocator, index, chosen.items, options.max_items);
-    result.affected_subsystems = try collectSubsystems(allocator, index, chosen.items);
+    const routing_started = sys.getMilliTick();
+    var routed = try routeEvidenceSeeds(allocator, index, paths, options.target, target, chosen.items, options.max_items, options.effective_budget);
+    result.profile.routing_index_build_ms += sys.getMilliTick() - routing_started;
+    defer routed.deinit(allocator);
+    result.evidence = try buildEvidence(allocator, index, routed.seeds, routed.routing_labels, options.max_items);
+    const merged_routing_suppressed = try mergeSuppressedNoiseLists(allocator, result.routing_suppressed, routed.suppressed_noise);
+    for (result.routing_suppressed) |*item| item.deinit(allocator);
+    allocator.free(result.routing_suppressed);
+    result.routing_suppressed = merged_routing_suppressed;
+    result.routing_trace = routed.routing_trace;
+    routed.routing_trace = .{ .allocator = allocator };
+    result.affected_subsystems = try collectSubsystems(allocator, index, routed.seeds);
     return result;
 }
 
@@ -2004,11 +4356,13 @@ fn queryBreaksIf(allocator: std.mem.Allocator, index: *const RepoIndex, paths: *
     var result = try initResult(allocator, options);
     errdefer result.deinit();
     result.invariant_model = INVARIANT_MODEL_NAME;
+    var pack_routing = abstractions.PackRoutingCollector.init(allocator);
+    defer pack_routing.deinit();
 
     var target_candidates = std.ArrayList(CandidateTrace).init(allocator);
     defer freeCandidateTraceList(allocator, &target_candidates);
 
-    const resolved = try resolveTarget(allocator, index, options.target, options.reasoning_mode, &target_candidates);
+    const resolved = try resolveTarget(allocator, index, options.target, options.reasoning_mode, options.effective_budget, &target_candidates);
     result.target_candidates = try target_candidates.toOwnedSlice();
 
     if (resolved.stop_reason != .none) {
@@ -2037,7 +4391,7 @@ fn queryBreaksIf(allocator: std.mem.Allocator, index: *const RepoIndex, paths: *
     defer import_surface.deinit();
     try collectReverseImportSurface(index, target.file_index, 2, &import_surface);
 
-    var grounding = try lookupSymbolicGrounding(allocator, index, paths, options.query_kind, target);
+    var grounding = try lookupSymbolicGrounding(allocator, index, paths, options.query_kind, target, options.effective_budget, &pack_routing);
     defer grounding.deinit(allocator);
     result.grounding_traces = grounding.traces;
     grounding.traces = &.{};
@@ -2049,6 +4403,14 @@ fn queryBreaksIf(allocator: std.mem.Allocator, index: *const RepoIndex, paths: *
         }
         try collectReverseImportSurface(index, grounded_target.file_index, 2, &import_surface);
     }
+
+    var reverse_grounding = try lookupReverseSymbolicGrounding(allocator, index, paths, options.query_kind, target, options.effective_budget, &pack_routing);
+    defer reverse_grounding.deinit(allocator);
+    result.reverse_grounding_traces = reverse_grounding.traces;
+    reverse_grounding.traces = &.{};
+    result.reverse_grounding_state = reverse_grounding.state;
+    if (reverse_grounding.detail) |detail| result.reverse_grounding_detail = try allocator.dupe(u8, detail);
+    result.routing_suppressed = try cloneSuppressedNoiseList(allocator, reverse_grounding.suppressed_noise);
 
     const invariants = try collectCombinedTargetInvariants(allocator, index, target, grounding.selected_target);
     defer allocator.free(invariants);
@@ -2063,9 +4425,23 @@ fn queryBreaksIf(allocator: std.mem.Allocator, index: *const RepoIndex, paths: *
     try collectEvidenceSeedPaths(&abstraction_paths, index, dependency_surface.items, options.max_items);
     try collectEvidenceSeedPaths(&abstraction_paths, index, import_surface.items, options.max_items);
     try collectContradictionPaths(&abstraction_paths, index, contradiction_seeds, options.max_items);
-    const abstraction_refs = try lookupQueryAbstractions(allocator, paths, options.query_kind, abstraction_paths.items, options.max_items);
+    var abstraction_signals = try buildQueryAbstractionSignals(allocator, options.target, options.other_target, abstraction_paths.items);
+    defer abstraction_signals.deinit(allocator);
+    const abstraction_refs = try lookupQueryAbstractions(
+        allocator,
+        paths,
+        options.query_kind,
+        abstraction_paths.items,
+        abstraction_signals.tokens,
+        abstraction_signals.patterns,
+        &pack_routing,
+        options.pack_conflict_policy,
+        options.effective_budget,
+        options.max_items,
+    );
     defer abstractions.deinitSupportReferences(allocator, abstraction_refs);
     result.abstraction_traces = try buildAbstractionTraces(allocator, abstraction_refs);
+    result.pack_routing_traces = try pack_routing.toOwnedSlice();
     var branch_biases = buildBranchBiases(options.query_kind, abstraction_refs);
     branch_biases.merge(grounding.biases);
 
@@ -2101,7 +4477,7 @@ fn queryBreaksIf(allocator: std.mem.Allocator, index: *const RepoIndex, paths: *
             contradiction_scores.items,
             1,
             @intCast(contradiction_branch_ids.items.len),
-            codeIntelLayer3Config(options.reasoning_mode, 180, 6),
+            codeIntelLayer3Config(options.reasoning_mode, 180, @min(@as(u32, 6), options.effective_budget.max_branches)),
         );
         result.confidence = decision.confidence;
         result.stop_reason = decision.stop_reason;
@@ -2115,6 +4491,12 @@ fn queryBreaksIf(allocator: std.mem.Allocator, index: *const RepoIndex, paths: *
         result.status = .supported;
         result.selected_scope = "bounded_invariant_breakage";
         result.contradiction_kind = contradictionCategoryName(selected_category);
+        const routing_started = sys.getMilliTick();
+        var routed = try routeContradictionEvidence(allocator, index, paths, options.target, target, contradiction_seeds, selected_category, options.max_items, options.effective_budget);
+        result.profile.routing_index_build_ms += sys.getMilliTick() - routing_started;
+        defer routed.deinit(allocator);
+        result.routing_trace = routed.routing_trace;
+        routed.routing_trace = .{ .allocator = allocator };
         result.evidence = try buildEvidenceFromContradictions(allocator, index, contradiction_seeds, selected_category, options.max_items);
         result.refactor_path = try buildRefactorPathFromContradictions(allocator, index, target, contradiction_seeds, selected_category, options.max_items);
         result.affected_subsystems = try collectSubsystemsFromContradictions(allocator, index, contradiction_seeds, selected_category);
@@ -2156,7 +4538,7 @@ fn queryBreaksIf(allocator: std.mem.Allocator, index: *const RepoIndex, paths: *
     }
 
     result.query_hypotheses = try hypotheses.toOwnedSlice();
-    const decision = mc.decideFromScores(branch_ids.items, scores.items, 1, @intCast(branch_ids.items.len), codeIntelLayer3Config(options.reasoning_mode, 160, 5));
+    const decision = mc.decideFromScores(branch_ids.items, scores.items, 1, @intCast(branch_ids.items.len), codeIntelLayer3Config(options.reasoning_mode, 160, @min(@as(u32, 5), options.effective_budget.max_branches)));
     result.confidence = decision.confidence;
     result.stop_reason = decision.stop_reason;
     if (decision.stop_reason != .none) {
@@ -2186,9 +4568,19 @@ fn queryBreaksIf(allocator: std.mem.Allocator, index: *const RepoIndex, paths: *
         else => {},
     }
 
-    result.evidence = try buildEvidence(allocator, index, chosen.items, options.max_items);
-    result.refactor_path = try buildRefactorPath(allocator, index, target, chosen.items, options.max_items);
-    result.affected_subsystems = try collectSubsystems(allocator, index, chosen.items);
+    const routing_started = sys.getMilliTick();
+    var routed = try routeEvidenceSeeds(allocator, index, paths, options.target, target, chosen.items, options.max_items, options.effective_budget);
+    result.profile.routing_index_build_ms += sys.getMilliTick() - routing_started;
+    defer routed.deinit(allocator);
+    result.evidence = try buildEvidence(allocator, index, routed.seeds, routed.routing_labels, options.max_items);
+    const merged_routing_suppressed = try mergeSuppressedNoiseLists(allocator, result.routing_suppressed, routed.suppressed_noise);
+    for (result.routing_suppressed) |*item| item.deinit(allocator);
+    allocator.free(result.routing_suppressed);
+    result.routing_suppressed = merged_routing_suppressed;
+    result.routing_trace = routed.routing_trace;
+    routed.routing_trace = .{ .allocator = allocator };
+    result.refactor_path = try buildRefactorPath(allocator, index, target, routed.seeds, options.max_items);
+    result.affected_subsystems = try collectSubsystems(allocator, index, routed.seeds);
     return result;
 }
 
@@ -2196,6 +4588,8 @@ fn queryContradicts(allocator: std.mem.Allocator, index: *const RepoIndex, paths
     var result = try initResult(allocator, options);
     errdefer result.deinit();
     result.invariant_model = INVARIANT_MODEL_NAME;
+    var pack_routing = abstractions.PackRoutingCollector.init(allocator);
+    defer pack_routing.deinit();
 
     const other_target = options.other_target orelse {
         result.status = .unresolved;
@@ -2206,10 +4600,10 @@ fn queryContradicts(allocator: std.mem.Allocator, index: *const RepoIndex, paths
 
     var target_candidates = std.ArrayList(CandidateTrace).init(allocator);
     defer freeCandidateTraceList(allocator, &target_candidates);
-    const left_resolved = try resolveTarget(allocator, index, options.target, options.reasoning_mode, &target_candidates);
+    const left_resolved = try resolveTarget(allocator, index, options.target, options.reasoning_mode, options.effective_budget, &target_candidates);
     var secondary_candidates = std.ArrayList(CandidateTrace).init(allocator);
     defer freeCandidateTraceList(allocator, &secondary_candidates);
-    const right_resolved = try resolveTarget(allocator, index, other_target, options.reasoning_mode, &secondary_candidates);
+    const right_resolved = try resolveTarget(allocator, index, other_target, options.reasoning_mode, options.effective_budget, &secondary_candidates);
 
     var merged_candidates = std.ArrayList(CandidateTrace).init(allocator);
     defer freeCandidateTraceList(allocator, &merged_candidates);
@@ -2237,25 +4631,19 @@ fn queryContradicts(allocator: std.mem.Allocator, index: *const RepoIndex, paths
     result.primary = try makeSubject(allocator, index, left);
     result.secondary = try makeSubject(allocator, index, right);
 
-    var left_grounding = try lookupSymbolicGrounding(allocator, index, paths, options.query_kind, left);
+    var left_grounding = try lookupSymbolicGrounding(allocator, index, paths, options.query_kind, left, options.effective_budget, &pack_routing);
     defer left_grounding.deinit(allocator);
-    var right_grounding = try lookupSymbolicGrounding(allocator, index, paths, options.query_kind, right);
+    var right_grounding = try lookupSymbolicGrounding(allocator, index, paths, options.query_kind, right, options.effective_budget, &pack_routing);
     defer right_grounding.deinit(allocator);
+    var left_reverse_grounding = try lookupReverseSymbolicGrounding(allocator, index, paths, options.query_kind, left, options.effective_budget, &pack_routing);
+    defer left_reverse_grounding.deinit(allocator);
+    var right_reverse_grounding = try lookupReverseSymbolicGrounding(allocator, index, paths, options.query_kind, right, options.effective_budget, &pack_routing);
+    defer right_reverse_grounding.deinit(allocator);
 
     if (left_grounding.traces.len > 0 or right_grounding.traces.len > 0) {
         var merged_groundings = std.ArrayList(GroundingTrace).init(allocator);
         errdefer {
-            for (merged_groundings.items) |trace| {
-                allocator.free(trace.surface);
-                allocator.free(trace.concept);
-                allocator.free(trace.source_spec);
-                allocator.free(trace.owner_id);
-                allocator.free(trace.relation);
-                if (trace.target_label) |target_label| allocator.free(target_label);
-                if (trace.target_rel_path) |target_rel_path| allocator.free(target_rel_path);
-                if (trace.target_kind) |target_kind| allocator.free(target_kind);
-                if (trace.detail) |detail| allocator.free(detail);
-            }
+            for (merged_groundings.items) |trace| deinitGroundingTrace(allocator, trace);
             merged_groundings.deinit();
         }
         try merged_groundings.appendSlice(left_grounding.traces);
@@ -2264,6 +4652,33 @@ fn queryContradicts(allocator: std.mem.Allocator, index: *const RepoIndex, paths
         right_grounding.traces = &.{};
         result.grounding_traces = try merged_groundings.toOwnedSlice();
     }
+
+    if (left_reverse_grounding.traces.len > 0 or right_reverse_grounding.traces.len > 0) {
+        var merged_reverse = std.ArrayList(GroundingTrace).init(allocator);
+        errdefer {
+            for (merged_reverse.items) |trace| deinitGroundingTrace(allocator, trace);
+            merged_reverse.deinit();
+        }
+        try merged_reverse.appendSlice(left_reverse_grounding.traces);
+        try merged_reverse.appendSlice(right_reverse_grounding.traces);
+        left_reverse_grounding.traces = &.{};
+        right_reverse_grounding.traces = &.{};
+        result.reverse_grounding_traces = try merged_reverse.toOwnedSlice();
+    }
+    result.reverse_grounding_state = mergeGroundingStates(left_reverse_grounding.state, right_reverse_grounding.state);
+    result.reverse_grounding_detail = try mergeGroundingDetail(allocator, left_reverse_grounding.detail, right_reverse_grounding.detail);
+    var merged_suppressed = std.ArrayList(SuppressedNoise).init(allocator);
+    defer {
+        for (merged_suppressed.items) |*item| item.deinit(allocator);
+        merged_suppressed.deinit();
+    }
+    for (left_reverse_grounding.suppressed_noise) |item| {
+        try appendSuppressedNoiseBounded(allocator, &merged_suppressed, item.label, item.reason, item.rel_path, item.line);
+    }
+    for (right_reverse_grounding.suppressed_noise) |item| {
+        try appendSuppressedNoiseBounded(allocator, &merged_suppressed, item.label, item.reason, item.rel_path, item.line);
+    }
+    result.routing_suppressed = try cloneSuppressedNoiseList(allocator, merged_suppressed.items);
 
     const left_invariants = try collectCombinedTargetInvariants(allocator, index, left, left_grounding.selected_target);
     defer allocator.free(left_invariants);
@@ -2284,9 +4699,23 @@ fn queryContradicts(allocator: std.mem.Allocator, index: *const RepoIndex, paths
     try appendUniqueRelPath(&abstraction_paths, index.files.items[left.file_index].rel_path, options.max_items);
     try appendUniqueRelPath(&abstraction_paths, index.files.items[right.file_index].rel_path, options.max_items);
     try collectContradictionPaths(&abstraction_paths, index, contradiction_seeds, options.max_items);
-    const abstraction_refs = try lookupQueryAbstractions(allocator, paths, options.query_kind, abstraction_paths.items, options.max_items);
+    var abstraction_signals = try buildQueryAbstractionSignals(allocator, options.target, options.other_target, abstraction_paths.items);
+    defer abstraction_signals.deinit(allocator);
+    const abstraction_refs = try lookupQueryAbstractions(
+        allocator,
+        paths,
+        options.query_kind,
+        abstraction_paths.items,
+        abstraction_signals.tokens,
+        abstraction_signals.patterns,
+        &pack_routing,
+        options.pack_conflict_policy,
+        options.effective_budget,
+        options.max_items,
+    );
     defer abstractions.deinitSupportReferences(allocator, abstraction_refs);
     result.abstraction_traces = try buildAbstractionTraces(allocator, abstraction_refs);
+    result.pack_routing_traces = try pack_routing.toOwnedSlice();
     var branch_biases = buildBranchBiases(options.query_kind, abstraction_refs);
     branch_biases.merge(left_grounding.biases);
     branch_biases.merge(right_grounding.biases);
@@ -2315,7 +4744,7 @@ fn queryContradicts(allocator: std.mem.Allocator, index: *const RepoIndex, paths
         return result;
     }
 
-    const decision = mc.decideFromScores(branch_ids.items, scores.items, 1, @intCast(branch_ids.items.len), codeIntelLayer3Config(options.reasoning_mode, 170, 5));
+    const decision = mc.decideFromScores(branch_ids.items, scores.items, 1, @intCast(branch_ids.items.len), codeIntelLayer3Config(options.reasoning_mode, 170, @min(@as(u32, 5), options.effective_budget.max_branches)));
     result.confidence = decision.confidence;
     result.stop_reason = decision.stop_reason;
     if (decision.stop_reason != .none) {
@@ -2328,6 +4757,12 @@ fn queryContradicts(allocator: std.mem.Allocator, index: *const RepoIndex, paths
     const selected_category = contradictionCategoryFromBranchId(decision.output);
     result.selected_scope = "bounded_invariant_contradiction";
     result.contradiction_kind = contradictionCategoryName(selected_category);
+    const routing_started = sys.getMilliTick();
+    var routed = try routeContradictionEvidence(allocator, index, paths, options.target, left, contradiction_seeds, selected_category, options.max_items, options.effective_budget);
+    result.profile.routing_index_build_ms += sys.getMilliTick() - routing_started;
+    defer routed.deinit(allocator);
+    result.routing_trace = routed.routing_trace;
+    routed.routing_trace = .{ .allocator = allocator };
     result.overlap = try buildEvidenceFromContradictions(allocator, index, contradiction_seeds, selected_category, options.max_items);
     result.evidence = try buildEvidenceFromContradictions(allocator, index, contradiction_seeds, selected_category, options.max_items);
     result.affected_subsystems = try collectSubsystemsFromContradictions(allocator, index, contradiction_seeds, selected_category);
@@ -2346,6 +4781,7 @@ fn resolveTarget(
     index: *const RepoIndex,
     raw_target: []const u8,
     reasoning_mode: mc.ReasoningMode,
+    budget: compute_budget.Effective,
     traces: *std.ArrayList(CandidateTrace),
 ) !ResolutionOutcome {
     var candidates = std.ArrayList(ResolutionCandidate).init(allocator);
@@ -2374,7 +4810,7 @@ fn resolveTarget(
     }
 
     std.sort.heap(ResolutionCandidate, candidates.items, {}, lessThanResolutionCandidate);
-    if (candidates.items.len > reasoningBranchCap(reasoning_mode)) candidates.items.len = reasoningBranchCap(reasoning_mode);
+    if (candidates.items.len > reasoningBranchCap(reasoning_mode, budget)) candidates.items.len = reasoningBranchCap(reasoning_mode, budget);
 
     var branch_ids = std.ArrayList(u32).init(allocator);
     defer branch_ids.deinit();
@@ -2398,7 +4834,7 @@ fn resolveTarget(
         };
     }
 
-    const decision = mc.decideFromScores(branch_ids.items, scores.items, 1, @intCast(branch_ids.items.len), codeIntelLayer3Config(reasoning_mode, 120, 5));
+    const decision = mc.decideFromScores(branch_ids.items, scores.items, 1, @intCast(branch_ids.items.len), codeIntelLayer3Config(reasoning_mode, 120, @min(@as(u32, 5), budget.max_branches)));
     if (decision.stop_reason != .none) {
         return .{
             .stop_reason = decision.stop_reason,
@@ -2429,8 +4865,8 @@ fn resolveTarget(
 
 fn collectPathSymbolCandidates(index: *const RepoIndex, raw_path: []const u8, symbol: []const u8, out: *std.ArrayList(ResolutionCandidate)) !void {
     for (index.files.items, 0..) |file, file_idx| {
-        const exact = std.mem.eql(u8, file.rel_path, raw_path);
-        const suffix = std.mem.endsWith(u8, file.rel_path, raw_path);
+        const exact = std.mem.eql(u8, file.rel_path, raw_path) or corpusSourceAliasMatch(index, file.rel_path, raw_path, true);
+        const suffix = std.mem.endsWith(u8, file.rel_path, raw_path) or corpusSourceAliasMatch(index, file.rel_path, raw_path, false);
         if (!exact and !suffix) continue;
         for (file.declaration_indexes.items) |decl_index| {
             const decl = index.declarations.items[decl_index];
@@ -2451,8 +4887,8 @@ fn collectPathSymbolCandidates(index: *const RepoIndex, raw_path: []const u8, sy
 
 fn collectFileCandidates(index: *const RepoIndex, raw_path: []const u8, out: *std.ArrayList(ResolutionCandidate)) !void {
     for (index.files.items, 0..) |file, file_idx| {
-        const exact = std.mem.eql(u8, file.rel_path, raw_path);
-        const suffix = std.mem.endsWith(u8, file.rel_path, raw_path);
+        const exact = std.mem.eql(u8, file.rel_path, raw_path) or corpusSourceAliasMatch(index, file.rel_path, raw_path, true);
+        const suffix = std.mem.endsWith(u8, file.rel_path, raw_path) or corpusSourceAliasMatch(index, file.rel_path, raw_path, false);
         if (!exact and !suffix) continue;
         const evidence_count = reverseImportCount(index, @intCast(file_idx));
         try out.append(.{
@@ -3117,7 +5553,24 @@ fn buildEvidenceFromContradictions(
     var evidence_seeds = std.ArrayList(EvidenceSeed).init(allocator);
     defer evidence_seeds.deinit();
     try appendContradictionEvidenceSeeds(&evidence_seeds, seeds, category);
-    return buildEvidence(allocator, index, evidence_seeds.items, max_items);
+    return buildEvidence(allocator, index, evidence_seeds.items, null, max_items);
+}
+
+fn routeContradictionEvidence(
+    allocator: std.mem.Allocator,
+    index: *const RepoIndex,
+    paths: *const shards.Paths,
+    raw_target: []const u8,
+    target: ResolvedTarget,
+    seeds: []const ContradictionSeed,
+    category: ContradictionCategory,
+    max_items: usize,
+    budget: compute_budget.Effective,
+) !RoutedEvidence {
+    var evidence_seeds = std.ArrayList(EvidenceSeed).init(allocator);
+    defer evidence_seeds.deinit();
+    try appendContradictionEvidenceSeeds(&evidence_seeds, seeds, category);
+    return routeEvidenceSeeds(allocator, index, paths, raw_target, target, evidence_seeds.items, max_items, budget);
 }
 
 fn buildRefactorPathFromContradictions(
@@ -3191,7 +5644,175 @@ fn buildContradictionTraces(
     return out;
 }
 
-fn buildEvidence(allocator: std.mem.Allocator, index: *const RepoIndex, seeds: []const EvidenceSeed, max_items: usize) ![]Evidence {
+fn routeEvidenceSeeds(
+    allocator: std.mem.Allocator,
+    index: *const RepoIndex,
+    paths: *const shards.Paths,
+    raw_target: []const u8,
+    target: ResolvedTarget,
+    seeds: []const EvidenceSeed,
+    max_items: usize,
+    budget: compute_budget.Effective,
+) !RoutedEvidence {
+    var sorted = std.ArrayList(EvidenceSeed).init(allocator);
+    defer sorted.deinit();
+    try sorted.appendSlice(seeds);
+    std.sort.heap(EvidenceSeed, sorted.items, index, lessThanEvidenceSeed);
+
+    var routing_entries = try allocator.alloc(support_routing.Entry, sorted.items.len);
+    defer allocator.free(routing_entries);
+    const target_family = sourceFamilyForPath(index, index.files.items[target.file_index].rel_path);
+    const trust_floor = targetTrustClass(index, target);
+    for (sorted.items, 0..) |seed, idx| {
+        const rel_path = index.files.items[seed.file_index].rel_path;
+        const family = sourceFamilyForPath(index, rel_path);
+        const corpus = lookupCorpusMeta(index, rel_path);
+        const exact_path = candidatePathMatchesExactAnchor(index, rel_path, extractTargetPath(raw_target));
+        const exact_symbol = fileHasExactSymbolAnchor(index, seed.file_index, raw_target);
+        const same_file = seed.file_index == target.file_index;
+        const compatible_family = targetFamilyCompatible(target_family, family);
+        routing_entries[idx] = .{
+            .id = rel_path,
+            .source_kind = if (corpus != null) .corpus_entry else .artifact,
+            .schema_domain_hint = subsystemName(index.files.items[seed.file_index].subsystem),
+            .artifact_type = routingArtifactTypeFromFamily(family),
+            .entity_signals = if (exact_symbol or same_file) 2 else 0,
+            .relation_signals = if (compatible_family) 1 else 0,
+            .trust_class = routingTrustFromAbstractionTrust(if (corpus) |meta| meta.trust_class else .project),
+            .freshness_state = .active,
+            .provenance = seed.reason,
+            .source_family = routingFamilyFromSourceFamily(family),
+            .exact_anchor = same_file or exact_path or exact_symbol,
+            .schema_compatible = compatible_family,
+            .conflict = if (corpus) |meta| !trustClassAtLeast(meta.trust_class, trust_floor) else false,
+            .budget_cost = 1,
+            .stable_rank = @intCast(idx),
+        };
+    }
+    var routing_trace = try support_routing.select(allocator, routing_entries, routingCapsFromBudget(budget, max_items));
+    errdefer routing_trace.deinit();
+
+    var kept = std.ArrayList(EvidenceSeed).init(allocator);
+    errdefer kept.deinit();
+    var labels = std.ArrayList([]u8).init(allocator);
+    errdefer {
+        for (labels.items) |item| allocator.free(item);
+        labels.deinit();
+    }
+    var suppressed = std.ArrayList(SuppressedNoise).init(allocator);
+    errdefer {
+        for (suppressed.items) |*item| item.deinit(allocator);
+        suppressed.deinit();
+    }
+
+    var seen_files = std.AutoHashMap(u32, void).init(allocator);
+    defer seen_files.deinit();
+
+    for (sorted.items) |seed| {
+        const rel_path = index.files.items[seed.file_index].rel_path;
+        if (!routingTraceSelectedPath(routing_trace, rel_path)) {
+            if (routingTraceSkipReason(routing_trace, rel_path)) |reason| {
+                try appendSuppressedNoiseBounded(allocator, &suppressed, rel_path, reason, rel_path, seed.line);
+            }
+            continue;
+        }
+        const family = sourceFamilyForPath(index, rel_path);
+        const same_file = seed.file_index == target.file_index;
+        const exact_path = candidatePathMatchesExactAnchor(index, rel_path, extractTargetPath(raw_target));
+        const exact_symbol = fileHasExactSymbolAnchor(index, seed.file_index, raw_target);
+        const compatible_family = targetFamilyCompatible(target_family, family);
+        const corpus = lookupCorpusMeta(index, rel_path);
+        const trust_ok = if (corpus) |meta| trustClassAtLeast(meta.trust_class, trust_floor) else true;
+        const anchored = same_file or exact_path or exact_symbol or (family == .code and compatible_family);
+        const reinforced_suppressed = try shouldApplyReinforcedRouteSuppressor(
+            allocator,
+            paths,
+            target_family,
+            family,
+            rel_path,
+            raw_target,
+            exact_path,
+            exact_symbol,
+        );
+
+        if (reinforced_suppressed) {
+            try appendSuppressedNoiseBounded(allocator, &suppressed, rel_path, "suppressed by reinforced route suppressor", rel_path, seed.line);
+            continue;
+        }
+        if (!trust_ok) {
+            try appendSuppressedNoiseBounded(allocator, &suppressed, rel_path, "suppressed by trust-envelope constraint", rel_path, seed.line);
+            continue;
+        }
+        if (!compatible_family and !same_file and !exact_path and !exact_symbol) {
+            try appendSuppressedNoiseBounded(allocator, &suppressed, rel_path, "suppressed by target-family compatibility gate", rel_path, seed.line);
+            continue;
+        }
+        if (!anchored) {
+            try appendSuppressedNoiseBounded(allocator, &suppressed, rel_path, "suppressed floating evidence because it did not attach to an active exact path/symbol anchor", rel_path, seed.line);
+            continue;
+        }
+        if (seen_files.contains(seed.file_index)) {
+            try appendSuppressedNoiseBounded(allocator, &suppressed, rel_path, "suppressed near-duplicate evidence from the same source surface", rel_path, seed.line);
+            continue;
+        }
+        if (kept.items.len >= max_items) {
+            try appendSuppressedNoiseBounded(allocator, &suppressed, rel_path, "suppressed by global routed-candidate cap", rel_path, seed.line);
+            continue;
+        }
+
+        try seen_files.put(seed.file_index, {});
+        try kept.append(seed);
+        const route_label = if (same_file)
+            "same_target_file"
+        else if (exact_path and exact_symbol)
+            "exact_path_and_symbol"
+        else if (exact_path)
+            "exact_path"
+        else if (exact_symbol)
+            "exact_symbol"
+        else
+            "compatible_family";
+        try labels.append(try allocator.dupe(u8, route_label));
+    }
+
+    return .{
+        .seeds = try kept.toOwnedSlice(),
+        .routing_labels = try labels.toOwnedSlice(),
+        .suppressed_noise = try suppressed.toOwnedSlice(),
+        .routing_trace = routing_trace,
+    };
+}
+
+fn routingTraceSelectedPath(trace: support_routing.Trace, rel_path: []const u8) bool {
+    for (trace.entries) |entry| {
+        if (entry.status == .selected and std.mem.eql(u8, entry.id, rel_path)) return true;
+    }
+    return false;
+}
+
+fn routingTraceSkipReason(trace: support_routing.Trace, rel_path: []const u8) ?[]const u8 {
+    for (trace.entries) |entry| {
+        if (entry.status == .selected or !std.mem.eql(u8, entry.id, rel_path)) continue;
+        return switch (entry.skip_reason) {
+            .none => null,
+            .low_support_potential => "suppressed by support-potential upper-bound floor",
+            .stale_or_low_trust => "suppressed by stale or low-trust support-potential bound",
+            .conflict_state => "suppressed by support-routing conflict state",
+            .source_family_quota => "suppressed by per-source-family routing quota",
+            .selection_budget => "suppressed by support-routing selection budget",
+            .considered_budget => "suppressed by support-routing considered budget",
+        };
+    }
+    return null;
+}
+
+fn buildEvidence(
+    allocator: std.mem.Allocator,
+    index: *const RepoIndex,
+    seeds: []const EvidenceSeed,
+    routing_labels: ?[]const []u8,
+    max_items: usize,
+) ![]Evidence {
     var sorted = std.ArrayList(EvidenceSeed).init(allocator);
     defer sorted.deinit();
     try sorted.appendSlice(seeds);
@@ -3206,6 +5827,8 @@ fn buildEvidence(allocator: std.mem.Allocator, index: *const RepoIndex, seeds: [
             .line = seed.line,
             .reason = seed.reason,
             .subsystem = subsystemName(file.subsystem),
+            .routing = if (routing_labels != null and idx < routing_labels.?.len) try allocator.dupe(u8, routing_labels.?[idx]) else null,
+            .corpus = if (lookupCorpusMeta(index, file.rel_path)) |meta| try cloneCorpusTrace(allocator, meta) else null,
         };
     }
     return out;
@@ -3230,8 +5853,9 @@ fn buildRefactorPath(
         .line = line,
         .reason = "subject",
         .subsystem = subsystemName(file.subsystem),
+        .corpus = if (lookupCorpusMeta(index, file.rel_path)) |meta| try cloneCorpusTrace(allocator, meta) else null,
     };
-    const evidence = try buildEvidence(allocator, index, seeds, max_items);
+    const evidence = try buildEvidence(allocator, index, seeds, null, max_items);
     defer {
         for (evidence) |item| allocator.free(item.rel_path);
         allocator.free(evidence);
@@ -3271,12 +5895,16 @@ fn initResult(allocator: std.mem.Allocator, options: Options) !Result {
         .shard_id = "",
         .shard_kind = .core,
         .reasoning_mode = options.reasoning_mode,
+        .effective_budget = options.effective_budget,
+        .routing_trace = .{ .allocator = allocator },
+        .unresolved = .{ .allocator = allocator },
         .support_graph = .{ .allocator = allocator },
     };
 }
 
 fn makeSubject(allocator: std.mem.Allocator, index: *const RepoIndex, target: ResolvedTarget) !Subject {
     const file = index.files.items[target.file_index];
+    const corpus = if (lookupCorpusMeta(index, file.rel_path)) |meta| try cloneCorpusTrace(allocator, meta) else null;
     return switch (target.target_kind) {
         .file => .{
             .name = try allocator.dupe(u8, std.fs.path.basename(file.rel_path)),
@@ -3284,6 +5912,7 @@ fn makeSubject(allocator: std.mem.Allocator, index: *const RepoIndex, target: Re
             .line = 1,
             .kind_name = "file",
             .subsystem = subsystemName(file.subsystem),
+            .corpus = corpus,
         },
         .declaration => blk: {
             const decl = index.declarations.items[target.decl_index.?];
@@ -3293,9 +5922,34 @@ fn makeSubject(allocator: std.mem.Allocator, index: *const RepoIndex, target: Re
                 .line = decl.line,
                 .kind_name = declKindName(decl.kind),
                 .subsystem = subsystemName(file.subsystem),
+                .corpus = corpus,
             };
         },
     };
+}
+
+fn lookupCorpusMeta(index: *const RepoIndex, rel_path: []const u8) ?*const corpus_ingest.CorpusMeta {
+    return if (index.corpus_meta.getPtr(rel_path)) |value| value else null;
+}
+
+fn cloneCorpusTrace(allocator: std.mem.Allocator, meta: *const corpus_ingest.CorpusMeta) !CorpusTrace {
+    return .{
+        .class_name = try allocator.dupe(u8, corpus_ingest.className(meta.class)),
+        .source_rel_path = try allocator.dupe(u8, meta.source_rel_path),
+        .source_label = try allocator.dupe(u8, meta.source_label),
+        .provenance = try allocator.dupe(u8, meta.provenance),
+        .trust_class = meta.trust_class,
+        .lineage_id = try allocator.dupe(u8, meta.lineage_id),
+        .lineage_version = meta.lineage_version,
+    };
+}
+
+fn deinitCorpusTrace(allocator: std.mem.Allocator, trace: CorpusTrace) void {
+    allocator.free(trace.class_name);
+    allocator.free(trace.source_rel_path);
+    allocator.free(trace.source_label);
+    allocator.free(trace.provenance);
+    allocator.free(trace.lineage_id);
 }
 
 fn resolveSelectedShardPaths(allocator: std.mem.Allocator, project_shard: ?[]const u8) !shards.Paths {
@@ -3308,19 +5962,29 @@ fn resolveSelectedShardPaths(allocator: std.mem.Allocator, project_shard: ?[]con
 }
 
 fn loadRepoIndex(allocator: std.mem.Allocator, repo_root: []const u8, shard_paths: *const shards.Paths, cache_persist: bool) !IndexLoadResult {
-    var scan_entries = try scanRepoFiles(allocator, repo_root);
+    const scan_started = sys.getMilliTick();
+    var scan_entries = try scanRepoFiles(allocator, repo_root, shard_paths);
     defer {
         for (scan_entries.items) |*entry| entry.deinit(allocator);
         scan_entries.deinit();
     }
+    const repo_scan_ms = sys.getMilliTick() - scan_started;
 
     if (!cache_persist) {
-        var cache = try buildCacheFromScan(allocator, repo_root, scan_entries.items);
+        const build_started = sys.getMilliTick();
+        var cache = try buildCacheFromScan(allocator, repo_root, shard_paths, scan_entries.items);
         defer cache.deinit();
+        const materialize_started = sys.getMilliTick();
+        var index = try RepoIndex.fromCache(allocator, repo_root, cache.files.items);
+        errdefer index.deinit();
+        try attachCorpusMetadata(allocator, &index, scan_entries.items);
         return .{
-            .index = try RepoIndex.fromCache(allocator, repo_root, cache.files.items),
+            .index = index,
             .lifecycle = .cold_build,
             .changed_files = @intCast(cache.files.items.len),
+            .repo_scan_ms = repo_scan_ms,
+            .cache_refresh_ms = sys.getMilliTick() - build_started,
+            .index_materialize_ms = sys.getMilliTick() - materialize_started,
         };
     }
 
@@ -3342,7 +6006,9 @@ fn loadRepoIndex(allocator: std.mem.Allocator, repo_root: []const u8, shard_path
         try PersistedCache.init(allocator, repo_root);
     defer cache.deinit();
 
-    const refresh = try refreshPersistedCache(allocator, &cache, scan_entries.items);
+    const refresh_started = sys.getMilliTick();
+    const refresh = try refreshPersistedCache(allocator, shard_paths, &cache, scan_entries.items);
+    const cache_refresh_ms = sys.getMilliTick() - refresh_started;
     const lifecycle: CacheLifecycle = if (!had_loaded_cache)
         .cold_build
     else if (refresh.changed_files == 0)
@@ -3355,10 +6021,18 @@ fn loadRepoIndex(allocator: std.mem.Allocator, repo_root: []const u8, shard_path
         try persistCache(allocator, cache_index_path, &cache);
     }
 
+    const materialize_started = sys.getMilliTick();
+    var index = try RepoIndex.fromCache(allocator, repo_root, cache.files.items);
+    errdefer index.deinit();
+    try attachCorpusMetadata(allocator, &index, scan_entries.items);
+
     return .{
-        .index = try RepoIndex.fromCache(allocator, repo_root, cache.files.items),
+        .index = index,
         .lifecycle = lifecycle,
         .changed_files = refresh.changed_files,
+        .repo_scan_ms = repo_scan_ms,
+        .cache_refresh_ms = cache_refresh_ms,
+        .index_materialize_ms = sys.getMilliTick() - materialize_started,
     };
 }
 
@@ -3442,16 +6116,16 @@ const AliasTarget = struct {
     symbol_name: ?[]const u8 = null,
 };
 
-fn buildCacheFromScan(allocator: std.mem.Allocator, repo_root: []const u8, scan_entries: []const RepoScanEntry) !PersistedCache {
+fn buildCacheFromScan(allocator: std.mem.Allocator, repo_root: []const u8, shard_paths: *const shards.Paths, scan_entries: []const RepoScanEntry) !PersistedCache {
     var cache = try PersistedCache.init(allocator, repo_root);
     errdefer cache.deinit();
     for (scan_entries) |entry| {
-        try cache.files.append(try parseCachedFileRecord(allocator, repo_root, scan_entries, entry));
+        try cache.files.append(try parseCachedFileRecord(allocator, shard_paths, repo_root, scan_entries, entry));
     }
     return cache;
 }
 
-fn refreshPersistedCache(allocator: std.mem.Allocator, cache: *PersistedCache, scan_entries: []const RepoScanEntry) !RefreshSummary {
+fn refreshPersistedCache(allocator: std.mem.Allocator, shard_paths: *const shards.Paths, cache: *PersistedCache, scan_entries: []const RepoScanEntry) !RefreshSummary {
     var refreshed = try PersistedCache.init(allocator, cache.repo_root);
     errdefer refreshed.deinit();
 
@@ -3466,7 +6140,7 @@ fn refreshPersistedCache(allocator: std.mem.Allocator, cache: *PersistedCache, s
             continue;
         }
         if (cache_index >= cache.files.items.len) {
-            try refreshed.files.append(try parseCachedFileRecord(allocator, cache.repo_root, scan_entries, scan_entries[scan_index]));
+            try refreshed.files.append(try parseCachedFileRecord(allocator, shard_paths, cache.repo_root, scan_entries, scan_entries[scan_index]));
             changed_files += 1;
             scan_index += 1;
             continue;
@@ -3476,7 +6150,7 @@ fn refreshPersistedCache(allocator: std.mem.Allocator, cache: *PersistedCache, s
         const cached_file = &cache.files.items[cache_index];
         switch (std.mem.order(u8, scan_entry.rel_path, cached_file.rel_path)) {
             .lt => {
-                try refreshed.files.append(try parseCachedFileRecord(allocator, cache.repo_root, scan_entries, scan_entry));
+                try refreshed.files.append(try parseCachedFileRecord(allocator, shard_paths, cache.repo_root, scan_entries, scan_entry));
                 changed_files += 1;
                 scan_index += 1;
             },
@@ -3488,7 +6162,7 @@ fn refreshPersistedCache(allocator: std.mem.Allocator, cache: *PersistedCache, s
                 if (scan_entry.size_bytes == cached_file.size_bytes and scan_entry.mtime_ns == cached_file.mtime_ns) {
                     try refreshed.files.append(try cached_file.clone(allocator));
                 } else {
-                    try refreshed.files.append(try parseCachedFileRecord(allocator, cache.repo_root, scan_entries, scan_entry));
+                    try refreshed.files.append(try parseCachedFileRecord(allocator, shard_paths, cache.repo_root, scan_entries, scan_entry));
                     changed_files += 1;
                 }
                 scan_index += 1;
@@ -3504,6 +6178,7 @@ fn refreshPersistedCache(allocator: std.mem.Allocator, cache: *PersistedCache, s
 
 fn parseCachedFileRecord(
     allocator: std.mem.Allocator,
+    shard_paths: *const shards.Paths,
     repo_root: []const u8,
     scan_entries: []const RepoScanEntry,
     entry: RepoScanEntry,
@@ -3512,7 +6187,7 @@ fn parseCachedFileRecord(
         return parseNativeCachedFileRecord(allocator, repo_root, scan_entries, entry);
     }
     if (isSymbolicExtension(entry.rel_path)) {
-        return parseSymbolicCachedFileRecord(allocator, entry);
+        return parseSymbolicCachedFileRecord(allocator, shard_paths, entry);
     }
     return parseZigCachedFileRecord(allocator, entry);
 }
@@ -3593,7 +6268,29 @@ fn parseZigCachedFileRecord(allocator: std.mem.Allocator, entry: RepoScanEntry) 
     return record;
 }
 
-fn parseSymbolicCachedFileRecord(allocator: std.mem.Allocator, entry: RepoScanEntry) !CachedFileRecord {
+fn lookupParserCascadePlan(
+    allocator: std.mem.Allocator,
+    shard_paths: *const shards.Paths,
+    rel_path: []const u8,
+    class: SymbolicClass,
+) !ParserCascadePlan {
+    const ext = std.fs.path.extension(rel_path);
+    const class_pattern = try std.fmt.allocPrint(allocator, "class:{s}", .{symbolicClassName(class)});
+    defer allocator.free(class_pattern);
+    const ext_pattern = try std.fmt.allocPrint(allocator, "ext:{s}", .{if (ext.len > 0) ext else "<none>"});
+    defer allocator.free(ext_pattern);
+    const stage_pattern = "stage:robust_structured";
+    const patterns = [_][]const u8{ class_pattern, ext_pattern, stage_pattern };
+    const refs = try abstractions.lookupFamilyConcepts(allocator, shard_paths, .{
+        .family = .parser_sketch,
+        .patterns = &patterns,
+        .max_items = 1,
+    });
+    defer abstractions.deinitSupportReferences(allocator, refs);
+    return .{ .prefer_robust = refs.len > 0 and refs[0].usable };
+}
+
+fn parseSymbolicCachedFileRecord(allocator: std.mem.Allocator, shard_paths: *const shards.Paths, entry: RepoScanEntry) !CachedFileRecord {
     // Symbolic ingestion is intentionally shallow: it extracts bounded units
     // from docs, config, markup, and DSL-like files so support-backed queries
     // can ground across code and non-code surfaces without claiming full
@@ -3614,11 +6311,35 @@ fn parseSymbolicCachedFileRecord(allocator: std.mem.Allocator, entry: RepoScanEn
     errdefer record.deinit();
     record.content_hash = std.hash.Fnv1a_64.hash(source);
 
-    switch (classifySymbolicClass(entry.rel_path, source)) {
-        .technical_text => try parseTechnicalTextRecord(&record, source),
-        .config_like => try parseConfigLikeRecord(&record, source),
-        .markup_like => try parseMarkupLikeRecord(&record, source),
-        .dsl_like => try parseDslLikeRecord(&record, source),
+    const class = classifySymbolicClass(entry.rel_path, source);
+    const parser_plan = try lookupParserCascadePlan(allocator, shard_paths, entry.rel_path, class);
+    const cascade = if (parser_plan.prefer_robust)
+        [_]SymbolicParseStage{
+            .robust_structured,
+            .strict_structured,
+            .delimiter_structured,
+            .fallback_fragment,
+        }
+    else
+        [_]SymbolicParseStage{
+            .strict_structured,
+            .robust_structured,
+            .delimiter_structured,
+            .fallback_fragment,
+        };
+    inline for (cascade, 0..) |stage, stage_idx| {
+        if (stage_idx >= MAX_SYMBOLIC_PARSE_STAGES) break;
+        switch (stage) {
+            .strict_structured => switch (class) {
+                .technical_text => try parseTechnicalTextRecord(&record, source),
+                .config_like => try parseConfigLikeRecord(&record, source),
+                .markup_like => try parseMarkupLikeRecord(&record, source),
+                .dsl_like => try parseDslLikeRecord(&record, source),
+            },
+            .robust_structured => try parseRobustStructuralFragments(&record, source, class),
+            .delimiter_structured => try parseDelimiterFragments(&record, source),
+            .fallback_fragment => try parseFallbackFragments(&record, source),
+        }
     }
 
     return record;
@@ -3632,17 +6353,29 @@ fn classifySymbolicClass(path: []const u8, source: []const u8) SymbolicClass {
         std.mem.endsWith(u8, path, ".ini") or
         std.mem.endsWith(u8, path, ".cfg") or
         std.mem.endsWith(u8, path, ".conf") or
-        std.mem.endsWith(u8, path, ".env"))
+        std.mem.endsWith(u8, path, ".env") or
+        std.mem.endsWith(u8, path, ".tf") or
+        std.mem.endsWith(u8, path, ".tfvars") or
+        std.mem.endsWith(u8, path, ".tpl"))
     {
         return .config_like;
     }
     if (std.mem.endsWith(u8, path, ".html") or std.mem.endsWith(u8, path, ".xml")) return .markup_like;
-    if (std.mem.endsWith(u8, path, ".rules") or std.mem.endsWith(u8, path, ".dsl")) return .dsl_like;
+    if (std.mem.endsWith(u8, path, ".rules") or std.mem.endsWith(u8, path, ".dsl") or std.mem.endsWith(u8, path, ".test") or std.mem.endsWith(u8, path, ".spec")) return .dsl_like;
     if (std.mem.endsWith(u8, path, ".md")) return .technical_text;
     if (std.mem.indexOfScalar(u8, source, '<') != null and std.mem.indexOfScalar(u8, source, '>') != null) return .markup_like;
     if (std.mem.indexOf(u8, source, "->") != null or std.mem.indexOf(u8, source, "=>") != null or std.mem.indexOf(u8, source, ":=") != null) return .dsl_like;
     if (std.mem.indexOfScalar(u8, source, '=') != null or std.mem.indexOfScalar(u8, source, ':') != null) return .config_like;
     return .technical_text;
+}
+
+fn symbolicClassName(class: SymbolicClass) []const u8 {
+    return switch (class) {
+        .technical_text => "technical_text",
+        .config_like => "config_like",
+        .markup_like => "markup_like",
+        .dsl_like => "dsl_like",
+    };
 }
 
 fn parseTechnicalTextRecord(record: *CachedFileRecord, source: []const u8) !void {
@@ -3809,6 +6542,107 @@ fn parseDslLikeRecord(record: *CachedFileRecord, source: []const u8) !void {
     }
 }
 
+fn parseRobustStructuralFragments(record: *CachedFileRecord, source: []const u8, class: SymbolicClass) !void {
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    var line_number: u32 = 1;
+    while (lines.next()) |raw_line| : (line_number += 1) {
+        const line = std.mem.trim(u8, std.mem.trimRight(u8, raw_line, "\r"), " \t");
+        if (line.len == 0 or line.len > MAX_SYMBOLIC_LINE_BYTES) continue;
+
+        var line_fragments: usize = 0;
+
+        if (partialSectionName(line)) |section_name| {
+            _ = try appendSymbolicNamedUnit(record, "section_fragment", section_name, line_number);
+            line_fragments += 1;
+        }
+
+        if (looseHeadingText(line)) |heading_text| {
+            if (line_fragments < MAX_SYMBOLIC_FRAGMENTS_PER_LINE) {
+                _ = try appendSymbolicUnit(record, "heading_fragment", heading_text, line_number, true);
+                line_fragments += 1;
+            }
+        }
+
+        if (looseListItemText(line)) |item_text| {
+            if (line_fragments < MAX_SYMBOLIC_FRAGMENTS_PER_LINE) {
+                _ = try appendSymbolicUnit(record, "list_fragment", item_text, line_number, true);
+                line_fragments += 1;
+            }
+        }
+
+        if (class == .markup_like) {
+            if (partialMarkupTag(line)) |tag_name| {
+                if (line_fragments < MAX_SYMBOLIC_FRAGMENTS_PER_LINE) {
+                    _ = try appendSymbolicUnit(record, "tag_fragment", tag_name, line_number, true);
+                    line_fragments += 1;
+                }
+            }
+        }
+
+        if (looseKeyValue(line)) |kv| {
+            if (line_fragments < MAX_SYMBOLIC_FRAGMENTS_PER_LINE) {
+                try appendLooseKeyValueUnit(record, "kv_fragment", kv.key, line, line_number);
+                line_fragments += 1;
+            }
+        } else if (looksMalformedKeyValue(line)) {
+            try appendCachedSuppressedNoise(record, line, line_number, "malformed key/value fragment suppressed during robust structural parse");
+        }
+    }
+}
+
+fn parseDelimiterFragments(record: *CachedFileRecord, source: []const u8) !void {
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    var line_number: u32 = 1;
+    while (lines.next()) |raw_line| : (line_number += 1) {
+        const line = std.mem.trim(u8, std.mem.trimRight(u8, raw_line, "\r"), " \t");
+        if (line.len == 0 or line.len > MAX_SYMBOLIC_LINE_BYTES) continue;
+
+        var line_fragments: usize = 0;
+
+        if (stackFrameInfo(line)) |frame| {
+            if (line_fragments < MAX_SYMBOLIC_FRAGMENTS_PER_LINE) {
+                _ = try appendSymbolicUnit(record, "frame", frame.symbol, line_number, true);
+                line_fragments += 1;
+            }
+            if (frame.path) |path_text| {
+                if (line_fragments < MAX_SYMBOLIC_FRAGMENTS_PER_LINE) {
+                    _ = try appendSymbolicUnit(record, "path", path_text, line_number, true);
+                    line_fragments += 1;
+                }
+            }
+        }
+
+        if (line_fragments < MAX_SYMBOLIC_FRAGMENTS_PER_LINE) {
+            if (pathLikeFragment(line)) |path_text| {
+                _ = try appendSymbolicUnit(record, "path", path_text, line_number, true);
+                line_fragments += 1;
+            }
+        }
+
+        if (line_fragments < MAX_SYMBOLIC_FRAGMENTS_PER_LINE) {
+            if (looseKeyValue(line)) |kv| {
+                try appendLooseKeyValueUnit(record, "kv_fragment", kv.key, line, line_number);
+                line_fragments += 1;
+            }
+        }
+
+        if (line_fragments == 0 and hasDelimiterSignal(line) and !hasEnoughTokenMassForFallback(line)) {
+            try appendCachedSuppressedNoise(record, line, line_number, "delimiter-heavy line suppressed because no bounded symbolic fragment survived extraction");
+        }
+    }
+}
+
+fn parseFallbackFragments(record: *CachedFileRecord, source: []const u8) !void {
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    var line_number: u32 = 1;
+    while (lines.next()) |raw_line| : (line_number += 1) {
+        const line = std.mem.trim(u8, std.mem.trimRight(u8, raw_line, "\r"), " \t");
+        if (line.len == 0 or line.len > MAX_SYMBOLIC_LINE_BYTES) continue;
+        if (!hasEnoughTokenMassForFallback(line)) continue;
+        _ = try appendSymbolicUnit(record, "fragment", line, line_number, true);
+    }
+}
+
 fn appendSymbolicUnit(
     record: *CachedFileRecord,
     prefix: []const u8,
@@ -3826,6 +6660,7 @@ fn appendSymbolicUnit(
         try std.fmt.allocPrint(record.allocator, "{s}:{s}", .{ prefix, slug });
     defer record.allocator.free(name);
 
+    if (cachedDeclExists(record, name, line)) return findCachedDeclName(record, name, line);
     try appendCachedDecl(record, name, line, .symbolic_unit, true, .definition);
     try appendSymbolicReferences(record, text, line);
     return record.declarations.items[record.declarations.items.len - 1].name;
@@ -3843,9 +6678,19 @@ fn appendSymbolicNamedUnit(record: *CachedFileRecord, prefix: []const u8, text: 
 
 fn appendSymbolicExactUnit(record: *CachedFileRecord, exact_name: []const u8, source_text: []const u8, line: u32) !?[]const u8 {
     if (record.declarations.items.len >= MAX_SYMBOLIC_UNITS_PER_FILE) return null;
+    if (cachedDeclExists(record, exact_name, line)) return findCachedDeclName(record, exact_name, line);
     try appendCachedDecl(record, exact_name, line, .symbolic_unit, true, .definition);
     try appendSymbolicReferences(record, source_text, line);
     return record.declarations.items[record.declarations.items.len - 1].name;
+}
+
+fn appendLooseKeyValueUnit(record: *CachedFileRecord, prefix: []const u8, key: []const u8, source_text: []const u8, line: u32) !void {
+    var name = std.ArrayList(u8).init(record.allocator);
+    defer name.deinit();
+    try name.appendSlice(prefix);
+    try name.append(':');
+    try appendSanitizedSymbolicText(&name, key, true);
+    _ = try appendSymbolicExactUnit(record, name.items, source_text, line);
 }
 
 fn appendSymbolicReferences(record: *CachedFileRecord, text: []const u8, line: u32) !void {
@@ -3883,6 +6728,18 @@ fn appendCachedSemanticEdge(
     });
 }
 
+fn appendCachedSuppressedNoise(record: *CachedFileRecord, label: []const u8, line: u32, reason: []const u8) !void {
+    if (record.suppressed_noise.items.len >= MAX_SYMBOLIC_NOISE_PER_FILE) return;
+    for (record.suppressed_noise.items) |existing| {
+        if (existing.line == line and std.mem.eql(u8, existing.label, label) and std.mem.eql(u8, existing.reason, reason)) return;
+    }
+    try record.suppressed_noise.append(.{
+        .label = try record.allocator.dupe(u8, label),
+        .reason = try record.allocator.dupe(u8, reason),
+        .line = line,
+    });
+}
+
 fn markdownHeadingText(line: []const u8) ?[]const u8 {
     var count: usize = 0;
     while (count < line.len and line[count] == '#') : (count += 1) {}
@@ -3895,6 +6752,15 @@ fn markdownListItemText(line: []const u8) ?[]const u8 {
     var i: usize = 0;
     while (i < line.len and std.ascii.isDigit(line[i])) : (i += 1) {}
     if (i > 0 and i + 1 < line.len and line[i] == '.' and line[i + 1] == ' ') return std.mem.trim(u8, line[i + 2 ..], " \t");
+    return null;
+}
+
+fn looseListItemText(line: []const u8) ?[]const u8 {
+    if (markdownListItemText(line) != null) return null;
+    if (line.len >= 2 and (line[0] == '-' or line[0] == '*')) return std.mem.trim(u8, line[1..], " \t");
+    var i: usize = 0;
+    while (i < line.len and std.ascii.isDigit(line[i])) : (i += 1) {}
+    if (i > 0 and i < line.len and (line[i] == '.' or line[i] == ')')) return std.mem.trim(u8, line[i + 1 ..], " \t");
     return null;
 }
 
@@ -3911,6 +6777,14 @@ fn configSectionName(line: []const u8) ?[]const u8 {
         return std.mem.trim(u8, line[1 .. line.len - 1], " \t\"");
     }
     return null;
+}
+
+fn partialSectionName(line: []const u8) ?[]const u8 {
+    if (configSectionName(line) != null) return null;
+    if (line.len < 2 or line[0] != '[') return null;
+    const body = std.mem.trim(u8, std.mem.trimLeft(u8, line[1..], " \t"), " \t]");
+    if (body.len == 0) return null;
+    return body;
 }
 
 fn yamlContainerName(line: []const u8) ?[]const u8 {
@@ -3938,6 +6812,27 @@ fn configKeyValue(line: []const u8) ?struct { key: []const u8, value: []const u8
     return null;
 }
 
+fn looseKeyValue(line: []const u8) ?struct { key: []const u8, value: []const u8 } {
+    if (configKeyValue(line)) |kv| return .{ .key = kv.key, .value = kv.value };
+    for (&[_][]const u8{ "=>", "->", "=", ":" }) |delim| {
+        if (std.mem.indexOf(u8, line, delim)) |idx| {
+            const key = std.mem.trim(u8, line[0..idx], " \t\"-*>[]()");
+            const value = std.mem.trim(u8, line[idx + delim.len ..], " \t\",");
+            if (key.len == 0 or value.len == 0) return null;
+            return .{ .key = key, .value = value };
+        }
+    }
+    return null;
+}
+
+fn looksMalformedKeyValue(line: []const u8) bool {
+    if (configKeyValue(line) != null or looseKeyValue(line) != null) return false;
+    for (&[_][]const u8{ "=>", "->", "=", ":" }) |delim| {
+        if (std.mem.indexOf(u8, line, delim)) |_| return true;
+    }
+    return false;
+}
+
 fn trimDslLine(raw_line: []const u8) []const u8 {
     var line = std.mem.trim(u8, std.mem.trimRight(u8, raw_line, "\r"), " \t");
     if (std.mem.indexOf(u8, line, "//")) |idx| line = std.mem.trimRight(u8, line[0..idx], " \t");
@@ -3953,6 +6848,84 @@ fn dslRuleSides(line: []const u8) ?struct { left: []const u8, right: []const u8 
             if (left.len == 0 or right.len == 0) return null;
             return .{ .left = left, .right = right };
         }
+    }
+    return null;
+}
+
+fn looseHeadingText(line: []const u8) ?[]const u8 {
+    if (markdownHeadingText(line) != null) return null;
+    if (!std.mem.endsWith(u8, line, ":")) return null;
+    const body = std.mem.trim(u8, line[0 .. line.len - 1], " \t");
+    if (body.len == 0 or body.len > 80) return null;
+    if (std.mem.indexOfScalar(u8, body, '=') != null) return null;
+    return body;
+}
+
+fn partialMarkupTag(line: []const u8) ?[]const u8 {
+    if (std.mem.indexOfScalar(u8, line, '<')) |start| {
+        if (start + 1 >= line.len) return null;
+        if (line[start + 1] == '/' or line[start + 1] == '!' or line[start + 1] == '?') return null;
+        var cursor = start + 1;
+        while (cursor < line.len and isMarkupTagChar(line[cursor])) : (cursor += 1) {}
+        if (cursor == start + 1) return null;
+        if (std.mem.indexOfScalar(u8, line[start..cursor], '>') != null) return null;
+        return line[start + 1 .. cursor];
+    }
+    return null;
+}
+
+fn pathLikeFragment(line: []const u8) ?[]const u8 {
+    var it = std.mem.tokenizeAny(u8, line, " \t()[]<>,;\"'");
+    while (it.next()) |token| {
+        if (token.len < 4) continue;
+        if (std.mem.indexOfScalar(u8, token, '/')) |_| return std.mem.trimRight(u8, token, ":.");
+        if (std.mem.indexOf(u8, token, ".zig:") != null or std.mem.indexOf(u8, token, ".md:") != null or std.mem.indexOf(u8, token, ".cfg:") != null) {
+            return std.mem.trimRight(u8, token, ":.");
+        }
+    }
+    return null;
+}
+
+fn stackFrameInfo(line: []const u8) ?struct { symbol: []const u8, path: ?[]const u8 = null } {
+    var body = line;
+    if (std.mem.startsWith(u8, body, "at ")) body = body[3..];
+    if (std.mem.startsWith(u8, body, "frame ")) body = body[6..];
+    const open = std.mem.indexOfScalar(u8, body, '(');
+    const close = std.mem.lastIndexOfScalar(u8, body, ')');
+    if (open == null or close == null or close.? <= open.?) return null;
+    const symbol = std.mem.trim(u8, body[0..open.?], " \t");
+    const path = std.mem.trim(u8, body[open.? + 1 .. close.?], " \t");
+    if (symbol.len == 0) return null;
+    return .{ .symbol = symbol, .path = if (path.len > 0) path else null };
+}
+
+fn hasDelimiterSignal(line: []const u8) bool {
+    return std.mem.indexOfScalar(u8, line, '=') != null or
+        std.mem.indexOfScalar(u8, line, ':') != null or
+        std.mem.indexOf(u8, line, "->") != null or
+        std.mem.indexOf(u8, line, "=>") != null or
+        std.mem.indexOfScalar(u8, line, '[') != null or
+        std.mem.indexOfScalar(u8, line, '<') != null;
+}
+
+fn hasEnoughTokenMassForFallback(line: []const u8) bool {
+    var token_count: usize = 0;
+    var it = std.mem.tokenizeAny(u8, line, " \t,;:()[]{}<>");
+    while (it.next()) |token| {
+        if (token.len < 2) continue;
+        token_count += 1;
+        if (token_count >= 3) return true;
+    }
+    return false;
+}
+
+fn cachedDeclExists(record: *const CachedFileRecord, name: []const u8, line: u32) bool {
+    return findCachedDeclName(record, name, line) != null;
+}
+
+fn findCachedDeclName(record: *const CachedFileRecord, name: []const u8, line: u32) ?[]const u8 {
+    for (record.declarations.items) |decl| {
+        if (decl.line == line and std.mem.eql(u8, decl.name, name)) return decl.name;
     }
     return null;
 }
@@ -4678,15 +7651,68 @@ fn findUniqueDeclarationByNameInFile(index: *const RepoIndex, file_index: u32, n
     return found;
 }
 
-fn scanRepoFiles(allocator: std.mem.Allocator, repo_root: []const u8) !std.ArrayList(RepoScanEntry) {
+fn scanRepoFiles(allocator: std.mem.Allocator, repo_root: []const u8, shard_paths: *const shards.Paths) !std.ArrayList(RepoScanEntry) {
     var entries = std.ArrayList(RepoScanEntry).init(allocator);
     errdefer {
         for (entries.items) |*entry| entry.deinit(allocator);
         entries.deinit();
     }
     try scanRepoDirRecursive(allocator, repo_root, "", &entries);
+    const corpus_entries = try corpus_ingest.collectLiveScanEntries(allocator, shard_paths);
+    defer allocator.free(corpus_entries);
+    for (corpus_entries) |*entry| {
+        try entries.append(.{
+            .rel_path = entry.rel_path,
+            .abs_path = entry.abs_path,
+            .size_bytes = entry.size_bytes,
+            .mtime_ns = entry.mtime_ns,
+            .corpus_meta = entry.corpus_meta,
+        });
+    }
+
+    if (shard_paths.metadata.kind == .project) {
+        const mounts = try knowledge_pack_store.listResolvedMounts(allocator, shard_paths);
+        defer {
+            for (mounts) |*mount| mount.deinit();
+            allocator.free(mounts);
+        }
+        for (mounts) |*mount| {
+            if (!mount.entry.enabled) continue;
+            const pack_entries = try corpus_ingest.collectPackScanEntries(
+                allocator,
+                mount.entry.pack_id,
+                mount.entry.pack_version,
+                mount.corpus_manifest_abs_path,
+                mount.corpus_files_abs_path,
+            );
+            defer allocator.free(pack_entries);
+            for (pack_entries) |*entry| {
+                try entries.append(.{
+                    .rel_path = entry.rel_path,
+                    .abs_path = entry.abs_path,
+                    .size_bytes = entry.size_bytes,
+                    .mtime_ns = entry.mtime_ns,
+                    .corpus_meta = entry.corpus_meta,
+                });
+            }
+        }
+    }
     std.sort.heap(RepoScanEntry, entries.items, {}, lessThanRepoScanEntry);
     return entries;
+}
+
+fn attachCorpusMetadata(allocator: std.mem.Allocator, index: *RepoIndex, scan_entries: []const RepoScanEntry) !void {
+    for (scan_entries) |entry| {
+        const meta = entry.corpus_meta orelse continue;
+        const key = try allocator.dupe(u8, entry.rel_path);
+        errdefer allocator.free(key);
+        const cloned = try meta.clone(allocator);
+        errdefer {
+            var copy = cloned;
+            copy.deinit();
+        }
+        try index.corpus_meta.put(key, cloned);
+    }
 }
 
 fn scanRepoDirRecursive(
@@ -4827,6 +7853,14 @@ fn loadPersistedCache(allocator: std.mem.Allocator, cache_index_path: []const u8
                     .kind = parseSemanticEdgeKind(fields.next() orelse return error.InvalidCodeIntelCache) orelse return error.InvalidCodeIntelCache,
                 });
             } else return error.InvalidCodeIntelCache;
+        } else if (std.mem.eql(u8, tag, "noise")) {
+            if (current) |*file_record| {
+                try file_record.suppressed_noise.append(.{
+                    .label = try parseCacheStringField(allocator, fields.next() orelse return error.InvalidCodeIntelCache),
+                    .reason = try parseCacheStringField(allocator, fields.next() orelse return error.InvalidCodeIntelCache),
+                    .line = try std.fmt.parseUnsigned(u32, fields.next() orelse return error.InvalidCodeIntelCache, 10),
+                });
+            } else return error.InvalidCodeIntelCache;
         } else if (std.mem.eql(u8, tag, "end")) {
             if (current == null) return error.InvalidCodeIntelCache;
             try cache.files.append(current.?);
@@ -4900,6 +7934,13 @@ fn persistCache(allocator: std.mem.Allocator, cache_index_path: []const u8, cach
                 edge.owner_line,
                 semanticEdgeKindName(edge.kind),
             });
+        }
+        for (file.suppressed_noise.items) |item| {
+            try writer.writeAll("noise\t");
+            try writeJsonString(writer, item.label);
+            try writer.writeByte('\t');
+            try writeJsonString(writer, item.reason);
+            try writer.print("\t{d}\n", .{item.line});
         }
         try writer.writeAll("end\n");
     }
@@ -5050,10 +8091,21 @@ fn writeSubject(writer: anytype, subject: Subject) !void {
     try writer.print(",\"line\":{d}", .{subject.line});
     try writeOptionalStringField(writer, "kind", subject.kind_name);
     try writeOptionalStringField(writer, "subsystem", subject.subsystem);
+    if (subject.corpus) |corpus| {
+        try writer.writeAll(",\"corpus\":{");
+        try writeJsonFieldString(writer, "class", corpus.class_name, true);
+        try writeJsonFieldString(writer, "sourcePath", corpus.source_rel_path, false);
+        try writeJsonFieldString(writer, "sourceLabel", corpus.source_label, false);
+        try writeJsonFieldString(writer, "provenance", corpus.provenance, false);
+        try writeJsonFieldString(writer, "trust", abstractions.trustClassName(corpus.trust_class), false);
+        try writeJsonFieldString(writer, "lineageId", corpus.lineage_id, false);
+        try writer.print(",\"lineageVersion\":{d}", .{corpus.lineage_version});
+        try writer.writeAll("}");
+    }
     try writer.writeAll("}");
 }
 
-fn writeEvidenceArray(writer: anytype, items: []const Evidence) !void {
+pub fn writeEvidenceArray(writer: anytype, items: []const Evidence) !void {
     try writer.writeAll("[");
     for (items, 0..) |item, idx| {
         if (idx != 0) try writer.writeByte(',');
@@ -5062,6 +8114,32 @@ fn writeEvidenceArray(writer: anytype, items: []const Evidence) !void {
         try writer.print(",\"line\":{d}", .{item.line});
         try writeOptionalStringField(writer, "reason", item.reason);
         try writeOptionalStringField(writer, "subsystem", item.subsystem);
+        if (item.routing) |routing| try writeOptionalStringField(writer, "routing", routing);
+        if (item.corpus) |corpus| {
+            try writer.writeAll(",\"corpus\":{");
+            try writeJsonFieldString(writer, "class", corpus.class_name, true);
+            try writeJsonFieldString(writer, "sourcePath", corpus.source_rel_path, false);
+            try writeJsonFieldString(writer, "sourceLabel", corpus.source_label, false);
+            try writeJsonFieldString(writer, "provenance", corpus.provenance, false);
+            try writeJsonFieldString(writer, "trust", abstractions.trustClassName(corpus.trust_class), false);
+            try writeJsonFieldString(writer, "lineageId", corpus.lineage_id, false);
+            try writer.print(",\"lineageVersion\":{d}", .{corpus.lineage_version});
+            try writer.writeAll("}");
+        }
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]");
+}
+
+fn writeSuppressedNoiseArray(writer: anytype, items: []const SuppressedNoise) !void {
+    try writer.writeAll("[");
+    for (items, 0..) |item, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try writer.writeAll("{");
+        try writeJsonFieldString(writer, "label", item.label, true);
+        try writeOptionalStringField(writer, "reason", item.reason);
+        if (item.rel_path) |rel_path| try writeOptionalStringField(writer, "relPath", rel_path);
+        if (item.line != 0) try writer.print(",\"line\":{d}", .{item.line});
         try writer.writeAll("}");
     }
     try writer.writeAll("]");
@@ -5095,16 +8173,18 @@ fn writeCandidateTraceArray(writer: anytype, items: []const CandidateTrace) !voi
     try writer.writeAll("]");
 }
 
-fn writeAbstractionTraceArray(writer: anytype, items: []const AbstractionTrace) !void {
+pub fn writeAbstractionTraceArray(writer: anytype, items: []const AbstractionTrace) !void {
     try writer.writeAll("[");
     for (items, 0..) |item, idx| {
         if (idx != 0) try writer.writeByte(',');
         try writer.writeAll("{");
         try writeJsonFieldString(writer, "label", item.label, true);
+        try writeJsonFieldString(writer, "family", abstractions.familyName(item.family), false);
         try writeJsonFieldString(writer, "tier", abstractions.tierName(item.tier), false);
         try writeJsonFieldString(writer, "category", abstractions.categoryName(item.category), false);
         try writeJsonFieldString(writer, "selectionMode", abstractions.selectionModeName(item.selection_mode), false);
         try writeJsonFieldString(writer, "resolution", abstractions.reuseResolutionName(item.resolution), false);
+        try writeJsonFieldString(writer, "packOutcome", abstractions.packRoutingStatusName(item.pack_outcome), false);
         try writeJsonFieldString(writer, "source", item.source_spec, false);
         try writer.print(",\"staged\":{s}", .{if (item.staged) "true" else "false"});
         try writer.print(",\"usable\":{s}", .{if (item.usable) "true" else "false"});
@@ -5118,8 +8198,14 @@ fn writeAbstractionTraceArray(writer: anytype, items: []const AbstractionTrace) 
         try writer.print(",\"lookupScore\":{d}", .{item.lookup_score});
         try writer.print(",\"directSupport\":{d}", .{item.direct_support_count});
         try writer.print(",\"lineageSupport\":{d}", .{item.lineage_support_count});
+        try writeOptionalStringField(writer, "trust", abstractions.trustClassName(item.trust_class));
+        try writer.writeAll(",\"lineage\":{");
+        try writeJsonFieldString(writer, "id", item.lineage_id, true);
+        try writer.print(",\"version\":{d}", .{item.lineage_version});
+        try writer.writeAll("}");
         if (item.reuse_decision != .none) try writeOptionalStringField(writer, "decision", abstractions.reuseDecisionName(item.reuse_decision));
         if (item.conflict_kind != .none) try writeOptionalStringField(writer, "conflictKind", abstractions.conflictKindName(item.conflict_kind));
+        if (item.pack_conflict_category != .none) try writeOptionalStringField(writer, "packConflictCategory", abstractions.packConflictCategoryName(item.pack_conflict_category));
         if (item.conflict_concept) |conflict_concept| try writeOptionalStringField(writer, "conflictConcept", conflict_concept);
         if (item.conflict_owner_id) |conflict_owner_id| {
             try writer.writeAll(",\"conflictProvenance\":{");
@@ -5134,21 +8220,318 @@ fn writeAbstractionTraceArray(writer: anytype, items: []const AbstractionTrace) 
     try writer.writeAll("]");
 }
 
-fn writeGroundingTraceArray(writer: anytype, items: []const GroundingTrace) !void {
-    try writer.writeAll("[");
+pub const PackInfluenceStats = struct {
+    considered_count: u32 = 0,
+    activated_count: u32 = 0,
+    skipped_count: u32 = 0,
+    suppressed_count: u32 = 0,
+    conflict_refused_count: u32 = 0,
+    trust_blocked_count: u32 = 0,
+    stale_blocked_count: u32 = 0,
+    candidate_surface_count: u32 = 0,
+    suppressed_candidate_surface_count: u32 = 0,
+    evidence_count: u32 = 0,
+    abstraction_count: u32 = 0,
+    grounding_count: u32 = 0,
+    reverse_grounding_count: u32 = 0,
+};
+
+fn isPackOwnerId(owner_id: []const u8) bool {
+    return std.mem.startsWith(u8, owner_id, "pack/");
+}
+
+fn isPackSourceSpec(spec: []const u8) bool {
+    return std.mem.startsWith(u8, spec, "@pack/");
+}
+
+fn hasPackCorpusTrace(corpus: ?CorpusTrace) bool {
+    if (corpus) |value| {
+        return isPackSourceSpec(value.source_rel_path) or
+            std.mem.startsWith(u8, value.provenance, "pack:") or
+            std.mem.indexOf(u8, value.provenance, "|pack/") != null;
+    }
+    return false;
+}
+
+pub fn collectPackInfluenceStats(
+    evidence: []const Evidence,
+    abstraction_traces: []const AbstractionTrace,
+    routing_traces: []const abstractions.PackRoutingTrace,
+    grounding_traces: []const GroundingTrace,
+    reverse_grounding_traces: []const GroundingTrace,
+) PackInfluenceStats {
+    var stats = PackInfluenceStats{};
+    for (routing_traces) |item| {
+        if (item.considered_rank != 0) stats.considered_count += 1;
+        stats.candidate_surface_count += item.candidate_surfaces;
+        stats.suppressed_candidate_surface_count += item.suppressed_candidates;
+        switch (item.status) {
+            .activated => stats.activated_count += 1,
+            .skipped => stats.skipped_count += 1,
+            .suppressed => stats.suppressed_count += 1,
+            .conflict_refused => stats.conflict_refused_count += 1,
+            .trust_blocked => stats.trust_blocked_count += 1,
+            .stale_blocked => stats.stale_blocked_count += 1,
+        }
+    }
+    for (evidence) |item| {
+        if (hasPackCorpusTrace(item.corpus)) stats.evidence_count += 1;
+    }
+    for (abstraction_traces) |item| {
+        if (isPackOwnerId(item.owner_id)) stats.abstraction_count += 1;
+    }
+    for (grounding_traces) |item| {
+        if (isPackOwnerId(item.owner_id) or isPackSourceSpec(item.source_spec)) stats.grounding_count += 1;
+    }
+    for (reverse_grounding_traces) |item| {
+        if (isPackOwnerId(item.owner_id) or isPackSourceSpec(item.source_spec)) stats.reverse_grounding_count += 1;
+    }
+    return stats;
+}
+
+pub fn writePackRoutingJson(writer: anytype, items: []const abstractions.PackRoutingTrace, caps: abstractions.PackRoutingCaps, policy: abstractions.PackConflictPolicy) !void {
+    try writer.writeAll("{\"caps\":{");
+    try writer.print("\"maxConsidered\":{d},\"maxActivated\":{d},\"maxCandidateSurfaces\":{d}", .{
+        caps.max_considered_per_query,
+        caps.max_activated_per_query,
+        caps.max_candidate_surfaces_per_query,
+    });
+    try writer.writeAll("},\"policy\":{");
+    try writeJsonFieldString(writer, "competition", abstractions.packCompetitionPolicyName(policy.competition), true);
+    try writer.writeAll("},\"considered\":[");
+    var considered_count: usize = 0;
+    for (items) |item| {
+        if (item.considered_rank == 0) continue;
+        if (considered_count != 0) try writer.writeByte(',');
+        try writeJsonString(writer, item.owner_id);
+        considered_count += 1;
+    }
+    try writer.writeAll("],\"activated\":[");
+    var activated_count: usize = 0;
+    for (items) |item| {
+        if (item.status != .activated) continue;
+        if (activated_count != 0) try writer.writeByte(',');
+        try writeJsonString(writer, item.owner_id);
+        activated_count += 1;
+    }
+    try writer.writeAll("],\"skipped\":[");
+    var skipped_count: usize = 0;
+    for (items) |item| {
+        if (item.status != .skipped) continue;
+        if (skipped_count != 0) try writer.writeByte(',');
+        try writeJsonString(writer, item.owner_id);
+        skipped_count += 1;
+    }
+    try writer.writeAll("],\"suppressed\":[");
+    var suppressed_count: usize = 0;
+    for (items) |item| {
+        if (item.status != .suppressed) continue;
+        if (suppressed_count != 0) try writer.writeByte(',');
+        try writeJsonString(writer, item.owner_id);
+        suppressed_count += 1;
+    }
+    try writer.writeAll("],\"conflictRefused\":[");
+    var conflict_refused_count: usize = 0;
+    for (items) |item| {
+        if (item.status != .conflict_refused) continue;
+        if (conflict_refused_count != 0) try writer.writeByte(',');
+        try writeJsonString(writer, item.owner_id);
+        conflict_refused_count += 1;
+    }
+    try writer.writeAll("],\"trustBlocked\":[");
+    var trust_blocked_count: usize = 0;
+    for (items) |item| {
+        if (item.status != .trust_blocked) continue;
+        if (trust_blocked_count != 0) try writer.writeByte(',');
+        try writeJsonString(writer, item.owner_id);
+        trust_blocked_count += 1;
+    }
+    try writer.writeAll("],\"staleBlocked\":[");
+    var stale_blocked_count: usize = 0;
+    for (items) |item| {
+        if (item.status != .stale_blocked) continue;
+        if (stale_blocked_count != 0) try writer.writeByte(',');
+        try writeJsonString(writer, item.owner_id);
+        stale_blocked_count += 1;
+    }
+    try writer.writeAll("],\"entries\":[");
     for (items, 0..) |item, idx| {
         if (idx != 0) try writer.writeByte(',');
         try writer.writeAll("{");
+        try writeJsonFieldString(writer, "stage", @tagName(item.stage), true);
+        try writeJsonFieldString(writer, "packId", item.pack_id, false);
+        try writeJsonFieldString(writer, "version", item.pack_version, false);
+        try writeJsonFieldString(writer, "ownerId", item.owner_id, false);
+        try writeJsonFieldString(writer, "status", abstractions.packRoutingStatusName(item.status), false);
+        try writeJsonFieldString(writer, "trust", abstractions.trustClassName(item.trust_class), false);
+        try writeJsonFieldString(writer, "freshness", knowledge_pack_store.packFreshnessName(item.freshness_state), false);
+        try writer.print(",\"score\":{d},\"supportPotentialUpperBound\":{d}", .{ item.score, item.support_potential_upper_bound });
+        if (item.call_id != 0) try writer.print(",\"callId\":{d}", .{item.call_id});
+        if (item.considered_rank != 0) try writer.print(",\"consideredRank\":{d}", .{item.considered_rank});
+        if (item.activation_rank != 0) try writer.print(",\"activationRank\":{d}", .{item.activation_rank});
+        try writer.print(",\"pathHits\":{d},\"symbolHits\":{d},\"domainHits\":{d},\"fileFamilyHits\":{d}", .{
+            item.path_hits,
+            item.symbol_hits,
+            item.domain_hits,
+            item.file_family_hits,
+        });
+        try writer.print(",\"candidateSurfaces\":{d},\"suppressedCandidates\":{d}", .{
+            item.candidate_surfaces,
+            item.suppressed_candidates,
+        });
+        try writer.print(",\"conflictRefused\":{s},\"localTruthWon\":{s}", .{
+            if (item.conflict_refused) "true" else "false",
+            if (item.local_truth_won) "true" else "false",
+        });
+        if (item.conflict_category != .none) try writeOptionalStringField(writer, "conflictCategory", abstractions.packConflictCategoryName(item.conflict_category));
+        try writeOptionalStringField(writer, "reason", item.reason);
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]}");
+}
+
+pub fn writeSupportRoutingTraceJson(writer: anytype, trace: support_routing.Trace) !void {
+    try writer.writeAll("{\"summary\":{");
+    try writer.print("\"consideredCount\":{d},\"selectedCount\":{d},\"skippedCount\":{d},\"suppressedCount\":{d},\"budgetCapHit\":{s}", .{
+        trace.considered_count,
+        trace.selected_count,
+        trace.skipped_count,
+        trace.suppressed_count,
+        if (trace.budget_cap_hit) "true" else "false",
+    });
+    try writer.writeAll("},\"selected\":[");
+    var selected_count: usize = 0;
+    for (trace.entries) |entry| {
+        if (entry.status != .selected) continue;
+        if (selected_count != 0) try writer.writeByte(',');
+        try writeJsonString(writer, entry.id);
+        selected_count += 1;
+    }
+    try writer.writeAll("],\"suppressed\":[");
+    var suppressed_count: usize = 0;
+    for (trace.entries) |entry| {
+        if (entry.status == .selected) continue;
+        if (suppressed_count != 0) try writer.writeByte(',');
+        try writeJsonString(writer, entry.id);
+        suppressed_count += 1;
+    }
+    try writer.writeAll("],\"entries\":[");
+    for (trace.entries, 0..) |entry, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try writer.writeAll("{");
+        try writeJsonFieldString(writer, "id", entry.id, true);
+        try writeJsonFieldString(writer, "sourceKind", support_routing.sourceKindName(entry.source_kind), false);
+        try writeJsonFieldString(writer, "sourceFamily", support_routing.sourceFamilyName(entry.source_family), false);
+        try writeJsonFieldString(writer, "status", support_routing.statusName(entry.status), false);
+        try writeJsonFieldString(writer, "skipReason", support_routing.skipReasonName(entry.skip_reason), false);
+        try writer.print(",\"supportPotentialUpperBound\":{d},\"consideredRank\":{d},\"selectedRank\":{d}", .{
+            entry.support_potential_upper_bound,
+            entry.considered_rank,
+            entry.selected_rank,
+        });
+        try writeOptionalStringField(writer, "provenance", entry.provenance);
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]}");
+}
+
+pub fn writePackInfluenceJson(
+    writer: anytype,
+    evidence: []const Evidence,
+    abstraction_traces: []const AbstractionTrace,
+    routing_traces: []const abstractions.PackRoutingTrace,
+    grounding_traces: []const GroundingTrace,
+    reverse_grounding_traces: []const GroundingTrace,
+) !void {
+    const stats = collectPackInfluenceStats(evidence, abstraction_traces, routing_traces, grounding_traces, reverse_grounding_traces);
+    try writer.writeAll("{\"summary\":{");
+    try writer.print(
+        "\"consideredCount\":{d},\"activatedCount\":{d},\"skippedCount\":{d},\"suppressedCount\":{d},\"conflictRefusedCount\":{d},\"trustBlockedCount\":{d},\"staleBlockedCount\":{d},\"candidateSurfaceCount\":{d},\"suppressedCandidateSurfaceCount\":{d},\"evidenceCount\":{d},\"abstractionCount\":{d},\"groundingCount\":{d},\"reverseGroundingCount\":{d}",
+        .{
+            stats.considered_count,
+            stats.activated_count,
+            stats.skipped_count,
+            stats.suppressed_count,
+            stats.conflict_refused_count,
+            stats.trust_blocked_count,
+            stats.stale_blocked_count,
+            stats.candidate_surface_count,
+            stats.suppressed_candidate_surface_count,
+            stats.evidence_count,
+            stats.abstraction_count,
+            stats.grounding_count,
+            stats.reverse_grounding_count,
+        },
+    );
+    try writer.writeAll("},\"evidencePaths\":[");
+    var evidence_count: usize = 0;
+    for (evidence) |item| {
+        if (!hasPackCorpusTrace(item.corpus)) continue;
+        if (evidence_count != 0) try writer.writeByte(',');
+        try writer.writeAll("{");
+        try writeJsonFieldString(writer, "path", item.rel_path, true);
+        try writer.print(",\"line\":{d}", .{item.line});
+        try writeOptionalStringField(writer, "reason", item.reason);
+        if (item.corpus) |corpus| {
+            try writer.writeAll(",\"corpus\":{");
+            try writeJsonFieldString(writer, "sourcePath", corpus.source_rel_path, true);
+            try writeJsonFieldString(writer, "provenance", corpus.provenance, false);
+            try writeJsonFieldString(writer, "trust", abstractions.trustClassName(corpus.trust_class), false);
+            try writer.writeAll("}");
+        }
+        try writer.writeAll("}");
+        evidence_count += 1;
+    }
+    try writer.writeAll("],\"abstractionPaths\":[");
+    var abstraction_count: usize = 0;
+    for (abstraction_traces) |item| {
+        if (!isPackOwnerId(item.owner_id)) continue;
+        if (abstraction_count != 0) try writer.writeByte(',');
+        try writer.writeAll("{");
+        try writeJsonFieldString(writer, "ownerId", item.owner_id, true);
+        try writeJsonFieldString(writer, "label", item.label, false);
+        try writeJsonFieldString(writer, "source", item.source_spec, false);
+        try writeJsonFieldString(writer, "trust", abstractions.trustClassName(item.trust_class), false);
+        try writeJsonFieldString(writer, "packOutcome", abstractions.packRoutingStatusName(item.pack_outcome), false);
+        if (item.pack_conflict_category != .none) try writeOptionalStringField(writer, "conflictCategory", abstractions.packConflictCategoryName(item.pack_conflict_category));
+        try writer.writeAll("}");
+        abstraction_count += 1;
+    }
+    try writer.writeAll("],\"groundingPaths\":");
+    try writeGroundingTraceArrayFiltered(writer, grounding_traces, true);
+    try writer.writeAll(",\"reverseGroundingPaths\":");
+    try writeGroundingTraceArrayFiltered(writer, reverse_grounding_traces, true);
+    try writer.writeAll("}");
+}
+
+pub fn writeGroundingTraceArray(writer: anytype, items: []const GroundingTrace) !void {
+    try writeGroundingTraceArrayFiltered(writer, items, false);
+}
+
+fn writeGroundingTraceArrayFiltered(writer: anytype, items: []const GroundingTrace, pack_only: bool) !void {
+    try writer.writeAll("[");
+    var count: usize = 0;
+    for (items) |item| {
+        if (pack_only and !isPackOwnerId(item.owner_id) and !isPackSourceSpec(item.source_spec)) continue;
+        if (count != 0) try writer.writeByte(',');
+        try writer.writeAll("{");
+        try writeJsonFieldString(writer, "direction", @tagName(item.direction), true);
         try writeJsonFieldString(writer, "surface", item.surface, true);
         try writeJsonFieldString(writer, "concept", item.concept, false);
         try writeJsonFieldString(writer, "relation", item.relation, false);
         try writeJsonFieldString(writer, "selectionMode", abstractions.selectionModeName(item.selection_mode), false);
         try writeJsonFieldString(writer, "resolution", abstractions.reuseResolutionName(item.resolution), false);
         try writeJsonFieldString(writer, "source", item.source_spec, false);
+        if (item.matched_source_spec) |matched_source_spec| try writeOptionalStringField(writer, "matchedSource", matched_source_spec);
         try writer.print(",\"usable\":{s}", .{if (item.usable) "true" else "false"});
         try writer.print(",\"ambiguous\":{s}", .{if (item.ambiguous) "true" else "false"});
         try writer.print(",\"lookupScore\":{d}", .{item.lookup_score});
         try writer.print(",\"confidenceScore\":{d}", .{item.confidence_score});
+        try writeOptionalStringField(writer, "trust", abstractions.trustClassName(item.trust_class));
+        try writer.writeAll(",\"lineage\":{");
+        try writeJsonFieldString(writer, "id", item.lineage_id, true);
+        try writer.print(",\"version\":{d}", .{item.lineage_version});
+        try writer.writeAll("}");
         try writer.print(",\"tokenSupport\":{d}", .{item.token_support_count});
         try writer.print(",\"patternSupport\":{d}", .{item.pattern_support_count});
         try writer.print(",\"sourceSupport\":{d}", .{item.source_support_count});
@@ -5164,6 +8547,7 @@ fn writeGroundingTraceArray(writer: anytype, items: []const GroundingTrace) !voi
         if (item.target_line != 0) try writer.print(",\"targetLine\":{d}", .{item.target_line});
         if (item.detail) |detail| try writeOptionalStringField(writer, "detail", detail);
         try writer.writeAll("}");
+        count += 1;
     }
     try writer.writeAll("]");
 }
@@ -5172,17 +8556,37 @@ fn supportNodeKindName(kind: SupportNodeKind) []const u8 {
     return switch (kind) {
         .output => "output",
         .shard => "shard",
+        .pack => "pack",
         .intent => "intent",
         .reasoning => "reasoning",
         .execution => "execution",
+        .rewrite_operator => "rewrite_operator",
         .target_candidate => "target_candidate",
         .query_hypothesis => "query_hypothesis",
         .evidence => "evidence",
         .contradiction => "contradiction",
         .abstraction => "abstraction",
         .grounding => "grounding",
+        .reverse_grounding => "reverse_grounding",
+        .external_evidence => "external_evidence",
         .handoff => "handoff",
         .gap => "gap",
+        .fragment => "fragment",
+        .scoped_claim => "scoped_claim",
+        .obligation => "obligation",
+        .ambiguity_set => "ambiguity_set",
+        .partial_finding => "partial_finding",
+        .freshness_check => "freshness_check",
+        .artifact => "artifact",
+        .entity => "entity",
+        .relation => "relation",
+        .verifier_hook => "verifier_hook",
+        .verifier_adapter => "verifier_adapter",
+        .verifier_run => "verifier_run",
+        .verifier_evidence => "verifier_evidence",
+        .verifier_failure => "verifier_failure",
+        .action_surface => "action_surface",
+        .routing_candidate => "routing_candidate",
     };
 }
 
@@ -5196,8 +8600,24 @@ fn supportEdgeKindName(kind: SupportEdgeKind) []const u8 {
         .supported_by => "supported_by",
         .checked_by => "checked_by",
         .grounded_by => "grounded_by",
+        .explained_by => "explained_by",
         .handoff_from => "handoff_from",
         .blocked_by => "blocked_by",
+        .contains => "contains",
+        .scoped_by => "scoped_by",
+        .requires => "requires",
+        .suppressed_by => "suppressed_by",
+        .freshness_checked_by => "freshness_checked_by",
+        .artifact_sourced_from => "artifact_sourced_from",
+        .fragment_of => "fragment_of",
+        .entity_from_fragment => "entity_from_fragment",
+        .relates_to => "relates_to",
+        .verified_by => "verified_by",
+        .required_by => "required_by",
+        .verifies => "verifies",
+        .discharges => "discharges",
+        .failed_by => "failed_by",
+        .produced_evidence => "produced_evidence",
     };
 }
 
@@ -5205,6 +8625,8 @@ pub fn writeSupportGraphJson(writer: anytype, graph: SupportGraph) !void {
     try writer.writeAll("{");
     try writeJsonFieldString(writer, "permission", @tagName(graph.permission), true);
     try writer.print(",\"minimumMet\":{s}", .{if (graph.minimum_met) "true" else "false"});
+    try writer.writeAll(",\"partialSupport\":");
+    try writePartialSupportJson(writer, graph.partial_support);
     try writeOptionalStringField(writer, "flowMode", graph.flow_mode);
     if (graph.unresolved_reason) |reason| try writeOptionalStringField(writer, "unresolvedReason", reason);
     try writer.writeAll(",\"nodes\":");
@@ -5233,6 +8655,124 @@ pub fn writeSupportGraphJson(writer: anytype, graph: SupportGraph) !void {
         try writer.writeAll("}");
     }
     try writer.writeAll("]}");
+}
+
+pub fn writePartialSupportJson(writer: anytype, partial_support: PartialSupport) !void {
+    try writer.writeAll("{");
+    try writeJsonFieldString(writer, "lattice", partialSupportLevelName(partial_support.lattice), true);
+    try writer.print(",\"nonAuthorizing\":{s}", .{if (partial_support.non_authorizing) "true" else "false"});
+    try writer.writeAll(",\"blocking\":");
+    try writeBlockingFlagsJson(writer, partial_support.blocking);
+    try writer.writeAll("}");
+}
+
+pub fn writeUnresolvedSupportJson(writer: anytype, unresolved: UnresolvedSupport) !void {
+    try writer.writeAll("{\"partialFindings\":");
+    try writer.writeAll("[");
+    for (unresolved.partial_findings, 0..) |item, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try writer.writeAll("{");
+        try writeJsonFieldString(writer, "kind", partialFindingKindName(item.kind), true);
+        try writeJsonFieldString(writer, "label", item.label, false);
+        try writeOptionalStringField(writer, "scope", item.scope);
+        try writeOptionalStringField(writer, "provenance", item.provenance);
+        try writer.print(",\"nonAuthorizing\":{s}", .{if (item.non_authorizing) "true" else "false"});
+        if (item.rel_path) |rel_path| try writeOptionalStringField(writer, "relPath", rel_path);
+        if (item.line != 0) try writer.print(",\"line\":{d}", .{item.line});
+        if (item.detail) |detail| try writeOptionalStringField(writer, "detail", detail);
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("],\"ambiguitySets\":");
+    try writer.writeAll("[");
+    for (unresolved.ambiguity_sets, 0..) |item, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try writer.writeAll("{");
+        try writeJsonFieldString(writer, "label", item.label, true);
+        try writeOptionalStringField(writer, "scope", item.scope);
+        if (item.reason) |reason| try writeOptionalStringField(writer, "reason", reason);
+        try writer.writeAll(",\"options\":[");
+        for (item.options, 0..) |option, option_idx| {
+            if (option_idx != 0) try writer.writeByte(',');
+            try writer.writeAll("{");
+            try writeJsonFieldString(writer, "label", option.label, true);
+            if (option.rel_path) |rel_path| try writeOptionalStringField(writer, "relPath", rel_path);
+            if (option.line != 0) try writer.print(",\"line\":{d}", .{option.line});
+            if (option.detail) |detail| try writeOptionalStringField(writer, "detail", detail);
+            try writer.writeAll("}");
+        }
+        try writer.writeAll("]}");
+    }
+    try writer.writeAll("],\"missingObligations\":");
+    try writer.writeAll("[");
+    for (unresolved.missing_obligations, 0..) |item, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try writer.writeAll("{");
+        try writeJsonFieldString(writer, "label", item.label, true);
+        try writeOptionalStringField(writer, "scope", item.scope);
+        if (item.detail) |detail| try writeOptionalStringField(writer, "detail", detail);
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("],\"suppressedNoise\":");
+    try writer.writeAll("[");
+    for (unresolved.suppressed_noise, 0..) |item, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try writer.writeAll("{");
+        try writeJsonFieldString(writer, "label", item.label, true);
+        try writeOptionalStringField(writer, "reason", item.reason);
+        if (item.rel_path) |rel_path| try writeOptionalStringField(writer, "relPath", rel_path);
+        if (item.line != 0) try writer.print(",\"line\":{d}", .{item.line});
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("],\"freshnessChecks\":");
+    try writer.writeAll("[");
+    for (unresolved.freshness_checks, 0..) |item, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try writer.writeAll("{");
+        try writeJsonFieldString(writer, "label", item.label, true);
+        try writeOptionalStringField(writer, "scope", item.scope);
+        try writeOptionalStringField(writer, "state", freshnessStateName(item.state));
+        if (item.detail) |detail| try writeOptionalStringField(writer, "detail", detail);
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]}");
+}
+
+fn writeBlockingFlagsJson(writer: anytype, flags: BlockingFlags) !void {
+    try writer.print(
+        "{{\"ambiguous\":{s},\"contradicted\":{s},\"insufficient\":{s},\"stale\":{s},\"outOfScope\":{s}}}",
+        .{
+            if (flags.ambiguous) "true" else "false",
+            if (flags.contradicted) "true" else "false",
+            if (flags.insufficient) "true" else "false",
+            if (flags.stale) "true" else "false",
+            if (flags.out_of_scope) "true" else "false",
+        },
+    );
+}
+
+fn partialSupportLevelName(level: PartialSupportLevel) []const u8 {
+    return switch (level) {
+        .void => "void",
+        .fragmentary => "fragmentary",
+        .scoped => "scoped",
+        .locally_verified => "locally_verified",
+    };
+}
+
+fn partialFindingKindName(kind: PartialFindingKind) []const u8 {
+    return switch (kind) {
+        .fragment => "fragment",
+        .scoped_claim => "scoped_claim",
+        .locally_verified => "locally_verified",
+    };
+}
+
+fn freshnessStateName(state: FreshnessState) []const u8 {
+    return switch (state) {
+        .not_needed => "not_needed",
+        .pending => "pending",
+        .stale => "stale",
+    };
 }
 
 fn writeSubsystemArray(writer: anytype, items: []const Subsystem) !void {
@@ -5299,10 +8839,15 @@ fn isSymbolicExtension(path: []const u8) bool {
         std.mem.endsWith(u8, path, ".cfg") or
         std.mem.endsWith(u8, path, ".conf") or
         std.mem.endsWith(u8, path, ".env") or
+        std.mem.endsWith(u8, path, ".tf") or
+        std.mem.endsWith(u8, path, ".tfvars") or
+        std.mem.endsWith(u8, path, ".tpl") or
         std.mem.endsWith(u8, path, ".xml") or
         std.mem.endsWith(u8, path, ".html") or
         std.mem.endsWith(u8, path, ".rules") or
-        std.mem.endsWith(u8, path, ".dsl");
+        std.mem.endsWith(u8, path, ".dsl") or
+        std.mem.endsWith(u8, path, ".test") or
+        std.mem.endsWith(u8, path, ".spec");
 }
 
 fn isNativeExtension(path: []const u8) bool {
@@ -6707,4 +10252,374 @@ fn surfaceContainsFile(surface: []const EvidenceSeed, file_index: u32) bool {
         if (seed.file_index == file_index) return true;
     }
     return false;
+}
+
+fn deleteTreeIfExistsAbsolute(path: []const u8) !void {
+    std.fs.deleteTreeAbsolute(path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+fn testProjectPaths(allocator: std.mem.Allocator, shard_id: []const u8) !shards.Paths {
+    var shard_metadata = try shards.resolveProjectMetadata(allocator, shard_id);
+    defer shard_metadata.deinit();
+    return shards.resolvePaths(allocator, shard_metadata.metadata);
+}
+
+test "routing keeps exact corpus path and symbol evidence ahead of noisy surfaces" {
+    const allocator = std.testing.allocator;
+    var shard_paths = try testProjectPaths(allocator, "routing-baseline-test");
+    defer shard_paths.deinit();
+    try deleteTreeIfExistsAbsolute(shard_paths.abstractions_root_abs_path);
+    defer deleteTreeIfExistsAbsolute(shard_paths.abstractions_root_abs_path) catch {};
+    var index = RepoIndex{
+        .allocator = allocator,
+        .repo_root = try allocator.dupe(u8, "."),
+        .files = std.ArrayList(FileRecord).init(allocator),
+        .declarations = std.ArrayList(DeclRecord).init(allocator),
+        .references = std.ArrayList(ReferenceRecord).init(allocator),
+        .semantic_edges = std.ArrayList(SemanticEdge).init(allocator),
+        .symbolic_noise = std.ArrayList(IndexedSuppressedNoise).init(allocator),
+        .corpus_meta = std.StringHashMap(corpus_ingest.CorpusMeta).init(allocator),
+    };
+    defer index.deinit();
+
+    try index.files.append(FileRecord.init(allocator, try allocator.dupe(u8, "@corpus/docs/runbook.md"), .docs));
+    try index.files.append(FileRecord.init(allocator, try allocator.dupe(u8, "@corpus/docs/guide-noise.md"), .docs));
+
+    try index.declarations.append(.{
+        .name = try allocator.dupe(u8, "heading:runtime_contracts@1"),
+        .file_index = 0,
+        .line = 1,
+        .kind = .symbolic_unit,
+        .is_pub = true,
+        .role = .definition,
+    });
+    try index.files.items[0].declaration_indexes.append(0);
+    try index.declarations.append(.{
+        .name = try allocator.dupe(u8, "heading:worker_notes@1"),
+        .file_index = 1,
+        .line = 1,
+        .kind = .symbolic_unit,
+        .is_pub = true,
+        .role = .definition,
+    });
+    try index.files.items[1].declaration_indexes.append(1);
+
+    try index.corpus_meta.put(try allocator.dupe(u8, "@corpus/docs/runbook.md"), .{
+        .allocator = allocator,
+        .class = .docs,
+        .source_rel_path = try allocator.dupe(u8, "runbook.md"),
+        .source_label = try allocator.dupe(u8, "fixture"),
+        .provenance = try allocator.dupe(u8, "local"),
+        .trust_class = .project,
+        .lineage_id = try allocator.dupe(u8, "runbook"),
+        .lineage_version = 1,
+    });
+    try index.corpus_meta.put(try allocator.dupe(u8, "@corpus/docs/guide-noise.md"), .{
+        .allocator = allocator,
+        .class = .docs,
+        .source_rel_path = try allocator.dupe(u8, "guide-noise.md"),
+        .source_label = try allocator.dupe(u8, "fixture"),
+        .provenance = try allocator.dupe(u8, "local"),
+        .trust_class = .project,
+        .lineage_id = try allocator.dupe(u8, "guide-noise"),
+        .lineage_version = 1,
+    });
+
+    const target = ResolvedTarget{
+        .target_kind = .declaration,
+        .file_index = 0,
+        .decl_index = 0,
+        .confidence = 400,
+    };
+    const seeds = [_]EvidenceSeed{
+        .{ .file_index = 0, .line = 1, .reason = "subject" },
+        .{ .file_index = 1, .line = 1, .reason = "noise" },
+    };
+
+    var routed = try routeEvidenceSeeds(allocator, &index, &shard_paths, "@corpus/docs/runbook.md:heading:runtime_contracts@1", target, &seeds, 4, compute_budget.resolve(.{}));
+    defer routed.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), routed.seeds.len);
+    try std.testing.expectEqual(@as(u32, 0), routed.seeds[0].file_index);
+    try std.testing.expectEqualStrings("same_target_file", routed.routing_labels[0]);
+    try std.testing.expect(routed.suppressed_noise.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, routed.suppressed_noise[0].reason, "active exact path/symbol anchor") != null);
+}
+
+test "routing suppresses duplicate file surfaces deterministically" {
+    const allocator = std.testing.allocator;
+    var shard_paths = try testProjectPaths(allocator, "routing-duplicate-test");
+    defer shard_paths.deinit();
+    try deleteTreeIfExistsAbsolute(shard_paths.abstractions_root_abs_path);
+    defer deleteTreeIfExistsAbsolute(shard_paths.abstractions_root_abs_path) catch {};
+    var index = RepoIndex{
+        .allocator = allocator,
+        .repo_root = try allocator.dupe(u8, "."),
+        .files = std.ArrayList(FileRecord).init(allocator),
+        .declarations = std.ArrayList(DeclRecord).init(allocator),
+        .references = std.ArrayList(ReferenceRecord).init(allocator),
+        .semantic_edges = std.ArrayList(SemanticEdge).init(allocator),
+        .symbolic_noise = std.ArrayList(IndexedSuppressedNoise).init(allocator),
+        .corpus_meta = std.StringHashMap(corpus_ingest.CorpusMeta).init(allocator),
+    };
+    defer index.deinit();
+
+    try index.files.append(FileRecord.init(allocator, try allocator.dupe(u8, "src/runtime/worker.zig"), .other));
+    try index.files.append(FileRecord.init(allocator, try allocator.dupe(u8, "src/app/root.zig"), .app));
+
+    try index.declarations.append(.{
+        .name = try allocator.dupe(u8, "sync"),
+        .file_index = 0,
+        .line = 1,
+        .kind = .function,
+        .is_pub = true,
+        .role = .definition,
+    });
+    try index.files.items[0].declaration_indexes.append(0);
+
+    const target = ResolvedTarget{
+        .target_kind = .declaration,
+        .file_index = 0,
+        .decl_index = 0,
+        .confidence = 320,
+    };
+    const seeds = [_]EvidenceSeed{
+        .{ .file_index = 1, .line = 3, .reason = "imports_subject_file" },
+        .{ .file_index = 1, .line = 6, .reason = "transitive_import" },
+        .{ .file_index = 0, .line = 1, .reason = "subject" },
+    };
+
+    var routed = try routeEvidenceSeeds(allocator, &index, &shard_paths, "src/runtime/worker.zig:sync", target, &seeds, 4, compute_budget.resolve(.{}));
+    defer routed.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), routed.seeds.len);
+    try std.testing.expect(std.mem.eql(u8, routed.routing_labels[0], "same_target_file") or std.mem.eql(u8, routed.routing_labels[1], "same_target_file"));
+    var saw_duplicate = false;
+    for (routed.suppressed_noise) |item| {
+        if (std.mem.indexOf(u8, item.reason, "near-duplicate evidence from the same source surface") != null) {
+            saw_duplicate = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_duplicate);
+}
+
+test "symbolic target anchor detection accepts exact line tokens" {
+    const allocator = std.testing.allocator;
+    var index = RepoIndex{
+        .allocator = allocator,
+        .repo_root = try allocator.dupe(u8, "."),
+        .files = std.ArrayList(FileRecord).init(allocator),
+        .declarations = std.ArrayList(DeclRecord).init(allocator),
+        .references = std.ArrayList(ReferenceRecord).init(allocator),
+        .semantic_edges = std.ArrayList(SemanticEdge).init(allocator),
+        .symbolic_noise = std.ArrayList(IndexedSuppressedNoise).init(allocator),
+        .corpus_meta = std.StringHashMap(corpus_ingest.CorpusMeta).init(allocator),
+    };
+    defer index.deinit();
+
+    try index.files.append(FileRecord.init(allocator, try allocator.dupe(u8, "@corpus/docs/runbook.md"), .docs));
+    try index.declarations.append(.{
+        .name = try allocator.dupe(u8, "paragraph:runtime_contract@2"),
+        .file_index = 0,
+        .line = 2,
+        .kind = .symbolic_unit,
+        .is_pub = true,
+        .role = .definition,
+    });
+    try index.files.items[0].declaration_indexes.append(0);
+    try index.references.append(.{
+        .name = try allocator.dupe(u8, "sync"),
+        .file_index = 0,
+        .line = 2,
+    });
+
+    const target = ResolvedTarget{
+        .target_kind = .declaration,
+        .file_index = 0,
+        .decl_index = 0,
+        .confidence = 300,
+    };
+    const signal_tokens = [_][]const u8{"sync"};
+    const signal_patterns = [_][]const u8{"worker"};
+    try std.testing.expect(symbolicTargetHasExactAnchor(&index, target, &signal_tokens, &signal_patterns));
+}
+
+test "repeated weak-structure parser sketch becomes reusable" {
+    const allocator = std.testing.allocator;
+    var shard_paths = try testProjectPaths(allocator, "parser-sketch-reuse-test");
+    defer shard_paths.deinit();
+    try deleteTreeIfExistsAbsolute(shard_paths.abstractions_root_abs_path);
+    defer deleteTreeIfExistsAbsolute(shard_paths.abstractions_root_abs_path) catch {};
+
+    const sources = [_][]const u8{"docs/a.md"};
+    const tokens = [_][]const u8{"heading_fragment"};
+    const patterns = [_][]const u8{ "class:technical_text", "ext:.md", "stage:robust_structured", "heading_fragment:runtime_contract" };
+    const events = [_]abstractions.ReinforcementEvent{
+        .{ .family = .parser_sketch, .key = "heading_fragment:runtime_contract", .case_id = "case-a", .category = .syntax, .outcome = .success, .source_specs = &sources, .tokens = &tokens, .patterns = &patterns },
+        .{ .family = .parser_sketch, .key = "heading_fragment:runtime_contract", .case_id = "case-b", .category = .syntax, .outcome = .success, .source_specs = &sources, .tokens = &tokens, .patterns = &patterns },
+        .{ .family = .parser_sketch, .key = "heading_fragment:runtime_contract", .case_id = "case-c", .category = .syntax, .outcome = .success, .source_specs = &sources, .tokens = &tokens, .patterns = &patterns },
+    };
+    _ = try abstractions.applyReinforcementEvents(allocator, &shard_paths, &events, .{ .max_events = 3, .max_new_records = 1 });
+
+    const plan = try lookupParserCascadePlan(allocator, &shard_paths, "docs/another.md", .technical_text);
+    try std.testing.expect(plan.prefer_robust);
+}
+
+test "repeated noisy route pattern becomes suppressible" {
+    const allocator = std.testing.allocator;
+    var shard_paths = try testProjectPaths(allocator, "route-suppressor-reuse-test");
+    defer shard_paths.deinit();
+    try deleteTreeIfExistsAbsolute(shard_paths.abstractions_root_abs_path);
+    defer deleteTreeIfExistsAbsolute(shard_paths.abstractions_root_abs_path) catch {};
+
+    const patterns = [_][]const u8{ "candidate_family:docs", "target_family:docs", "anchor:targeted" };
+    const sources = [_][]const u8{"@corpus/docs/guide-noise.md"};
+    const events = [_]abstractions.ReinforcementEvent{
+        .{ .family = .route_suppressor, .key = "suppressed floating evidence", .case_id = "route-a", .category = .control_flow, .outcome = .success, .source_specs = &sources, .patterns = &patterns },
+        .{ .family = .route_suppressor, .key = "suppressed floating evidence", .case_id = "route-b", .category = .control_flow, .outcome = .success, .source_specs = &sources, .patterns = &patterns },
+    };
+    _ = try abstractions.applyReinforcementEvents(allocator, &shard_paths, &events, .{ .max_events = 2, .max_new_records = 1 });
+
+    var index = RepoIndex{
+        .allocator = allocator,
+        .repo_root = try allocator.dupe(u8, "."),
+        .files = std.ArrayList(FileRecord).init(allocator),
+        .declarations = std.ArrayList(DeclRecord).init(allocator),
+        .references = std.ArrayList(ReferenceRecord).init(allocator),
+        .semantic_edges = std.ArrayList(SemanticEdge).init(allocator),
+        .symbolic_noise = std.ArrayList(IndexedSuppressedNoise).init(allocator),
+        .corpus_meta = std.StringHashMap(corpus_ingest.CorpusMeta).init(allocator),
+    };
+    defer index.deinit();
+    try index.files.append(FileRecord.init(allocator, try allocator.dupe(u8, "@corpus/docs/runbook.md"), .docs));
+    try index.files.append(FileRecord.init(allocator, try allocator.dupe(u8, "@corpus/docs/guide-noise.md"), .docs));
+    try index.declarations.append(.{ .name = try allocator.dupe(u8, "heading:runtime_contracts@1"), .file_index = 0, .line = 1, .kind = .symbolic_unit, .is_pub = true, .role = .definition });
+    try index.files.items[0].declaration_indexes.append(0);
+
+    const target = ResolvedTarget{ .target_kind = .declaration, .file_index = 0, .decl_index = 0, .confidence = 400 };
+    const seeds = [_]EvidenceSeed{
+        .{ .file_index = 0, .line = 1, .reason = "subject" },
+        .{ .file_index = 1, .line = 4, .reason = "noise" },
+    };
+    var routed = try routeEvidenceSeeds(allocator, &index, &shard_paths, "@corpus/docs/runbook.md:heading:runtime_contracts@1", target, &seeds, 4, compute_budget.resolve(.{}));
+    defer routed.deinit(allocator);
+
+    var saw_reinforced = false;
+    for (routed.suppressed_noise) |item| {
+        if (std.mem.indexOf(u8, item.reason, "reinforced route suppressor") != null) saw_reinforced = true;
+    }
+    try std.testing.expect(saw_reinforced);
+}
+
+test "contradicted grounding reinforcement is demoted and blocked" {
+    const allocator = std.testing.allocator;
+    var shard_paths = try testProjectPaths(allocator, "grounding-demotion-test");
+    defer shard_paths.deinit();
+    try deleteTreeIfExistsAbsolute(shard_paths.abstractions_root_abs_path);
+    defer deleteTreeIfExistsAbsolute(shard_paths.abstractions_root_abs_path) catch {};
+
+    const patterns = [_][]const u8{ "heading:runtime_contracts@1", "direction:symbolic_to_code", "target_kind:declaration", "src/runtime/worker.zig" };
+    const sources = [_][]const u8{"region:@corpus/docs/runbook.md:1-3"};
+    const events = [_]abstractions.ReinforcementEvent{
+        .{ .family = .grounding_schema, .key = "heading:runtime_contracts@1", .case_id = "ground-a", .tier = .idiom, .category = .interface, .outcome = .success, .source_specs = &sources, .patterns = &patterns },
+        .{ .family = .grounding_schema, .key = "heading:runtime_contracts@1", .case_id = "ground-b", .tier = .idiom, .category = .interface, .outcome = .success, .source_specs = &sources, .patterns = &patterns },
+        .{ .family = .grounding_schema, .key = "heading:runtime_contracts@1", .case_id = "ground-c", .tier = .idiom, .category = .interface, .outcome = .contradicted, .source_specs = &sources, .patterns = &patterns },
+    };
+    _ = try abstractions.applyReinforcementEvents(allocator, &shard_paths, &events, .{ .max_events = 3, .max_new_records = 1 });
+
+    const refs = try abstractions.lookupFamilyConcepts(allocator, &shard_paths, .{
+        .family = .grounding_schema,
+        .patterns = &patterns,
+        .max_items = 4,
+    });
+    defer abstractions.deinitSupportReferences(allocator, refs);
+    try std.testing.expectEqual(@as(usize, 0), refs.len);
+}
+
+test "reinforced abstractions never authorize supported output directly" {
+    const allocator = std.testing.allocator;
+    var result = try initResult(allocator, .{
+        .repo_root = ".",
+        .query_kind = .impact,
+        .target = "src/runtime/worker.zig:sync",
+    });
+    defer result.deinit();
+
+    result.status = .supported;
+    result.abstraction_traces = try allocator.alloc(AbstractionTrace, 1);
+    result.abstraction_traces[0] = .{
+        .label = try allocator.dupe(u8, "grounding_schema:runtime_contracts"),
+        .family = .grounding_schema,
+        .source_spec = try allocator.dupe(u8, "region:@corpus/docs/runbook.md:1-3"),
+        .tier = .idiom,
+        .category = .interface,
+        .selection_mode = .promoted,
+        .staged = false,
+        .owner_kind = .project,
+        .owner_id = try allocator.dupe(u8, "reinforced-proof-gate-test"),
+        .quality_score = 900,
+        .confidence_score = 900,
+        .lookup_score = 900,
+        .direct_support_count = 2,
+        .lineage_support_count = 2,
+        .trust_class = .project,
+        .lineage_id = try allocator.dupe(u8, "project:reinforced-proof-gate-test:grounding_schema:runtime_contracts"),
+        .lineage_version = 2,
+        .consensus_hash = 1,
+        .usable = true,
+        .reuse_decision = .none,
+        .resolution = .local,
+        .conflict_kind = .none,
+    };
+
+    try enforceSupportPermission(allocator, &result);
+    try std.testing.expectEqual(Status.unresolved, result.status);
+}
+
+test "compute budget maps low and high pack routing caps deterministically" {
+    const low = compute_budget.resolve(.{ .tier = .low });
+    const high = compute_budget.resolve(.{ .tier = .high });
+    const low_caps = packRoutingCapsFromBudget(low);
+    const high_caps = packRoutingCapsFromBudget(high);
+
+    try std.testing.expect(low_caps.max_considered_per_query < high_caps.max_considered_per_query);
+    try std.testing.expect(low_caps.max_activated_per_query < high_caps.max_activated_per_query);
+    try std.testing.expect(low_caps.max_candidate_surfaces_per_query < high_caps.max_candidate_surfaces_per_query);
+}
+
+test "budget exhaustion is surfaced honestly in code intel results" {
+    var result = Result{
+        .allocator = std.testing.allocator,
+        .status = .supported,
+        .query_kind = .impact,
+        .query_target = try std.testing.allocator.dupe(u8, "src/runtime/worker.zig:sync"),
+        .repo_root = try std.testing.allocator.dupe(u8, "/tmp/ghost-budget-code-intel"),
+        .shard_root = try std.testing.allocator.dupe(u8, "/tmp/ghost-budget-code-intel"),
+        .shard_id = try std.testing.allocator.dupe(u8, "ghost-budget-code-intel"),
+        .shard_kind = .project,
+        .effective_budget = compute_budget.resolve(.{ .tier = .low }),
+        .unresolved = .{ .allocator = std.testing.allocator },
+        .support_graph = .{ .allocator = std.testing.allocator },
+    };
+    defer result.deinit();
+
+    try setBudgetExhaustion(
+        std.testing.allocator,
+        &result,
+        .max_graph_nodes,
+        .code_intel_support_graph,
+        40,
+        result.effective_budget.max_graph_nodes,
+        "support graph growth exceeded the low tier cap",
+        "remaining support graph nodes were skipped",
+    );
+
+    try std.testing.expectEqual(mc.StopReason.budget, result.stop_reason);
+    try std.testing.expectEqual(Status.unresolved, result.status);
+    try std.testing.expect(result.budget_exhaustion != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.unresolved_detail.?, "compute budget exhausted") != null);
 }

@@ -168,6 +168,16 @@ pub fn run(allocator: std.mem.Allocator, options: Options, step: Step) !Result {
         defer allocator.free(combined);
         try env_map.put("PATH", combined);
     }
+    if (step.kind == .zig_build or step.kind == .zig_run) {
+        const local_cache_dir = try std.fs.path.join(allocator, &.{ options.workspace_root, ".ghost_zig_local_cache" });
+        defer allocator.free(local_cache_dir);
+        const global_cache_dir = try std.fs.path.join(allocator, &.{ options.workspace_root, ".ghost_zig_global_cache" });
+        defer allocator.free(global_cache_dir);
+        try std.fs.cwd().makePath(local_cache_dir);
+        try std.fs.cwd().makePath(global_cache_dir);
+        try env_map.put("ZIG_LOCAL_CACHE_DIR", local_cache_dir);
+        try env_map.put("ZIG_GLOBAL_CACHE_DIR", global_cache_dir);
+    }
 
     var capture = runCaptureBounded(
         allocator,

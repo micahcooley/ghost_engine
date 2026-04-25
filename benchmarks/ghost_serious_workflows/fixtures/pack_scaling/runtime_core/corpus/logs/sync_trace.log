@@ -1,0 +1,4 @@
+runtime worker sync entered bounded mode
+queue guard held at 32
+retry window reset after checkpoint flush
+catalog scans remained deterministic

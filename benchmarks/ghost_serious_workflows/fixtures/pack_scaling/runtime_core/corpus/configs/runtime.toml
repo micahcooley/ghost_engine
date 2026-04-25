@@ -1,0 +1,9 @@
+[runtime]
+worker_mode = "sync"
+queue_guard = 32
+retry_window_ms = 250
+checkpoint_flush = "bounded"
+
+[budgets]
+candidate_surfaces = 12
+catalog_scan = "bounded"

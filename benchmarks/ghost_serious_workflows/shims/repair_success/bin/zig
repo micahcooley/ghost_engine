@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+if [ "${1:-}" = "build" ] && [ "${2:-}" = "test" ]; then
+  case "$PWD" in
+    *__repair_*)
+      exit 0
+      ;;
+    *)
+    echo "broader call surface contradicted invariant; narrow to primary surface" >&2
+    exit 1
+      ;;
+  esac
+fi
+exit 0

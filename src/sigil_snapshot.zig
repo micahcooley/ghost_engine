@@ -3,6 +3,7 @@ const config = @import("config.zig");
 const engine = @import("engine.zig");
 const ghost_state = @import("ghost_state.zig");
 const abstractions = @import("abstractions.zig");
+const corpus_ingest = @import("corpus_ingest.zig");
 const patch_candidates = @import("patch_candidates.zig");
 const shards = @import("shards.zig");
 const scratchpad = @import("scratchpad.zig");
@@ -329,6 +330,7 @@ fn writeSlot(state: LiveState, slot: Slot) !void {
     try copyBytesToFile(state.allocator, control_path, control_bytes);
 
     try abstractions.writeLiveToSlot(state.allocator, state.paths, slotDir(state.paths, slot));
+    try corpus_ingest.writeLiveToSlot(state.allocator, state.paths, slotDir(state.paths, slot));
 }
 
 fn readControlSlot(allocator: std.mem.Allocator, paths: *const shards.Paths, slot: Slot) !sigil_runtime.CapturedControlState {
@@ -400,6 +402,7 @@ fn restoreSlot(state: LiveState, slot: Slot) !void {
     try state.control.restoreState(&captured);
 
     try abstractions.restoreLiveFromSlot(state.allocator, state.paths, slotDir(state.paths, slot));
+    try corpus_ingest.restoreLiveFromSlot(state.allocator, state.paths, slotDir(state.paths, slot));
 
     if (state.engine.vulkan) |vk| {
         const host_lattice = state.lattice_words orelse return error.HostLatticeUnavailable;
@@ -461,6 +464,7 @@ pub fn executeCommand(state: LiveState, command: Command) !SnapshotStatus {
                 state.scratchpad.clear();
             }
             try abstractions.clearStaged(state.allocator, state.paths);
+            try corpus_ingest.clearStaged(state.allocator, state.paths);
             try patch_candidates.clearStaged(state.allocator, state.paths);
             try writeSlot(state, .scratch);
         },
@@ -469,6 +473,7 @@ pub fn executeCommand(state: LiveState, command: Command) !SnapshotStatus {
             state.scratchpad.clear();
             try restoreSlot(state, .scratch);
             try abstractions.clearStaged(state.allocator, state.paths);
+            try corpus_ingest.clearStaged(state.allocator, state.paths);
             try patch_candidates.clearStaged(state.allocator, state.paths);
             state.scratchpad.endSession();
             state.scratchpad.clear();
@@ -481,6 +486,7 @@ pub fn executeCommand(state: LiveState, command: Command) !SnapshotStatus {
                 try sys.flushMappedMemory(state.tags_file);
             }
             try abstractions.applyStaged(state.allocator, state.paths);
+            try corpus_ingest.applyStaged(state.allocator, state.paths);
             try patch_candidates.clearStaged(state.allocator, state.paths);
             try writeSlot(state, .committed);
             state.scratchpad.endSession();
@@ -493,6 +499,7 @@ pub fn executeCommand(state: LiveState, command: Command) !SnapshotStatus {
             if (state.scratchpad.isSessionActive()) return error.ScratchSessionActive;
             try restoreSlot(state, .snapshot);
             try abstractions.clearStaged(state.allocator, state.paths);
+            try corpus_ingest.clearStaged(state.allocator, state.paths);
             try patch_candidates.clearStaged(state.allocator, state.paths);
             state.scratchpad.clear();
         },
