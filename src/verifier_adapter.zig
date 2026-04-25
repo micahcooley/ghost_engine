@@ -102,6 +102,70 @@ pub const CandidateBlockedReason = enum {
     budget_exhausted,
     contradiction_blocker,
     approval_required,
+    missing_candidate,
+    not_approved,
+    unsafe_materialization,
+};
+
+pub const ApprovalKind = enum {
+    user,
+    test_fixture,
+    policy,
+};
+
+pub const VerifierCandidateApproval = struct {
+    candidate_id: []u8,
+    approved_by: []u8,
+    approval_kind: ApprovalKind,
+    approval_reason: []u8,
+    timestamp_ms: u64,
+    trace: []u8,
+    scope: []u8,
+    allow_materialize_check_plan: bool = false,
+    allow_propose_file: bool = false,
+    allow_propose_patch: bool = false,
+    allow_schedule_verifier_later: bool = false,
+
+    pub fn deinit(self: *VerifierCandidateApproval, allocator: std.mem.Allocator) void {
+        allocator.free(self.candidate_id);
+        allocator.free(self.approved_by);
+        allocator.free(self.approval_reason);
+        allocator.free(self.trace);
+        allocator.free(self.scope);
+        self.* = undefined;
+    }
+};
+
+pub const MaterializationKind = enum {
+    check_plan,
+    file_proposal,
+    patch_proposal,
+    command_plan,
+};
+
+pub const VerifierCandidateMaterialization = struct {
+    id: []u8,
+    candidate_id: []u8,
+    kind: MaterializationKind,
+    generated_artifact_refs: [][]u8 = &.{},
+    patch_proposal_refs: [][]u8 = &.{},
+    write_proposal_refs: [][]u8 = &.{},
+    command_plan_refs: [][]u8 = &.{},
+    requires_approval: bool = true,
+    requires_verification: bool = true,
+    non_authorizing: bool = true,
+    trace: []u8,
+
+    pub fn deinit(self: *VerifierCandidateMaterialization, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.candidate_id);
+        freeStringList(allocator, self.generated_artifact_refs);
+        freeStringList(allocator, self.patch_proposal_refs);
+        freeStringList(allocator, self.write_proposal_refs);
+        freeStringList(allocator, self.command_plan_refs);
+        allocator.free(self.trace);
+        self.* = undefined;
+    }
 };
 
 pub const CommandPlan = struct {
@@ -132,6 +196,9 @@ pub const VerifierCandidate = struct {
     scope_limitations: [][]u8 = &.{},
     status: CandidateStatus = .proposed,
     blocked_reason: ?CandidateBlockedReason = null,
+    approval: ?VerifierCandidateApproval = null,
+    materialization: ?VerifierCandidateMaterialization = null,
+    rejection_reason: ?[]u8 = null,
     requires_approval: bool = true,
     non_authorizing: bool = true,
     provenance: []u8,
@@ -151,6 +218,9 @@ pub const VerifierCandidate = struct {
         freeStringList(self.allocator, self.safety_constraints);
         freeStringList(self.allocator, self.missing_obligations);
         freeStringList(self.allocator, self.scope_limitations);
+        if (self.approval) |*approval| approval.deinit(self.allocator);
+        if (self.materialization) |*materialization| materialization.deinit(self.allocator);
+        if (self.rejection_reason) |reason| self.allocator.free(reason);
         self.allocator.free(self.provenance);
         self.allocator.free(self.trace);
         self.* = undefined;
@@ -210,6 +280,8 @@ pub const HandoffResult = struct {
     verifier_candidate_blocked_count: usize = 0,
     verifier_candidate_accepted_count: usize = 0,
     verifier_candidate_materialized_count: usize = 0,
+    verifier_candidate_rejected_count: usize = 0,
+    verifier_candidate_materialization_blocked_count: usize = 0,
     verifier_candidate_scheduled_count: usize = 0,
     verifier_candidate_executed_count: usize = 0,
     verifier_candidate_budget_exhausted_count: usize = 0,
@@ -1007,6 +1079,34 @@ fn appendVerifierCandidatesToSupportGraph(
         try appendNode(allocator, nodes, plan_id, .verifier_candidate_check_plan, candidate.proposed_check, null, 0, 0, false, "check plan only; does not discharge obligations");
         try appendEdge(allocator, edges, candidate_id, plan_id, .candidate_checks);
 
+        if (candidate.approval) |approval| {
+            const approval_id = try std.fmt.allocPrint(allocator, "verifier_candidate_approval_{d}", .{idx + 1});
+            defer allocator.free(approval_id);
+            try appendNode(allocator, nodes, approval_id, .verifier_candidate_approval, approval.approved_by, null, 0, 0, false, approval.approval_reason);
+            try appendEdge(allocator, edges, approval_id, candidate_id, .approves_candidate);
+        }
+
+        if (candidate.materialization) |mat| {
+            const mat_id = try std.fmt.allocPrint(allocator, "verifier_candidate_materialization_{d}", .{idx + 1});
+            defer allocator.free(mat_id);
+            try appendNode(allocator, nodes, mat_id, .verifier_candidate_materialization, @tagName(mat.kind), null, 0, 0, false, mat.trace);
+            try appendEdge(allocator, edges, mat_id, candidate_id, .materializes_candidate);
+            for (mat.generated_artifact_refs, 0..) |ref, ref_idx| {
+                if (ref_idx >= 2) break;
+                const ref_node_id = try std.fmt.allocPrint(allocator, "verifier_candidate_materialized_artifact_{d}_{d}", .{ idx + 1, ref_idx + 1 });
+                defer allocator.free(ref_node_id);
+                try appendNode(allocator, nodes, ref_node_id, .verifier_candidate_artifact, ref, null, 0, 0, false, "materialized artifact proposal");
+                try appendEdge(allocator, edges, mat_id, ref_node_id, .materialization_proposes_artifact);
+            }
+        }
+
+        if (candidate.status == .rejected) {
+            const rejection_id = try std.fmt.allocPrint(allocator, "verifier_candidate_rejection_{d}", .{idx + 1});
+            defer allocator.free(rejection_id);
+            try appendNode(allocator, nodes, rejection_id, .verifier_candidate_rejection, candidate.rejection_reason orelse "rejected", null, 0, 0, false, "candidate rejected by lifecycle");
+            try appendEdge(allocator, edges, rejection_id, candidate_id, .rejects_candidate);
+        }
+
         for (candidate.required_inputs, 0..) |input, input_idx| {
             if (input_idx >= 2) break;
             const input_id = try std.fmt.allocPrint(allocator, "verifier_candidate_input_{d}_{d}", .{ idx + 1, input_idx + 1 });
@@ -1074,6 +1174,103 @@ fn appendEdge(
     });
 }
 
+pub const MaterializationPolicy = struct {
+    max_generated_bytes: usize = 1024 * 1024,
+    allow_check_plan: bool = true,
+    allow_file_proposal: bool = false,
+    allow_patch_proposal: bool = false,
+    allow_command_plan: bool = false,
+    require_acceptance: bool = true,
+};
+
+pub fn acceptVerifierCandidate(candidate: *VerifierCandidate, approval: VerifierCandidateApproval) !void {
+    if (candidate.status != .proposed) return error.InvalidStatus;
+    if (candidate.approval) |*old| old.deinit(candidate.allocator);
+    candidate.approval = approval;
+    candidate.status = .accepted;
+    const old_trace = candidate.trace;
+    candidate.trace = try std.fmt.allocPrint(candidate.allocator, "accepted verifier candidate; approved_by={s}; kind={s}; {s}", .{ approval.approved_by, @tagName(approval.approval_kind), old_trace });
+    candidate.allocator.free(old_trace);
+}
+
+pub fn rejectVerifierCandidate(candidate: *VerifierCandidate, reason: []const u8) !void {
+    if (candidate.status != .proposed and candidate.status != .accepted) return error.InvalidStatus;
+    if (candidate.rejection_reason) |old| candidate.allocator.free(old);
+    candidate.rejection_reason = try candidate.allocator.dupe(u8, reason);
+    candidate.status = .rejected;
+    const old_trace = candidate.trace;
+    candidate.trace = try std.fmt.allocPrint(candidate.allocator, "rejected verifier candidate; reason={s}; {s}", .{ reason, old_trace });
+    candidate.allocator.free(old_trace);
+}
+
+pub fn materializeVerifierCandidate(
+    allocator: std.mem.Allocator,
+    candidate: *VerifierCandidate,
+    policy: MaterializationPolicy,
+) !void {
+    if (policy.require_acceptance and candidate.status != .accepted) {
+        candidate.status = .blocked;
+        candidate.blocked_reason = .not_approved;
+        const old_trace = candidate.trace;
+        candidate.trace = try std.fmt.allocPrint(allocator, "materialization blocked because candidate is not accepted; {s}", .{old_trace});
+        allocator.free(old_trace);
+        return;
+    }
+    if (candidate.status != .proposed and candidate.status != .accepted) return error.InvalidStatus;
+
+    if (!candidate.non_authorizing) {
+        candidate.status = .blocked;
+        candidate.blocked_reason = .unsafe_materialization;
+        const old_trace = candidate.trace;
+        candidate.trace = try std.fmt.allocPrint(allocator, "materialization blocked because candidate is authorizing; {s}", .{old_trace});
+        allocator.free(old_trace);
+        return;
+    }
+
+    var mat = VerifierCandidateMaterialization{
+        .id = try std.fmt.allocPrint(allocator, "mat:{s}", .{candidate.id}),
+        .candidate_id = try allocator.dupe(u8, candidate.id),
+        .kind = .check_plan,
+        .trace = try allocator.dupe(u8, "materialized from candidate proposal"),
+    };
+    errdefer mat.deinit(allocator);
+
+    if (candidate.generated_artifacts.len > 0) {
+        mat.generated_artifact_refs = try cloneStringList(allocator, candidate.generated_artifacts);
+        if (mat.generated_artifact_refs.len > policy.max_generated_bytes / 1024) { // simplified cap
+            return error.BudgetExhausted;
+        }
+    }
+
+    if (candidate.patch_or_file_proposal) |p| {
+        if (std.mem.startsWith(u8, p, "generated verifier candidate file proposal")) {
+            if (policy.allow_file_proposal) {
+                mat.kind = .file_proposal;
+                mat.write_proposal_refs = try cloneStringList(allocator, &.{p});
+            }
+        } else {
+            if (policy.allow_patch_proposal) {
+                mat.kind = .patch_proposal;
+                mat.patch_proposal_refs = try cloneStringList(allocator, &.{p});
+            }
+        }
+    }
+
+    if (candidate.command_plan) |plan| {
+        if (policy.allow_command_plan) {
+            mat.kind = .command_plan;
+            mat.command_plan_refs = try cloneStringList(allocator, plan.argv);
+        }
+    }
+
+    if (candidate.materialization) |*old| old.deinit(allocator);
+    candidate.materialization = mat;
+    candidate.status = .materialized;
+    const old_trace = candidate.trace;
+    candidate.trace = try std.fmt.allocPrint(allocator, "materialized verifier candidate; kind={s}; {s}", .{ @tagName(mat.kind), old_trace });
+    allocator.free(old_trace);
+}
+
 pub fn renderHandoffJson(allocator: std.mem.Allocator, handoff: HandoffResult) ![]u8 {
     var out = std.ArrayList(u8).init(allocator);
     errdefer out.deinit();
@@ -1124,6 +1321,23 @@ pub fn renderHandoffJson(allocator: std.mem.Allocator, handoff: HandoffResult) !
         }
         if (candidate.patch_or_file_proposal) |proposal| try writeJsonFieldString(writer, "patch_or_file_proposal", proposal, false);
         if (candidate.blocked_reason) |reason| try writeJsonFieldString(writer, "blocked_reason", candidateBlockedReasonName(reason), false);
+        if (candidate.rejection_reason) |reason| try writeJsonFieldString(writer, "rejection_reason", reason, false);
+        if (candidate.approval) |approval| {
+            try writer.writeAll(",\"approval\":{");
+            try writeJsonFieldString(writer, "approved_by", approval.approved_by, true);
+            try writeJsonFieldString(writer, "approval_kind", @tagName(approval.approval_kind), false);
+            try writeJsonFieldString(writer, "approval_reason", approval.approval_reason, false);
+            try writer.print(",\"timestamp_ms\":{d}", .{approval.timestamp_ms});
+            try writer.writeAll("}");
+        }
+        if (candidate.materialization) |mat| {
+            try writer.writeAll(",\"materialization\":{");
+            try writeJsonFieldString(writer, "id", mat.id, true);
+            try writeJsonFieldString(writer, "kind", @tagName(mat.kind), false);
+            try writer.writeAll(",\"generated_artifact_refs\":");
+            try writeJsonStringList(writer, mat.generated_artifact_refs);
+            try writer.writeAll("}");
+        }
         try writer.print(",\"requires_approval\":{s},\"non_authorizing\":{s}", .{
             if (candidate.requires_approval) "true" else "false",
             if (candidate.non_authorizing) "true" else "false",

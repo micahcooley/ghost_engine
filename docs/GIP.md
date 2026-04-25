@@ -75,6 +75,54 @@ Every response that produces output includes a `resultState`:
 Hypotheses are always non-authorizing. No output grants permission without
 explicit verification.
 
+## Read-Only Inspection vs. Mutating Operations
+
+GIP operations are divided into three maturity categories:
+
+### Fully implemented (real engine data queried)
+
+| Operation | Description |
+|-----------|-------------|
+| `protocol.describe` | Protocol metadata, implemented kinds, maturity |
+| `capabilities.describe` | Current capability policies |
+| `engine.status` | Engine version, platform, operational status |
+| `verifier.list` | Lists all 7 builtin adapter entries from registry |
+| `pack.list` | Lists mounted packs from mount registry |
+| `pack.inspect` | Reads pack manifest from disk without mounting |
+
+### Implemented but stateless/context-required (returns valid empty shape)
+
+These have real dispatch handlers and valid JSON output, but return empty
+results when GIP has no active session or workspace metadata:
+
+| Operation | Behavior without context | Maturity |
+|-----------|------------------------|----------|
+| `hypothesis.list` | Returns empty hypotheses + zero counts | `stateless` |
+| `hypothesis.triage` | Returns empty triage summary with scoring policy version | `stateless` |
+| `feedback.summary` | Returns event counts if workspace metadata resolves; otherwise `unsupported` flag | `requires_workspace_metadata` |
+| `session.get` | Returns session data if session file exists; otherwise `path_not_found` | `requires_existing_session` |
+
+Stateless operations do not fake data. They return structurally valid empty
+outputs that are safe for clients to consume.
+
+### Unsupported (structured unsupported response)
+
+| Operation | Status |
+|-----------|--------|
+| `verifier.run` | Not implemented |
+| `command.run` | Not implemented |
+| `artifact.patch.apply` | Not implemented |
+| `pack.mount` / `pack.unmount` | Not implemented |
+| `pack.import` / `pack.export` | Not implemented |
+| `artifact.write.*` | Not implemented |
+| `conversation.replay` | Not implemented |
+| `hypothesis.generate` | Not implemented |
+| `feedback.record` | Not implemented |
+| `session.create` / `session.update` / `session.close` | Not implemented |
+
+> No MCP bridge is implemented. GIP is consumed directly via the CLI or
+> programmatic API. `protocol.describe` reports maturity per operation.
+
 ## Request Kinds
 
 ### Meta Operations
@@ -106,54 +154,95 @@ explicit verification.
 - `artifact.write.apply` — Write new file (requires approval) **(Not implemented yet)**
 
 ### Verification
-- `verifier.list` — List registered verifier adapters **(Not implemented yet)**
+- `verifier.list` — List registered verifier adapters **(Implemented)**
+  - **Request**: `{}`
+  - **Response**: `{"adapters": [{"adapterId": "...", "domain": "...", "hookKind": "...", "inputArtifactTypes": [...], "requiredEntityKinds": [...], "requiredRelationKinds": [...], "requiredObligations": [...], "budgetCost": int, "evidenceKind": "...", "safeLocal": bool, "external": bool, "enabled": bool}]}`
+  - Returns the builtin adapter registry. Does not run any verifier.
+  - `safeLocal: true` indicates the adapter runs without external process execution.
+  - `external: true` indicates the adapter requires build/test/runtime execution harness.
 - `verifier.run` — Run a specific verifier **(Not implemented yet)**
 - `hypothesis.verifier.schedule` — Schedule verifier for hypothesis **(Not implemented yet)**
 
 ### Hypotheses
 - `hypothesis.generate` — Generate hypotheses from context **(Not implemented yet)**
-- `hypothesis.triage` — Triage and select hypotheses **(Not implemented yet)**
-- `hypothesis.list` — List active hypotheses **(Not implemented yet)**
+- `hypothesis.list` — List active hypotheses **(Implemented — stateless)**
+  - **Request**: `{"sessionId": string (optional), "artifactRef": string (optional), "statusFilter": string (optional), "maxItems": int (optional, default 128, max 128)}`
+  - **Response**: `{"hypotheses": [], "counts": {"total": 0, "proposed": 0, "triaged": 0, "selected": 0, "suppressed": 0, "verified": 0, "rejected": 0, "blocked": 0, "unresolved": 0}, "maxItems": int}`
+  - Hypotheses are always non-authorizing.
+  - Returns empty list with zero counts — no fake hypotheses generated.
+  - Does not generate new hypotheses in the list operation.
+  - Will return real data when GIP bridges to active hypothesis context.
+- `hypothesis.triage` — Triage and select hypotheses **(Implemented — stateless)**
+  - **Request**: `{"sessionId": string (optional), "artifactRef": string (optional), "maxItems": int (optional, default 128, max 128), "includeSuppressed": bool (optional)}`
+  - **Response**: `{"triageSummary": {"total": 0, "selected": 0, "suppressed": 0, "duplicate": 0, "blocked": 0, "deferred": 0, "budgetHits": 0, "scoringPolicyVersion": "hypothesis_triage_v1"}, "items": [], "maxItems": int, "includeSuppressed": bool}`
+  - Does not schedule verifiers.
+  - `selected` means selected for investigation, not supported.
+  - Returns empty triage summary — no fake triage data.
 
 ### Knowledge Packs
-- `pack.list` — List available packs **(Not implemented yet)**
-- `pack.inspect` — Inspect pack contents **(Not implemented yet)**
-- `pack.mount` / `pack.unmount` — Mount/unmount packs (requires approval) **(Not implemented yet)**
-- `pack.import` / `pack.export` — Import/export packs (requires approval) **(Not implemented yet)**
+- `pack.list` — List mounted packs **(Implemented)**
+  - **Request**: `{}`
+  - **Response**: `{"packs": [{"packId": "...", "version": "...", "mounted": bool, "enabled": bool, "domainFamily": "...", "trustClass": "...", "summary": "...", "nonAuthorizingInfluence": true}]}`
+  - Pack listing does not mount, import, or export packs.
+  - Pack signals remain non-authorizing.
+  - If no mount registry exists, returns `ok` with empty list.
+- `pack.inspect` — Inspect pack manifest **(Implemented)**
+  - **Request**: `{"packId": string, "version": string (optional, default "v1")}`
+  - **Response**: `{"manifestSummary": {...}, "trustFreshnessStatus": {...}, "contentSummary": {...}, "provenance": {...}, "influencePolicy": "non_authorizing", "nonAuthorizing": true}`
+  - Does not mount pack. Does not mutate registry.
+  - Missing pack returns structured error with `path_not_found`.
+- `pack.mount` / `pack.unmount` — Mount/unmount packs **(Not implemented yet)**
+- `pack.import` / `pack.export` — Import/export packs **(Not implemented yet)**
 - `pack.distill.*` — Distillation operations **(Not implemented yet)**
 
 ### Feedback
 - `feedback.record` — Record feedback event **(Not implemented yet)**
 - `feedback.replay` — Replay feedback for reinforcement **(Not implemented yet)**
-- `feedback.summary` — Summarize feedback history **(Not implemented yet)**
+- `feedback.summary` — Summarize feedback history **(Implemented — requires workspace metadata)**
+  - **Request**: `{"projectShard": string (optional)}`
+  - **Response**: `{"eventCounts": {"total": int}, "reinforcementFamilies": ["intent_interpretation", "action_surface", "verifier_pattern"]}`
+  - If workspace/feedback data is unavailable, returns `{"unsupported": true, "reason": "..."}` with status `ok`.
+  - Returns real event counts when project shard has feedback data.
 
 ### Session
-- `session.create` / `session.get` / `session.update` / `session.close` **(Not implemented yet)**
+- `session.create` — Create session **(Not implemented yet)**
+- `session.get` — Read session by ID **(Implemented — requires existing session)**
+  - **Request**: `{"sessionId": string, "projectShard": string (optional)}`
+  - **Response**: `{"sessionId": "...", "historyCount": int, "currentIntent": {...}, "pendingObligations": int, "pendingAmbiguities": int, "lastResultState": {...}}`
+  - Returns real session data loaded from disk if session file exists.
+  - Missing session returns structured error with `path_not_found`.
+- `session.update` / `session.close` — **(Not implemented yet)**
 
 ### Command
-- `command.run` — Execute allowlisted command (sandboxed) **(Not implemented yet - currently unsupported)**
+- `command.run` — Execute allowlisted command (sandboxed) **(Not implemented)**
 
 ## Capability Model
 
-| Capability | Default Policy |
-|-----------|---------------|
-| `artifact.read` | allowed |
-| `artifact.list` | allowed |
-| `artifact.search` | allowed |
-| `artifact.patch.propose` | allowed |
-| `artifact.patch.apply` | requires_approval |
-| `artifact.write.propose` | allowed |
-| `artifact.write.apply` | requires_approval |
-| `command.run` | allowlist |
-| `verifier.run` | allowed |
-| `pack.inspect` | allowed |
-| `pack.mount` | requires_approval |
-| `pack.unmount` | requires_approval |
-| `pack.import` | requires_approval |
-| `pack.export` | requires_approval |
-| `feedback.record` | allowed |
-| `session.write` | allowed |
-| `network.access` | denied |
+| Capability | Default Policy | Read-Only |
+|-----------|---------------|-----------|
+| `artifact.read` | allowed | yes |
+| `artifact.list` | allowed | yes |
+| `artifact.search` | allowed | yes |
+| `artifact.patch.propose` | allowed | yes |
+| `artifact.patch.apply` | requires_approval | no (mutation) |
+| `artifact.write.propose` | allowed | yes |
+| `artifact.write.apply` | requires_approval | no (mutation) |
+| `hypothesis.list` | allowed | yes |
+| `hypothesis.triage` | allowed | yes |
+| `verifier.list` | allowed | yes |
+| `pack.list` | allowed | yes |
+| `pack.inspect` | allowed | yes |
+| `feedback.summary` | allowed | yes |
+| `session.get` | allowed | yes |
+| `command.run` | allowlist | no (not implemented) |
+| `verifier.run` | allowed | no (not implemented) |
+| `pack.mount` | requires_approval | no (not implemented) |
+| `pack.unmount` | requires_approval | no (not implemented) |
+| `pack.import` | requires_approval | no (not implemented) |
+| `pack.export` | requires_approval | no (not implemented) |
+| `feedback.record` | allowed | no (mutation) |
+| `session.write` | allowed | no (mutation) |
+| `network.access` | denied | n/a |
 
 ### Command Allowlist
 
@@ -170,6 +259,8 @@ Maximum timeout: 30 seconds. Maximum output: 256KB.
 4. **Path containment** — all paths validated against workspace boundary
 5. **Network denied by default** — no external requests
 6. **Draft semantics** — all outputs start as drafts with non-authorization notices
+7. **Pack signals are non-authorizing** — pack influence never grants permission
+8. **Read-only inspection is safe** — list/inspect/summary operations never mutate state
 
 ## CLI Usage
 
@@ -184,7 +275,26 @@ ghost_gip --json '{"gipVersion":"gip.v0.1","kind":"protocol.describe"}'
 
 # Stdin pipe
 echo '{"gipVersion":"gip.v0.1","kind":"engine.status"}' | ghost_gip --stdin
+
+# Inspection operations
+echo '{"gipVersion":"gip.v0.1","kind":"verifier.list"}' | ghost_gip --stdin
+echo '{"gipVersion":"gip.v0.1","kind":"pack.list"}' | ghost_gip --stdin --workspace /path/to/project
+echo '{"gipVersion":"gip.v0.1","kind":"hypothesis.list"}' | ghost_gip --stdin
+echo '{"gipVersion":"gip.v0.1","kind":"hypothesis.triage","maxItems":16}' | ghost_gip --stdin
+echo '{"gipVersion":"gip.v0.1","kind":"pack.inspect","packId":"my-pack"}' | ghost_gip --stdin
+echo '{"gipVersion":"gip.v0.1","kind":"feedback.summary"}' | ghost_gip --stdin --workspace /path/to/project
+echo '{"gipVersion":"gip.v0.1","kind":"session.get","sessionId":"my-session"}' | ghost_gip --stdin
 ```
+
+## Examples
+
+See `examples/gip/` for sample request JSON files:
+
+- `hypothesis_list.json` — hypothesis.list request
+- `hypothesis_triage.json` — hypothesis.triage request
+- `verifier_list.json` — verifier.list request
+- `pack_list.json` — pack.list request
+- `pack_inspect.json` — pack.inspect request
 
 ## Module Structure
 

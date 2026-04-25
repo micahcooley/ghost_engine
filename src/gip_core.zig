@@ -193,11 +193,17 @@ pub const CapabilityName = enum {
     @"command.run",
     @"command.run.allowlist",
     @"verifier.run",
+    @"hypothesis.list",
+    @"hypothesis.triage",
+    @"verifier.list",
+    @"pack.list",
     @"pack.inspect",
     @"pack.mount",
     @"pack.unmount",
     @"pack.import",
     @"pack.export",
+    @"feedback.summary",
+    @"session.get",
     @"feedback.record",
     @"session.write",
     @"network.access",
@@ -224,7 +230,7 @@ pub const CapabilityEntry = struct {
     policy: CapabilityPolicy,
 };
 
-pub fn defaultCapabilities() [18]CapabilityEntry {
+pub fn defaultCapabilities() [24]CapabilityEntry {
     return .{
         .{ .capability = .@"artifact.read", .policy = .allowed },
         .{ .capability = .@"artifact.list", .policy = .allowed },
@@ -236,11 +242,17 @@ pub fn defaultCapabilities() [18]CapabilityEntry {
         .{ .capability = .@"command.run", .policy = .allowlist },
         .{ .capability = .@"command.run.allowlist", .policy = .allowlist },
         .{ .capability = .@"verifier.run", .policy = .allowed },
+        .{ .capability = .@"hypothesis.list", .policy = .allowed },
+        .{ .capability = .@"hypothesis.triage", .policy = .allowed },
+        .{ .capability = .@"verifier.list", .policy = .allowed },
+        .{ .capability = .@"pack.list", .policy = .allowed },
         .{ .capability = .@"pack.inspect", .policy = .allowed },
         .{ .capability = .@"pack.mount", .policy = .requires_approval },
         .{ .capability = .@"pack.unmount", .policy = .requires_approval },
         .{ .capability = .@"pack.import", .policy = .requires_approval },
         .{ .capability = .@"pack.export", .policy = .requires_approval },
+        .{ .capability = .@"feedback.summary", .policy = .allowed },
+        .{ .capability = .@"session.get", .policy = .allowed },
         .{ .capability = .@"feedback.record", .policy = .allowed },
         .{ .capability = .@"session.write", .policy = .allowed },
         .{ .capability = .@"network.access", .policy = .denied },
@@ -353,6 +365,10 @@ pub const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 pub const MAX_ARTIFACT_READ_BYTES: usize = 1024 * 1024;
 pub const MAX_LIST_ENTRIES: usize = 512;
 pub const MAX_SEARCH_RESULTS: usize = 64;
+pub const MAX_HYPOTHESIS_ITEMS: usize = 128;
+pub const MAX_TRIAGE_ITEMS: usize = 128;
+pub const MAX_VERIFIER_ADAPTERS: usize = 64;
+pub const MAX_PACK_LIST_ITEMS: usize = 128;
 
 pub fn isCommandAllowed(argv0: []const u8) bool {
     // Extract basename from potential path
@@ -376,6 +392,13 @@ pub const IMPLEMENTED_KINDS = [_]RequestKind{
     .@"artifact.read",
     .@"artifact.list",
     .@"artifact.patch.propose",
+    .@"hypothesis.list",
+    .@"hypothesis.triage",
+    .@"verifier.list",
+    .@"pack.list",
+    .@"pack.inspect",
+    .@"feedback.summary",
+    .@"session.get",
 };
 
 pub fn isImplemented(kind: RequestKind) bool {
@@ -415,7 +438,7 @@ test "default capabilities have safe defaults" {
     // command.run should be allowlisted
     try std.testing.expectEqual(CapabilityPolicy.allowlist, caps[7].policy);
     // network.access should be denied
-    try std.testing.expectEqual(CapabilityPolicy.denied, caps[17].policy);
+    try std.testing.expectEqual(CapabilityPolicy.denied, caps[23].policy);
 }
 
 test "command allowlist rejects arbitrary commands" {

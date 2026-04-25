@@ -281,7 +281,10 @@ const CaseResult = struct {
     non_code_hypothesis_verifier_job_count: u32 = 0,
     verifier_candidate_proposed_count: u32 = 0,
     verifier_candidate_blocked_count: u32 = 0,
+    verifier_candidate_accepted_count: u32 = 0,
     verifier_candidate_materialized_count: u32 = 0,
+    verifier_candidate_rejected_count: u32 = 0,
+    verifier_candidate_materialization_blocked_count: u32 = 0,
     verifier_candidate_budget_hit_count: u32 = 0,
     code_verifier_candidate_count: u32 = 0,
     non_code_verifier_candidate_count: u32 = 0,
@@ -449,7 +452,10 @@ const Metrics = struct {
     non_code_hypothesis_verifier_job_count: u32 = 0,
     verifier_candidate_proposed_count: u32 = 0,
     verifier_candidate_blocked_count: u32 = 0,
+    verifier_candidate_accepted_count: u32 = 0,
     verifier_candidate_materialized_count: u32 = 0,
+    verifier_candidate_rejected_count: u32 = 0,
+    verifier_candidate_materialization_blocked_count: u32 = 0,
     verifier_candidate_budget_hit_count: u32 = 0,
     code_verifier_candidate_count: u32 = 0,
     non_code_verifier_candidate_count: u32 = 0,
@@ -1686,7 +1692,10 @@ fn recordPipelineHypotheses(metrics: *Metrics, pipeline: *const artifact_schema.
             metrics.non_code_hypothesis_verifier_job_count += @intCast(value.non_code_job_count);
             metrics.verifier_candidate_proposed_count += @intCast(value.verifier_candidate_proposed_count);
             metrics.verifier_candidate_blocked_count += @intCast(value.verifier_candidate_blocked_count);
+            metrics.verifier_candidate_accepted_count += @intCast(value.verifier_candidate_accepted_count);
             metrics.verifier_candidate_materialized_count += @intCast(value.verifier_candidate_materialized_count);
+            metrics.verifier_candidate_rejected_count += @intCast(value.verifier_candidate_rejected_count);
+            metrics.verifier_candidate_materialization_blocked_count += @intCast(value.verifier_candidate_materialization_blocked_count);
             metrics.verifier_candidate_budget_hit_count += @intCast(value.verifier_candidate_budget_exhausted_count);
             metrics.code_verifier_candidate_count += @intCast(value.code_verifier_candidate_count);
             metrics.non_code_verifier_candidate_count += @intCast(value.non_code_verifier_candidate_count);
@@ -3592,7 +3601,7 @@ fn renderJsonReport(allocator: std.mem.Allocator, metrics: *const Metrics, resul
         metrics.verifier_hint_signal_count,
         metrics.fallback_signal_used_count,
     });
-    try writer.print(",\"generatedHypothesisCount\":{d},\"selectedHypothesisCount\":{d},\"suppressedHypothesisCount\":{d},\"hypothesisGenerationBudgetHitCount\":{d},\"hypothesisGenerationRulesFired\":{d},\"codeHypothesisCount\":{d},\"nonCodeHypothesisCount\":{d},\"hypothesisTriageSelectedCount\":{d},\"hypothesisTriageSuppressedCount\":{d},\"hypothesisDuplicateCount\":{d},\"hypothesisBudgetHitCount\":{d},\"selectedCodeHypothesisCount\":{d},\"selectedNonCodeHypothesisCount\":{d},\"hypothesisVerifierEligibleCount\":{d},\"hypothesisVerifierScheduledCount\":{d},\"hypothesisVerifierCompletedCount\":{d},\"hypothesisVerifierBlockedCount\":{d},\"hypothesisVerifierSkippedCount\":{d},\"hypothesisVerifierBudgetExhaustedCount\":{d},\"codeHypothesisVerifierJobCount\":{d},\"nonCodeHypothesisVerifierJobCount\":{d},\"verifierCandidateProposedCount\":{d},\"verifierCandidateBlockedCount\":{d},\"verifierCandidateMaterializedCount\":{d},\"verifierCandidateBudgetHitCount\":{d},\"codeVerifierCandidateCount\":{d},\"nonCodeVerifierCandidateCount\":{d}", .{
+    try writer.print(",\"generatedHypothesisCount\":{d},\"selectedHypothesisCount\":{d},\"suppressedHypothesisCount\":{d},\"hypothesisGenerationBudgetHitCount\":{d},\"hypothesisGenerationRulesFired\":{d},\"codeHypothesisCount\":{d},\"nonCodeHypothesisCount\":{d},\"hypothesisTriageSelectedCount\":{d},\"hypothesisTriageSuppressedCount\":{d},\"hypothesisDuplicateCount\":{d},\"hypothesisBudgetHitCount\":{d},\"selectedCodeHypothesisCount\":{d},\"selectedNonCodeHypothesisCount\":{d},\"hypothesisVerifierEligibleCount\":{d},\"hypothesisVerifierScheduledCount\":{d},\"hypothesisVerifierCompletedCount\":{d},\"hypothesisVerifierBlockedCount\":{d},\"hypothesisVerifierSkippedCount\":{d},\"hypothesisVerifierBudgetExhaustedCount\":{d},\"codeHypothesisVerifierJobCount\":{d},\"nonCodeHypothesisVerifierJobCount\":{d},\"verifierCandidateProposedCount\":{d},\"verifierCandidateBlockedCount\":{d},\"verifierCandidateAcceptedCount\":{d},\"verifierCandidateMaterializedCount\":{d},\"verifierCandidateRejectedCount\":{d},\"verifierCandidateMaterializationBlockedCount\":{d},\"verifierCandidateBudgetHitCount\":{d},\"codeVerifierCandidateCount\":{d},\"nonCodeVerifierCandidateCount\":{d}", .{
         metrics.generated_hypothesis_count,
         metrics.selected_hypothesis_count,
         metrics.suppressed_hypothesis_count,
@@ -3616,7 +3625,10 @@ fn renderJsonReport(allocator: std.mem.Allocator, metrics: *const Metrics, resul
         metrics.non_code_hypothesis_verifier_job_count,
         metrics.verifier_candidate_proposed_count,
         metrics.verifier_candidate_blocked_count,
+        metrics.verifier_candidate_accepted_count,
         metrics.verifier_candidate_materialized_count,
+        metrics.verifier_candidate_rejected_count,
+        metrics.verifier_candidate_materialization_blocked_count,
         metrics.verifier_candidate_budget_hit_count,
         metrics.code_verifier_candidate_count,
         metrics.non_code_verifier_candidate_count,
@@ -3921,10 +3933,13 @@ fn renderMarkdownReport(allocator: std.mem.Allocator, metrics: *const Metrics, r
         metrics.code_hypothesis_verifier_job_count,
         metrics.non_code_hypothesis_verifier_job_count,
     });
-    try writer.print("- verifier candidates: proposed={d}, blocked={d}, materialized={d}, budget_hits={d}, code={d}, non_code={d}\n", .{
+    try writer.print("- verifier candidates: proposed={d}, blocked={d}, accepted={d}, materialized={d}, rejected={d}, materialization_blocked={d}, budget_hits={d}, code={d}, non_code={d}\n", .{
         metrics.verifier_candidate_proposed_count,
         metrics.verifier_candidate_blocked_count,
+        metrics.verifier_candidate_accepted_count,
         metrics.verifier_candidate_materialized_count,
+        metrics.verifier_candidate_rejected_count,
+        metrics.verifier_candidate_materialization_blocked_count,
         metrics.verifier_candidate_budget_hit_count,
         metrics.code_verifier_candidate_count,
         metrics.non_code_verifier_candidate_count,

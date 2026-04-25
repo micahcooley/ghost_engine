@@ -1,0 +1,7 @@
+{
+  "gipVersion": "gip.v0.1",
+  "kind": "pack.inspect",
+  "requestId": "example-pack-inspect-001",
+  "packId": "example-pack",
+  "version": "v1"
+}

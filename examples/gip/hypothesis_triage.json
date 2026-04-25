@@ -1,0 +1,7 @@
+{
+  "gipVersion": "gip.v0.1",
+  "kind": "hypothesis.triage",
+  "requestId": "example-hypothesis-triage-001",
+  "maxItems": 32,
+  "includeSuppressed": true
+}
