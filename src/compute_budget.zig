@@ -40,6 +40,15 @@ pub const Limit = enum {
     max_verifier_candidate_commands,
     max_verifier_candidate_bytes,
     max_verifier_candidate_obligations,
+    max_verifier_candidate_execution_jobs,
+    max_verifier_candidate_execution_time_ms,
+    max_verifier_candidate_execution_output_bytes,
+    max_correction_events,
+    max_negative_knowledge_candidates,
+    max_negative_knowledge_records,
+    max_negative_knowledge_influence_matches,
+    max_negative_knowledge_trace_items,
+    max_trust_decay_candidates,
     max_wall_time_ms,
     max_temp_work_bytes,
 };
@@ -70,6 +79,10 @@ pub const Stage = enum {
     hypothesis_verifier_need_collection,
     verifier_candidate_generation,
     verifier_candidate_artifact_planning,
+    verifier_candidate_execution,
+    verifier_candidate_evidence,
+    correction_hook,
+    negative_knowledge,
 };
 
 pub const Overrides = struct {
@@ -104,6 +117,15 @@ pub const Overrides = struct {
     max_verifier_candidate_commands: ?usize = null,
     max_verifier_candidate_bytes: ?usize = null,
     max_verifier_candidate_obligations: ?usize = null,
+    max_verifier_candidate_execution_jobs: ?usize = null,
+    max_verifier_candidate_execution_time_ms: ?u32 = null,
+    max_verifier_candidate_execution_output_bytes: ?usize = null,
+    max_correction_events: ?usize = null,
+    max_negative_knowledge_candidates: ?usize = null,
+    max_negative_knowledge_records: ?usize = null,
+    max_negative_knowledge_influence_matches: ?usize = null,
+    max_negative_knowledge_trace_items: ?usize = null,
+    max_trust_decay_candidates: ?usize = null,
     max_wall_time_ms: ?u32 = null,
     max_temp_work_bytes: ?usize = null,
 };
@@ -153,6 +175,15 @@ pub const Effective = struct {
     max_verifier_candidate_commands: usize,
     max_verifier_candidate_bytes: usize,
     max_verifier_candidate_obligations: usize,
+    max_verifier_candidate_execution_jobs: usize,
+    max_verifier_candidate_execution_time_ms: u32,
+    max_verifier_candidate_execution_output_bytes: usize,
+    max_correction_events: usize,
+    max_negative_knowledge_candidates: usize,
+    max_negative_knowledge_records: usize,
+    max_negative_knowledge_influence_matches: usize,
+    max_negative_knowledge_trace_items: usize,
+    max_trust_decay_candidates: usize,
     max_wall_time_ms: u32,
     max_temp_work_bytes: usize,
 };
@@ -253,6 +284,15 @@ pub fn resolve(request: Request) Effective {
     applyOverrideUsize(&effective.max_verifier_candidate_commands, request.overrides.max_verifier_candidate_commands, 0);
     applyOverrideUsize(&effective.max_verifier_candidate_bytes, request.overrides.max_verifier_candidate_bytes, 0);
     applyOverrideUsize(&effective.max_verifier_candidate_obligations, request.overrides.max_verifier_candidate_obligations, 0);
+    applyOverrideUsize(&effective.max_verifier_candidate_execution_jobs, request.overrides.max_verifier_candidate_execution_jobs, 0);
+    applyOverrideU32(&effective.max_verifier_candidate_execution_time_ms, request.overrides.max_verifier_candidate_execution_time_ms, 1);
+    applyOverrideUsize(&effective.max_verifier_candidate_execution_output_bytes, request.overrides.max_verifier_candidate_execution_output_bytes, 0);
+    applyOverrideUsize(&effective.max_correction_events, request.overrides.max_correction_events, 0);
+    applyOverrideUsize(&effective.max_negative_knowledge_candidates, request.overrides.max_negative_knowledge_candidates, 0);
+    applyOverrideUsize(&effective.max_negative_knowledge_records, request.overrides.max_negative_knowledge_records, 0);
+    applyOverrideUsize(&effective.max_negative_knowledge_influence_matches, request.overrides.max_negative_knowledge_influence_matches, 0);
+    applyOverrideUsize(&effective.max_negative_knowledge_trace_items, request.overrides.max_negative_knowledge_trace_items, 0);
+    applyOverrideUsize(&effective.max_trust_decay_candidates, request.overrides.max_trust_decay_candidates, 0);
     applyOverrideU32(&effective.max_wall_time_ms, request.overrides.max_wall_time_ms, 1);
     applyOverrideUsize(&effective.max_temp_work_bytes, request.overrides.max_temp_work_bytes, 1024);
 
@@ -294,6 +334,27 @@ pub fn resolve(request: Request) Effective {
     }
     if (effective.max_verifier_candidate_commands > effective.max_verifier_candidates_generated) {
         effective.max_verifier_candidate_commands = effective.max_verifier_candidates_generated;
+    }
+    if (effective.max_verifier_candidate_execution_jobs > effective.max_verifier_candidates_generated) {
+        effective.max_verifier_candidate_execution_jobs = effective.max_verifier_candidates_generated;
+    }
+    if (effective.max_verifier_candidate_execution_time_ms > effective.max_verifier_time_ms) {
+        effective.max_verifier_candidate_execution_time_ms = effective.max_verifier_time_ms;
+    }
+    if (effective.max_verifier_candidate_execution_output_bytes > effective.max_verifier_evidence_bytes) {
+        effective.max_verifier_candidate_execution_output_bytes = effective.max_verifier_evidence_bytes;
+    }
+    if (effective.max_negative_knowledge_candidates > effective.max_correction_events) {
+        effective.max_negative_knowledge_candidates = effective.max_correction_events;
+    }
+    if (effective.max_negative_knowledge_records > effective.max_negative_knowledge_candidates) {
+        effective.max_negative_knowledge_records = effective.max_negative_knowledge_candidates;
+    }
+    if (effective.max_negative_knowledge_trace_items > effective.max_negative_knowledge_influence_matches) {
+        effective.max_negative_knowledge_trace_items = effective.max_negative_knowledge_influence_matches;
+    }
+    if (effective.max_trust_decay_candidates > effective.max_negative_knowledge_influence_matches) {
+        effective.max_trust_decay_candidates = effective.max_negative_knowledge_influence_matches;
     }
     return effective;
 }
@@ -340,6 +401,15 @@ fn preset(tier: Tier) Effective {
             .max_verifier_candidate_commands = 1,
             .max_verifier_candidate_bytes = 8 * 1024,
             .max_verifier_candidate_obligations = 4,
+            .max_verifier_candidate_execution_jobs = 2,
+            .max_verifier_candidate_execution_time_ms = 8_000,
+            .max_verifier_candidate_execution_output_bytes = 32 * 1024,
+            .max_correction_events = 4,
+            .max_negative_knowledge_candidates = 2,
+            .max_negative_knowledge_records = 2,
+            .max_negative_knowledge_influence_matches = 4,
+            .max_negative_knowledge_trace_items = 4,
+            .max_trust_decay_candidates = 2,
             .max_wall_time_ms = 12_000,
             .max_temp_work_bytes = 256 * 1024,
         },
@@ -383,6 +453,15 @@ fn preset(tier: Tier) Effective {
             .max_verifier_candidate_commands = 0,
             .max_verifier_candidate_bytes = 4 * 1024,
             .max_verifier_candidate_obligations = 2,
+            .max_verifier_candidate_execution_jobs = 1,
+            .max_verifier_candidate_execution_time_ms = 2_000,
+            .max_verifier_candidate_execution_output_bytes = 16 * 1024,
+            .max_correction_events = 2,
+            .max_negative_knowledge_candidates = 1,
+            .max_negative_knowledge_records = 1,
+            .max_negative_knowledge_influence_matches = 2,
+            .max_negative_knowledge_trace_items = 2,
+            .max_trust_decay_candidates = 1,
             .max_wall_time_ms = 4_000,
             .max_temp_work_bytes = 64 * 1024,
         },
@@ -426,6 +505,15 @@ fn preset(tier: Tier) Effective {
             .max_verifier_candidate_commands = 2,
             .max_verifier_candidate_bytes = 16 * 1024,
             .max_verifier_candidate_obligations = 6,
+            .max_verifier_candidate_execution_jobs = 4,
+            .max_verifier_candidate_execution_time_ms = 12_000,
+            .max_verifier_candidate_execution_output_bytes = 64 * 1024,
+            .max_correction_events = 8,
+            .max_negative_knowledge_candidates = 4,
+            .max_negative_knowledge_records = 4,
+            .max_negative_knowledge_influence_matches = 8,
+            .max_negative_knowledge_trace_items = 8,
+            .max_trust_decay_candidates = 4,
             .max_wall_time_ms = 15_000,
             .max_temp_work_bytes = 512 * 1024,
         },
@@ -469,6 +557,15 @@ fn preset(tier: Tier) Effective {
             .max_verifier_candidate_commands = 3,
             .max_verifier_candidate_bytes = 24 * 1024,
             .max_verifier_candidate_obligations = 8,
+            .max_verifier_candidate_execution_jobs = 6,
+            .max_verifier_candidate_execution_time_ms = 15_000,
+            .max_verifier_candidate_execution_output_bytes = 96 * 1024,
+            .max_correction_events = 12,
+            .max_negative_knowledge_candidates = 6,
+            .max_negative_knowledge_records = 6,
+            .max_negative_knowledge_influence_matches = 12,
+            .max_negative_knowledge_trace_items = 12,
+            .max_trust_decay_candidates = 6,
             .max_wall_time_ms = 15_000,
             .max_temp_work_bytes = 1024 * 1024,
         },

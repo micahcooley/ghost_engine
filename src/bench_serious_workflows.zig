@@ -339,6 +339,20 @@ const CaseResult = struct {
     task_artifact_write_count: u32 = 0,
     task_session_save_ms: u64 = 0,
     task_session_save_count: u32 = 0,
+    verifier_candidate_execution_eligible_count: u32 = 0,
+    verifier_candidate_execution_scheduled_count: u32 = 0,
+    verifier_candidate_execution_completed_count: u32 = 0,
+    verifier_candidate_execution_failed_count: u32 = 0,
+    verifier_candidate_execution_blocked_count: u32 = 0,
+    verifier_candidate_execution_budget_hit_count: u32 = 0,
+    correction_event_count: u32 = 0,
+    negative_knowledge_candidate_count: u32 = 0,
+    negative_knowledge_accepted_count: u32 = 0,
+    negative_knowledge_rejected_count: u32 = 0,
+    negative_knowledge_influence_match_count: u32 = 0,
+    negative_knowledge_triage_penalty_count: u32 = 0,
+    negative_knowledge_verifier_requirement_count: u32 = 0,
+    negative_knowledge_trust_decay_candidate_count: u32 = 0,
 
     fn deinit(self: *CaseResult) void {
         self.allocator.free(self.detail);
@@ -500,6 +514,20 @@ const Metrics = struct {
     task_artifact_write_count: u32 = 0,
     task_session_save_ms: u64 = 0,
     task_session_save_count: u32 = 0,
+    verifier_candidate_execution_eligible_count: u32 = 0,
+    verifier_candidate_execution_scheduled_count: u32 = 0,
+    verifier_candidate_execution_completed_count: u32 = 0,
+    verifier_candidate_execution_failed_count: u32 = 0,
+    verifier_candidate_execution_blocked_count: u32 = 0,
+    verifier_candidate_execution_budget_hit_count: u32 = 0,
+    correction_event_count: u32 = 0,
+    negative_knowledge_candidate_count: u32 = 0,
+    negative_knowledge_accepted_count: u32 = 0,
+    negative_knowledge_rejected_count: u32 = 0,
+    negative_knowledge_influence_match_count: u32 = 0,
+    negative_knowledge_triage_penalty_count: u32 = 0,
+    negative_knowledge_verifier_requirement_count: u32 = 0,
+    negative_knowledge_trust_decay_candidate_count: u32 = 0,
 };
 
 const ABSTRACTION_CATALOG =
@@ -1653,6 +1681,9 @@ fn recordPipelineHypotheses(metrics: *Metrics, pipeline: *const artifact_schema.
         metrics.hypothesis_triage_suppressed_count += @intCast(triaged.suppressed + triaged.blocked + triaged.deferred);
         metrics.hypothesis_duplicate_count += @intCast(triaged.duplicates);
         metrics.hypothesis_budget_hit_count += @intCast(triaged.budget_hits);
+        metrics.negative_knowledge_influence_match_count += @intCast(triaged.negative_knowledge_influence_match_count);
+        metrics.negative_knowledge_triage_penalty_count += @intCast(triaged.negative_knowledge_triage_penalty_count);
+        metrics.negative_knowledge_verifier_requirement_count += @intCast(triaged.negative_knowledge_verifier_requirement_count);
         metrics.selected_code_hypothesis_count += @intCast(triaged.selected_code_count);
         metrics.selected_non_code_hypothesis_count += @intCast(triaged.selected_non_code_count);
         for (triaged.items, 0..) |item, idx| {
@@ -3440,6 +3471,21 @@ fn accumulateMetrics(metrics: *Metrics, spec: CaseSpec, result: *const CaseResul
     metrics.task_session_save_ms += result.task_session_save_ms;
     metrics.task_session_save_count += result.task_session_save_count;
 
+    metrics.verifier_candidate_execution_eligible_count += result.verifier_candidate_execution_eligible_count;
+    metrics.verifier_candidate_execution_scheduled_count += result.verifier_candidate_execution_scheduled_count;
+    metrics.verifier_candidate_execution_completed_count += result.verifier_candidate_execution_completed_count;
+    metrics.verifier_candidate_execution_failed_count += result.verifier_candidate_execution_failed_count;
+    metrics.verifier_candidate_execution_blocked_count += result.verifier_candidate_execution_blocked_count;
+    metrics.verifier_candidate_execution_budget_hit_count += result.verifier_candidate_execution_budget_hit_count;
+    metrics.correction_event_count += result.correction_event_count;
+    metrics.negative_knowledge_candidate_count += result.negative_knowledge_candidate_count;
+    metrics.negative_knowledge_accepted_count += result.negative_knowledge_accepted_count;
+    metrics.negative_knowledge_rejected_count += result.negative_knowledge_rejected_count;
+    metrics.negative_knowledge_influence_match_count += result.negative_knowledge_influence_match_count;
+    metrics.negative_knowledge_triage_penalty_count += result.negative_knowledge_triage_penalty_count;
+    metrics.negative_knowledge_verifier_requirement_count += result.negative_knowledge_verifier_requirement_count;
+    metrics.negative_knowledge_trust_decay_candidate_count += result.negative_knowledge_trust_decay_candidate_count;
+
     if (result.cold_duration_ms > 0 or result.warm_duration_ms > 0) {
         metrics.cold_start_ms = result.cold_duration_ms;
         metrics.warm_start_ms = result.warm_duration_ms;
@@ -3685,6 +3731,35 @@ fn renderJsonReport(allocator: std.mem.Allocator, metrics: *const Metrics, resul
         metrics.task_session_save_ms,
         metrics.task_session_save_count,
     });
+    try writer.print(",\"verifierCandidateExecutionEligibleCount\":{d},\"verifierCandidateExecutionScheduledCount\":{d},\"verifierCandidateExecutionCompletedCount\":{d},\"verifierCandidateExecutionFailedCount\":{d},\"verifierCandidateExecutionBlockedCount\":{d},\"verifierCandidateExecutionBudgetHitCount\":{d},\"correctionEventCount\":{d},\"negativeKnowledgeCandidateCount\":{d}", .{
+        metrics.verifier_candidate_execution_eligible_count,
+        metrics.verifier_candidate_execution_scheduled_count,
+        metrics.verifier_candidate_execution_completed_count,
+        metrics.verifier_candidate_execution_failed_count,
+        metrics.verifier_candidate_execution_blocked_count,
+        metrics.verifier_candidate_execution_budget_hit_count,
+        metrics.correction_event_count,
+        metrics.negative_knowledge_candidate_count,
+    });
+    try writer.print(",\"negativeKnowledgeAcceptedCount\":{d},\"negativeKnowledgeRejectedCount\":{d},\"negativeKnowledgeInfluenceMatchCount\":{d},\"negativeKnowledgeTriagePenaltyCount\":{d},\"negativeKnowledgeVerifierRequirementCount\":{d},\"negativeKnowledgeTrustDecayCandidateCount\":{d}", .{
+        metrics.negative_knowledge_accepted_count,
+        metrics.negative_knowledge_rejected_count,
+        metrics.negative_knowledge_influence_match_count,
+        metrics.negative_knowledge_triage_penalty_count,
+        metrics.negative_knowledge_verifier_requirement_count,
+        metrics.negative_knowledge_trust_decay_candidate_count,
+    });
+    try writer.writeAll(",\"negativeKnowledge\":{");
+    try writer.print("\"candidateCount\":{d},\"acceptedCount\":{d},\"rejectedCount\":{d},\"expiredCount\":0,\"influenceMatchCount\":{d},\"triagePenaltyCount\":{d},\"verifierRequirementCount\":{d},\"suppressionCount\":0,\"trustDecayCandidateCount\":{d}", .{
+        metrics.negative_knowledge_candidate_count,
+        metrics.negative_knowledge_accepted_count,
+        metrics.negative_knowledge_rejected_count,
+        metrics.negative_knowledge_influence_match_count,
+        metrics.negative_knowledge_triage_penalty_count,
+        metrics.negative_knowledge_verifier_requirement_count,
+        metrics.negative_knowledge_trust_decay_candidate_count,
+    });
+    try writer.writeAll(",\"records\":[]}");
     try writer.writeAll("}");
 
     try writer.writeAll(",\"cases\":[");
@@ -3993,6 +4068,26 @@ fn renderMarkdownReport(allocator: std.mem.Allocator, metrics: *const Metrics, r
     try writer.print("- measured task session saves: {d} ms across {d} saves\n", .{
         metrics.task_session_save_ms,
         metrics.task_session_save_count,
+    });
+    try writer.print("- verifier candidate execution: {d} eligible, {d} scheduled, {d} completed, {d} failed, {d} blocked, {d} budget-hit\n", .{
+        metrics.verifier_candidate_execution_eligible_count,
+        metrics.verifier_candidate_execution_scheduled_count,
+        metrics.verifier_candidate_execution_completed_count,
+        metrics.verifier_candidate_execution_failed_count,
+        metrics.verifier_candidate_execution_blocked_count,
+        metrics.verifier_candidate_execution_budget_hit_count,
+    });
+    try writer.print("- correction events: {d}; negative knowledge candidates: {d}\n", .{
+        metrics.correction_event_count,
+        metrics.negative_knowledge_candidate_count,
+    });
+    try writer.print("- negative knowledge lifecycle: accepted={d}, rejected={d}, influence_matches={d}, triage_penalties={d}, verifier_requirements={d}, trust_decay_candidates={d}\n", .{
+        metrics.negative_knowledge_accepted_count,
+        metrics.negative_knowledge_rejected_count,
+        metrics.negative_knowledge_influence_match_count,
+        metrics.negative_knowledge_triage_penalty_count,
+        metrics.negative_knowledge_verifier_requirement_count,
+        metrics.negative_knowledge_trust_decay_candidate_count,
     });
     try writer.writeAll("\nNotes:\n");
     try writer.writeAll("- patch compile-pass and test-pass rates are per attempted candidate verification step, not per benchmark case.\n");

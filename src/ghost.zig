@@ -36,6 +36,9 @@ pub const intent_grounding = @import("intent_grounding.zig");
 pub const response_engine = @import("response_engine.zig");
 pub const conversation_session = @import("conversation_session.zig");
 pub const verifier_adapter = @import("verifier_adapter.zig");
+pub const verifier_execution = @import("verifier_execution.zig");
+pub const correction_hooks = @import("correction_hooks.zig");
+pub const negative_knowledge = @import("negative_knowledge.zig");
 pub const repo_hygiene = @import("repo_hygiene.zig");
 pub const gip = @import("gip.zig");
 

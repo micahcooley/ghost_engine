@@ -785,6 +785,14 @@ pub const SupportNodeKind = enum {
     verifier_candidate_approval,
     verifier_candidate_materialization,
     verifier_candidate_rejection,
+    verifier_execution_job,
+    verifier_execution_result,
+    correction_event,
+    negative_knowledge_candidate,
+    negative_knowledge_record,
+    negative_knowledge_review,
+    negative_knowledge_influence,
+    trust_decay_candidate,
     action_surface,
     routing_candidate,
 };
@@ -837,6 +845,25 @@ pub const SupportEdgeKind = enum {
     materializes_candidate,
     materialization_proposes_artifact,
     materialization_requires_approval,
+    executes_candidate,
+    execution_for_materialization,
+    execution_produces_evidence,
+    execution_contradicts,
+    correction_for,
+    correction_from_evidence,
+    correction_updates_state,
+    proposes_negative_knowledge,
+    negative_knowledge_from_correction,
+    reviews_candidate,
+    accepts_negative_knowledge,
+    rejects_negative_knowledge,
+    negative_knowledge_from_candidate,
+    negative_knowledge_influences_hypothesis,
+    negative_knowledge_warns_routing,
+    negative_knowledge_requires_verifier,
+    proposes_trust_decay,
+    supersedes_negative_knowledge,
+    expires_negative_knowledge,
     rejected_by,
     triages,
     suppresses,
@@ -4137,6 +4164,13 @@ fn appendHypothesisTriageSupportGraph(
         defer allocator.free(detail);
         try appendSupportGraphNode(allocator, nodes, score_id, .hypothesis_score, item.hypothesis_id, null, 0, item.score, false, detail);
         try appendSupportGraphEdge(allocator, edges, "hypothesis_triage", score_id, if (item.selected_for_next_stage) .triages else .suppresses);
+        if (item.negative_knowledge_match_count > 0) {
+            const influence_id = try std.fmt.allocPrint(allocator, "negative_knowledge_influence_{d}", .{idx + 1});
+            defer allocator.free(influence_id);
+            try appendSupportGraphNode(allocator, nodes, influence_id, .negative_knowledge_influence, "negative knowledge accepted for scoped influence", null, 0, @intCast(@min(item.negative_knowledge_match_count, std.math.maxInt(u32))), false, "non-authorizing influence only; cannot support output");
+            try appendSupportGraphEdge(allocator, edges, influence_id, score_id, .negative_knowledge_influences_hypothesis);
+            if (item.required_verifiers.len > 0) try appendSupportGraphEdge(allocator, edges, influence_id, score_id, .negative_knowledge_requires_verifier);
+        }
         if (previous_score_id) |previous| {
             try appendSupportGraphEdge(allocator, edges, previous, score_id, .ranks_above);
             allocator.free(previous);
@@ -8991,6 +9025,14 @@ fn supportNodeKindName(kind: SupportNodeKind) []const u8 {
         .verifier_candidate_approval => "verifier_candidate_approval",
         .verifier_candidate_materialization => "verifier_candidate_materialization",
         .verifier_candidate_rejection => "verifier_candidate_rejection",
+        .verifier_execution_job => "verifier_execution_job",
+        .verifier_execution_result => "verifier_execution_result",
+        .correction_event => "correction_event",
+        .negative_knowledge_candidate => "negative_knowledge_candidate",
+        .negative_knowledge_record => "negative_knowledge_record",
+        .negative_knowledge_review => "negative_knowledge_review",
+        .negative_knowledge_influence => "negative_knowledge_influence",
+        .trust_decay_candidate => "trust_decay_candidate",
         .action_surface => "action_surface",
         .routing_candidate => "routing_candidate",
     };
@@ -9045,6 +9087,25 @@ fn supportEdgeKindName(kind: SupportEdgeKind) []const u8 {
         .materializes_candidate => "materializes_candidate",
         .materialization_proposes_artifact => "materialization_proposes_artifact",
         .materialization_requires_approval => "materialization_requires_approval",
+        .executes_candidate => "executes_candidate",
+        .execution_for_materialization => "execution_for_materialization",
+        .execution_produces_evidence => "execution_produces_evidence",
+        .execution_contradicts => "execution_contradicts",
+        .correction_for => "correction_for",
+        .correction_from_evidence => "correction_from_evidence",
+        .correction_updates_state => "correction_updates_state",
+        .proposes_negative_knowledge => "proposes_negative_knowledge",
+        .negative_knowledge_from_correction => "negative_knowledge_from_correction",
+        .reviews_candidate => "reviews_candidate",
+        .accepts_negative_knowledge => "accepts_negative_knowledge",
+        .rejects_negative_knowledge => "rejects_negative_knowledge",
+        .negative_knowledge_from_candidate => "negative_knowledge_from_candidate",
+        .negative_knowledge_influences_hypothesis => "negative_knowledge_influences_hypothesis",
+        .negative_knowledge_warns_routing => "negative_knowledge_warns_routing",
+        .negative_knowledge_requires_verifier => "negative_knowledge_requires_verifier",
+        .proposes_trust_decay => "proposes_trust_decay",
+        .supersedes_negative_knowledge => "supersedes_negative_knowledge",
+        .expires_negative_knowledge => "expires_negative_knowledge",
         .rejected_by => "rejected_by",
         .triages => "triages",
         .suppresses => "suppresses",
@@ -9264,6 +9325,13 @@ fn writeHypothesisTriageJson(writer: anytype, triage: hypothesis_core.TriageResu
     );
     try writeJsonFieldString(writer, "scoring_policy_version", triage.scoring_policy_version, false);
     try writer.print(",\"selected_code_hypothesis_count\":{d},\"selected_non_code_hypothesis_count\":{d}", .{ triage.selected_code_count, triage.selected_non_code_count });
+    try writer.print(",\"negativeKnowledge\":{{\"influenceMatchCount\":{d},\"triagePenaltyCount\":{d},\"verifierRequirementCount\":{d},\"suppressionCount\":{d},\"budgetHitCount\":{d},\"non_authorizing\":true}}", .{
+        triage.negative_knowledge_influence_match_count,
+        triage.negative_knowledge_triage_penalty_count,
+        triage.negative_knowledge_verifier_requirement_count,
+        triage.negative_knowledge_suppression_count,
+        triage.negative_knowledge_budget_hit_count,
+    });
     try writer.writeAll(",\"top_selected_hypothesis_kinds\":");
     try writeStringArray(writer, triage.top_selected_kinds);
     try writer.writeAll(",\"items\":[");
@@ -9276,6 +9344,9 @@ fn writeHypothesisTriageJson(writer: anytype, triage: hypothesis_core.TriageResu
         if (item.duplicate_group_id) |group| try writeJsonFieldString(writer, "duplicate_group_id", group, false);
         if (item.suppression_reason) |reason| try writeJsonFieldString(writer, "suppression_reason", reason, false);
         try writer.print(",\"selected_for_next_stage\":{s}", .{if (item.selected_for_next_stage) "true" else "false"});
+        try writer.print(",\"negative_knowledge_match_count\":{d},\"non_authorizing\":true", .{item.negative_knowledge_match_count});
+        try writer.writeAll(",\"required_verifiers\":");
+        try writeStringArray(writer, item.required_verifiers);
         try writer.writeAll(",\"score_breakdown\":{");
         try writer.print(
             "\"support_potential_score\":{d},\"verifier_availability_score\":{d},\"provenance_score\":{d},\"trust_score\":{d},\"freshness_score\":{d},\"obligation_cost\":{d},\"relation_strength_score\":{d},\"novelty_score\":{d},\"artifact_schema_compatibility_score\":{d},\"evidence_fragment_score\":{d},\"negative_score\":{d}",
@@ -11167,6 +11238,14 @@ test "compute budget maps low and high pack routing caps deterministically" {
     try std.testing.expect(low_caps.max_considered_per_query < high_caps.max_considered_per_query);
     try std.testing.expect(low_caps.max_activated_per_query < high_caps.max_activated_per_query);
     try std.testing.expect(low_caps.max_candidate_surfaces_per_query < high_caps.max_candidate_surfaces_per_query);
+}
+
+test "negative knowledge support graph kinds remain non-authorizing" {
+    try std.testing.expectEqualStrings("negative_knowledge_record", supportNodeKindName(.negative_knowledge_record));
+    try std.testing.expectEqualStrings("negative_knowledge_review", supportNodeKindName(.negative_knowledge_review));
+    try std.testing.expectEqualStrings("negative_knowledge_influence", supportNodeKindName(.negative_knowledge_influence));
+    try std.testing.expect(!std.mem.eql(u8, supportEdgeKindName(.negative_knowledge_influences_hypothesis), "supported_by"));
+    try std.testing.expect(!std.mem.eql(u8, supportEdgeKindName(.negative_knowledge_requires_verifier), "supported_by"));
 }
 
 test "budget exhaustion is surfaced honestly in code intel results" {

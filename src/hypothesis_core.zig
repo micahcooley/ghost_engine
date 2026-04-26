@@ -1,5 +1,6 @@
 const std = @import("std");
 const compute_budget = @import("compute_budget.zig");
+const negative_knowledge = @import("negative_knowledge.zig");
 
 pub const HypothesisKind = enum {
     possible_inconsistency,
@@ -142,6 +143,8 @@ pub const TriageItem = struct {
     score_breakdown: ScoreBreakdown = .{},
     duplicate_group_id: ?[]const u8 = null,
     suppression_reason: ?[]const u8 = null,
+    required_verifiers: []const []const u8 = &.{},
+    negative_knowledge_match_count: usize = 0,
     selected_for_next_stage: bool = false,
     trace: []const u8,
 
@@ -149,6 +152,7 @@ pub const TriageItem = struct {
         allocator.free(self.hypothesis_id);
         if (self.duplicate_group_id) |value| allocator.free(value);
         if (self.suppression_reason) |value| allocator.free(value);
+        freeStringSlice(allocator, self.required_verifiers);
         allocator.free(self.trace);
         self.* = undefined;
     }
@@ -171,6 +175,11 @@ pub const TriageResult = struct {
     scoring_policy_version: []const u8 = scoring_policy_version,
     selected_code_count: usize = 0,
     selected_non_code_count: usize = 0,
+    negative_knowledge_influence_match_count: usize = 0,
+    negative_knowledge_triage_penalty_count: usize = 0,
+    negative_knowledge_verifier_requirement_count: usize = 0,
+    negative_knowledge_suppression_count: usize = 0,
+    negative_knowledge_budget_hit_count: usize = 0,
     top_selected_kinds: []const []const u8 = &.{},
     items: []TriageItem = &.{},
 
@@ -223,6 +232,16 @@ pub fn triage(
     hypotheses: []const Hypothesis,
     policy: TriagePolicy,
 ) !TriageResult {
+    return triageWithNegativeKnowledge(allocator, hypotheses, policy, &.{}, compute_budget.resolve(.{ .tier = .medium }));
+}
+
+pub fn triageWithNegativeKnowledge(
+    allocator: std.mem.Allocator,
+    hypotheses: []const Hypothesis,
+    policy: TriagePolicy,
+    negative_records: []const negative_knowledge.Record,
+    budget: compute_budget.Effective,
+) !TriageResult {
     var result = TriageResult{
         .allocator = allocator,
         .total = hypotheses.len,
@@ -241,17 +260,36 @@ pub fn triage(
     defer allocator.free(ranked);
 
     for (hypotheses, 0..) |hypothesis, idx| {
-        const breakdown = scoreHypothesis(hypothesis);
+        var breakdown = scoreHypothesis(hypothesis);
+        var influence = try negative_knowledge.influenceHypothesis(allocator, negative_records, hypothesis, budget);
+        defer influence.deinit();
+        if (influence.triage_delta < 0) {
+            breakdown.negative_score += @intCast(-influence.triage_delta);
+            result.negative_knowledge_triage_penalty_count += 1;
+        }
         const score = breakdown.total();
+        var trace = std.ArrayList(u8).init(allocator);
+        defer trace.deinit();
+        try trace.writer().print(
+            "policy={s}; deterministic score from explicit hypothesis signals only; selected_for_investigation_does_not_authorize=true",
+            .{scoring_policy_version},
+        );
+        if (influence.matched_record_ids.len > 0) {
+            result.negative_knowledge_influence_match_count += influence.matched_record_ids.len;
+            try trace.writer().print("; negative knowledge accepted for scoped influence matches={d}", .{influence.matched_record_ids.len});
+        }
+        if (influence.required_verifiers.len > 0) {
+            result.negative_knowledge_verifier_requirement_count += influence.required_verifiers.len;
+            try trace.writer().writeAll("; verifier requirement added");
+        }
+        if (influence.budget_exhausted != null) result.negative_knowledge_budget_hit_count += 1;
         items[idx] = .{
             .hypothesis_id = try allocator.dupe(u8, hypothesis.id),
             .score = score,
             .score_breakdown = breakdown,
-            .trace = try std.fmt.allocPrint(
-                allocator,
-                "policy={s}; deterministic score from explicit hypothesis signals only; selected_for_investigation_does_not_authorize=true",
-                .{scoring_policy_version},
-            ),
+            .required_verifiers = try cloneStringSliceLimited(allocator, influence.required_verifiers, influence.required_verifiers.len),
+            .negative_knowledge_match_count = influence.matched_record_ids.len,
+            .trace = try trace.toOwnedSlice(),
         };
         initialized_items += 1;
         ranked[idx] = .{ .index = idx, .score = score, .id = hypothesis.id };
@@ -259,6 +297,12 @@ pub fn triage(
             items[idx].triage_status = .blocked;
             try setSuppressionReason(allocator, &items[idx], "blocked by explicit contradiction, ambiguity, or out-of-scope signal");
             result.blocked += 1;
+        }
+        if (influence.suppression_reason) |reason| {
+            items[idx].triage_status = .suppressed;
+            try setSuppressionReason(allocator, &items[idx], reason);
+            result.suppressed += 1;
+            result.negative_knowledge_suppression_count += 1;
         }
     }
 
@@ -818,6 +862,82 @@ test "hypothesis triage: dominated hypothesis is suppressed with reason" {
     defer triaged.deinit();
     try std.testing.expectEqual(TriageStatus.suppressed, triaged.items[1].triage_status);
     try std.testing.expect(triaged.items[1].suppression_reason != null);
+}
+
+test "negative knowledge triage: accepted failed_hypothesis penalizes matching hypothesis" {
+    const allocator = std.testing.allocator;
+    const influence = [_]negative_knowledge.AllowedInfluence{.triage_penalty};
+    var record = try negative_knowledge.acceptNegativeKnowledgeCandidate(allocator, .{
+        .id = "cand:triage:penalty",
+        .correction_event_id = "corr:triage",
+        .kind = .failed_hypothesis,
+        .scope = .artifact,
+        .condition = "hyp:penalized",
+        .evidence_ref = "evidence:failed",
+        .triage_penalty = 20,
+    }, .{ .approved_by = "test", .approval_kind = .test_fixture, .reason = "fixture failure", .scope = .artifact, .allowed_influence = &influence });
+    defer record.deinit();
+    var hypotheses = [_]Hypothesis{
+        try testHypothesis(allocator, "hyp:penalized", "src/a.zig", "code_artifact_schema", .possible_behavior_mismatch, &.{"Worker"}, &.{"updates"}, &.{"fresh high_trust anchor evidence"}, &.{"verify"}, &.{"runtime_check"}, "anchor", &.{"anchor"}, "fresh high_trust", "hyp:penalized"),
+        try testHypothesis(allocator, "hyp:clean", "src/b.zig", "code_artifact_schema", .possible_behavior_mismatch, &.{"Worker"}, &.{"updates"}, &.{"fresh high_trust anchor evidence"}, &.{"verify"}, &.{"runtime_check"}, "anchor", &.{"anchor"}, "fresh high_trust", "clean"),
+    };
+    defer deinitHypothesisArray(allocator, &hypotheses);
+    var triaged = try triageWithNegativeKnowledge(allocator, &hypotheses, .{ .max_hypotheses_selected = 2 }, &.{record}, compute_budget.resolve(.{ .tier = .medium }));
+    defer triaged.deinit();
+    try std.testing.expect(triaged.items[0].score < triaged.items[1].score);
+    try std.testing.expectEqual(@as(usize, 1), triaged.negative_knowledge_triage_penalty_count);
+}
+
+test "negative knowledge triage: rejected and expired records have no effect" {
+    const allocator = std.testing.allocator;
+    const influence = [_]negative_knowledge.AllowedInfluence{.triage_penalty};
+    var record = try negative_knowledge.acceptNegativeKnowledgeCandidate(allocator, .{
+        .id = "cand:triage:no-effect",
+        .correction_event_id = "corr",
+        .kind = .failed_hypothesis,
+        .scope = .artifact,
+        .condition = "hyp:no-effect",
+        .evidence_ref = "evidence",
+        .triage_penalty = 20,
+    }, .{ .approved_by = "test", .approval_kind = .test_fixture, .reason = "fixture", .scope = .artifact, .allowed_influence = &influence });
+    defer record.deinit();
+    var hypothesis = [_]Hypothesis{
+        try testHypothesis(allocator, "hyp:no-effect", "src/a.zig", "code_artifact_schema", .possible_behavior_mismatch, &.{"Worker"}, &.{}, &.{"fresh high_trust anchor evidence"}, &.{"verify"}, &.{"runtime_check"}, "anchor", &.{"anchor"}, "fresh high_trust", "hyp:no-effect"),
+    };
+    defer deinitHypothesisArray(allocator, &hypothesis);
+    record.status = .rejected;
+    var rejected = try triageWithNegativeKnowledge(allocator, &hypothesis, .{ .max_hypotheses_selected = 1 }, &.{record}, compute_budget.resolve(.{ .tier = .medium }));
+    defer rejected.deinit();
+    try std.testing.expectEqual(@as(usize, 0), rejected.negative_knowledge_influence_match_count);
+    record.status = .expired;
+    var expired = try triageWithNegativeKnowledge(allocator, &hypothesis, .{ .max_hypotheses_selected = 1 }, &.{record}, compute_budget.resolve(.{ .tier = .medium }));
+    defer expired.deinit();
+    try std.testing.expectEqual(@as(usize, 0), expired.negative_knowledge_influence_match_count);
+}
+
+test "negative knowledge triage: suppression and verifier requirement are explicit and not executed" {
+    const allocator = std.testing.allocator;
+    const influence = [_]negative_knowledge.AllowedInfluence{ .suppression_rule, .verifier_requirement };
+    var record = try negative_knowledge.acceptNegativeKnowledgeCandidate(allocator, .{
+        .id = "cand:triage:suppress",
+        .correction_event_id = "corr",
+        .kind = .failed_patch,
+        .scope = .artifact,
+        .condition = "hyp:repeat",
+        .evidence_ref = "evidence",
+        .suppression_rule = "exact_failed_hypothesis",
+        .verifier_requirement = "strong_runtime_check",
+    }, .{ .approved_by = "test", .approval_kind = .test_fixture, .reason = "fixture", .scope = .artifact, .allowed_influence = &influence });
+    defer record.deinit();
+    var hypothesis = [_]Hypothesis{
+        try testHypothesis(allocator, "hyp:repeat", "src/a.zig", "code_artifact_schema", .possible_behavior_mismatch, &.{"Worker"}, &.{}, &.{"fresh high_trust anchor evidence"}, &.{"verify"}, &.{"runtime_check"}, "anchor", &.{"anchor"}, "fresh high_trust", "hyp:repeat"),
+    };
+    defer deinitHypothesisArray(allocator, &hypothesis);
+    var triaged = try triageWithNegativeKnowledge(allocator, &hypothesis, .{ .max_hypotheses_selected = 1 }, &.{record}, compute_budget.resolve(.{ .tier = .medium }));
+    defer triaged.deinit();
+    try std.testing.expectEqual(TriageStatus.suppressed, triaged.items[0].triage_status);
+    try std.testing.expect(triaged.items[0].suppression_reason != null);
+    try std.testing.expectEqual(@as(usize, 1), triaged.items[0].required_verifiers.len);
 }
 
 test "hypothesis triage: per-kind cap preserves diversity" {
