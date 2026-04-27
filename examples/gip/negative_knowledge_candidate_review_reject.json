@@ -1,0 +1,8 @@
+{
+  "gipVersion": "gip.v0.1",
+  "kind": "negative_knowledge.candidate.review",
+  "requestId": "example-negative-knowledge-review-reject-001",
+  "candidateId": "out:nk:nk:1:correction:1:cand-real",
+  "decision": "reject",
+  "reason": "candidate scope was too broad for the available evidence"
+}

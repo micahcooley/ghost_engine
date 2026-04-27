@@ -1,0 +1,6 @@
+{
+  "gipVersion": "gip.v0.1",
+  "kind": "negative_knowledge.influence.list",
+  "requestId": "example-negative-knowledge-influence-list-001",
+  "maxItems": 32
+}

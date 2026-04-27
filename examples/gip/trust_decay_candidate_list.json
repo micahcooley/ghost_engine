@@ -1,0 +1,6 @@
+{
+  "gipVersion": "gip.v0.1",
+  "kind": "trust_decay.candidate.list",
+  "requestId": "example-trust-decay-candidate-list-001",
+  "maxItems": 32
+}

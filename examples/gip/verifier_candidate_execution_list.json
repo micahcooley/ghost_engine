@@ -1,0 +1,6 @@
+{
+  "gipVersion": "gip.v0.1",
+  "kind": "verifier.candidate.execution.list",
+  "requestId": "example-verifier-candidate-execution-list-001",
+  "maxItems": 32
+}

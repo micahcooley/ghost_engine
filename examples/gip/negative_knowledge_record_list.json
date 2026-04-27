@@ -1,0 +1,6 @@
+{
+  "gipVersion": "gip.v0.1",
+  "kind": "negative_knowledge.record.list",
+  "requestId": "example-negative-knowledge-record-list-001",
+  "maxItems": 32
+}

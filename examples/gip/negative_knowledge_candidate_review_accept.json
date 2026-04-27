@@ -1,0 +1,18 @@
+{
+  "gipVersion": "gip.v0.1",
+  "kind": "negative_knowledge.candidate.review",
+  "requestId": "example-negative-knowledge-review-accept-001",
+  "candidateId": "out:nk:nk:1:correction:1:cand-real",
+  "decision": "accept",
+  "approvalContext": {
+    "approvedBy": "operator",
+    "approvalKind": "user",
+    "reason": "reviewed verifier evidence shows this exact hypothesis pattern failed",
+    "scope": "artifact",
+    "allowedInfluence": [
+      "triage_penalty",
+      "verifier_requirement",
+      "suppression_rule"
+    ]
+  }
+}

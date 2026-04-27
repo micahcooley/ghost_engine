@@ -37,8 +37,27 @@ pub const RequestKind = enum {
 
     // Verification
     @"verifier.list",
+    @"verifier.candidate.execution.list",
+    @"verifier.candidate.execution.get",
     @"verifier.run",
+    @"verifier.candidate.execute",
     @"hypothesis.verifier.schedule",
+
+    // Correction / negative knowledge inspection
+    @"correction.list",
+    @"correction.get",
+    @"correction.apply",
+    @"negative_knowledge.candidate.list",
+    @"negative_knowledge.candidate.get",
+    @"negative_knowledge.record.list",
+    @"negative_knowledge.record.get",
+    @"negative_knowledge.influence.list",
+    @"negative_knowledge.candidate.review",
+    @"negative_knowledge.record.expire",
+    @"negative_knowledge.record.supersede",
+    @"negative_knowledge.promote",
+    @"trust_decay.candidate.list",
+    @"trust_decay.apply",
 
     // Hypotheses
     @"hypothesis.generate",
@@ -55,6 +74,7 @@ pub const RequestKind = enum {
     @"pack.distill.list",
     @"pack.distill.show",
     @"pack.distill.export",
+    @"pack.update_from_negative_knowledge",
 
     // Feedback
     @"feedback.record",
@@ -193,15 +213,33 @@ pub const CapabilityName = enum {
     @"command.run",
     @"command.run.allowlist",
     @"verifier.run",
+    @"verifier.candidate.execution.list",
+    @"verifier.candidate.execution.get",
+    @"verifier.candidate.execute",
     @"hypothesis.list",
     @"hypothesis.triage",
     @"verifier.list",
+    @"correction.list",
+    @"correction.get",
+    @"correction.apply",
+    @"negative_knowledge.candidate.list",
+    @"negative_knowledge.candidate.get",
+    @"negative_knowledge.record.list",
+    @"negative_knowledge.record.get",
+    @"negative_knowledge.influence.list",
+    @"negative_knowledge.candidate.review",
+    @"negative_knowledge.record.expire",
+    @"negative_knowledge.record.supersede",
+    @"negative_knowledge.promote",
+    @"trust_decay.candidate.list",
+    @"trust_decay.apply",
     @"pack.list",
     @"pack.inspect",
     @"pack.mount",
     @"pack.unmount",
     @"pack.import",
     @"pack.export",
+    @"pack.update_from_negative_knowledge",
     @"feedback.summary",
     @"session.get",
     @"feedback.record",
@@ -230,7 +268,7 @@ pub const CapabilityEntry = struct {
     policy: CapabilityPolicy,
 };
 
-pub fn defaultCapabilities() [24]CapabilityEntry {
+pub fn defaultCapabilities() [42]CapabilityEntry {
     return .{
         .{ .capability = .@"artifact.read", .policy = .allowed },
         .{ .capability = .@"artifact.list", .policy = .allowed },
@@ -242,15 +280,33 @@ pub fn defaultCapabilities() [24]CapabilityEntry {
         .{ .capability = .@"command.run", .policy = .allowlist },
         .{ .capability = .@"command.run.allowlist", .policy = .allowlist },
         .{ .capability = .@"verifier.run", .policy = .allowed },
+        .{ .capability = .@"verifier.candidate.execution.list", .policy = .allowed },
+        .{ .capability = .@"verifier.candidate.execution.get", .policy = .allowed },
+        .{ .capability = .@"verifier.candidate.execute", .policy = .denied },
         .{ .capability = .@"hypothesis.list", .policy = .allowed },
         .{ .capability = .@"hypothesis.triage", .policy = .allowed },
         .{ .capability = .@"verifier.list", .policy = .allowed },
+        .{ .capability = .@"correction.list", .policy = .allowed },
+        .{ .capability = .@"correction.get", .policy = .allowed },
+        .{ .capability = .@"correction.apply", .policy = .denied },
+        .{ .capability = .@"negative_knowledge.candidate.list", .policy = .allowed },
+        .{ .capability = .@"negative_knowledge.candidate.get", .policy = .allowed },
+        .{ .capability = .@"negative_knowledge.record.list", .policy = .allowed },
+        .{ .capability = .@"negative_knowledge.record.get", .policy = .allowed },
+        .{ .capability = .@"negative_knowledge.influence.list", .policy = .allowed },
+        .{ .capability = .@"negative_knowledge.candidate.review", .policy = .allowed },
+        .{ .capability = .@"negative_knowledge.record.expire", .policy = .allowed },
+        .{ .capability = .@"negative_knowledge.record.supersede", .policy = .allowed },
+        .{ .capability = .@"negative_knowledge.promote", .policy = .denied },
+        .{ .capability = .@"trust_decay.candidate.list", .policy = .allowed },
+        .{ .capability = .@"trust_decay.apply", .policy = .denied },
         .{ .capability = .@"pack.list", .policy = .allowed },
         .{ .capability = .@"pack.inspect", .policy = .allowed },
         .{ .capability = .@"pack.mount", .policy = .requires_approval },
         .{ .capability = .@"pack.unmount", .policy = .requires_approval },
         .{ .capability = .@"pack.import", .policy = .requires_approval },
         .{ .capability = .@"pack.export", .policy = .requires_approval },
+        .{ .capability = .@"pack.update_from_negative_knowledge", .policy = .denied },
         .{ .capability = .@"feedback.summary", .policy = .allowed },
         .{ .capability = .@"session.get", .policy = .allowed },
         .{ .capability = .@"feedback.record", .policy = .allowed },
@@ -369,6 +425,12 @@ pub const MAX_HYPOTHESIS_ITEMS: usize = 128;
 pub const MAX_TRIAGE_ITEMS: usize = 128;
 pub const MAX_VERIFIER_ADAPTERS: usize = 64;
 pub const MAX_PACK_LIST_ITEMS: usize = 128;
+pub const MAX_VERIFIER_EXECUTION_ITEMS: usize = 128;
+pub const MAX_CORRECTION_ITEMS: usize = 128;
+pub const MAX_NEGATIVE_KNOWLEDGE_CANDIDATE_ITEMS: usize = 128;
+pub const MAX_NEGATIVE_KNOWLEDGE_RECORD_ITEMS: usize = 128;
+pub const MAX_NEGATIVE_KNOWLEDGE_INFLUENCE_ITEMS: usize = 128;
+pub const MAX_TRUST_DECAY_CANDIDATE_ITEMS: usize = 128;
 
 pub fn isCommandAllowed(argv0: []const u8) bool {
     // Extract basename from potential path
@@ -395,6 +457,19 @@ pub const IMPLEMENTED_KINDS = [_]RequestKind{
     .@"hypothesis.list",
     .@"hypothesis.triage",
     .@"verifier.list",
+    .@"verifier.candidate.execution.list",
+    .@"verifier.candidate.execution.get",
+    .@"correction.list",
+    .@"correction.get",
+    .@"negative_knowledge.candidate.list",
+    .@"negative_knowledge.candidate.get",
+    .@"negative_knowledge.record.list",
+    .@"negative_knowledge.record.get",
+    .@"negative_knowledge.influence.list",
+    .@"trust_decay.candidate.list",
+    .@"negative_knowledge.candidate.review",
+    .@"negative_knowledge.record.expire",
+    .@"negative_knowledge.record.supersede",
     .@"pack.list",
     .@"pack.inspect",
     .@"feedback.summary",
@@ -438,7 +513,7 @@ test "default capabilities have safe defaults" {
     // command.run should be allowlisted
     try std.testing.expectEqual(CapabilityPolicy.allowlist, caps[7].policy);
     // network.access should be denied
-    try std.testing.expectEqual(CapabilityPolicy.denied, caps[23].policy);
+    try std.testing.expectEqual(CapabilityPolicy.denied, caps[41].policy);
 }
 
 test "command allowlist rejects arbitrary commands" {

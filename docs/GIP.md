@@ -99,17 +99,43 @@ results when GIP has no active session or workspace metadata:
 |-----------|------------------------|----------|
 | `hypothesis.list` | Returns empty hypotheses + zero counts | `stateless` |
 | `hypothesis.triage` | Returns empty triage summary with scoring policy version | `stateless` |
+| `verifier.candidate.execution.list` | Reads existing task/result support-graph state; returns empty when no state is visible | `read_only_state_inspection` |
+| `verifier.candidate.execution.get` | Reads one existing execution job/result projection; missing IDs return `path_not_found` | `read_only_state_inspection` |
+| `correction.list` | Reads existing correction-event state; returns empty when no state is visible | `read_only_state_inspection` |
+| `correction.get` | Reads one existing correction event projection; missing IDs return `path_not_found` | `read_only_state_inspection` |
+| `negative_knowledge.candidate.list` | Reads existing proposed negative-knowledge candidate state; returns empty when no state is visible | `read_only_state_inspection` |
+| `negative_knowledge.candidate.get` | Reads one existing candidate projection; missing IDs return `path_not_found` | `read_only_state_inspection` |
+| `negative_knowledge.record.list` | Reads reviewed negative-knowledge record projections; returns empty when no state is visible | `read_only_state_inspection` |
+| `negative_knowledge.record.get` | Reads one reviewed record projection; missing IDs return `path_not_found` | `read_only_state_inspection` |
+| `negative_knowledge.influence.list` | Reads recorded negative-knowledge influence projections; does not recompute or mutate triage/routing | `read_only_state_inspection` |
+| `trust_decay.candidate.list` | Reads proposed trust-decay candidate projections; does not apply trust changes | `read_only_state_inspection` |
+| `negative_knowledge.candidate.review` | Validates review requests but returns structured unsupported until safe append-only persistence is available | `structured_unsupported_without_persistence` |
+| `negative_knowledge.record.expire` | Validates expiry requests but returns structured unsupported until safe append-only persistence is available | `structured_unsupported_without_persistence` |
+| `negative_knowledge.record.supersede` | Validates supersede requests but returns structured unsupported until safe append-only persistence is available | `structured_unsupported_without_persistence` |
 | `feedback.summary` | Returns event counts if workspace metadata resolves; otherwise `unsupported` flag | `requires_workspace_metadata` |
 | `session.get` | Returns session data if session file exists; otherwise `path_not_found` | `requires_existing_session` |
 
 Stateless operations do not fake data. They return structurally valid empty
 outputs that are safe for clients to consume.
 
+State-inspection operations read existing task-session result paths or a
+workspace-contained `statePath` JSON result file. They report `state_source` as
+`no_state_found` when no persisted state is visible, or `support_graph` when
+data was projected from a persisted support graph. Support-graph projection is
+read-only and may omit fields that were not persisted in the graph; omitted
+fields must not be interpreted as authorization, proof, approval, execution,
+promotion, or pack mutation.
+
 ### Unsupported (structured unsupported response)
 
 | Operation | Status |
 |-----------|--------|
 | `verifier.run` | Not implemented |
+| `verifier.candidate.execute` | Not implemented; denied mutation/future work |
+| `correction.apply` | Not implemented; denied mutation/future work |
+| `negative_knowledge.promote` | Not implemented; denied mutation/future work |
+| `pack.update_from_negative_knowledge` | Not implemented; denied mutation/future work |
+| `trust_decay.apply` | Not implemented; denied mutation/future work |
 | `command.run` | Not implemented |
 | `artifact.patch.apply` | Not implemented |
 | `pack.mount` / `pack.unmount` | Not implemented |
@@ -161,7 +187,82 @@ outputs that are safe for clients to consume.
   - `safeLocal: true` indicates the adapter runs without external process execution.
   - `external: true` indicates the adapter requires build/test/runtime execution harness.
 - `verifier.run` — Run a specific verifier **(Not implemented yet)**
+- `verifier.candidate.execution.list` — Inspect verifier candidate execution jobs **(Implemented — inspection only)**
+  - **Request**: `{"sessionId": string (optional), "candidateId": string (optional), "hypothesisId": string (optional), "statusFilter": string (optional), "maxItems": int (optional, default 128, max 128)}`
+  - **Response**: `{"executions": [], "counts": {"total": 0, "pending": 0, "scheduled": 0, "running": 0, "completed": 0, "failed": 0, "blocked": 0, "skipped": 0, "budget_exhausted": 0, "timeout": 0}, "max_items": int, "read_only": true, "non_authorizing_input": true, "state_source": "no_state_found" | "support_graph", "trace": {...}}`
+  - Read-only. Does not schedule, run, approve, or retry verifiers.
+  - Reads existing state via `sessionId`/`projectShard` task-session result paths, or an explicit workspace-contained `statePath` JSON result file. Empty output means no visible state exists.
+- `verifier.candidate.execution.get` — Inspect one execution job/result by ID **(Implemented — inspection only)**
+  - **Request**: `{"executionId": string}`
+  - **Response**: Existing execution job/result projection from persisted support-graph state; missing IDs return structured `path_not_found`.
+  - Support-graph projections may omit original job/result fields unavailable in persisted graph state.
+  - Future populated responses must use bounded stdout/stderr summaries or refs, not unbounded logs.
+- `verifier.candidate.execute` — Execute an approved verifier candidate **(Not implemented; denied mutation/future work)**
 - `hypothesis.verifier.schedule` — Schedule verifier for hypothesis **(Not implemented yet)**
+
+### Corrections
+- `correction.list` — Inspect correction events **(Implemented — inspection only)**
+  - **Request**: `{"sessionId": string (optional), "artifactRef": string (optional), "correctionKind": string (optional), "maxItems": int (optional, default 128, max 128)}`
+  - **Response**: `{"corrections": [], "counts_by_correction_kind": {...}, "max_items": int, "read_only": true, "non_authorizing": true, "state_source": "no_state_found" | "support_graph", "trace": {...}}`
+  - A `correction_event` records state transition evidence: a previous state was contradicted and an updated state was produced from linked evidence.
+  - Correction is not proof. It remains non-authorizing and deterministic.
+- `correction.get` — Inspect one correction event by ID **(Implemented — inspection only)**
+  - **Request**: `{"correctionId": string}`
+  - **Response**: Existing correction event projection plus linked evidence and negative-knowledge candidate refs; missing IDs return structured `path_not_found`.
+  - Support-graph projections may omit original correction fields unavailable in persisted graph state.
+- `correction.apply` — Apply a correction mutation **(Not implemented; denied mutation/future work)**
+
+### Negative Knowledge
+- `negative_knowledge.candidate.list` — Inspect proposed negative-knowledge candidates **(Implemented — inspection only)**
+  - **Request**: `{"sessionId": string (optional), "candidateKind": string (optional), "scope": string (optional), "maxItems": int (optional, default 128, max 128)}`
+  - **Response**: `{"candidates": [], "counts": {"total": 0, "failed_hypothesis": 0, "failed_patch": 0, "failed_repair_strategy": 0, "misleading_pack_signal": 0, "insufficient_test": 0, "unsafe_verifier_candidate": 0, "overbroad_rule": 0}, "max_items": int, "read_only": true, "non_authorizing": true, "promoted": false, "pack_authorized": false, "state_source": "no_state_found" | "support_graph"}`
+  - Candidates are proposed only. They are not promoted, not pack-authorized, and not proof.
+- `negative_knowledge.candidate.get` — Inspect one negative-knowledge candidate by ID **(Implemented — inspection only)**
+  - **Request**: `{"candidateId": string}`
+  - **Response**: Existing candidate projection plus correction/evidence refs and promotion status; missing IDs return structured `path_not_found`.
+  - Support-graph projections may omit original candidate fields unavailable in persisted graph state.
+- `negative_knowledge.record.list` — Inspect reviewed negative-knowledge records **(Implemented — inspection only)**
+  - **Request**: `{"sessionId": string (optional), "projectShard": string (optional), "statePath": string (optional), "statusFilter": string (optional), "kindFilter": string (optional), "scopeFilter": string (optional), "maxItems": int (optional, default 128, max 128)}`
+  - **Response**: `{"records": [], "counts": {"total": 0, "accepted": 0, "rejected": 0, "expired": 0, "superseded": 0, "proposed": 0}, "state_source": "no_state_found" | "support_graph" | "session_state" | "state_path", "read_only": true, "non_authorizing": true}`
+  - Listing records does not apply influence, mutate routing, mutate packs, or promote anything globally.
+- `negative_knowledge.record.get` — Inspect one reviewed negative-knowledge record **(Implemented — inspection only)**
+  - **Request**: `{"recordId": string, "statePath": string (optional), "sessionId": string (optional)}`
+  - **Response**: Full support-graph projection with review metadata, influence metadata, linked correction/candidate refs, and projection-completeness metadata.
+  - Missing IDs return structured `path_not_found`.
+- `negative_knowledge.influence.list` — Inspect recorded influence projections **(Implemented — inspection only)**
+  - **Request**: `{"sessionId": string (optional), "statePath": string (optional), "hypothesisId": string (optional), "artifactRef": string (optional), "maxItems": int (optional, default 128, max 128)}`
+  - **Response**: `{"influence_results": [], "counts": {"matches": 0, "triage_penalties": 0, "verifier_requirements": 0, "suppressions": 0, "routing_warnings": 0, "trust_decay_candidates": 0}, "mutated_triage": false, "mutated_routing": false}`
+  - This endpoint reads recorded/projection state only. It does not recompute expensive influence and does not mutate triage or routing.
+- `trust_decay.candidate.list` — Inspect trust-decay candidates **(Implemented — inspection only)**
+  - **Request**: `{"sessionId": string (optional), "statePath": string (optional), "sourceRef": string (optional), "packId": string (optional), "maxItems": int (optional, default 128, max 128)}`
+  - **Response**: `{"candidates": [{"id": "...", "source_ref": "...", "reason": "...", "evidence_ref": "...", "suggested_delta": null, "status": "proposed", "non_authorizing": true}], "counts": {"total": int, "proposed": int}, "trust_mutation": false}`
+  - Trust decay candidates are proposals only. GIP does not directly change pack or source trust.
+- `negative_knowledge.candidate.review` — Review a candidate **(Validation implemented; persistence unsupported)**
+  - **Request**: `{"candidateId": string, "decision": "accept" | "reject" | "defer", "approvalContext": {"approvedBy": string, "approvalKind": "user" | "test_fixture" | "policy", "reason": string, "scope": string, "allowedInfluence": string[]}, "statePath": string (optional), "sessionId": string (optional)}`
+  - Accept requires explicit `approvalContext`. Reject requires `reason`. Defer is allowed.
+  - Current behavior after validation is a structured `unsupported` result because GIP does not yet have a safe append-only persistence target for review events.
+  - It does not mutate packs, promote global authority, execute verifiers, or alter support/proof permission.
+- `negative_knowledge.record.expire` / `negative_knowledge.record.supersede` — Record lifecycle mutation **(Validation implemented; persistence unsupported)**
+  - Both require explicit reasons. Supersede also requires `newRecordId`.
+  - Current behavior after validation is structured `unsupported` until safe append-only persistence is available.
+- `negative_knowledge.promote` — Promote a candidate to negative knowledge **(Not implemented; denied mutation/future work)**
+  - Global promotion remains unsupported. `global_candidate` is only a candidate for future export/review, not global authority.
+
+Negative knowledge lifecycle:
+
+```text
+correction event
+→ negative knowledge candidate
+→ review request
+→ accepted / rejected / expired / superseded record
+→ scoped influence projection
+```
+
+Accepted negative knowledge remains non-authorizing. It may warn, penalize
+triage, require stronger verifiers, suppress exact repeated failed patterns, or
+propose trust-decay candidates. It cannot prove claims, support outputs,
+discharge obligations, execute verifiers, apply patches, mutate packs, or
+promote global authority.
 
 ### Hypotheses
 - `hypothesis.generate` — Generate hypotheses from context **(Not implemented yet)**
@@ -194,6 +295,7 @@ outputs that are safe for clients to consume.
 - `pack.mount` / `pack.unmount` — Mount/unmount packs **(Not implemented yet)**
 - `pack.import` / `pack.export` — Import/export packs **(Not implemented yet)**
 - `pack.distill.*` — Distillation operations **(Not implemented yet)**
+- `pack.update_from_negative_knowledge` — Mutate a pack from negative knowledge **(Not implemented; denied mutation/future work)**
 
 ### Feedback
 - `feedback.record` — Record feedback event **(Not implemented yet)**
@@ -230,12 +332,30 @@ outputs that are safe for clients to consume.
 | `hypothesis.list` | allowed | yes |
 | `hypothesis.triage` | allowed | yes |
 | `verifier.list` | allowed | yes |
+| `verifier.candidate.execution.list` | allowed | yes |
+| `verifier.candidate.execution.get` | allowed | yes |
+| `correction.list` | allowed | yes |
+| `correction.get` | allowed | yes |
+| `negative_knowledge.candidate.list` | allowed | yes |
+| `negative_knowledge.candidate.get` | allowed | yes |
+| `negative_knowledge.record.list` | allowed | yes |
+| `negative_knowledge.record.get` | allowed | yes |
+| `negative_knowledge.influence.list` | allowed | yes |
+| `trust_decay.candidate.list` | allowed | yes |
+| `negative_knowledge.candidate.review` | requires_approval | no (unsupported persistence) |
+| `negative_knowledge.record.expire` | requires_approval | no (unsupported persistence) |
+| `negative_knowledge.record.supersede` | requires_approval | no (unsupported persistence) |
 | `pack.list` | allowed | yes |
 | `pack.inspect` | allowed | yes |
 | `feedback.summary` | allowed | yes |
 | `session.get` | allowed | yes |
 | `command.run` | allowlist | no (not implemented) |
 | `verifier.run` | allowed | no (not implemented) |
+| `verifier.candidate.execute` | denied | no (not implemented) |
+| `correction.apply` | denied | no (not implemented) |
+| `negative_knowledge.promote` | denied | no (not implemented) |
+| `pack.update_from_negative_knowledge` | denied | no (not implemented) |
+| `trust_decay.apply` | denied | no (not implemented) |
 | `pack.mount` | requires_approval | no (not implemented) |
 | `pack.unmount` | requires_approval | no (not implemented) |
 | `pack.import` | requires_approval | no (not implemented) |
@@ -261,6 +381,9 @@ Maximum timeout: 30 seconds. Maximum output: 256KB.
 6. **Draft semantics** — all outputs start as drafts with non-authorization notices
 7. **Pack signals are non-authorizing** — pack influence never grants permission
 8. **Read-only inspection is safe** — list/inspect/summary operations never mutate state
+9. **Corrections are not proof** — correction events only expose state transition evidence
+10. **Negative knowledge remains non-authorizing** — records and influence projections never support output
+11. **No automatic negative-knowledge mutation** — GIP does not mutate packs, apply trust decay, or promote global authority
 
 ## CLI Usage
 
@@ -281,6 +404,9 @@ echo '{"gipVersion":"gip.v0.1","kind":"verifier.list"}' | ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"pack.list"}' | ghost_gip --stdin --workspace /path/to/project
 echo '{"gipVersion":"gip.v0.1","kind":"hypothesis.list"}' | ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"hypothesis.triage","maxItems":16}' | ghost_gip --stdin
+echo '{"gipVersion":"gip.v0.1","kind":"verifier.candidate.execution.list"}' | ghost_gip --stdin
+echo '{"gipVersion":"gip.v0.1","kind":"correction.list"}' | ghost_gip --stdin
+echo '{"gipVersion":"gip.v0.1","kind":"negative_knowledge.candidate.list"}' | ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"pack.inspect","packId":"my-pack"}' | ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"feedback.summary"}' | ghost_gip --stdin --workspace /path/to/project
 echo '{"gipVersion":"gip.v0.1","kind":"session.get","sessionId":"my-session"}' | ghost_gip --stdin
@@ -293,6 +419,9 @@ See `examples/gip/` for sample request JSON files:
 - `hypothesis_list.json` — hypothesis.list request
 - `hypothesis_triage.json` — hypothesis.triage request
 - `verifier_list.json` — verifier.list request
+- `verifier_candidate_execution_list.json` — verifier.candidate.execution.list request
+- `correction_list.json` — correction.list request
+- `negative_knowledge_candidate_list.json` — negative_knowledge.candidate.list request
 - `pack_list.json` — pack.list request
 - `pack_inspect.json` — pack.inspect request
 
