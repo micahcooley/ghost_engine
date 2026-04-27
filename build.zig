@@ -148,6 +148,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "ghost_intent_grounding", .root = "src/intent_grounding_cli.zig" },
         .{ .name = "ghost_knowledge_pack", .root = "src/knowledge_packs.zig" },
         .{ .name = "ghost_gip", .root = "src/gip_cli.zig" },
+        .{ .name = "ghost_project_autopsy", .root = "src/project_autopsy_cli.zig" },
     };
 
     for (exes) |cfg| {
