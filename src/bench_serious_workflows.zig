@@ -352,6 +352,10 @@ const CaseResult = struct {
     negative_knowledge_influence_match_count: u32 = 0,
     negative_knowledge_triage_penalty_count: u32 = 0,
     negative_knowledge_verifier_requirement_count: u32 = 0,
+    negative_knowledge_verifier_blocked_count: u32 = 0,
+    negative_knowledge_verifier_strengthened_count: u32 = 0,
+    negative_knowledge_suppression_count: u32 = 0,
+    negative_knowledge_routing_warning_count: u32 = 0,
     negative_knowledge_trust_decay_candidate_count: u32 = 0,
 
     fn deinit(self: *CaseResult) void {
@@ -527,6 +531,10 @@ const Metrics = struct {
     negative_knowledge_influence_match_count: u32 = 0,
     negative_knowledge_triage_penalty_count: u32 = 0,
     negative_knowledge_verifier_requirement_count: u32 = 0,
+    negative_knowledge_verifier_blocked_count: u32 = 0,
+    negative_knowledge_verifier_strengthened_count: u32 = 0,
+    negative_knowledge_suppression_count: u32 = 0,
+    negative_knowledge_routing_warning_count: u32 = 0,
     negative_knowledge_trust_decay_candidate_count: u32 = 0,
 };
 
@@ -1684,6 +1692,8 @@ fn recordPipelineHypotheses(metrics: *Metrics, pipeline: *const artifact_schema.
         metrics.negative_knowledge_influence_match_count += @intCast(triaged.negative_knowledge_influence_match_count);
         metrics.negative_knowledge_triage_penalty_count += @intCast(triaged.negative_knowledge_triage_penalty_count);
         metrics.negative_knowledge_verifier_requirement_count += @intCast(triaged.negative_knowledge_verifier_requirement_count);
+        metrics.negative_knowledge_suppression_count += @intCast(triaged.negative_knowledge_suppression_count);
+        metrics.negative_knowledge_routing_warning_count += @intCast(triaged.negative_knowledge_routing_warning_count);
         metrics.selected_code_hypothesis_count += @intCast(triaged.selected_code_count);
         metrics.selected_non_code_hypothesis_count += @intCast(triaged.selected_non_code_count);
         for (triaged.items, 0..) |item, idx| {
@@ -1730,6 +1740,9 @@ fn recordPipelineHypotheses(metrics: *Metrics, pipeline: *const artifact_schema.
             metrics.verifier_candidate_budget_hit_count += @intCast(value.verifier_candidate_budget_exhausted_count);
             metrics.code_verifier_candidate_count += @intCast(value.code_verifier_candidate_count);
             metrics.non_code_verifier_candidate_count += @intCast(value.non_code_verifier_candidate_count);
+            metrics.negative_knowledge_verifier_requirement_count += @intCast(value.negative_knowledge_verifier_requirement_count);
+            metrics.negative_knowledge_verifier_blocked_count += @intCast(value.negative_knowledge_verifier_blocked_count);
+            metrics.negative_knowledge_verifier_strengthened_count += @intCast(value.negative_knowledge_verifier_strengthened_count);
         }
     } else {
         metrics.selected_hypothesis_count += @intCast(summary.selected_count);
@@ -3484,6 +3497,10 @@ fn accumulateMetrics(metrics: *Metrics, spec: CaseSpec, result: *const CaseResul
     metrics.negative_knowledge_influence_match_count += result.negative_knowledge_influence_match_count;
     metrics.negative_knowledge_triage_penalty_count += result.negative_knowledge_triage_penalty_count;
     metrics.negative_knowledge_verifier_requirement_count += result.negative_knowledge_verifier_requirement_count;
+    metrics.negative_knowledge_verifier_blocked_count += result.negative_knowledge_verifier_blocked_count;
+    metrics.negative_knowledge_verifier_strengthened_count += result.negative_knowledge_verifier_strengthened_count;
+    metrics.negative_knowledge_suppression_count += result.negative_knowledge_suppression_count;
+    metrics.negative_knowledge_routing_warning_count += result.negative_knowledge_routing_warning_count;
     metrics.negative_knowledge_trust_decay_candidate_count += result.negative_knowledge_trust_decay_candidate_count;
 
     if (result.cold_duration_ms > 0 or result.warm_duration_ms > 0) {
@@ -3741,22 +3758,28 @@ fn renderJsonReport(allocator: std.mem.Allocator, metrics: *const Metrics, resul
         metrics.correction_event_count,
         metrics.negative_knowledge_candidate_count,
     });
-    try writer.print(",\"negativeKnowledgeAcceptedCount\":{d},\"negativeKnowledgeRejectedCount\":{d},\"negativeKnowledgeInfluenceMatchCount\":{d},\"negativeKnowledgeTriagePenaltyCount\":{d},\"negativeKnowledgeVerifierRequirementCount\":{d},\"negativeKnowledgeTrustDecayCandidateCount\":{d}", .{
+    try writer.print(",\"negativeKnowledgeAcceptedCount\":{d},\"negativeKnowledgeRejectedCount\":{d},\"negativeKnowledgeInfluenceMatchCount\":{d},\"negativeKnowledgeTriagePenaltyCount\":{d},\"negativeKnowledgeVerifierRequirementCount\":{d},\"negativeKnowledgeVerifierBlockedCount\":{d},\"negativeKnowledgeVerifierStrengthenedCount\":{d},\"negativeKnowledgeSuppressionCount\":{d},\"negativeKnowledgeRoutingWarningCount\":{d},\"negativeKnowledgeTrustDecayCandidateCount\":{d}", .{
         metrics.negative_knowledge_accepted_count,
         metrics.negative_knowledge_rejected_count,
         metrics.negative_knowledge_influence_match_count,
         metrics.negative_knowledge_triage_penalty_count,
         metrics.negative_knowledge_verifier_requirement_count,
+        metrics.negative_knowledge_verifier_blocked_count,
+        metrics.negative_knowledge_verifier_strengthened_count,
+        metrics.negative_knowledge_suppression_count,
+        metrics.negative_knowledge_routing_warning_count,
         metrics.negative_knowledge_trust_decay_candidate_count,
     });
     try writer.writeAll(",\"negativeKnowledge\":{");
-    try writer.print("\"candidateCount\":{d},\"acceptedCount\":{d},\"rejectedCount\":{d},\"expiredCount\":0,\"influenceMatchCount\":{d},\"triagePenaltyCount\":{d},\"verifierRequirementCount\":{d},\"suppressionCount\":0,\"trustDecayCandidateCount\":{d}", .{
+    try writer.print("\"candidateCount\":{d},\"acceptedCount\":{d},\"rejectedCount\":{d},\"expiredCount\":0,\"influenceMatchCount\":{d},\"triagePenaltyCount\":{d},\"verifierRequirementCount\":{d},\"verifierBlockedCount\":{d},\"verifierStrengthenedCount\":{d},\"suppressionCount\":0,\"trustDecayCandidateCount\":{d}", .{
         metrics.negative_knowledge_candidate_count,
         metrics.negative_knowledge_accepted_count,
         metrics.negative_knowledge_rejected_count,
         metrics.negative_knowledge_influence_match_count,
         metrics.negative_knowledge_triage_penalty_count,
         metrics.negative_knowledge_verifier_requirement_count,
+        metrics.negative_knowledge_verifier_blocked_count,
+        metrics.negative_knowledge_verifier_strengthened_count,
         metrics.negative_knowledge_trust_decay_candidate_count,
     });
     try writer.writeAll(",\"records\":[]}");
@@ -4081,12 +4104,14 @@ fn renderMarkdownReport(allocator: std.mem.Allocator, metrics: *const Metrics, r
         metrics.correction_event_count,
         metrics.negative_knowledge_candidate_count,
     });
-    try writer.print("- negative knowledge lifecycle: accepted={d}, rejected={d}, influence_matches={d}, triage_penalties={d}, verifier_requirements={d}, trust_decay_candidates={d}\n", .{
+    try writer.print("- negative knowledge lifecycle: accepted={d}, rejected={d}, influence_matches={d}, triage_penalties={d}, verifier_requirements={d}, verifier_blocked={d}, verifier_strengthened={d}, trust_decay_candidates={d}\n", .{
         metrics.negative_knowledge_accepted_count,
         metrics.negative_knowledge_rejected_count,
         metrics.negative_knowledge_influence_match_count,
         metrics.negative_knowledge_triage_penalty_count,
         metrics.negative_knowledge_verifier_requirement_count,
+        metrics.negative_knowledge_verifier_blocked_count,
+        metrics.negative_knowledge_verifier_strengthened_count,
         metrics.negative_knowledge_trust_decay_candidate_count,
     });
     try writer.writeAll("\nNotes:\n");

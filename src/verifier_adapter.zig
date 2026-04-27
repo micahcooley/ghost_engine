@@ -5,6 +5,7 @@ const code_intel = @import("code_intel.zig");
 const compute_budget = @import("compute_budget.zig");
 const execution = @import("execution.zig");
 const hypothesis_core = @import("hypothesis_core.zig");
+const negative_knowledge = @import("negative_knowledge.zig");
 
 pub const HookKind = enum {
     build,
@@ -66,6 +67,8 @@ pub const HandoffBlockedReason = enum {
     budget_exhausted,
     unsupported_domain,
     unsafe_or_disallowed_verification,
+    blocked_by_negative_knowledge,
+    no_adapter_satisfies_negative_knowledge,
 };
 
 pub const CandidateKind = enum {
@@ -105,6 +108,7 @@ pub const CandidateBlockedReason = enum {
     missing_candidate,
     not_approved,
     unsafe_materialization,
+    negative_knowledge_blocked,
 };
 
 pub const ApprovalKind = enum {
@@ -199,6 +203,12 @@ pub const VerifierCandidate = struct {
     approval: ?VerifierCandidateApproval = null,
     materialization: ?VerifierCandidateMaterialization = null,
     rejection_reason: ?[]u8 = null,
+    negative_knowledge_record_ids: [][]u8 = &.{},
+    verifier_requirement: ?[]u8 = null,
+    blocked_by_negative_knowledge: bool = false,
+    required_strength: ?[]u8 = null,
+    selected_adapter_after_nk: ?[]u8 = null,
+    fallback_reason: ?[]u8 = null,
     requires_approval: bool = true,
     non_authorizing: bool = true,
     provenance: []u8,
@@ -221,6 +231,11 @@ pub const VerifierCandidate = struct {
         if (self.approval) |*approval| approval.deinit(self.allocator);
         if (self.materialization) |*materialization| materialization.deinit(self.allocator);
         if (self.rejection_reason) |reason| self.allocator.free(reason);
+        freeStringList(self.allocator, self.negative_knowledge_record_ids);
+        if (self.verifier_requirement) |value| self.allocator.free(value);
+        if (self.required_strength) |value| self.allocator.free(value);
+        if (self.selected_adapter_after_nk) |value| self.allocator.free(value);
+        if (self.fallback_reason) |value| self.allocator.free(value);
         self.allocator.free(self.provenance);
         self.allocator.free(self.trace);
         self.* = undefined;
@@ -244,6 +259,12 @@ pub const HandoffJob = struct {
     result_ref: ?[]u8 = null,
     result_status: ?Status = null,
     evidence_ref: ?[]u8 = null,
+    negative_knowledge_record_ids: [][]u8 = &.{},
+    verifier_requirement: ?[]u8 = null,
+    blocked_by_negative_knowledge: bool = false,
+    required_strength: ?[]u8 = null,
+    selected_adapter_after_nk: ?[]u8 = null,
+    fallback_reason: ?[]u8 = null,
     non_authorizing_input: bool = true,
     trace: []u8,
 
@@ -259,6 +280,11 @@ pub const HandoffJob = struct {
         freeStringList(self.allocator, self.input_evidence_refs);
         if (self.result_ref) |value| self.allocator.free(value);
         if (self.evidence_ref) |value| self.allocator.free(value);
+        freeStringList(self.allocator, self.negative_knowledge_record_ids);
+        if (self.verifier_requirement) |value| self.allocator.free(value);
+        if (self.required_strength) |value| self.allocator.free(value);
+        if (self.selected_adapter_after_nk) |value| self.allocator.free(value);
+        if (self.fallback_reason) |value| self.allocator.free(value);
         self.allocator.free(self.trace);
         self.* = undefined;
     }
@@ -287,6 +313,9 @@ pub const HandoffResult = struct {
     verifier_candidate_budget_exhausted_count: usize = 0,
     code_verifier_candidate_count: usize = 0,
     non_code_verifier_candidate_count: usize = 0,
+    negative_knowledge_verifier_requirement_count: usize = 0,
+    negative_knowledge_verifier_blocked_count: usize = 0,
+    negative_knowledge_verifier_strengthened_count: usize = 0,
 
     pub fn deinit(self: *HandoffResult) void {
         for (self.jobs) |*job| job.deinit();
@@ -303,6 +332,7 @@ pub const HandoffInputs = struct {
     relations: []const artifact_schema.RelationEdge = &.{},
     obligations: []const artifact_schema.Obligation = &.{},
     fragments: []const artifact_schema.Fragment = &.{},
+    negative_knowledge_records: []const negative_knowledge.Record = &.{},
 };
 
 const ArtifactCounter = struct {
@@ -530,6 +560,163 @@ fn isExternal(kind: HookKind) bool {
         .build, .@"test", .runtime, .custom_external => true,
         else => false,
     };
+}
+
+fn verifierCandidateViewForAdapter(hypothesis: hypothesis_core.Hypothesis, adapter: Adapter) negative_knowledge.VerifierCandidateView {
+    return .{
+        .id = adapter.id,
+        .artifact_scope = hypothesis.artifact_scope,
+        .target_claim_surface = if (hypothesis.affected_entities.len > 0) hypothesis.affected_entities[0] else hypothesis.artifact_scope,
+        .proposed_check = if (hypothesis.missing_obligations.len > 0) hypothesis.missing_obligations[0] else @tagName(adapter.hook_kind),
+        .provenance = "hypothesis_verifier_handoff",
+    };
+}
+
+fn verifierCandidateView(candidate: VerifierCandidate) negative_knowledge.VerifierCandidateView {
+    return .{
+        .id = candidate.id,
+        .artifact_scope = candidate.artifact_scope,
+        .target_claim_surface = candidate.target_claim_surface,
+        .proposed_check = candidate.proposed_check,
+        .provenance = candidate.provenance,
+    };
+}
+
+fn applyNegativeKnowledgeToHandoffJob(
+    allocator: std.mem.Allocator,
+    job: *HandoffJob,
+    influence: negative_knowledge.InfluenceResult,
+    selected_adapter_after_nk: ?[]const u8,
+    fallback_reason: ?[]const u8,
+) !void {
+    if (influence.matched_record_ids.len == 0) return;
+    freeStringList(allocator, job.negative_knowledge_record_ids);
+    job.negative_knowledge_record_ids = try cloneStringList(allocator, influence.matched_record_ids);
+    if (influence.required_verifiers.len > 0) {
+        if (job.verifier_requirement) |value| allocator.free(value);
+        job.verifier_requirement = try allocator.dupe(u8, influence.required_verifiers[0]);
+        if (job.required_strength) |value| allocator.free(value);
+        job.required_strength = try allocator.dupe(u8, influence.required_verifiers[0]);
+    }
+    if (selected_adapter_after_nk) |value| {
+        if (job.selected_adapter_after_nk) |old| allocator.free(old);
+        job.selected_adapter_after_nk = try allocator.dupe(u8, value);
+    }
+    const effective_fallback: ?[]const u8 = if (fallback_reason) |value|
+        value
+    else if (influence.suppression_reason) |value|
+        value
+    else
+        null;
+    if (effective_fallback) |value| {
+        if (job.fallback_reason) |old| allocator.free(old);
+        job.fallback_reason = try allocator.dupe(u8, value);
+        job.blocked_by_negative_knowledge = true;
+    }
+    const old_trace = job.trace;
+    job.trace = try std.fmt.allocPrint(allocator, "{s}; negative_knowledge_record_ids={d}; verifier_requirement={s}; selected_adapter_after_nk={s}; fallback_reason={s}", .{
+        old_trace,
+        influence.matched_record_ids.len,
+        if (influence.required_verifiers.len > 0) influence.required_verifiers[0] else "none",
+        selected_adapter_after_nk orelse "none",
+        effective_fallback orelse "none",
+    });
+    allocator.free(old_trace);
+}
+
+fn applyNegativeKnowledgeToVerifierCandidate(
+    allocator: std.mem.Allocator,
+    result: *HandoffResult,
+    candidate: *VerifierCandidate,
+    negative_records: []const negative_knowledge.Record,
+    budget: compute_budget.Effective,
+) !void {
+    if (negative_records.len == 0) return;
+    var influence = try negative_knowledge.influenceVerifierCandidate(allocator, negative_records, verifierCandidateView(candidate.*), budget);
+    defer influence.deinit();
+    if (influence.matched_record_ids.len == 0) return;
+    candidate.negative_knowledge_record_ids = try cloneStringList(allocator, influence.matched_record_ids);
+    if (influence.required_verifiers.len > 0) {
+        candidate.verifier_requirement = try allocator.dupe(u8, influence.required_verifiers[0]);
+        candidate.required_strength = try allocator.dupe(u8, influence.required_verifiers[0]);
+        result.negative_knowledge_verifier_requirement_count += influence.required_verifiers.len;
+    }
+    if (influence.suppression_reason) |reason| {
+        candidate.status = .blocked;
+        candidate.blocked_reason = .negative_knowledge_blocked;
+        candidate.blocked_by_negative_knowledge = true;
+        candidate.fallback_reason = try allocator.dupe(u8, reason);
+        result.negative_knowledge_verifier_blocked_count += 1;
+    }
+    const old_trace = candidate.trace;
+    candidate.trace = try std.fmt.allocPrint(allocator, "{s}; negative_knowledge_record_ids={d}; verifier_requirement={s}; blocked_by_negative_knowledge={s}; fallback_reason={s}", .{
+        old_trace,
+        influence.matched_record_ids.len,
+        if (influence.required_verifiers.len > 0) influence.required_verifiers[0] else "none",
+        if (candidate.blocked_by_negative_knowledge) "true" else "false",
+        candidate.fallback_reason orelse "none",
+    });
+    allocator.free(old_trace);
+}
+
+fn findAdapterForNegativeKnowledgeRequirement(
+    allocator: std.mem.Allocator,
+    registry: *Registry,
+    schema_name: []const u8,
+    base_adapter: Adapter,
+    requirement: []const u8,
+    mode: HandoffMode,
+) !?Adapter {
+    const maybe_hook = requirementHookKind(requirement);
+    const applicable = try registry.listApplicable(allocator, schema_name, maybe_hook);
+    defer allocator.free(applicable);
+    var selected: ?Adapter = null;
+    for (applicable) |adapter| {
+        if (!adapterSatisfiesNegativeKnowledgeRequirement(adapter, requirement)) continue;
+        if (!adapterIsStrongerThan(adapter, base_adapter, requirement)) continue;
+        if (!modeAllowsAdapter(mode, adapter)) continue;
+        if (selected == null or adapter.budget_cost > selected.?.budget_cost or (adapter.budget_cost == selected.?.budget_cost and std.mem.lessThan(u8, adapter.id, selected.?.id))) {
+            selected = adapter;
+        }
+    }
+    return selected;
+}
+
+fn adapterSatisfiesNegativeKnowledgeRequirement(adapter: Adapter, requirement: []const u8) bool {
+    if (std.mem.eql(u8, adapter.id, requirement)) return true;
+    if (std.mem.eql(u8, @tagName(adapter.hook_kind), requirement)) return true;
+    if (std.mem.indexOf(u8, adapter.id, requirement) != null) return true;
+    for (adapter.required_obligations) |obligation| {
+        if (std.mem.eql(u8, obligation, requirement) or std.mem.indexOf(u8, obligation, requirement) != null) return true;
+    }
+    const hook = requirementHookKind(requirement) orelse return false;
+    return adapter.hook_kind == hook and adapter.budget_cost > 1;
+}
+
+fn adapterIsStrongerThan(adapter: Adapter, base_adapter: Adapter, requirement: []const u8) bool {
+    if (std.mem.eql(u8, adapter.id, base_adapter.id)) return !strongerRequirement(requirement) and adapterSatisfiesNegativeKnowledgeRequirement(adapter, requirement);
+    if (adapter.budget_cost > base_adapter.budget_cost) return true;
+    return adapterSatisfiesNegativeKnowledgeRequirement(adapter, requirement) and adapter.budget_cost >= base_adapter.budget_cost;
+}
+
+fn strongerRequirement(requirement: []const u8) bool {
+    return std.mem.indexOf(u8, requirement, "strong") != null or
+        std.mem.indexOf(u8, requirement, "enhanced") != null or
+        std.mem.indexOf(u8, requirement, "deep") != null;
+}
+
+fn requirementHookKind(requirement: []const u8) ?HookKind {
+    if (std.mem.indexOf(u8, requirement, "runtime") != null) return .runtime;
+    if (std.mem.indexOf(u8, requirement, "test") != null) return .@"test";
+    if (std.mem.indexOf(u8, requirement, "build") != null) return .build;
+    if (std.mem.indexOf(u8, requirement, "schema") != null) return .schema_validation;
+    if (std.mem.indexOf(u8, requirement, "consistency") != null) return .consistency_check;
+    if (std.mem.indexOf(u8, requirement, "freshness") != null) return .freshness_check;
+    if (std.mem.indexOf(u8, requirement, "citation") != null) return .citation_check;
+    if (std.mem.indexOf(u8, requirement, "unit") != null) return .unit_consistency;
+    if (std.mem.indexOf(u8, requirement, "constraint") != null) return .constraint_check;
+    if (std.mem.indexOf(u8, requirement, "external") != null) return .custom_external;
+    return null;
 }
 
 pub fn registerBuiltinAdapters(registry: *Registry) !void {
@@ -884,7 +1071,7 @@ pub fn handoffSelectedHypotheses(
         const hypothesis = hypotheses[idx];
         if (hypothesis.verifier_hooks_needed.len == 0) {
             const job = try makeBlockedHandoffJob(allocator, hypothesis, "missing_verifier_hook", null, .missing_verifier_hook, "selected hypothesis had no verifier_hooks_needed entry");
-            try maybeAppendVerifierCandidate(allocator, &result, &candidates, hypothesis, job, .missing_verifier_hook, tracker.budget);
+            try maybeAppendVerifierCandidate(allocator, &result, &candidates, hypothesis, job, .missing_verifier_hook, tracker.budget, inputs.negative_knowledge_records);
             try jobs.append(job);
             result.blocked_count += 1;
             continue;
@@ -893,42 +1080,42 @@ pub fn handoffSelectedHypotheses(
 
         if (!boundArtifactScope(hypothesis.artifact_scope)) {
             const job = try makeBlockedHandoffJob(allocator, hypothesis, hypothesis.verifier_hooks_needed[0], null, .unbound_artifact_scope, "verification blocked because artifact scope is not bound");
-            try maybeAppendVerifierCandidate(allocator, &result, &candidates, hypothesis, job, .unbound_artifact_scope, tracker.budget);
+            try maybeAppendVerifierCandidate(allocator, &result, &candidates, hypothesis, job, .unbound_artifact_scope, tracker.budget, inputs.negative_knowledge_records);
             try jobs.append(job);
             result.blocked_count += 1;
             continue;
         }
         if (!provenanceBackedEvidence(hypothesis)) {
             const job = try makeBlockedHandoffJob(allocator, hypothesis, hypothesis.verifier_hooks_needed[0], null, .insufficient_evidence, "verification blocked because hypothesis input evidence was not provenance-backed");
-            try maybeAppendVerifierCandidate(allocator, &result, &candidates, hypothesis, job, .insufficient_evidence, tracker.budget);
+            try maybeAppendVerifierCandidate(allocator, &result, &candidates, hypothesis, job, .insufficient_evidence, tracker.budget, inputs.negative_knowledge_records);
             try jobs.append(job);
             result.blocked_count += 1;
             continue;
         }
         if (hasUnsafeSignal(hypothesis)) {
             const job = try makeBlockedHandoffJob(allocator, hypothesis, hypothesis.verifier_hooks_needed[0], null, .unsafe_or_disallowed_verification, "verification blocked by unsafe or disallowed verifier request");
-            try maybeAppendVerifierCandidate(allocator, &result, &candidates, hypothesis, job, .unsafe_or_disallowed_verification, tracker.budget);
+            try maybeAppendVerifierCandidate(allocator, &result, &candidates, hypothesis, job, .unsafe_or_disallowed_verification, tracker.budget, inputs.negative_knowledge_records);
             try jobs.append(job);
             result.blocked_count += 1;
             continue;
         }
         if (hasContradictionBlocker(hypothesis)) {
             const job = try makeBlockedHandoffJob(allocator, hypothesis, hypothesis.verifier_hooks_needed[0], null, .contradiction_blocker, "verification blocked by active contradiction blocker");
-            try maybeAppendVerifierCandidate(allocator, &result, &candidates, hypothesis, job, .contradiction_blocker, tracker.budget);
+            try maybeAppendVerifierCandidate(allocator, &result, &candidates, hypothesis, job, .contradiction_blocker, tracker.budget, inputs.negative_knowledge_records);
             try jobs.append(job);
             result.blocked_count += 1;
             continue;
         }
         if (jobs.items.len >= tracker.budget.max_hypothesis_verifier_jobs) {
             const job = try makeBlockedHandoffJob(allocator, hypothesis, hypothesis.verifier_hooks_needed[0], null, .budget_exhausted, "hypothesis verifier job budget exhausted before scheduling");
-            try maybeAppendVerifierCandidate(allocator, &result, &candidates, hypothesis, job, .budget_exhausted, tracker.budget);
+            try maybeAppendVerifierCandidate(allocator, &result, &candidates, hypothesis, job, .budget_exhausted, tracker.budget, inputs.negative_knowledge_records);
             try jobs.append(job);
             result.budget_exhausted_count += 1;
             continue;
         }
         if (countArtifactJobs(artifact_counts.items, hypothesis.artifact_scope) >= tracker.budget.max_hypothesis_verifier_jobs_per_artifact) {
             const job = try makeBlockedHandoffJob(allocator, hypothesis, hypothesis.verifier_hooks_needed[0], null, .budget_exhausted, "per-artifact hypothesis verifier job budget exhausted before scheduling");
-            try maybeAppendVerifierCandidate(allocator, &result, &candidates, hypothesis, job, .budget_exhausted, tracker.budget);
+            try maybeAppendVerifierCandidate(allocator, &result, &candidates, hypothesis, job, .budget_exhausted, tracker.budget, inputs.negative_knowledge_records);
             try jobs.append(job);
             result.budget_exhausted_count += 1;
             continue;
@@ -936,18 +1123,51 @@ pub fn handoffSelectedHypotheses(
 
         const hook_kind = parseHookKind(hypothesis.verifier_hooks_needed[0]) orelse {
             const job = try makeBlockedHandoffJob(allocator, hypothesis, hypothesis.verifier_hooks_needed[0], null, .unsupported_domain, "verification blocked because hook kind is not supported by the adapter interface");
-            try maybeAppendVerifierCandidate(allocator, &result, &candidates, hypothesis, job, .unsupported_domain, tracker.budget);
+            try maybeAppendVerifierCandidate(allocator, &result, &candidates, hypothesis, job, .unsupported_domain, tracker.budget, inputs.negative_knowledge_records);
             try jobs.append(job);
             result.blocked_count += 1;
             continue;
         };
-        const adapter = registry.lookup(hypothesis.schema_name, hook_kind, firstObligation(hypothesis)) orelse registry.lookup(hypothesis.schema_name, hook_kind, null) orelse {
+        var adapter = registry.lookup(hypothesis.schema_name, hook_kind, firstObligation(hypothesis)) orelse registry.lookup(hypothesis.schema_name, hook_kind, null) orelse {
             const job = try makeBlockedHandoffJob(allocator, hypothesis, hypothesis.verifier_hooks_needed[0], null, .no_matching_adapter, "verification blocked because no matching verifier adapter exists");
-            try maybeAppendVerifierCandidate(allocator, &result, &candidates, hypothesis, job, .no_matching_adapter, tracker.budget);
+            try maybeAppendVerifierCandidate(allocator, &result, &candidates, hypothesis, job, .no_matching_adapter, tracker.budget, inputs.negative_knowledge_records);
             try jobs.append(job);
             result.blocked_count += 1;
             continue;
         };
+        if (inputs.negative_knowledge_records.len > 0) {
+            var influence = try negative_knowledge.influenceVerifierCandidate(
+                allocator,
+                inputs.negative_knowledge_records,
+                verifierCandidateViewForAdapter(hypothesis, adapter),
+                tracker.budget,
+            );
+            defer influence.deinit();
+            if (influence.matched_record_ids.len > 0) result.negative_knowledge_verifier_requirement_count += influence.required_verifiers.len;
+            if (influence.suppression_reason) |reason| {
+                var job = try makeBlockedHandoffJob(allocator, hypothesis, hypothesis.verifier_hooks_needed[0], adapter.id, .blocked_by_negative_knowledge, reason);
+                try applyNegativeKnowledgeToHandoffJob(allocator, &job, influence, null, reason);
+                try jobs.append(job);
+                result.blocked_count += 1;
+                result.negative_knowledge_verifier_blocked_count += 1;
+                continue;
+            }
+            if (influence.required_verifiers.len > 0) {
+                const requirement = influence.required_verifiers[0];
+                const selected = try findAdapterForNegativeKnowledgeRequirement(allocator, registry, hypothesis.schema_name, adapter, requirement, mode);
+                if (selected) |strengthened| {
+                    adapter = strengthened;
+                    result.negative_knowledge_verifier_strengthened_count += 1;
+                } else {
+                    var job = try makeBlockedHandoffJob(allocator, hypothesis, hypothesis.verifier_hooks_needed[0], adapter.id, .no_adapter_satisfies_negative_knowledge, "no verifier adapter satisfied accepted negative knowledge verifier requirement");
+                    try applyNegativeKnowledgeToHandoffJob(allocator, &job, influence, null, "no_adapter_satisfies_negative_knowledge");
+                    try jobs.append(job);
+                    result.blocked_count += 1;
+                    result.negative_knowledge_verifier_blocked_count += 1;
+                    continue;
+                }
+            }
+        }
         if (!modeAllowsAdapter(mode, adapter)) {
             var job = try makeScheduledHandoffJob(allocator, hypothesis, adapter, .skipped, "verification skipped by response mode policy");
             try setJobResult(allocator, &job, .skipped, null, "response_mode_policy_skipped");
@@ -957,6 +1177,16 @@ pub fn handoffSelectedHypotheses(
         }
 
         var job = try makeScheduledHandoffJob(allocator, hypothesis, adapter, .scheduled, "verification scheduled from selected non-authorizing hypothesis");
+        if (inputs.negative_knowledge_records.len > 0) {
+            var influence = try negative_knowledge.influenceVerifierCandidate(
+                allocator,
+                inputs.negative_knowledge_records,
+                verifierCandidateViewForAdapter(hypothesis, adapter),
+                tracker.budget,
+            );
+            defer influence.deinit();
+            try applyNegativeKnowledgeToHandoffJob(allocator, &job, influence, adapter.id, null);
+        }
         result.scheduled_count += 1;
         try incrementArtifactJobs(allocator, &artifact_counts, hypothesis.artifact_scope);
 
@@ -1027,9 +1257,30 @@ pub fn appendHandoffToSupportGraph(
     for (handoff.jobs, 0..) |job, idx| {
         const job_id = try std.fmt.allocPrint(allocator, "hypothesis_verifier_job_{d}", .{idx + 1});
         defer allocator.free(job_id);
-        try appendNode(allocator, nodes, job_id, .hypothesis_verifier_job, job.id, null, 0, job.budget_cost, false, job.trace);
+        const job_detail = try std.fmt.allocPrint(
+            allocator,
+            "{s}; negative_knowledge_record_ids={d}; verifier_requirement={s}; blocked_by_negative_knowledge={s}; required_strength={s}; selected_adapter_after_nk={s}; fallback_reason={s}",
+            .{
+                job.trace,
+                job.negative_knowledge_record_ids.len,
+                job.verifier_requirement orelse "none",
+                if (job.blocked_by_negative_knowledge) "true" else "false",
+                job.required_strength orelse "none",
+                job.selected_adapter_after_nk orelse "none",
+                job.fallback_reason orelse "none",
+            },
+        );
+        defer allocator.free(job_detail);
+        try appendNode(allocator, nodes, job_id, .hypothesis_verifier_job, job.id, null, 0, job.budget_cost, false, job_detail);
         try appendEdge(allocator, edges, "hypothesis_verifier_handoff", job_id, .schedules_verifier);
         try appendEdge(allocator, edges, job_id, parent_id, .verifier_job_for);
+        if (job.negative_knowledge_record_ids.len > 0) {
+            const nk_id = try std.fmt.allocPrint(allocator, "negative_knowledge_verifier_influence_{d}", .{idx + 1});
+            defer allocator.free(nk_id);
+            try appendNode(allocator, nodes, nk_id, .negative_knowledge_influence, "negative knowledge verifier influence", null, 0, @intCast(@min(job.negative_knowledge_record_ids.len, std.math.maxInt(u32))), false, "non-authorizing verifier selection influence only");
+            try appendEdge(allocator, edges, nk_id, job_id, .negative_knowledge_requires_verifier);
+            if (job.blocked_by_negative_knowledge) try appendEdge(allocator, edges, job_id, nk_id, .blocked_verification_by);
+        }
         if (job.evidence_ref) |evidence| {
             const result_id = try std.fmt.allocPrint(allocator, "hypothesis_verifier_result_{d}", .{idx + 1});
             defer allocator.free(result_id);
@@ -1058,7 +1309,7 @@ fn appendVerifierCandidatesToSupportGraph(
         defer allocator.free(candidate_id);
         const detail = try std.fmt.allocPrint(
             allocator,
-            "kind={s}; status={s}; requires_approval={s}; non_authorizing={s}; check={s}; does_not_check={s}; trace={s}",
+            "kind={s}; status={s}; requires_approval={s}; non_authorizing={s}; check={s}; does_not_check={s}; negative_knowledge_record_ids={d}; verifier_requirement={s}; blocked_by_negative_knowledge={s}; required_strength={s}; selected_adapter_after_nk={s}; fallback_reason={s}; trace={s}",
             .{
                 candidateKindName(candidate.candidate_kind),
                 candidateStatusName(candidate.status),
@@ -1066,6 +1317,12 @@ fn appendVerifierCandidatesToSupportGraph(
                 if (candidate.non_authorizing) "true" else "false",
                 candidate.proposed_check,
                 if (candidate.scope_limitations.len > 0) candidate.scope_limitations[0] else "final support or truth",
+                candidate.negative_knowledge_record_ids.len,
+                candidate.verifier_requirement orelse "none",
+                if (candidate.blocked_by_negative_knowledge) "true" else "false",
+                candidate.required_strength orelse "none",
+                candidate.selected_adapter_after_nk orelse "none",
+                candidate.fallback_reason orelse "none",
                 candidate.trace,
             },
         );
@@ -1132,6 +1389,12 @@ fn appendVerifierCandidatesToSupportGraph(
             defer allocator.free(blocked_id);
             try appendNode(allocator, nodes, blocked_id, .verifier_candidate_safety_obligation, if (candidate.blocked_reason) |reason| candidateBlockedReasonName(reason) else "blocked", null, 0, 0, false, "candidate generation blocked before authorization");
             try appendEdge(allocator, edges, candidate_id, blocked_id, .candidate_blocked_by);
+        }
+        if (candidate.negative_knowledge_record_ids.len > 0) {
+            const nk_id = try std.fmt.allocPrint(allocator, "negative_knowledge_verifier_candidate_influence_{d}", .{idx + 1});
+            defer allocator.free(nk_id);
+            try appendNode(allocator, nodes, nk_id, .negative_knowledge_influence, "negative knowledge verifier candidate influence", null, 0, @intCast(@min(candidate.negative_knowledge_record_ids.len, std.math.maxInt(u32))), false, "non-authorizing verifier candidate influence only");
+            try appendEdge(allocator, edges, nk_id, candidate_id, .negative_knowledge_requires_verifier);
         }
     }
 }
@@ -1284,6 +1547,29 @@ pub fn renderHandoffJson(allocator: std.mem.Allocator, handoff: HandoffResult) !
         handoff.skipped_count,
         handoff.budget_exhausted_count,
     });
+    try writer.print(",\"negativeKnowledgeVerifierRequirementCount\":{d},\"negativeKnowledgeVerifierBlockedCount\":{d},\"negativeKnowledgeVerifierStrengthenedCount\":{d},\"items\":[", .{
+        handoff.negative_knowledge_verifier_requirement_count,
+        handoff.negative_knowledge_verifier_blocked_count,
+        handoff.negative_knowledge_verifier_strengthened_count,
+    });
+    for (handoff.jobs, 0..) |job, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try writer.writeAll("{");
+        try writeJsonFieldString(writer, "id", job.id, true);
+        try writeJsonFieldString(writer, "hypothesis_id", job.hypothesis_id, false);
+        try writeJsonFieldString(writer, "adapter_id", job.adapter_id, false);
+        try writeJsonFieldString(writer, "status", @tagName(job.status), false);
+        try writer.writeAll(",\"negative_knowledge_record_ids\":");
+        try writeJsonStringList(writer, job.negative_knowledge_record_ids);
+        if (job.verifier_requirement) |value| try writeJsonFieldString(writer, "verifier_requirement", value, false);
+        try writer.print(",\"blocked_by_negative_knowledge\":{s}", .{if (job.blocked_by_negative_knowledge) "true" else "false"});
+        if (job.required_strength) |value| try writeJsonFieldString(writer, "required_strength", value, false);
+        if (job.selected_adapter_after_nk) |value| try writeJsonFieldString(writer, "selected_adapter_after_nk", value, false);
+        if (job.fallback_reason) |value| try writeJsonFieldString(writer, "fallback_reason", value, false);
+        try writeJsonFieldString(writer, "trace", job.trace, false);
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]");
     try writer.writeAll("},\"verifier_candidates\":{");
     try writer.print("\"proposed_count\":{d},\"blocked_count\":{d},\"accepted_count\":{d},\"materialized_count\":{d},\"scheduled_count\":{d},\"executed_count\":{d},\"budget_exhausted_count\":{d},\"items\":[", .{
         handoff.verifier_candidate_proposed_count,
@@ -1322,6 +1608,13 @@ pub fn renderHandoffJson(allocator: std.mem.Allocator, handoff: HandoffResult) !
         if (candidate.patch_or_file_proposal) |proposal| try writeJsonFieldString(writer, "patch_or_file_proposal", proposal, false);
         if (candidate.blocked_reason) |reason| try writeJsonFieldString(writer, "blocked_reason", candidateBlockedReasonName(reason), false);
         if (candidate.rejection_reason) |reason| try writeJsonFieldString(writer, "rejection_reason", reason, false);
+        try writer.writeAll(",\"negative_knowledge_record_ids\":");
+        try writeJsonStringList(writer, candidate.negative_knowledge_record_ids);
+        if (candidate.verifier_requirement) |value| try writeJsonFieldString(writer, "verifier_requirement", value, false);
+        try writer.print(",\"blocked_by_negative_knowledge\":{s}", .{if (candidate.blocked_by_negative_knowledge) "true" else "false"});
+        if (candidate.required_strength) |value| try writeJsonFieldString(writer, "required_strength", value, false);
+        if (candidate.selected_adapter_after_nk) |value| try writeJsonFieldString(writer, "selected_adapter_after_nk", value, false);
+        if (candidate.fallback_reason) |value| try writeJsonFieldString(writer, "fallback_reason", value, false);
         if (candidate.approval) |approval| {
             try writer.writeAll(",\"approval\":{");
             try writeJsonFieldString(writer, "approved_by", approval.approved_by, true);
@@ -1389,6 +1682,7 @@ fn maybeAppendVerifierCandidate(
     job: HandoffJob,
     handoff_reason: HandoffBlockedReason,
     budget: compute_budget.Effective,
+    negative_records: []const negative_knowledge.Record,
 ) !void {
     if (!candidateEligibleHandoffReason(handoff_reason)) return;
     if (candidates.items.len >= budget.max_verifier_candidates_generated) {
@@ -1446,9 +1740,14 @@ fn maybeAppendVerifierCandidate(
 
     var candidate = try makeVerifierCandidate(allocator, hypothesis, job, handoff_reason, budget);
     errdefer candidate.deinit();
+    try applyNegativeKnowledgeToVerifierCandidate(allocator, result, &candidate, negative_records, budget);
     try candidates.append(candidate);
-    result.verifier_candidate_proposed_count += 1;
-    if (candidate.generated_artifacts.len > 0) result.verifier_candidate_materialized_count += 1;
+    if (candidate.status == .blocked) {
+        result.verifier_candidate_blocked_count += 1;
+    } else {
+        result.verifier_candidate_proposed_count += 1;
+        if (candidate.generated_artifacts.len > 0) result.verifier_candidate_materialized_count += 1;
+    }
     if (isCodeCandidate(candidate)) {
         result.code_verifier_candidate_count += 1;
     } else {
@@ -2067,6 +2366,47 @@ fn nonSelectedTriage() !hypothesis_core.TriageResult {
     };
 }
 
+fn acceptedNkRecord(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    kind: negative_knowledge.Kind,
+    condition: []const u8,
+    verifier_requirement: ?[]const u8,
+) !negative_knowledge.Record {
+    const influences = [_]negative_knowledge.AllowedInfluence{ .verifier_requirement, .suppression_rule, .triage_penalty };
+    return negative_knowledge.acceptNegativeKnowledgeCandidate(allocator, .{
+        .id = id,
+        .correction_event_id = "corr:nk-verifier",
+        .kind = kind,
+        .scope = .artifact,
+        .condition = condition,
+        .evidence_ref = "ev:nk-verifier",
+        .verifier_requirement = verifier_requirement,
+    }, .{
+        .approved_by = "test",
+        .approval_kind = .test_fixture,
+        .reason = "verified negative verifier influence fixture",
+        .scope = .artifact,
+        .allowed_influence = &influences,
+    });
+}
+
+fn strongCodeBuildAdapter() Adapter {
+    var adapter = codeBuildAdapter();
+    adapter.id = "code.build.strong";
+    adapter.required_obligations = &.{"strong_build"};
+    adapter.budget_cost = 6;
+    return adapter;
+}
+
+fn strongConfigSchemaAdapter() Adapter {
+    var adapter = configSchemaValidationAdapter();
+    adapter.id = "config.schema.strong_validation";
+    adapter.required_obligations = &.{"strong_schema_check"};
+    adapter.budget_cost = 2;
+    return adapter;
+}
+
 test "selected hypothesis blocked by no matching adapter creates verifier candidate" {
     const allocator = std.testing.allocator;
     var registry = Registry.init(allocator);
@@ -2081,6 +2421,177 @@ test "selected hypothesis blocked by no matching adapter creates verifier candid
     try std.testing.expectEqual(@as(usize, 1), handoff.verifier_candidate_proposed_count);
     try std.testing.expectEqual(CandidateKind.document_consistency_check, handoff.verifier_candidates[0].candidate_kind);
     try std.testing.expect(handoff.verifier_candidates[0].non_authorizing);
+}
+
+test "accepted failed patch requires stronger verifier during handoff" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+    try registry.register(codeBuildAdapter());
+    try registry.register(strongCodeBuildAdapter());
+    var tracker = BudgetTracker.init(allocator, compute_budget.resolve(.{ .tier = .max }));
+    var hypothesis = try testHypothesis(allocator, "code_artifact_schema", "src/api.zig", "build", "build");
+    defer deinitTestHypothesis(allocator, &hypothesis);
+    var record = try acceptedNkRecord(allocator, "cand:nk-strong-build", .failed_patch, "src/api.zig", "strong_build");
+    defer record.deinit();
+
+    var handoff = try handoffSelectedHypotheses(allocator, &registry, &tracker, &.{hypothesis}, try selectedTriage(), .{ .negative_knowledge_records = &.{record} }, .deep);
+    defer handoff.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), handoff.negative_knowledge_verifier_requirement_count);
+    try std.testing.expectEqual(@as(usize, 1), handoff.negative_knowledge_verifier_strengthened_count);
+    try std.testing.expectEqualStrings("code.build.strong", handoff.jobs[0].adapter_id);
+    try std.testing.expectEqualStrings("strong_build", handoff.jobs[0].required_strength.?);
+    try std.testing.expect(handoff.jobs[0].negative_knowledge_record_ids.len == 1);
+}
+
+test "rejected and expired records do not affect verifier handoff" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+    try registry.register(codeBuildAdapter());
+    try registry.register(strongCodeBuildAdapter());
+    var tracker = BudgetTracker.init(allocator, compute_budget.resolve(.{ .tier = .max }));
+    var hypothesis = try testHypothesis(allocator, "code_artifact_schema", "src/api.zig", "build", "build");
+    defer deinitTestHypothesis(allocator, &hypothesis);
+    var rejected = try acceptedNkRecord(allocator, "cand:nk-rejected", .failed_patch, "src/api.zig", "strong_build");
+    defer rejected.deinit();
+    rejected.status = .rejected;
+    var expired = try acceptedNkRecord(allocator, "cand:nk-expired", .failed_patch, "src/api.zig", "strong_build");
+    defer expired.deinit();
+    expired.status = .expired;
+
+    var handoff = try handoffSelectedHypotheses(allocator, &registry, &tracker, &.{hypothesis}, try selectedTriage(), .{ .negative_knowledge_records = &.{ rejected, expired } }, .deep);
+    defer handoff.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), handoff.negative_knowledge_verifier_requirement_count);
+    try std.testing.expectEqualStrings("code.build.zig_build", handoff.jobs[0].adapter_id);
+    try std.testing.expect(handoff.jobs[0].negative_knowledge_record_ids.len == 0);
+}
+
+test "exact unsafe verifier reuse is blocked during handoff" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+    try registry.register(codeBuildAdapter());
+    var tracker = BudgetTracker.init(allocator, compute_budget.resolve(.{ .tier = .max }));
+    var hypothesis = try testHypothesis(allocator, "code_artifact_schema", "src/api.zig", "build", "build");
+    defer deinitTestHypothesis(allocator, &hypothesis);
+    var record = try acceptedNkRecord(allocator, "cand:nk-unsafe-adapter", .unsafe_verifier_candidate, "code.build.zig_build", "strong_build");
+    defer record.deinit();
+
+    var handoff = try handoffSelectedHypotheses(allocator, &registry, &tracker, &.{hypothesis}, try selectedTriage(), .{ .negative_knowledge_records = &.{record} }, .deep);
+    defer handoff.deinit();
+
+    try std.testing.expectEqual(HandoffJobStatus.blocked, handoff.jobs[0].status);
+    try std.testing.expectEqual(HandoffBlockedReason.blocked_by_negative_knowledge, handoff.jobs[0].blocked_reason.?);
+    try std.testing.expect(handoff.jobs[0].blocked_by_negative_knowledge);
+    try std.testing.expectEqual(@as(usize, 1), handoff.negative_knowledge_verifier_blocked_count);
+}
+
+test "missing stronger verifier produces explicit blocked handoff reason" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+    try registry.register(codeBuildAdapter());
+    var tracker = BudgetTracker.init(allocator, compute_budget.resolve(.{ .tier = .max }));
+    var hypothesis = try testHypothesis(allocator, "code_artifact_schema", "src/api.zig", "build", "build");
+    defer deinitTestHypothesis(allocator, &hypothesis);
+    var record = try acceptedNkRecord(allocator, "cand:nk-missing-strong", .failed_patch, "src/api.zig", "strong_build");
+    defer record.deinit();
+
+    var handoff = try handoffSelectedHypotheses(allocator, &registry, &tracker, &.{hypothesis}, try selectedTriage(), .{ .negative_knowledge_records = &.{record} }, .deep);
+    defer handoff.deinit();
+
+    try std.testing.expectEqual(HandoffJobStatus.blocked, handoff.jobs[0].status);
+    try std.testing.expectEqual(HandoffBlockedReason.no_adapter_satisfies_negative_knowledge, handoff.jobs[0].blocked_reason.?);
+    try std.testing.expectEqualStrings("strong_build", handoff.jobs[0].verifier_requirement.?);
+    try std.testing.expect(std.mem.indexOf(u8, handoff.jobs[0].fallback_reason.?, "no_adapter_satisfies_negative_knowledge") != null);
+}
+
+test "non-code verifier handoff uses same negative knowledge influence model" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+    try registry.register(configSchemaValidationAdapter());
+    try registry.register(strongConfigSchemaAdapter());
+    var tracker = BudgetTracker.init(allocator, compute_budget.resolve(.{ .tier = .max }));
+    var hypothesis = try testHypothesis(allocator, "config_schema", "config/app.toml", "schema_validation", "schema");
+    defer deinitTestHypothesis(allocator, &hypothesis);
+    var record = try acceptedNkRecord(allocator, "cand:nk-config-strong", .failed_patch, "config/app.toml", "strong_schema_check");
+    defer record.deinit();
+
+    var handoff = try handoffSelectedHypotheses(allocator, &registry, &tracker, &.{hypothesis}, try selectedTriage(), .{ .negative_knowledge_records = &.{record} }, .deep);
+    defer handoff.deinit();
+
+    try std.testing.expectEqualStrings("config.schema.strong_validation", handoff.jobs[0].adapter_id);
+    try std.testing.expectEqual(@as(usize, 1), handoff.non_code_job_count);
+    try std.testing.expectEqual(@as(usize, 1), handoff.negative_knowledge_verifier_strengthened_count);
+}
+
+test "negative knowledge verifier trace is emitted without support edges" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+    try registry.register(codeBuildAdapter());
+    try registry.register(strongCodeBuildAdapter());
+    var tracker = BudgetTracker.init(allocator, compute_budget.resolve(.{ .tier = .max }));
+    var hypothesis = try testHypothesis(allocator, "code_artifact_schema", "src/api.zig", "build", "build");
+    defer deinitTestHypothesis(allocator, &hypothesis);
+    var record = try acceptedNkRecord(allocator, "cand:nk-trace", .failed_patch, "src/api.zig", "strong_build");
+    defer record.deinit();
+    var handoff = try handoffSelectedHypotheses(allocator, &registry, &tracker, &.{hypothesis}, try selectedTriage(), .{ .negative_knowledge_records = &.{record} }, .deep);
+    defer handoff.deinit();
+
+    var nodes = std.ArrayList(code_intel.SupportGraphNode).init(allocator);
+    defer {
+        for (nodes.items) |node| {
+            allocator.free(node.id);
+            allocator.free(node.label);
+            if (node.rel_path) |path| allocator.free(path);
+            if (node.detail) |detail| allocator.free(detail);
+        }
+        nodes.deinit();
+    }
+    var edges = std.ArrayList(code_intel.SupportGraphEdge).init(allocator);
+    defer {
+        for (edges.items) |edge| {
+            allocator.free(edge.from_id);
+            allocator.free(edge.to_id);
+        }
+        edges.deinit();
+    }
+    try appendHandoffToSupportGraph(allocator, &nodes, &edges, "output", handoff);
+    var saw_nk = false;
+    for (nodes.items) |node| {
+        if (node.kind == .negative_knowledge_influence) saw_nk = true;
+        try std.testing.expect(!node.usable or node.kind != .negative_knowledge_influence);
+    }
+    for (edges.items) |edge| try std.testing.expect(edge.kind != .supported_by);
+    try std.testing.expect(saw_nk);
+}
+
+test "negative knowledge verifier handoff behavior is deterministic" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+    try registry.register(codeBuildAdapter());
+    try registry.register(strongCodeBuildAdapter());
+    var hypothesis = try testHypothesis(allocator, "code_artifact_schema", "src/api.zig", "build", "build");
+    defer deinitTestHypothesis(allocator, &hypothesis);
+    var record = try acceptedNkRecord(allocator, "cand:nk-deterministic", .failed_patch, "src/api.zig", "strong_build");
+    defer record.deinit();
+    var tracker_a = BudgetTracker.init(allocator, compute_budget.resolve(.{ .tier = .max }));
+    var tracker_b = BudgetTracker.init(allocator, compute_budget.resolve(.{ .tier = .max }));
+
+    var first = try handoffSelectedHypotheses(allocator, &registry, &tracker_a, &.{hypothesis}, try selectedTriage(), .{ .negative_knowledge_records = &.{record} }, .deep);
+    defer first.deinit();
+    var second = try handoffSelectedHypotheses(allocator, &registry, &tracker_b, &.{hypothesis}, try selectedTriage(), .{ .negative_knowledge_records = &.{record} }, .deep);
+    defer second.deinit();
+
+    try std.testing.expectEqualStrings(first.jobs[0].adapter_id, second.jobs[0].adapter_id);
+    try std.testing.expectEqual(first.negative_knowledge_verifier_strengthened_count, second.negative_knowledge_verifier_strengthened_count);
+    try std.testing.expectEqual(first.jobs[0].negative_knowledge_record_ids.len, second.jobs[0].negative_knowledge_record_ids.len);
 }
 
 test "non-selected hypothesis does not create verifier candidate" {

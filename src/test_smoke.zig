@@ -29,6 +29,10 @@ const conversation_session = @import("conversation_session.zig");
 const intent_grounding = @import("intent_grounding.zig");
 const response_engine = @import("response_engine.zig");
 const verifier_adapter = @import("verifier_adapter.zig");
+const verifier_execution = @import("verifier_execution.zig");
+const correction_hooks = @import("correction_hooks.zig");
+const negative_knowledge = @import("negative_knowledge.zig");
+const support_routing = @import("support_routing.zig");
 const repo_hygiene = @import("repo_hygiene.zig");
 const hypothesis_core = @import("hypothesis_core.zig");
 const gip = @import("gip.zig");
@@ -37,6 +41,10 @@ comptime {
     _ = repo_hygiene;
     _ = hypothesis_core;
     _ = gip;
+    _ = verifier_execution;
+    _ = correction_hooks;
+    _ = negative_knowledge;
+    _ = support_routing;
 }
 
 const TraceCapture = struct {
@@ -9255,4 +9263,702 @@ test "conversation reasoning level is passed into response policy" {
     defer max.deinit();
     try std.testing.expect(max.session.last_result != null);
     try std.testing.expect(max.session.last_result.?.selected_mode == .deep or max.session.last_result.?.selected_mode == .unresolved);
+}
+
+// ── Negative Knowledge Application Pass 1 Tests ──
+
+test "nk application: accepted failed_hypothesis penalizes matching hypothesis" {
+    const allocator = std.testing.allocator;
+    const influences = [_]negative_knowledge.AllowedInfluence{ .triage_penalty, .suppression_rule };
+    var record = try negative_knowledge.acceptNegativeKnowledgeCandidate(allocator, .{
+        .id = "cand:penalty-test",
+        .correction_event_id = "corr:1",
+        .kind = .failed_hypothesis,
+        .scope = .artifact,
+        .condition = "src/main.zig",
+        .evidence_ref = "ev:1",
+        .suppression_rule = "exact_failed_hypothesis",
+    }, .{
+        .approved_by = "test",
+        .approval_kind = .test_fixture,
+        .reason = "fixture",
+        .scope = .artifact,
+        .allowed_influence = &influences,
+    });
+    defer record.deinit();
+
+    var hyp = try hypothesis_core.make(allocator, "hyp:main", "src/main.zig", "code_artifact_schema", .possible_behavior_mismatch, &.{"main evidence"}, &.{}, &.{}, "verify", "main", "main");
+    defer hyp.deinit(allocator);
+
+    var result = try hypothesis_core.triageWithNegativeKnowledge(
+        allocator,
+        &.{hyp},
+        .{ .max_hypotheses_selected = 4 },
+        &.{record},
+        compute_budget.resolve(.{ .tier = .medium }),
+    );
+    defer result.deinit();
+
+    try std.testing.expect(result.negative_knowledge_influence_match_count > 0);
+    try std.testing.expect(result.negative_knowledge_triage_penalty_count > 0);
+    // Hypothesis is NOT marked unsupported solely from NK - just penalized
+    try std.testing.expect(result.items[0].negative_knowledge_match_count > 0);
+    try std.testing.expect(result.items[0].score_breakdown.negative_score > 0);
+    // Trace entries present
+    try std.testing.expect(result.items[0].trace.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, result.items[0].trace, "negative knowledge") != null);
+}
+
+test "nk application: accepted failed_patch requires stronger verifier" {
+    const allocator = std.testing.allocator;
+    const influences = [_]negative_knowledge.AllowedInfluence{ .verifier_requirement, .triage_penalty };
+    var record = try negative_knowledge.acceptNegativeKnowledgeCandidate(allocator, .{
+        .id = "cand:patch-fail",
+        .correction_event_id = "corr:2",
+        .kind = .failed_patch,
+        .scope = .artifact,
+        .condition = "src/api.zig",
+        .evidence_ref = "ev:2",
+        .verifier_requirement = "strong_consistency_check",
+    }, .{
+        .approved_by = "test",
+        .approval_kind = .test_fixture,
+        .reason = "fixture",
+        .scope = .artifact,
+        .allowed_influence = &influences,
+    });
+    defer record.deinit();
+
+    var hyp = try hypothesis_core.make(allocator, "hyp:api", "src/api.zig", "code_artifact_schema", .possible_inconsistency, &.{"api evidence"}, &.{}, &.{}, "verify", "api", "api");
+    defer hyp.deinit(allocator);
+
+    var result = try hypothesis_core.triageWithNegativeKnowledge(
+        allocator,
+        &.{hyp},
+        .{ .max_hypotheses_selected = 4 },
+        &.{record},
+        compute_budget.resolve(.{ .tier = .medium }),
+    );
+    defer result.deinit();
+
+    try std.testing.expect(result.negative_knowledge_verifier_requirement_count > 0);
+    try std.testing.expect(result.items[0].required_verifiers.len > 0);
+    try std.testing.expectEqualStrings("strong_consistency_check", result.items[0].required_verifiers[0]);
+}
+
+test "nk application: rejected record has no effect on triage" {
+    const allocator = std.testing.allocator;
+    var hyp = try hypothesis_core.make(allocator, "hyp:rej-test", "src/a.zig", "code_artifact_schema", .possible_behavior_mismatch, &.{"rej evidence"}, &.{}, &.{}, "verify", "rej", "rej");
+    defer hyp.deinit(allocator);
+
+    const influences = [_]negative_knowledge.AllowedInfluence{.triage_penalty};
+    var record = try negative_knowledge.acceptNegativeKnowledgeCandidate(allocator, .{
+        .id = "cand:rej",
+        .correction_event_id = "corr:rej",
+        .kind = .failed_hypothesis,
+        .scope = .artifact,
+        .condition = "src/a.zig",
+        .evidence_ref = "ev",
+    }, .{
+        .approved_by = "test",
+        .approval_kind = .test_fixture,
+        .reason = "fixture",
+        .scope = .artifact,
+        .allowed_influence = &influences,
+    });
+    defer record.deinit();
+    record.status = .rejected;
+
+    // First triage without any NK records to get baseline score
+    var baseline = try hypothesis_core.triageWithNegativeKnowledge(
+        allocator,
+        &.{hyp},
+        .{ .max_hypotheses_selected = 4 },
+        &.{},
+        compute_budget.resolve(.{ .tier = .medium }),
+    );
+    defer baseline.deinit();
+    const baseline_negative_score = baseline.items[0].score_breakdown.negative_score;
+    const baseline_total_score = baseline.items[0].score;
+
+    // Then triage with the rejected record
+    var result = try hypothesis_core.triageWithNegativeKnowledge(
+        allocator,
+        &.{hyp},
+        .{ .max_hypotheses_selected = 4 },
+        &.{record},
+        compute_budget.resolve(.{ .tier = .medium }),
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.negative_knowledge_influence_match_count);
+    try std.testing.expectEqual(@as(usize, 0), result.negative_knowledge_triage_penalty_count);
+    // Rejected record contributes no additional negative score
+    try std.testing.expectEqual(baseline_negative_score, result.items[0].score_breakdown.negative_score);
+    try std.testing.expectEqual(baseline_total_score, result.items[0].score);
+}
+
+test "nk application: expired record has no effect on triage" {
+    const allocator = std.testing.allocator;
+    var hyp = try hypothesis_core.make(allocator, "hyp:exp", "src/b.zig", "code_artifact_schema", .possible_ambiguity, &.{"exp evidence"}, &.{}, &.{}, "verify", "exp", "exp");
+    defer hyp.deinit(allocator);
+
+    const influences = [_]negative_knowledge.AllowedInfluence{.triage_penalty};
+    var record = try negative_knowledge.acceptNegativeKnowledgeCandidate(allocator, .{
+        .id = "cand:exp",
+        .correction_event_id = "corr:exp",
+        .kind = .failed_hypothesis,
+        .scope = .artifact,
+        .condition = "src/b.zig",
+        .evidence_ref = "ev",
+    }, .{
+        .approved_by = "test",
+        .approval_kind = .test_fixture,
+        .reason = "fixture",
+        .scope = .artifact,
+        .allowed_influence = &influences,
+    });
+    defer record.deinit();
+    record.status = .expired;
+
+    var result = try hypothesis_core.triageWithNegativeKnowledge(
+        allocator,
+        &.{hyp},
+        .{ .max_hypotheses_selected = 4 },
+        &.{record},
+        compute_budget.resolve(.{ .tier = .medium }),
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.negative_knowledge_influence_match_count);
+}
+
+test "nk application: exact repeated failed hypothesis is explicitly suppressed" {
+    const allocator = std.testing.allocator;
+    const influences = [_]negative_knowledge.AllowedInfluence{ .triage_penalty, .suppression_rule };
+    var record = try negative_knowledge.acceptNegativeKnowledgeCandidate(allocator, .{
+        .id = "cand:suppress",
+        .correction_event_id = "corr:suppress",
+        .kind = .failed_hypothesis,
+        .scope = .artifact,
+        .condition = "hyp:exact-fail",
+        .evidence_ref = "ev",
+        .suppression_rule = "exact_failed_hypothesis",
+    }, .{
+        .approved_by = "test",
+        .approval_kind = .test_fixture,
+        .reason = "fixture",
+        .scope = .artifact,
+        .allowed_influence = &influences,
+    });
+    defer record.deinit();
+
+    // Hypothesis with matching ID triggers exact suppression
+    var hyp = try hypothesis_core.make(allocator, "hyp:exact-fail", "src/c.zig", "code_artifact_schema", .possible_behavior_mismatch, &.{"exact evidence"}, &.{}, &.{}, "verify", "exact", "exact");
+    defer hyp.deinit(allocator);
+
+    var result = try hypothesis_core.triageWithNegativeKnowledge(
+        allocator,
+        &.{hyp},
+        .{ .max_hypotheses_selected = 4 },
+        &.{record},
+        compute_budget.resolve(.{ .tier = .medium }),
+    );
+    defer result.deinit();
+
+    try std.testing.expect(result.negative_knowledge_suppression_count > 0);
+    try std.testing.expect(result.items[0].triage_status == .suppressed);
+    try std.testing.expect(result.items[0].suppression_reason != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.items[0].suppression_reason.?, "suppressed by accepted negative knowledge") != null);
+    // Hypothesis is NOT deleted - it's still in the result
+    try std.testing.expectEqual(@as(usize, 1), result.items.len);
+}
+
+test "nk application: overbroad rule creates warning but does not suppress all candidates" {
+    const allocator = std.testing.allocator;
+    const influences = [_]negative_knowledge.AllowedInfluence{.routing_warning};
+    var record = try negative_knowledge.acceptNegativeKnowledgeCandidate(allocator, .{
+        .id = "cand:overbroad",
+        .correction_event_id = "corr:overbroad",
+        .kind = .overbroad_rule,
+        .scope = .project,
+        .condition = "runtime",
+        .evidence_ref = "ev",
+        .triage_penalty = 6,
+    }, .{
+        .approved_by = "test",
+        .approval_kind = .test_fixture,
+        .reason = "fixture",
+        .scope = .project,
+        .allowed_influence = &influences,
+    });
+    defer record.deinit();
+
+    var influence = try negative_knowledge.influenceRoutingEntry(
+        allocator,
+        &.{record},
+        .{ .id = "runtime-candidate", .source_kind = .artifact, .provenance = "runtime candidate", .source_family = .code },
+        compute_budget.resolve(.{ .tier = .medium }),
+    );
+    defer influence.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), influence.warnings.len);
+    // No suppression - overbroad rules only warn
+    try std.testing.expect(influence.suppression_reason == null);
+    try std.testing.expect(influence.triage_delta < 0);
+}
+
+test "nk application: misleading_pack_signal creates trust_decay_candidate only" {
+    const allocator = std.testing.allocator;
+    const influences = [_]negative_knowledge.AllowedInfluence{ .routing_warning, .pack_trust_decay_candidate };
+    var record = try negative_knowledge.acceptNegativeKnowledgeCandidate(allocator, .{
+        .id = "cand:mislead",
+        .correction_event_id = "corr:mislead",
+        .kind = .misleading_pack_signal,
+        .scope = .pack,
+        .condition = "pack:runtime",
+        .evidence_ref = "ev",
+        .trust_decay_suggestion = "pack:runtime stale signal",
+    }, .{
+        .approved_by = "test",
+        .approval_kind = .test_fixture,
+        .reason = "fixture",
+        .scope = .pack,
+        .allowed_influence = &influences,
+    });
+    defer record.deinit();
+
+    var influence = try negative_knowledge.influenceRoutingEntry(
+        allocator,
+        &.{record},
+        .{ .id = "pack:runtime", .source_kind = .knowledge_pack_preview, .provenance = "pack:runtime", .source_family = .pack },
+        compute_budget.resolve(.{ .tier = .medium }),
+    );
+    defer influence.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), influence.warnings.len);
+    try std.testing.expectEqual(@as(usize, 1), influence.trust_decay_candidates.len);
+    try std.testing.expect(influence.suppression_reason == null);
+    // Trust decay is a *candidate* only - does not mutate pack trust
+    try std.testing.expect(influence.non_authorizing);
+}
+
+test "nk application: unknown evidence is distinct from negative evidence" {
+    const allocator = std.testing.allocator;
+    var hyp = try hypothesis_core.make(allocator, "hyp:unknown", "src/unknown.zig", "code_artifact_schema", .possible_behavior_mismatch, &.{}, &.{}, &.{}, "verify", "unknown", "unknown");
+    defer hyp.deinit(allocator);
+
+    // Empty records = unknown (no evidence), not negative evidence
+    var first = try negative_knowledge.influenceHypothesis(allocator, &.{}, hyp, compute_budget.resolve(.{ .tier = .medium }));
+    defer first.deinit();
+    try std.testing.expectEqual(@as(usize, 0), first.matched_record_ids.len);
+    try std.testing.expectEqual(@as(i32, 0), first.triage_delta);
+    try std.testing.expect(first.suppression_reason == null);
+    try std.testing.expect(first.non_authorizing);
+
+    // Same empty = deterministic
+    var second = try negative_knowledge.influenceHypothesis(allocator, &.{}, hyp, compute_budget.resolve(.{ .tier = .medium }));
+    defer second.deinit();
+    try std.testing.expectEqual(first.triage_delta, second.triage_delta);
+    try std.testing.expectEqual(first.matched_record_ids.len, second.matched_record_ids.len);
+}
+
+test "nk application: influence is deterministic across runs" {
+    const allocator = std.testing.allocator;
+    const influences = [_]negative_knowledge.AllowedInfluence{ .triage_penalty, .verifier_requirement };
+    var record = try negative_knowledge.acceptNegativeKnowledgeCandidate(allocator, .{
+        .id = "cand:det",
+        .correction_event_id = "corr:det",
+        .kind = .failed_hypothesis,
+        .scope = .artifact,
+        .condition = "src/det.zig",
+        .evidence_ref = "ev",
+        .verifier_requirement = "deterministic_check",
+    }, .{
+        .approved_by = "test",
+        .approval_kind = .test_fixture,
+        .reason = "fixture",
+        .scope = .artifact,
+        .allowed_influence = &influences,
+    });
+    defer record.deinit();
+
+    var hyp = try hypothesis_core.make(allocator, "hyp:det", "src/det.zig", "code_artifact_schema", .possible_behavior_mismatch, &.{"det evidence"}, &.{}, &.{}, "verify", "det", "det");
+    defer hyp.deinit(allocator);
+
+    var a = try negative_knowledge.influenceHypothesis(allocator, &.{record}, hyp, compute_budget.resolve(.{ .tier = .medium }));
+    defer a.deinit();
+    var b = try negative_knowledge.influenceHypothesis(allocator, &.{record}, hyp, compute_budget.resolve(.{ .tier = .medium }));
+    defer b.deinit();
+
+    try std.testing.expectEqual(a.triage_delta, b.triage_delta);
+    try std.testing.expectEqual(a.matched_record_ids.len, b.matched_record_ids.len);
+    try std.testing.expectEqual(a.required_verifiers.len, b.required_verifiers.len);
+    try std.testing.expectEqual(a.trace_entries.len, b.trace_entries.len);
+}
+
+test "nk application: influence respects budget caps" {
+    const allocator = std.testing.allocator;
+    const influences = [_]negative_knowledge.AllowedInfluence{.triage_penalty};
+    var a = try negative_knowledge.acceptNegativeKnowledgeCandidate(allocator, .{ .id = "cand:cap1", .correction_event_id = "corr", .kind = .failed_hypothesis, .scope = .artifact, .condition = "src/a.zig", .evidence_ref = "ev" }, .{ .approved_by = "test", .approval_kind = .test_fixture, .reason = "fixture", .scope = .artifact, .allowed_influence = &influences });
+    defer a.deinit();
+    var b = try negative_knowledge.acceptNegativeKnowledgeCandidate(allocator, .{ .id = "cand:cap2", .correction_event_id = "corr", .kind = .failed_hypothesis, .scope = .artifact, .condition = "src/a.zig", .evidence_ref = "ev" }, .{ .approved_by = "test", .approval_kind = .test_fixture, .reason = "fixture", .scope = .artifact, .allowed_influence = &influences });
+    defer b.deinit();
+    var hyp = try hypothesis_core.make(allocator, "hyp:budget", "src/a.zig", "code_artifact_schema", .possible_behavior_mismatch, &.{}, &.{}, &.{}, "verify", "budget", "budget");
+    defer hyp.deinit(allocator);
+    var influence = try negative_knowledge.influenceHypothesis(allocator, &.{ a, b }, hyp, compute_budget.resolve(.{ .tier = .medium, .overrides = .{ .max_negative_knowledge_influence_matches = 1 } }));
+    defer influence.deinit();
+    try std.testing.expectEqual(@as(usize, 1), influence.matched_record_ids.len);
+    try std.testing.expect(influence.budget_exhausted != null);
+}
+
+test "nk application: support graph influence nodes cannot support final output" {
+    const allocator = std.testing.allocator;
+    const influences = [_]negative_knowledge.AllowedInfluence{ .triage_penalty, .verifier_requirement };
+    var record = try negative_knowledge.acceptNegativeKnowledgeCandidate(allocator, .{
+        .id = "cand:graph",
+        .correction_event_id = "corr:graph",
+        .kind = .failed_hypothesis,
+        .scope = .artifact,
+        .condition = "src/graph.zig",
+        .evidence_ref = "ev",
+        .verifier_requirement = "graph_check",
+    }, .{
+        .approved_by = "test",
+        .approval_kind = .test_fixture,
+        .reason = "fixture",
+        .scope = .artifact,
+        .allowed_influence = &influences,
+    });
+    defer record.deinit();
+
+    var hyp = try hypothesis_core.make(allocator, "hyp:graph", "src/graph.zig", "code_artifact_schema", .possible_behavior_mismatch, &.{"graph evidence"}, &.{}, &.{}, "verify", "graph", "graph");
+    defer hyp.deinit(allocator);
+
+    var influence_result = try negative_knowledge.influenceHypothesis(allocator, &.{record}, hyp, compute_budget.resolve(.{ .tier = .medium }));
+    defer influence_result.deinit();
+
+    var nodes = std.ArrayList(code_intel.SupportGraphNode).init(allocator);
+    defer {
+        for (nodes.items) |node| {
+            allocator.free(node.id);
+            allocator.free(node.label);
+            if (node.rel_path) |p| allocator.free(p);
+            if (node.detail) |d| allocator.free(d);
+        }
+        nodes.deinit();
+    }
+    var edges = std.ArrayList(code_intel.SupportGraphEdge).init(allocator);
+    defer {
+        for (edges.items) |edge| {
+            allocator.free(edge.from_id);
+            allocator.free(edge.to_id);
+        }
+        edges.deinit();
+    }
+
+    try correction_hooks.appendNegativeKnowledgeInfluenceToSupportGraph(
+        allocator,
+        &nodes,
+        &edges,
+        "output:1",
+        influence_result.trace_entries,
+        "hyp:graph",
+    );
+
+    // All nodes are non-authorizing (not usable)
+    for (nodes.items) |node| {
+        try std.testing.expect(!node.usable);
+    }
+
+    // No supported_by edges
+    for (edges.items) |edge| {
+        try std.testing.expect(edge.kind != .supported_by);
+    }
+
+    // Must have at least one influence node
+    try std.testing.expect(nodes.items.len > 0);
+    try std.testing.expect(edges.items.len > 0);
+}
+
+test "nk application: non-code artifacts use same influence model" {
+    const allocator = std.testing.allocator;
+    const influences = [_]negative_knowledge.AllowedInfluence{ .verifier_requirement, .triage_penalty };
+    var record = try negative_knowledge.acceptNegativeKnowledgeCandidate(allocator, .{
+        .id = "cand:doc",
+        .correction_event_id = "corr:doc",
+        .kind = .failed_patch,
+        .scope = .artifact,
+        .condition = "docs/contract.md",
+        .evidence_ref = "ev",
+        .verifier_requirement = "strong_consistency_check",
+    }, .{
+        .approved_by = "test",
+        .approval_kind = .test_fixture,
+        .reason = "fixture",
+        .scope = .artifact,
+        .allowed_influence = &influences,
+    });
+    defer record.deinit();
+
+    var hyp = try hypothesis_core.make(allocator, "hyp:doc", "docs/contract.md", "document_schema", .possible_unsupported_claim, &.{"doc evidence"}, &.{}, &.{}, "verify", "doc", "doc");
+    defer hyp.deinit(allocator);
+
+    var result = try hypothesis_core.triageWithNegativeKnowledge(
+        allocator,
+        &.{hyp},
+        .{ .max_hypotheses_selected = 4 },
+        &.{record},
+        compute_budget.resolve(.{ .tier = .medium }),
+    );
+    defer result.deinit();
+
+    try std.testing.expect(result.negative_knowledge_influence_match_count > 0);
+    try std.testing.expect(result.negative_knowledge_triage_penalty_count > 0);
+    try std.testing.expect(result.negative_knowledge_verifier_requirement_count > 0);
+    try std.testing.expect(result.items[0].required_verifiers.len > 0);
+}
+
+test "nk application: routing select with negative knowledge applies penalties" {
+    const allocator = std.testing.allocator;
+    const influences = [_]negative_knowledge.AllowedInfluence{ .routing_warning, .pack_trust_decay_candidate };
+    var record = try negative_knowledge.acceptNegativeKnowledgeCandidate(allocator, .{
+        .id = "cand:routing",
+        .correction_event_id = "corr:routing",
+        .kind = .misleading_pack_signal,
+        .scope = .pack,
+        .condition = "pack:noisy",
+        .evidence_ref = "ev",
+        .trust_decay_suggestion = "pack:noisy stale signal",
+    }, .{
+        .approved_by = "test",
+        .approval_kind = .test_fixture,
+        .reason = "fixture",
+        .scope = .pack,
+        .allowed_influence = &influences,
+    });
+    defer record.deinit();
+
+    const entries = [_]support_routing.Entry{
+        .{ .id = "pack:noisy", .source_kind = .knowledge_pack_preview, .provenance = "pack:noisy", .source_family = .pack, .trust_class = .promoted, .freshness_state = .active },
+        .{ .id = "code:clean", .source_kind = .artifact, .provenance = "clean", .source_family = .code, .trust_class = .core, .freshness_state = .active },
+    };
+
+    // Without NK
+    var trace_no_nk = try support_routing.select(allocator, &entries, .{ .max_selected = 2 });
+    defer trace_no_nk.deinit();
+
+    // With NK
+    var trace_with_nk = try support_routing.selectWithNegativeKnowledge(
+        allocator,
+        &entries,
+        .{ .max_selected = 2 },
+        &.{record},
+        compute_budget.resolve(.{ .tier = .medium }),
+    );
+    defer trace_with_nk.deinit();
+
+    // The noisy pack entry should have a lower score when NK is applied
+    try std.testing.expect(trace_with_nk.negative_knowledge_routing_warning_count > 0);
+    // Both should still select the clean code entry
+    try std.testing.expect(trace_with_nk.selected_count > 0);
+}
+
+test "nk application: influence trace entries are complete" {
+    const allocator = std.testing.allocator;
+    const influences = [_]negative_knowledge.AllowedInfluence{ .triage_penalty, .verifier_requirement, .suppression_rule };
+    var record = try negative_knowledge.acceptNegativeKnowledgeCandidate(allocator, .{
+        .id = "cand:trace",
+        .correction_event_id = "corr:trace",
+        .kind = .failed_hypothesis,
+        .scope = .artifact,
+        .condition = "src/trace.zig",
+        .evidence_ref = "ev",
+        .verifier_requirement = "trace_check",
+        .suppression_rule = "exact_failed_hypothesis",
+    }, .{
+        .approved_by = "test",
+        .approval_kind = .test_fixture,
+        .reason = "fixture",
+        .scope = .artifact,
+        .allowed_influence = &influences,
+    });
+    defer record.deinit();
+
+    var hyp = try hypothesis_core.make(allocator, "hyp:trace", "src/trace.zig", "code_artifact_schema", .possible_behavior_mismatch, &.{"trace evidence"}, &.{}, &.{}, "verify", "trace", "trace");
+    defer hyp.deinit(allocator);
+
+    var influence = try negative_knowledge.influenceHypothesis(allocator, &.{record}, hyp, compute_budget.resolve(.{ .tier = .medium }));
+    defer influence.deinit();
+
+    try std.testing.expect(influence.trace_entries.len > 0);
+
+    for (influence.trace_entries) |entry| {
+        try std.testing.expect(entry.record_id.len > 0);
+        try std.testing.expect(entry.matched_scope.len > 0);
+        try std.testing.expect(entry.non_authorizing);
+        switch (entry.influence_kind) {
+            .triage_penalty => {
+                try std.testing.expect(entry.triage_delta < 0);
+            },
+            .verifier_requirement => {
+                try std.testing.expect(entry.verifier_requirement != null);
+            },
+            .suppression_rule => {
+                try std.testing.expect(entry.suppression_reason != null);
+            },
+            else => {},
+        }
+    }
+}
+
+test "nk application: influenceVerifierCandidate blocks unsafe verifier reuse" {
+    const allocator = std.testing.allocator;
+    const influences = [_]negative_knowledge.AllowedInfluence{ .verifier_requirement, .suppression_rule };
+    var record = try negative_knowledge.acceptNegativeKnowledgeCandidate(allocator, .{
+        .id = "cand:unsafe-vc",
+        .correction_event_id = "corr:unsafe",
+        .kind = .unsafe_verifier_candidate,
+        .scope = .artifact,
+        .condition = "cand:bad-verifier",
+        .evidence_ref = "ev",
+        .verifier_requirement = "stronger_verifier",
+    }, .{
+        .approved_by = "test",
+        .approval_kind = .test_fixture,
+        .reason = "fixture",
+        .scope = .artifact,
+        .allowed_influence = &influences,
+    });
+    defer record.deinit();
+
+    var candidate = verifier_adapter.VerifierCandidate{
+        .allocator = allocator,
+        .id = try allocator.dupe(u8, "cand:bad-verifier"),
+        .hypothesis_id = try allocator.dupe(u8, "hyp:unsafe"),
+        .candidate_kind = .regression_test,
+        .artifact_scope = try allocator.dupe(u8, "src/main.zig"),
+        .target_claim_surface = try allocator.dupe(u8, "test_target"),
+        .proposed_check = try allocator.dupe(u8, "test check"),
+        .provenance = try allocator.dupe(u8, "test"),
+        .trace = try allocator.dupe(u8, "proposed"),
+    };
+    defer candidate.deinit();
+
+    var influence = try negative_knowledge.influenceVerifierCandidate(
+        allocator,
+        &.{record},
+        .{
+            .id = candidate.id,
+            .artifact_scope = candidate.artifact_scope,
+            .target_claim_surface = candidate.target_claim_surface,
+            .proposed_check = candidate.proposed_check,
+            .provenance = candidate.provenance,
+        },
+        compute_budget.resolve(.{ .tier = .medium }),
+    );
+    defer influence.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), influence.matched_record_ids.len);
+    try std.testing.expect(influence.suppression_reason != null);
+    try std.testing.expect(std.mem.indexOf(u8, influence.suppression_reason.?, "blocked unsafe verifier candidate") != null);
+    try std.testing.expect(influence.required_verifiers.len > 0);
+    try std.testing.expectEqualStrings("stronger_verifier", influence.required_verifiers[0]);
+}
+
+test "nk application: influenceVerifierCandidate distinguishes requires stronger verifier from failed" {
+    const allocator = std.testing.allocator;
+    const influences = [_]negative_knowledge.AllowedInfluence{.verifier_requirement};
+    var record = try negative_knowledge.acceptNegativeKnowledgeCandidate(allocator, .{
+        .id = "cand:patch-vc",
+        .correction_event_id = "corr:patch",
+        .kind = .failed_patch,
+        .scope = .artifact,
+        .condition = "src/api.zig",
+        .evidence_ref = "ev",
+        .verifier_requirement = "enhanced_patch_check",
+    }, .{
+        .approved_by = "test",
+        .approval_kind = .test_fixture,
+        .reason = "fixture",
+        .scope = .artifact,
+        .allowed_influence = &influences,
+    });
+    defer record.deinit();
+
+    var candidate = verifier_adapter.VerifierCandidate{
+        .allocator = allocator,
+        .id = try allocator.dupe(u8, "cand:patch-retry"),
+        .hypothesis_id = try allocator.dupe(u8, "hyp:patch"),
+        .candidate_kind = .regression_test,
+        .artifact_scope = try allocator.dupe(u8, "src/api.zig"),
+        .target_claim_surface = try allocator.dupe(u8, "api_target"),
+        .proposed_check = try allocator.dupe(u8, "patch check"),
+        .provenance = try allocator.dupe(u8, "test"),
+        .trace = try allocator.dupe(u8, "proposed"),
+    };
+    defer candidate.deinit();
+
+    var influence = try negative_knowledge.influenceVerifierCandidate(
+        allocator,
+        &.{record},
+        .{
+            .id = candidate.id,
+            .artifact_scope = candidate.artifact_scope,
+            .target_claim_surface = candidate.target_claim_surface,
+            .proposed_check = candidate.proposed_check,
+            .provenance = candidate.provenance,
+        },
+        compute_budget.resolve(.{ .tier = .medium }),
+    );
+    defer influence.deinit();
+
+    // Requires stronger verifier but NOT suppressed (not unsafe_verifier_candidate kind)
+    try std.testing.expect(influence.required_verifiers.len > 0);
+    try std.testing.expect(influence.suppression_reason == null);
+    try std.testing.expect(influence.warnings.len > 0);
+}
+
+test "nk application: unknown vs negative evidence distinction is explicit" {
+    const allocator = std.testing.allocator;
+
+    // Test with no records: unknown state
+    var hyp = try hypothesis_core.make(allocator, "hyp:ev-test", "src/ev.zig", "code_artifact_schema", .possible_behavior_mismatch, &.{}, &.{}, &.{}, "verify", "ev", "ev");
+    defer hyp.deinit(allocator);
+
+    var unknown_influence = try negative_knowledge.influenceHypothesis(allocator, &.{}, hyp, compute_budget.resolve(.{ .tier = .medium }));
+    defer unknown_influence.deinit();
+
+    // Unknown: no matches, no delta, no trace entries
+    try std.testing.expectEqual(@as(usize, 0), unknown_influence.matched_record_ids.len);
+    try std.testing.expectEqual(@as(i32, 0), unknown_influence.triage_delta);
+    try std.testing.expectEqual(@as(usize, 0), unknown_influence.trace_entries.len);
+
+    // Test with accepted record that matches: negative evidence
+    const influences = [_]negative_knowledge.AllowedInfluence{.triage_penalty};
+    var record = try negative_knowledge.acceptNegativeKnowledgeCandidate(allocator, .{
+        .id = "cand:ev-match",
+        .correction_event_id = "corr:ev",
+        .kind = .failed_hypothesis,
+        .scope = .artifact,
+        .condition = "src/ev.zig",
+        .evidence_ref = "ev",
+    }, .{
+        .approved_by = "test",
+        .approval_kind = .test_fixture,
+        .reason = "fixture",
+        .scope = .artifact,
+        .allowed_influence = &influences,
+    });
+    defer record.deinit();
+
+    var negative_influence = try negative_knowledge.influenceHypothesis(allocator, &.{record}, hyp, compute_budget.resolve(.{ .tier = .medium }));
+    defer negative_influence.deinit();
+
+    // Negative evidence: matches, delta, trace entries
+    try std.testing.expect(negative_influence.matched_record_ids.len > 0);
+    try std.testing.expect(negative_influence.triage_delta < 0);
+    try std.testing.expect(negative_influence.trace_entries.len > 0);
+    // The trace entry explicitly labels the influence kind
+    try std.testing.expect(negative_influence.trace_entries[0].influence_kind == .triage_penalty);
 }

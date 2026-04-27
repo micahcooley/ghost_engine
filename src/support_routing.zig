@@ -1,4 +1,6 @@
 const std = @import("std");
+const compute_budget = @import("compute_budget.zig");
+const negative_knowledge = @import("negative_knowledge.zig");
 
 pub const SourceKind = enum {
     artifact,
@@ -156,6 +158,8 @@ pub const Trace = struct {
     skipped_count: usize = 0,
     suppressed_count: usize = 0,
     budget_cap_hit: bool = false,
+    negative_knowledge_routing_warning_count: usize = 0,
+    negative_knowledge_trust_decay_candidate_count: usize = 0,
     entries: []Decision = &.{},
 
     pub fn deinit(self: *Trace) void {
@@ -272,6 +276,100 @@ pub fn select(allocator: std.mem.Allocator, entries: []const Entry, caps: Caps) 
             if (status == .suppressed) trace.suppressed_count += 1;
         }
         try appendDecisionBounded(allocator, &decisions, caps, item.entry, item.upper, status, skip, considered_rank, if (status == .selected) selected_rank else 0);
+    }
+
+    trace.entries = try decisions.toOwnedSlice();
+    return trace;
+}
+
+pub fn selectWithNegativeKnowledge(
+    allocator: std.mem.Allocator,
+    entries: []const Entry,
+    caps: Caps,
+    negative_records: []const negative_knowledge.Record,
+    budget: compute_budget.Effective,
+) !Trace {
+    const nk = @import("negative_knowledge.zig");
+
+    var ranked = try allocator.alloc(Ranked, entries.len);
+    defer allocator.free(ranked);
+    for (entries, 0..) |entry, idx| {
+        var upper = supportPotentialUpperBound(entry);
+        // Apply NK routing influence
+        if (negative_records.len > 0) {
+            var influence = try nk.influenceRoutingEntry(allocator, negative_records, entry, budget);
+            defer influence.deinit();
+            if (influence.triage_delta < 0) {
+                const penalty = @as(u16, @intCast(@min(-influence.triage_delta, 200)));
+                if (upper > penalty) upper -= penalty else upper = 0;
+            }
+        }
+        ranked[idx] = .{ .entry = entry, .upper = upper };
+    }
+    std.sort.heap(Ranked, ranked, {}, lessThanRanked);
+
+    var decisions = std.ArrayList(Decision).init(allocator);
+    errdefer {
+        for (decisions.items) |*decision| decision.deinit();
+        decisions.deinit();
+    }
+    var selected = std.ArrayList(Entry).init(allocator);
+    defer selected.deinit();
+    var counts = FamilyCounts{};
+    var trace = Trace{ .allocator = allocator };
+    var considered_rank: u16 = 0;
+    var selected_rank: u16 = 0;
+
+    for (ranked, 0..) |item, idx| {
+        if (idx >= caps.max_considered) {
+            trace.budget_cap_hit = true;
+            trace.skipped_count += 1;
+            try appendDecisionBounded(allocator, &decisions, caps, item.entry, item.upper, .suppressed, .considered_budget, 0, 0);
+            continue;
+        }
+        trace.considered_count += 1;
+        considered_rank += 1;
+
+        var status: Status = .selected;
+        var skip: SkipReason = .none;
+        if (item.entry.conflict) {
+            status = .suppressed;
+            skip = .conflict_state;
+        } else if (item.entry.freshness_state == .stale or item.entry.trust_class == .exploratory and item.upper < 260) {
+            status = .skipped;
+            skip = .stale_or_low_trust;
+        } else if (item.upper < 220) {
+            status = .skipped;
+            skip = .low_support_potential;
+        } else if (familyCount(counts, item.entry.source_family) >= familyLimit(caps, item.entry.source_family)) {
+            status = .suppressed;
+            skip = .source_family_quota;
+        } else if (selected.items.len >= caps.max_selected) {
+            status = .suppressed;
+            skip = .selection_budget;
+            trace.budget_cap_hit = true;
+        }
+
+        if (status == .selected) {
+            selected_rank += 1;
+            try selected.append(item.entry);
+            incrementFamily(&counts, item.entry.source_family);
+            trace.selected_count += 1;
+        } else {
+            trace.skipped_count += 1;
+            if (status == .suppressed) trace.suppressed_count += 1;
+        }
+        try appendDecisionBounded(allocator, &decisions, caps, item.entry, item.upper, status, skip, considered_rank, if (status == .selected) selected_rank else 0);
+    }
+
+    // Collect aggregate NK influence counts across all considered entries
+    if (negative_records.len > 0) {
+        for (ranked) |item| {
+            var influence = try nk.influenceRoutingEntry(allocator, negative_records, item.entry, budget);
+            defer influence.deinit();
+            trace.negative_knowledge_routing_warning_count += influence.warnings.len;
+            trace.negative_knowledge_trust_decay_candidate_count += influence.trust_decay_candidates.len;
+        }
     }
 
     trace.entries = try decisions.toOwnedSlice();

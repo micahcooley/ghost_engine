@@ -179,6 +179,7 @@ pub const TriageResult = struct {
     negative_knowledge_triage_penalty_count: usize = 0,
     negative_knowledge_verifier_requirement_count: usize = 0,
     negative_knowledge_suppression_count: usize = 0,
+    negative_knowledge_routing_warning_count: usize = 0,
     negative_knowledge_budget_hit_count: usize = 0,
     top_selected_kinds: []const []const u8 = &.{},
     items: []TriageItem = &.{},
@@ -283,6 +284,7 @@ pub fn triageWithNegativeKnowledge(
             try trace.writer().writeAll("; verifier requirement added");
         }
         if (influence.budget_exhausted != null) result.negative_knowledge_budget_hit_count += 1;
+        result.negative_knowledge_routing_warning_count += influence.warnings.len;
         items[idx] = .{
             .hypothesis_id = try allocator.dupe(u8, hypothesis.id),
             .score = score,

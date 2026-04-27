@@ -168,6 +168,35 @@ pub const ReviewEvent = struct {
     }
 };
 
+pub const InfluenceKind = enum {
+    triage_penalty,
+    verifier_requirement,
+    suppression_rule,
+    routing_warning,
+    trust_decay_candidate,
+};
+
+pub const InfluenceTraceEntry = struct {
+    allocator: std.mem.Allocator,
+    record_id: []u8,
+    matched_scope: []u8,
+    influence_kind: InfluenceKind,
+    triage_delta: i32 = 0,
+    verifier_requirement: ?[]u8 = null,
+    warning: ?[]u8 = null,
+    suppression_reason: ?[]u8 = null,
+    non_authorizing: bool = true,
+
+    pub fn deinit(self: *InfluenceTraceEntry) void {
+        self.allocator.free(self.record_id);
+        self.allocator.free(self.matched_scope);
+        if (self.verifier_requirement) |v| self.allocator.free(v);
+        if (self.warning) |v| self.allocator.free(v);
+        if (self.suppression_reason) |v| self.allocator.free(v);
+        self.* = undefined;
+    }
+};
+
 pub const InfluenceResult = struct {
     allocator: std.mem.Allocator,
     matched_record_ids: [][]u8 = &.{},
@@ -176,6 +205,7 @@ pub const InfluenceResult = struct {
     required_verifiers: [][]u8 = &.{},
     suppression_reason: ?[]u8 = null,
     trust_decay_candidates: [][]u8 = &.{},
+    trace_entries: []InfluenceTraceEntry = &.{},
     budget_exhausted: ?compute_budget.Exhaustion = null,
     non_authorizing: bool = true,
 
@@ -185,9 +215,19 @@ pub const InfluenceResult = struct {
         freeStringList(self.allocator, self.required_verifiers);
         if (self.suppression_reason) |value| self.allocator.free(value);
         freeStringList(self.allocator, self.trust_decay_candidates);
+        for (self.trace_entries) |*entry| entry.deinit();
+        if (self.trace_entries.len != 0) self.allocator.free(self.trace_entries);
         if (self.budget_exhausted) |*value| value.deinit();
         self.* = undefined;
     }
+};
+
+pub const VerifierCandidateView = struct {
+    id: []const u8,
+    artifact_scope: []const u8,
+    target_claim_surface: []const u8,
+    proposed_check: []const u8,
+    provenance: []const u8,
 };
 
 pub const Summary = struct {
@@ -199,6 +239,7 @@ pub const Summary = struct {
     triage_penalty_count: usize = 0,
     verifier_requirement_count: usize = 0,
     suppression_count: usize = 0,
+    routing_warning_count: usize = 0,
     trust_decay_candidate_count: usize = 0,
 };
 
@@ -292,6 +333,11 @@ pub fn influenceHypothesis(
     errdefer freeStringList(allocator, warnings.items);
     var verifiers = std.ArrayList([]u8).init(allocator);
     errdefer freeStringList(allocator, verifiers.items);
+    var traces = std.ArrayList(InfluenceTraceEntry).init(allocator);
+    errdefer {
+        for (traces.items) |*t| t.deinit();
+        traces.deinit();
+    }
     var matches: usize = 0;
 
     for (records) |record| {
@@ -303,15 +349,52 @@ pub fn influenceHypothesis(
         }
         matches += 1;
         try matched.append(try allocator.dupe(u8, record.id));
+        const matched_scope = try matchedScopeText(allocator, record);
+        defer allocator.free(matched_scope);
+
         if (record.triage_penalty) |penalty| {
-            result.triage_delta -= @max(0, penalty);
+            const delta = @max(0, penalty);
+            result.triage_delta -= delta;
+            if (traces.items.len < budget.max_negative_knowledge_trace_items) {
+                try traces.append(.{
+                    .allocator = allocator,
+                    .record_id = try allocator.dupe(u8, record.id),
+                    .matched_scope = try allocator.dupe(u8, matched_scope),
+                    .influence_kind = .triage_penalty,
+                    .triage_delta = -@as(i32, @intCast(delta)),
+                    .non_authorizing = true,
+                });
+            }
         }
         if (record.verifier_requirement) |req| {
-            if (!containsString(verifiers.items, req)) try verifiers.append(try allocator.dupe(u8, req));
+            if (!containsString(verifiers.items, req)) {
+                try verifiers.append(try allocator.dupe(u8, req));
+            }
+            if (traces.items.len < budget.max_negative_knowledge_trace_items) {
+                try traces.append(.{
+                    .allocator = allocator,
+                    .record_id = try allocator.dupe(u8, record.id),
+                    .matched_scope = try allocator.dupe(u8, matched_scope),
+                    .influence_kind = .verifier_requirement,
+                    .verifier_requirement = try allocator.dupe(u8, req),
+                    .non_authorizing = true,
+                });
+            }
         }
         if (record.suppression_rule) |rule| {
             if (suppressionMatches(record, hypothesis, rule) and result.suppression_reason == null) {
-                result.suppression_reason = try std.fmt.allocPrint(allocator, "suppressed by accepted negative knowledge {s}: {s}", .{ record.id, rule });
+                const reason = try std.fmt.allocPrint(allocator, "suppressed by accepted negative knowledge {s}: {s}", .{ record.id, rule });
+                result.suppression_reason = reason;
+                if (traces.items.len < budget.max_negative_knowledge_trace_items) {
+                    try traces.append(.{
+                        .allocator = allocator,
+                        .record_id = try allocator.dupe(u8, record.id),
+                        .matched_scope = try allocator.dupe(u8, matched_scope),
+                        .influence_kind = .suppression_rule,
+                        .suppression_reason = try allocator.dupe(u8, reason),
+                        .non_authorizing = true,
+                    });
+                }
             }
         }
         try warnings.append(try std.fmt.allocPrint(allocator, "negative knowledge accepted for scoped influence: {s}", .{record.id}));
@@ -320,6 +403,7 @@ pub fn influenceHypothesis(
     result.matched_record_ids = try matched.toOwnedSlice();
     result.warnings = try warnings.toOwnedSlice();
     result.required_verifiers = try verifiers.toOwnedSlice();
+    result.trace_entries = try traces.toOwnedSlice();
     return result;
 }
 
@@ -337,6 +421,11 @@ pub fn influenceRoutingEntry(
     errdefer freeStringList(allocator, warnings.items);
     var trust = std.ArrayList([]u8).init(allocator);
     errdefer freeStringList(allocator, trust.items);
+    var traces = std.ArrayList(InfluenceTraceEntry).init(allocator);
+    errdefer {
+        for (traces.items) |*t| t.deinit();
+        traces.deinit();
+    }
 
     var matches: usize = 0;
     for (records) |record| {
@@ -348,11 +437,40 @@ pub fn influenceRoutingEntry(
         }
         matches += 1;
         try matched.append(try allocator.dupe(u8, record.id));
-        try warnings.append(try std.fmt.allocPrint(allocator, "routing warning from accepted negative knowledge {s}", .{record.id}));
-        result.triage_delta -= @max(0, record.triage_penalty orelse 8);
+        const matched_scope = try matchedScopeText(allocator, record);
+        defer allocator.free(matched_scope);
+
+        const penalty = @max(0, record.triage_penalty orelse 8);
+        result.triage_delta -= penalty;
+
+        const warning_text = try std.fmt.allocPrint(allocator, "routing warning from accepted negative knowledge {s}", .{record.id});
+        try warnings.append(warning_text);
+
+        if (traces.items.len < budget.max_negative_knowledge_trace_items) {
+            try traces.append(.{
+                .allocator = allocator,
+                .record_id = try allocator.dupe(u8, record.id),
+                .matched_scope = try allocator.dupe(u8, matched_scope),
+                .influence_kind = .routing_warning,
+                .triage_delta = -@as(i32, @intCast(penalty)),
+                .warning = try allocator.dupe(u8, warning_text),
+                .non_authorizing = true,
+            });
+        }
         if (record.trust_decay_suggestion) |suggestion| {
             if (trust.items.len < budget.max_trust_decay_candidates) {
-                try trust.append(try std.fmt.allocPrint(allocator, "trust decay candidate proposed: {s}", .{suggestion}));
+                const candidate_text = try std.fmt.allocPrint(allocator, "trust decay candidate proposed: {s}", .{suggestion});
+                try trust.append(candidate_text);
+                if (traces.items.len < budget.max_negative_knowledge_trace_items) {
+                    try traces.append(.{
+                        .allocator = allocator,
+                        .record_id = try allocator.dupe(u8, record.id),
+                        .matched_scope = try allocator.dupe(u8, record.id),
+                        .influence_kind = .trust_decay_candidate,
+                        .warning = try allocator.dupe(u8, candidate_text),
+                        .non_authorizing = true,
+                    });
+                }
             }
         }
     }
@@ -360,6 +478,96 @@ pub fn influenceRoutingEntry(
     result.matched_record_ids = try matched.toOwnedSlice();
     result.warnings = try warnings.toOwnedSlice();
     result.trust_decay_candidates = try trust.toOwnedSlice();
+    result.trace_entries = try traces.toOwnedSlice();
+    return result;
+}
+
+pub fn influenceVerifierCandidate(
+    allocator: std.mem.Allocator,
+    records: []const Record,
+    candidate: VerifierCandidateView,
+    budget: compute_budget.Effective,
+) !InfluenceResult {
+    var result = InfluenceResult{ .allocator = allocator };
+    errdefer result.deinit();
+    var matched = std.ArrayList([]u8).init(allocator);
+    errdefer freeStringList(allocator, matched.items);
+    var warnings = std.ArrayList([]u8).init(allocator);
+    errdefer freeStringList(allocator, warnings.items);
+    var verifiers = std.ArrayList([]u8).init(allocator);
+    errdefer freeStringList(allocator, verifiers.items);
+    var traces = std.ArrayList(InfluenceTraceEntry).init(allocator);
+    errdefer {
+        for (traces.items) |*t| t.deinit();
+        traces.deinit();
+    }
+    var matches: usize = 0;
+
+    for (records) |record| {
+        if (record.status != .accepted) continue;
+        const kind_matches = switch (record.kind) {
+            .failed_patch, .failed_repair_strategy, .insufficient_test, .unsafe_verifier_candidate => true,
+            else => false,
+        };
+        if (!kind_matches) continue;
+        const text_matches = recordMatchesText(record, candidate.id) or
+            recordMatchesText(record, candidate.artifact_scope) or
+            recordMatchesText(record, candidate.target_claim_surface) or
+            recordMatchesText(record, candidate.proposed_check) or
+            recordMatchesText(record, candidate.provenance);
+        if (!text_matches) continue;
+        if (matches >= budget.max_negative_knowledge_influence_matches) {
+            result.budget_exhausted = try compute_budget.Exhaustion.init(allocator, .max_negative_knowledge_influence_matches, .negative_knowledge, matches + 1, budget.max_negative_knowledge_influence_matches, "negative knowledge verifier influence cap hit", "remaining accepted records skipped");
+            break;
+        }
+        matches += 1;
+        try matched.append(try allocator.dupe(u8, record.id));
+        const matched_scope = try matchedScopeText(allocator, record);
+        defer allocator.free(matched_scope);
+
+        if (record.verifier_requirement) |req| {
+            if (!containsString(verifiers.items, req)) {
+                try verifiers.append(try allocator.dupe(u8, req));
+            }
+            if (traces.items.len < budget.max_negative_knowledge_trace_items) {
+                try traces.append(.{
+                    .allocator = allocator,
+                    .record_id = try allocator.dupe(u8, record.id),
+                    .matched_scope = try allocator.dupe(u8, matched_scope),
+                    .influence_kind = .verifier_requirement,
+                    .verifier_requirement = try allocator.dupe(u8, req),
+                    .non_authorizing = true,
+                });
+            }
+        }
+
+        if (record.kind == .unsafe_verifier_candidate) {
+            if (recordMatchesText(record, candidate.id)) {
+                result.suppression_reason = try std.fmt.allocPrint(allocator, "blocked unsafe verifier candidate reuse: {s}", .{record.id});
+                if (traces.items.len < budget.max_negative_knowledge_trace_items) {
+                    try traces.append(.{
+                        .allocator = allocator,
+                        .record_id = try allocator.dupe(u8, record.id),
+                        .matched_scope = try allocator.dupe(u8, matched_scope),
+                        .influence_kind = .suppression_rule,
+                        .suppression_reason = try allocator.dupe(u8, result.suppression_reason.?),
+                        .non_authorizing = true,
+                    });
+                }
+            }
+        }
+
+        if (record.triage_penalty) |penalty| {
+            result.triage_delta -= @max(0, penalty);
+        }
+
+        try warnings.append(try std.fmt.allocPrint(allocator, "negative knowledge verifier influence: {s}", .{record.id}));
+    }
+
+    result.matched_record_ids = try matched.toOwnedSlice();
+    result.warnings = try warnings.toOwnedSlice();
+    result.required_verifiers = try verifiers.toOwnedSlice();
+    result.trace_entries = try traces.toOwnedSlice();
     return result;
 }
 
@@ -379,6 +587,7 @@ pub fn summarize(records: []const Record, influence: ?InfluenceResult) Summary {
         if (value.triage_delta != 0) out.triage_penalty_count = 1;
         out.verifier_requirement_count = value.required_verifiers.len;
         out.suppression_count = if (value.suppression_reason != null) 1 else 0;
+        out.routing_warning_count = value.warnings.len;
         out.trust_decay_candidate_count = value.trust_decay_candidates.len;
     }
     return out;
@@ -396,6 +605,13 @@ fn reviewEvent(allocator: std.mem.Allocator, candidate_id: []const u8, record_id
         .non_authorizing = true,
         .trace = try allocator.dupe(u8, trace),
     };
+}
+
+fn matchedScopeText(allocator: std.mem.Allocator, record: Record) ![]u8 {
+    if (record.condition.len > 0) return allocator.dupe(u8, record.condition);
+    if (record.affected_artifacts.len > 0) return allocator.dupe(u8, record.affected_artifacts[0]);
+    if (record.affected_entities.len > 0) return allocator.dupe(u8, record.affected_entities[0]);
+    return allocator.dupe(u8, record.id);
 }
 
 fn recordMatchesHypothesis(record: Record, hypothesis: hypothesis_core.Hypothesis) bool {

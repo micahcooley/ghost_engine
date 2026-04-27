@@ -297,6 +297,75 @@ pub fn appendCorrectionToSupportGraph(
     }
 }
 
+pub fn appendNegativeKnowledgeInfluenceToSupportGraph(
+    allocator: std.mem.Allocator,
+    nodes: *std.ArrayList(code_intel.SupportGraphNode),
+    edges: *std.ArrayList(code_intel.SupportGraphEdge),
+    output_id: []const u8,
+    trace_entries: []const @import("negative_knowledge.zig").InfluenceTraceEntry,
+    target_id: []const u8,
+) !void {
+    for (trace_entries, 0..) |entry, idx| {
+        const influence_node_id = try std.fmt.allocPrint(allocator, "{s}:nk_influence:{s}:{d}", .{ output_id, entry.record_id, idx });
+        const influence_kind_name = @tagName(entry.influence_kind);
+
+        try nodes.append(.{
+            .id = influence_node_id,
+            .kind = .negative_knowledge_influence,
+            .label = try std.fmt.allocPrint(allocator, "NK influence {s} on {s}", .{ entry.record_id, target_id }),
+            .score = 0,
+            .usable = false,
+            .detail = try std.fmt.allocPrint(allocator, "kind={s} scope={s} triage_delta={d} non_authorizing=true", .{
+                influence_kind_name,
+                entry.matched_scope,
+                entry.triage_delta,
+            }),
+        });
+        const influence_node_idx = nodes.items.len - 1;
+
+        const edge_kind: code_intel.SupportEdgeKind = switch (entry.influence_kind) {
+            .triage_penalty => .negative_knowledge_influences_hypothesis,
+            .verifier_requirement => .negative_knowledge_requires_verifier,
+            .suppression_rule => .negative_knowledge_influences_hypothesis,
+            .routing_warning => .negative_knowledge_warns_routing,
+            .trust_decay_candidate => .proposes_trust_decay,
+        };
+
+        try edges.append(.{
+            .from_id = try allocator.dupe(u8, nodes.items[influence_node_idx].id),
+            .to_id = try allocator.dupe(u8, target_id),
+            .kind = edge_kind,
+        });
+
+        try edges.append(.{
+            .from_id = try allocator.dupe(u8, nodes.items[influence_node_idx].id),
+            .to_id = try allocator.dupe(u8, entry.record_id),
+            .kind = .negative_knowledge_from_candidate,
+        });
+    }
+
+    // Add trust decay candidate nodes for any trust_decay_candidate entries
+    for (trace_entries, 0..) |entry, idx| {
+        if (entry.influence_kind != .trust_decay_candidate) continue;
+        const td_node_id = try std.fmt.allocPrint(allocator, "{s}:trust_decay:{s}:{d}", .{ output_id, entry.record_id, idx });
+        try nodes.append(.{
+            .id = td_node_id,
+            .kind = .trust_decay_candidate,
+            .label = try std.fmt.allocPrint(allocator, "trust decay candidate from {s}", .{entry.record_id}),
+            .score = 0,
+            .usable = false,
+            .detail = try std.fmt.allocPrint(allocator, "non_authorizing=true source_record={s}", .{entry.record_id}),
+        });
+        const td_node_idx = nodes.items.len - 1;
+
+        try edges.append(.{
+            .from_id = try allocator.dupe(u8, nodes.items[td_node_idx].id),
+            .to_id = try allocator.dupe(u8, entry.record_id),
+            .kind = .proposes_trust_decay,
+        });
+    }
+}
+
 pub fn correctionKindName(kind: CorrectionKind) []const u8 {
     return @tagName(kind);
 }
