@@ -3,6 +3,7 @@ const compute_budget = @import("compute_budget.zig");
 const correction_hooks = @import("correction_hooks.zig");
 const feedback = @import("feedback.zig");
 const intent_grounding = @import("intent_grounding.zig");
+const epistemic_renderer = @import("epistemic_renderer.zig");
 const response_engine = @import("response_engine.zig");
 const shards = @import("shards.zig");
 const sys = @import("sys.zig");
@@ -465,12 +466,15 @@ fn renderConversationReply(allocator: std.mem.Allocator, session: *const Session
     }
 
     if (session.last_result) |last| {
-        switch (last.kind) {
-            .draft => try writer.writeAll("[Draft]\n"),
-            .verified => try writer.writeAll("[Verified]\n"),
-            .unresolved => try writer.writeAll("[Unresolved]\n"),
-            .feedback => try writer.writeAll("[Feedback]\n"),
-        }
+        const state = conversationState(last);
+        const d = epistemic_renderer.descriptor(state);
+        try writer.print("[state]\ntag={s}\nlabel={s}\nsummary={s}\nauthority={s}\nnon_authorizing={s}\n", .{
+            d.tag,
+            d.label,
+            d.summary,
+            d.authority_statement,
+            if (d.non_authorizing) "true" else "false",
+        });
         try writer.print("summary={s}\n", .{last.summary});
         try writer.print("session={s}\n", .{session.session_id});
         if (last.artifact_path) |path| try writer.print("artifact={s}\n", .{path});
@@ -478,7 +482,10 @@ fn renderConversationReply(allocator: std.mem.Allocator, session: *const Session
 
     if (session.last_corrections) |corrections| {
         if (corrections.correction_count > 0) {
+            const section = epistemic_renderer.descriptor(.correction_recorded);
+            const contradicted = epistemic_renderer.descriptor(.contradicted);
             try writer.writeAll("\n[correction_recorded]\n");
+            try writer.print("summary={s}\nauthority={s}\ncontradiction={s}\n", .{ section.summary, section.authority_statement, contradicted.summary });
             const count = @min(corrections.user_visible_summaries.len, 4);
             for (corrections.user_visible_summaries[0..count], 0..) |summary, idx| {
                 const previous = if (idx < corrections.contradicted_refs.len) corrections.contradicted_refs[idx] else "unknown";
@@ -486,6 +493,8 @@ fn renderConversationReply(allocator: std.mem.Allocator, session: *const Session
                 try writer.print("previous_assumption={s}\ncontradicting_evidence={s}\nupdated_state={s}\n", .{ previous, evidence, summary });
             }
             if (corrections.negative_knowledge_candidate_refs.len > 0) {
+                const nk_candidate = epistemic_renderer.descriptor(.negative_knowledge_candidate_proposed);
+                try writer.print("candidate_summary={s}\ncandidate_authority={s}\n", .{ nk_candidate.summary, nk_candidate.authority_statement });
                 try writer.print("negative_knowledge_candidate_proposed={s}\nreview_required=true\n", .{corrections.negative_knowledge_candidate_refs[0]});
             } else {
                 try writer.writeAll("negative_knowledge_candidate_proposed=false\nreview_required=false\n");
@@ -496,23 +505,27 @@ fn renderConversationReply(allocator: std.mem.Allocator, session: *const Session
 
     if (session.last_negative_knowledge_influence) |influence| {
         if (influence.influence_count > 0 or influence.trust_decay_candidate_count > 0) {
+            const applied = epistemic_renderer.descriptor(.negative_knowledge_applied);
             try writer.writeAll("\n[negative_knowledge_applied]\n");
+            try writer.print("summary={s}\nauthority={s}\n", .{ applied.summary, applied.authority_statement });
             const count = @min(influence.record_ids.len, 4);
             for (influence.record_ids[0..count], 0..) |record_id, idx| {
                 const kind = if (idx < influence.influence_kinds.len) influence.influence_kinds[idx] else "accepted_negative_knowledge";
                 try writer.print("record={s}\ninfluence={s}\n", .{ record_id, kind });
             }
             if (influence.triage_penalty_count > 0) try writer.print("triage_penalty_count={d}\n", .{influence.triage_penalty_count});
-            if (influence.verifier_requirement_count > 0) try writer.print("stronger_verifier_required={d}\n", .{influence.verifier_requirement_count});
-            if (influence.suppression_count > 0) try writer.print("exact_repeat_suppressed={d}\n", .{influence.suppression_count});
-            if (influence.routing_warning_count > 0) try writer.print("routing_warning={d}\n", .{influence.routing_warning_count});
-            if (influence.trust_decay_candidate_count > 0) try writer.print("trust_decay_candidate_proposed={d}\n", .{influence.trust_decay_candidate_count});
+            if (influence.verifier_requirement_count > 0) try renderCountedEpistemicLine(writer, .stronger_verifier_required, "stronger_verifier_required", influence.verifier_requirement_count);
+            if (influence.suppression_count > 0) try renderCountedEpistemicLine(writer, .exact_repeat_suppressed, "exact_repeat_suppressed", influence.suppression_count);
+            if (influence.routing_warning_count > 0) try renderCountedEpistemicLine(writer, .routing_warning, "routing_warning", influence.routing_warning_count);
+            if (influence.trust_decay_candidate_count > 0) try renderCountedEpistemicLine(writer, .trust_decay_candidate_proposed, "trust_decay_candidate_proposed", influence.trust_decay_candidate_count);
             try writer.writeAll("did_not_prove_claim=true\ndid_not_authorize_support=true\ndid_not_mutate_packs=true\nnon_authorizing=true\n");
         } else if (influence.proposed_candidates.len > 0) {
+            const candidate = epistemic_renderer.descriptor(.negative_knowledge_candidate_proposed);
             try writer.writeAll("\n[negative_knowledge_candidate_proposed]\n");
+            try writer.print("summary={s}\nauthority={s}\n", .{ candidate.summary, candidate.authority_statement });
             const count = @min(influence.proposed_candidates.len, 4);
-            for (influence.proposed_candidates[0..count]) |candidate| {
-                try writer.print("candidate={s}\n", .{candidate});
+            for (influence.proposed_candidates[0..count]) |candidate_id| {
+                try writer.print("candidate={s}\n", .{candidate_id});
             }
             try writer.writeAll("review_required=true\nnon_authorizing=true\n");
         }
@@ -544,6 +557,20 @@ fn renderConversationReply(allocator: std.mem.Allocator, session: *const Session
     }
 
     return out.toOwnedSlice();
+}
+
+fn conversationState(last: LastResult) epistemic_renderer.State {
+    return switch (last.kind) {
+        .draft => .draft,
+        .verified => if (last.selected_mode == .deep) .verified else .checked,
+        .unresolved => if (last.stop_reason == .budget) .budget_exhausted else .unresolved,
+        .feedback => .checked,
+    };
+}
+
+fn renderCountedEpistemicLine(writer: anytype, state: epistemic_renderer.State, key: []const u8, count: usize) !void {
+    const d = epistemic_renderer.descriptor(state);
+    try writer.print("{s}={d}\n{s}_summary={s}\n{s}_authority={s}\n", .{ key, count, key, d.summary, key, d.authority_statement });
 }
 
 fn replaceLastResult(session: *Session, result: *const response_engine.ResponseResult, mode: ConversationMode, deep_blocked_by_ambiguity: bool) !void {
@@ -1246,6 +1273,9 @@ test "conversation session preserves bounded correction and negative knowledge p
     const reply = try renderConversationReply(allocator, &session, null);
     defer allocator.free(reply);
     try std.testing.expect(std.mem.indexOf(u8, reply, "[correction_recorded]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "Correction recorded: Ghost updated the investigation state based on contradicting evidence.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "A correction records changed investigation state; it does not prove the new claim.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "Negative knowledge candidate proposed: Ghost found a failure pattern") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "review_required=true") != null);
 
     try save(&session);

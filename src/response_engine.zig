@@ -3,6 +3,7 @@ const correction_hooks = @import("correction_hooks.zig");
 const intent_grounding = @import("intent_grounding.zig");
 const artifact_schema = @import("artifact_schema.zig");
 const compute_budget = @import("compute_budget.zig");
+const epistemic_renderer = @import("epistemic_renderer.zig");
 const negative_knowledge = @import("negative_knowledge.zig");
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -1754,6 +1755,8 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const ResponseResult) !
     try writeCorrectionsJson(writer, result.corrections);
     try writer.writeAll(",\"negative_knowledge\":");
     try writeNegativeKnowledgeJson(writer, result.negative_knowledge);
+    try writer.writeAll(",\"epistemic_render\":");
+    try writeEpistemicRenderJson(writer, result);
     if (result.draft.mode.enabled) {
         try writer.writeAll(",\"assumptions\":");
         try writeJsonStringArray(writer, result.draft.assumptions);
@@ -1782,6 +1785,143 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const ResponseResult) !
     try writer.writeAll("}");
 
     return buf.toOwnedSlice();
+}
+
+fn responseRenderState(result: *const ResponseResult) epistemic_renderer.State {
+    return epistemic_renderer.primaryState(.{
+        .is_draft = result.draft.mode.enabled,
+        .is_supported = result.stop_reason == .supported,
+        .is_deep = result.selected_mode == .deep_path,
+        .is_budget_exhausted = result.stop_reason == .budget,
+        .is_blocked = false,
+        .has_missing_obligation = result.grounded_intent.missing_obligations.len > 0 or result.grounded_intent.obligations.len > 0,
+    });
+}
+
+fn writeEpistemicRenderJson(writer: anytype, result: *const ResponseResult) !void {
+    const primary = epistemic_renderer.descriptor(responseRenderState(result));
+    try writer.writeAll("{\"state_tag\":\"");
+    try writeJsonEscaped(writer, primary.tag);
+    try writer.writeAll("\",\"state_label\":\"");
+    try writeJsonEscaped(writer, primary.label);
+    try writer.writeAll("\",\"state_summary\":\"");
+    try writeJsonEscaped(writer, primary.summary);
+    try writer.writeAll("\",\"authority_statement\":\"");
+    try writeJsonEscaped(writer, primary.authority_statement);
+    try writer.writeAll("\",\"non_authorizing\":");
+    try writer.writeAll(if (primary.non_authorizing) "true" else "false");
+
+    try writer.writeAll(",\"correction_summaries\":[");
+    if (result.corrections.summary.correction_count > 0) {
+        const correction = epistemic_renderer.descriptor(.correction_recorded);
+        const contradicted = epistemic_renderer.descriptor(.contradicted);
+        try writer.writeAll("\"");
+        try writeJsonEscaped(writer, correction.summary);
+        try writer.writeAll("\",\"");
+        try writeJsonEscaped(writer, contradicted.summary);
+        try writer.writeAll("\"");
+    }
+    try writer.writeAll("]");
+
+    try writer.writeAll(",\"negative_knowledge_summaries\":[");
+    var wrote_nk = false;
+    if (result.negative_knowledge.proposed_candidates.len > 0) {
+        const d = epistemic_renderer.descriptor(.negative_knowledge_candidate_proposed);
+        try writer.writeAll("\"");
+        try writeJsonEscaped(writer, d.summary);
+        try writer.writeAll("\"");
+        wrote_nk = true;
+    }
+    if (result.negative_knowledge.influence_summary.influence_count > 0 or result.negative_knowledge.applied_records.len > 0) {
+        const d = epistemic_renderer.descriptor(.negative_knowledge_applied);
+        if (wrote_nk) try writer.writeAll(",");
+        try writer.writeAll("\"");
+        try writeJsonEscaped(writer, d.summary);
+        try writer.writeAll("\"");
+        wrote_nk = true;
+    }
+    if (result.negative_knowledge.influence_summary.verifier_requirement_count > 0) {
+        const d = epistemic_renderer.descriptor(.stronger_verifier_required);
+        if (wrote_nk) try writer.writeAll(",");
+        try writer.writeAll("\"");
+        try writeJsonEscaped(writer, d.summary);
+        try writer.writeAll("\"");
+        wrote_nk = true;
+    }
+    if (result.negative_knowledge.influence_summary.suppression_count > 0) {
+        const d = epistemic_renderer.descriptor(.exact_repeat_suppressed);
+        if (wrote_nk) try writer.writeAll(",");
+        try writer.writeAll("\"");
+        try writeJsonEscaped(writer, d.summary);
+        try writer.writeAll("\"");
+        wrote_nk = true;
+    }
+    if (result.negative_knowledge.influence_summary.routing_warning_count > 0) {
+        const d = epistemic_renderer.descriptor(.routing_warning);
+        if (wrote_nk) try writer.writeAll(",");
+        try writer.writeAll("\"");
+        try writeJsonEscaped(writer, d.summary);
+        try writer.writeAll("\"");
+        wrote_nk = true;
+    }
+    if (result.negative_knowledge.influence_summary.trust_decay_candidate_count > 0 or result.negative_knowledge.trust_decay_candidates.len > 0) {
+        const d = epistemic_renderer.descriptor(.trust_decay_candidate_proposed);
+        if (wrote_nk) try writer.writeAll(",");
+        try writer.writeAll("\"");
+        try writeJsonEscaped(writer, d.summary);
+        try writer.writeAll("\"");
+    }
+    try writer.writeAll("]");
+
+    try writer.writeAll(",\"next_actions\":[");
+    var wrote_action = false;
+    if (primary.suggested_next_action) |action| {
+        try writer.writeAll("\"");
+        try writeJsonEscaped(writer, action);
+        try writer.writeAll("\"");
+        wrote_action = true;
+    }
+    if (result.negative_knowledge.influence_summary.verifier_requirement_count > 0) {
+        const d = epistemic_renderer.descriptor(.stronger_verifier_required);
+        if (wrote_action) try writer.writeAll(",");
+        try writer.writeAll("\"");
+        try writeJsonEscaped(writer, d.suggested_next_action orelse d.summary);
+        try writer.writeAll("\"");
+        wrote_action = true;
+    }
+    if (result.negative_knowledge.proposed_candidates.len > 0) {
+        const d = epistemic_renderer.descriptor(.negative_knowledge_candidate_proposed);
+        if (wrote_action) try writer.writeAll(",");
+        try writer.writeAll("\"");
+        try writeJsonEscaped(writer, d.suggested_next_action orelse d.summary);
+        try writer.writeAll("\"");
+    }
+    try writer.writeAll("]");
+
+    try writer.writeAll(",\"non_authorizing_notes\":[");
+    var wrote_note = false;
+    if (primary.non_authorizing) {
+        try writer.writeAll("\"");
+        try writeJsonEscaped(writer, primary.authority_statement);
+        try writer.writeAll("\"");
+        wrote_note = true;
+    }
+    if (result.corrections.summary.correction_count > 0) {
+        const d = epistemic_renderer.descriptor(.correction_recorded);
+        if (wrote_note) try writer.writeAll(",");
+        try writer.writeAll("\"");
+        try writeJsonEscaped(writer, d.authority_statement);
+        try writer.writeAll("\"");
+        wrote_note = true;
+    }
+    if (result.negative_knowledge.proposed_candidates.len > 0 or result.negative_knowledge.influence_summary.influence_count > 0) {
+        const d = epistemic_renderer.descriptor(.negative_knowledge_applied);
+        if (wrote_note) try writer.writeAll(",");
+        try writer.writeAll("\"");
+        try writeJsonEscaped(writer, d.authority_statement);
+        try writer.writeAll("\"");
+    }
+    try writer.writeAll("]}");
 }
 
 fn writeCorrectionsJson(writer: anytype, corrections: CorrectionProtocol) !void {
@@ -2193,6 +2333,9 @@ test "response engine: render json marks draft contract explicitly" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"assumptions\":[") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"escalationHint\":\"This can be verified\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"stopReason\":\"supported\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"epistemic_render\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"state_tag\":\"draft\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Draft: this is not verified yet.") != null);
 }
 
 test "response engine: correction protocol appears in json and remains non-authorizing" {
@@ -2223,7 +2366,9 @@ test "response engine: correction protocol appears in json and remains non-autho
     const rendered = try renderJson(allocator, &result);
     defer allocator.free(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"corrections\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"correction_summaries\":[\"Correction recorded") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"negative_knowledge_candidate_ref\":\"nk:test:1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Negative knowledge candidate proposed") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"non_authorizing\":true") != null);
     try std.testing.expectEqual(StopReason.unresolved, result.stop_reason);
 }
@@ -2283,6 +2428,8 @@ test "response engine: accepted negative knowledge influence renders explicit ef
     defer allocator.free(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "stronger verifier required") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "exact repeat suppressed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Prior negative knowledge affected this result") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Stronger verifier required") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"non_authorizing\":true") != null);
 }
 
@@ -2296,7 +2443,32 @@ test "response engine: empty correction and influence summaries render consisten
     defer allocator.free(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"correction_count\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"influence_count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"correction_summaries\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"negative_knowledge_summaries\":[]") != null);
     try std.testing.expectEqual(StopReason.unresolved, result.stop_reason);
+}
+
+test "response engine: epistemic render json remains parseable and backward compatible" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "verify src/main.zig:init is correct", .{});
+    defer gi.deinit();
+
+    var result = try execute(allocator, &gi, .deepOnly());
+    defer result.deinit();
+
+    const rendered = try renderJson(allocator, &result);
+    defer allocator.free(rendered);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, rendered, .{});
+    defer parsed.deinit();
+
+    const object = parsed.value.object;
+    try std.testing.expect(object.contains("selectedMode"));
+    try std.testing.expect(object.contains("stopReason"));
+    try std.testing.expect(object.contains("corrections"));
+    try std.testing.expect(object.contains("negative_knowledge"));
+    try std.testing.expect(object.contains("epistemic_render"));
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"state_tag\":\"verified\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Verified: support requirements were met by the available evidence.") != null);
 }
 
 test "resolve budget: fast path maps to low tier" {

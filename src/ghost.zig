@@ -34,6 +34,7 @@ pub const artifact_schema = @import("artifact_schema.zig");
 pub const hypothesis_core = @import("hypothesis_core.zig");
 pub const intent_grounding = @import("intent_grounding.zig");
 pub const response_engine = @import("response_engine.zig");
+pub const epistemic_renderer = @import("epistemic_renderer.zig");
 pub const conversation_session = @import("conversation_session.zig");
 pub const verifier_adapter = @import("verifier_adapter.zig");
 pub const verifier_execution = @import("verifier_execution.zig");

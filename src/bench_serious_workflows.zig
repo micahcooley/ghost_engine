@@ -346,7 +346,17 @@ const CaseResult = struct {
     verifier_candidate_execution_blocked_count: u32 = 0,
     verifier_candidate_execution_budget_hit_count: u32 = 0,
     correction_event_count: u32 = 0,
+    correction_summary_count: u32 = 0,
+    correction_rendered_count: u32 = 0,
     negative_knowledge_candidate_count: u32 = 0,
+    negative_knowledge_influence_summary_count: u32 = 0,
+    negative_knowledge_applied_rendered_count: u32 = 0,
+    stronger_verifier_requirement_rendered_count: u32 = 0,
+    exact_repeat_suppression_rendered_count: u32 = 0,
+    epistemic_render_correction_count: u32 = 0,
+    epistemic_render_negative_knowledge_count: u32 = 0,
+    epistemic_render_verifier_requirement_count: u32 = 0,
+    epistemic_render_suppression_count: u32 = 0,
     negative_knowledge_accepted_count: u32 = 0,
     negative_knowledge_rejected_count: u32 = 0,
     negative_knowledge_influence_match_count: u32 = 0,
@@ -532,6 +542,10 @@ const Metrics = struct {
     negative_knowledge_applied_rendered_count: u32 = 0,
     stronger_verifier_requirement_rendered_count: u32 = 0,
     exact_repeat_suppression_rendered_count: u32 = 0,
+    epistemic_render_correction_count: u32 = 0,
+    epistemic_render_negative_knowledge_count: u32 = 0,
+    epistemic_render_verifier_requirement_count: u32 = 0,
+    epistemic_render_suppression_count: u32 = 0,
     negative_knowledge_accepted_count: u32 = 0,
     negative_knowledge_rejected_count: u32 = 0,
     negative_knowledge_influence_match_count: u32 = 0,
@@ -3497,7 +3511,17 @@ fn accumulateMetrics(metrics: *Metrics, spec: CaseSpec, result: *const CaseResul
     metrics.verifier_candidate_execution_blocked_count += result.verifier_candidate_execution_blocked_count;
     metrics.verifier_candidate_execution_budget_hit_count += result.verifier_candidate_execution_budget_hit_count;
     metrics.correction_event_count += result.correction_event_count;
+    metrics.correction_summary_count += result.correction_summary_count;
+    metrics.correction_rendered_count += result.correction_rendered_count;
     metrics.negative_knowledge_candidate_count += result.negative_knowledge_candidate_count;
+    metrics.negative_knowledge_influence_summary_count += result.negative_knowledge_influence_summary_count;
+    metrics.negative_knowledge_applied_rendered_count += result.negative_knowledge_applied_rendered_count;
+    metrics.stronger_verifier_requirement_rendered_count += result.stronger_verifier_requirement_rendered_count;
+    metrics.exact_repeat_suppression_rendered_count += result.exact_repeat_suppression_rendered_count;
+    metrics.epistemic_render_correction_count += result.epistemic_render_correction_count;
+    metrics.epistemic_render_negative_knowledge_count += result.epistemic_render_negative_knowledge_count;
+    metrics.epistemic_render_verifier_requirement_count += result.epistemic_render_verifier_requirement_count;
+    metrics.epistemic_render_suppression_count += result.epistemic_render_suppression_count;
     metrics.negative_knowledge_accepted_count += result.negative_knowledge_accepted_count;
     metrics.negative_knowledge_rejected_count += result.negative_knowledge_rejected_count;
     metrics.negative_knowledge_influence_match_count += result.negative_knowledge_influence_match_count;
@@ -3766,11 +3790,15 @@ fn renderJsonReport(allocator: std.mem.Allocator, metrics: *const Metrics, resul
         metrics.correction_rendered_count,
         metrics.negative_knowledge_candidate_count,
     });
-    try writer.print(",\"negativeKnowledgeInfluenceSummaryCount\":{d},\"negativeKnowledgeAppliedRenderedCount\":{d},\"strongerVerifierRequirementRenderedCount\":{d},\"exactRepeatSuppressionRenderedCount\":{d},\"negativeKnowledgeAcceptedCount\":{d},\"negativeKnowledgeRejectedCount\":{d},\"negativeKnowledgeInfluenceMatchCount\":{d},\"negativeKnowledgeTriagePenaltyCount\":{d},\"negativeKnowledgeVerifierRequirementCount\":{d},\"negativeKnowledgeVerifierBlockedCount\":{d},\"negativeKnowledgeVerifierStrengthenedCount\":{d},\"negativeKnowledgeSuppressionCount\":{d},\"negativeKnowledgeRoutingWarningCount\":{d},\"negativeKnowledgeTrustDecayCandidateCount\":{d}", .{
+    try writer.print(",\"negativeKnowledgeInfluenceSummaryCount\":{d},\"negativeKnowledgeAppliedRenderedCount\":{d},\"strongerVerifierRequirementRenderedCount\":{d},\"exactRepeatSuppressionRenderedCount\":{d},\"epistemicRenderCorrectionCount\":{d},\"epistemicRenderNegativeKnowledgeCount\":{d},\"epistemicRenderVerifierRequirementCount\":{d},\"epistemicRenderSuppressionCount\":{d},\"negativeKnowledgeAcceptedCount\":{d},\"negativeKnowledgeRejectedCount\":{d},\"negativeKnowledgeInfluenceMatchCount\":{d},\"negativeKnowledgeTriagePenaltyCount\":{d},\"negativeKnowledgeVerifierRequirementCount\":{d},\"negativeKnowledgeVerifierBlockedCount\":{d},\"negativeKnowledgeVerifierStrengthenedCount\":{d},\"negativeKnowledgeSuppressionCount\":{d},\"negativeKnowledgeRoutingWarningCount\":{d},\"negativeKnowledgeTrustDecayCandidateCount\":{d}", .{
         metrics.negative_knowledge_influence_summary_count,
         metrics.negative_knowledge_applied_rendered_count,
         metrics.stronger_verifier_requirement_rendered_count,
         metrics.exact_repeat_suppression_rendered_count,
+        metrics.epistemic_render_correction_count,
+        metrics.epistemic_render_negative_knowledge_count,
+        metrics.epistemic_render_verifier_requirement_count,
+        metrics.epistemic_render_suppression_count,
         metrics.negative_knowledge_accepted_count,
         metrics.negative_knowledge_rejected_count,
         metrics.negative_knowledge_influence_match_count,
@@ -4123,6 +4151,12 @@ fn renderMarkdownReport(allocator: std.mem.Allocator, metrics: *const Metrics, r
         metrics.negative_knowledge_applied_rendered_count,
         metrics.stronger_verifier_requirement_rendered_count,
         metrics.exact_repeat_suppression_rendered_count,
+    });
+    try writer.print("- epistemic rendering: corrections={d}, negative_knowledge={d}, verifier_requirements={d}, suppressions={d}\n", .{
+        metrics.epistemic_render_correction_count,
+        metrics.epistemic_render_negative_knowledge_count,
+        metrics.epistemic_render_verifier_requirement_count,
+        metrics.epistemic_render_suppression_count,
     });
     try writer.print("- negative knowledge lifecycle: accepted={d}, rejected={d}, influence_matches={d}, triage_penalties={d}, verifier_requirements={d}, verifier_blocked={d}, verifier_strengthened={d}, trust_decay_candidates={d}\n", .{
         metrics.negative_knowledge_accepted_count,
