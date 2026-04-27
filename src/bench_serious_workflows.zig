@@ -525,7 +525,13 @@ const Metrics = struct {
     verifier_candidate_execution_blocked_count: u32 = 0,
     verifier_candidate_execution_budget_hit_count: u32 = 0,
     correction_event_count: u32 = 0,
+    correction_summary_count: u32 = 0,
+    correction_rendered_count: u32 = 0,
     negative_knowledge_candidate_count: u32 = 0,
+    negative_knowledge_influence_summary_count: u32 = 0,
+    negative_knowledge_applied_rendered_count: u32 = 0,
+    stronger_verifier_requirement_rendered_count: u32 = 0,
+    exact_repeat_suppression_rendered_count: u32 = 0,
     negative_knowledge_accepted_count: u32 = 0,
     negative_knowledge_rejected_count: u32 = 0,
     negative_knowledge_influence_match_count: u32 = 0,
@@ -3748,7 +3754,7 @@ fn renderJsonReport(allocator: std.mem.Allocator, metrics: *const Metrics, resul
         metrics.task_session_save_ms,
         metrics.task_session_save_count,
     });
-    try writer.print(",\"verifierCandidateExecutionEligibleCount\":{d},\"verifierCandidateExecutionScheduledCount\":{d},\"verifierCandidateExecutionCompletedCount\":{d},\"verifierCandidateExecutionFailedCount\":{d},\"verifierCandidateExecutionBlockedCount\":{d},\"verifierCandidateExecutionBudgetHitCount\":{d},\"correctionEventCount\":{d},\"negativeKnowledgeCandidateCount\":{d}", .{
+    try writer.print(",\"verifierCandidateExecutionEligibleCount\":{d},\"verifierCandidateExecutionScheduledCount\":{d},\"verifierCandidateExecutionCompletedCount\":{d},\"verifierCandidateExecutionFailedCount\":{d},\"verifierCandidateExecutionBlockedCount\":{d},\"verifierCandidateExecutionBudgetHitCount\":{d},\"correctionEventCount\":{d},\"correctionSummaryCount\":{d},\"correctionRenderedCount\":{d},\"negativeKnowledgeCandidateCount\":{d}", .{
         metrics.verifier_candidate_execution_eligible_count,
         metrics.verifier_candidate_execution_scheduled_count,
         metrics.verifier_candidate_execution_completed_count,
@@ -3756,9 +3762,15 @@ fn renderJsonReport(allocator: std.mem.Allocator, metrics: *const Metrics, resul
         metrics.verifier_candidate_execution_blocked_count,
         metrics.verifier_candidate_execution_budget_hit_count,
         metrics.correction_event_count,
+        metrics.correction_summary_count,
+        metrics.correction_rendered_count,
         metrics.negative_knowledge_candidate_count,
     });
-    try writer.print(",\"negativeKnowledgeAcceptedCount\":{d},\"negativeKnowledgeRejectedCount\":{d},\"negativeKnowledgeInfluenceMatchCount\":{d},\"negativeKnowledgeTriagePenaltyCount\":{d},\"negativeKnowledgeVerifierRequirementCount\":{d},\"negativeKnowledgeVerifierBlockedCount\":{d},\"negativeKnowledgeVerifierStrengthenedCount\":{d},\"negativeKnowledgeSuppressionCount\":{d},\"negativeKnowledgeRoutingWarningCount\":{d},\"negativeKnowledgeTrustDecayCandidateCount\":{d}", .{
+    try writer.print(",\"negativeKnowledgeInfluenceSummaryCount\":{d},\"negativeKnowledgeAppliedRenderedCount\":{d},\"strongerVerifierRequirementRenderedCount\":{d},\"exactRepeatSuppressionRenderedCount\":{d},\"negativeKnowledgeAcceptedCount\":{d},\"negativeKnowledgeRejectedCount\":{d},\"negativeKnowledgeInfluenceMatchCount\":{d},\"negativeKnowledgeTriagePenaltyCount\":{d},\"negativeKnowledgeVerifierRequirementCount\":{d},\"negativeKnowledgeVerifierBlockedCount\":{d},\"negativeKnowledgeVerifierStrengthenedCount\":{d},\"negativeKnowledgeSuppressionCount\":{d},\"negativeKnowledgeRoutingWarningCount\":{d},\"negativeKnowledgeTrustDecayCandidateCount\":{d}", .{
+        metrics.negative_knowledge_influence_summary_count,
+        metrics.negative_knowledge_applied_rendered_count,
+        metrics.stronger_verifier_requirement_rendered_count,
+        metrics.exact_repeat_suppression_rendered_count,
         metrics.negative_knowledge_accepted_count,
         metrics.negative_knowledge_rejected_count,
         metrics.negative_knowledge_influence_match_count,
@@ -4100,9 +4112,17 @@ fn renderMarkdownReport(allocator: std.mem.Allocator, metrics: *const Metrics, r
         metrics.verifier_candidate_execution_blocked_count,
         metrics.verifier_candidate_execution_budget_hit_count,
     });
-    try writer.print("- correction events: {d}; negative knowledge candidates: {d}\n", .{
+    try writer.print("- correction events: {d}; correction summaries: {d}; correction rendered: {d}; negative knowledge candidates: {d}\n", .{
         metrics.correction_event_count,
+        metrics.correction_summary_count,
+        metrics.correction_rendered_count,
         metrics.negative_knowledge_candidate_count,
+    });
+    try writer.print("- negative knowledge rendering: influence_summaries={d}, applied_rendered={d}, stronger_verifier_rendered={d}, exact_repeat_suppression_rendered={d}\n", .{
+        metrics.negative_knowledge_influence_summary_count,
+        metrics.negative_knowledge_applied_rendered_count,
+        metrics.stronger_verifier_requirement_rendered_count,
+        metrics.exact_repeat_suppression_rendered_count,
     });
     try writer.print("- negative knowledge lifecycle: accepted={d}, rejected={d}, influence_matches={d}, triage_penalties={d}, verifier_requirements={d}, verifier_blocked={d}, verifier_strengthened={d}, trust_decay_candidates={d}\n", .{
         metrics.negative_knowledge_accepted_count,

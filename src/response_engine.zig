@@ -1,7 +1,9 @@
 const std = @import("std");
+const correction_hooks = @import("correction_hooks.zig");
 const intent_grounding = @import("intent_grounding.zig");
 const artifact_schema = @import("artifact_schema.zig");
 const compute_budget = @import("compute_budget.zig");
+const negative_knowledge = @import("negative_knowledge.zig");
 
 // ──────────────────────────────────────────────────────────────────────────
 // Fast Path / Deep Path Response Engine
@@ -22,6 +24,8 @@ const compute_budget = @import("compute_budget.zig");
 
 pub const MAX_PARTIAL_FINDINGS: usize = 16;
 pub const MAX_ELIGIBILITY_TRACES: usize = 16;
+pub const MAX_CORRECTION_ITEMS: usize = 16;
+pub const MAX_NEGATIVE_KNOWLEDGE_ITEMS: usize = 16;
 
 // ── Response Modes ─────────────────────────────────────────────────────
 
@@ -240,6 +244,125 @@ pub const SpeculativeSchedulerTrace = struct {
     }
 };
 
+pub const CorrectionItem = struct {
+    id: []u8,
+    kind: []u8,
+    previous_state: []u8,
+    updated_state: []u8,
+    contradicted_ref: []u8,
+    evidence_ref: []u8,
+    negative_knowledge_candidate_ref: ?[]u8 = null,
+    trust_decay_candidate_ref: ?[]u8 = null,
+    user_visible_summary: []u8,
+    non_authorizing: bool = true,
+
+    pub fn deinit(self: *CorrectionItem, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.kind);
+        allocator.free(self.previous_state);
+        allocator.free(self.updated_state);
+        allocator.free(self.contradicted_ref);
+        allocator.free(self.evidence_ref);
+        if (self.negative_knowledge_candidate_ref) |value| allocator.free(value);
+        if (self.trust_decay_candidate_ref) |value| allocator.free(value);
+        allocator.free(self.user_visible_summary);
+        self.* = undefined;
+    }
+};
+
+pub const CorrectionSummary = struct {
+    correction_count: usize = 0,
+    correction_kinds: [][]u8 = &.{},
+    contradicted_refs: [][]u8 = &.{},
+    evidence_refs: [][]u8 = &.{},
+    negative_knowledge_candidate_refs: [][]u8 = &.{},
+    trust_decay_candidate_refs: [][]u8 = &.{},
+    user_visible_summaries: [][]u8 = &.{},
+    non_authorizing: bool = true,
+
+    pub fn deinit(self: *CorrectionSummary, allocator: std.mem.Allocator) void {
+        freeStringList(allocator, self.correction_kinds);
+        freeStringList(allocator, self.contradicted_refs);
+        freeStringList(allocator, self.evidence_refs);
+        freeStringList(allocator, self.negative_knowledge_candidate_refs);
+        freeStringList(allocator, self.trust_decay_candidate_refs);
+        freeStringList(allocator, self.user_visible_summaries);
+        self.* = undefined;
+    }
+};
+
+pub const CorrectionProtocol = struct {
+    summary: CorrectionSummary = .{},
+    items: []CorrectionItem = &.{},
+
+    pub fn deinit(self: *CorrectionProtocol, allocator: std.mem.Allocator) void {
+        self.summary.deinit(allocator);
+        for (self.items) |*item| item.deinit(allocator);
+        allocator.free(self.items);
+        self.* = undefined;
+    }
+};
+
+pub const NegativeKnowledgeInfluenceItem = struct {
+    record_id: []u8,
+    influence_kind: []u8,
+    matched_scope: []u8,
+    target_ref: []u8,
+    effect: []u8,
+    non_authorizing: bool = true,
+
+    pub fn deinit(self: *NegativeKnowledgeInfluenceItem, allocator: std.mem.Allocator) void {
+        allocator.free(self.record_id);
+        allocator.free(self.influence_kind);
+        allocator.free(self.matched_scope);
+        allocator.free(self.target_ref);
+        allocator.free(self.effect);
+        self.* = undefined;
+    }
+};
+
+pub const NegativeKnowledgeInfluenceSummary = struct {
+    influence_count: usize = 0,
+    record_ids: [][]u8 = &.{},
+    influence_kinds: [][]u8 = &.{},
+    affected_hypotheses: [][]u8 = &.{},
+    affected_routes: [][]u8 = &.{},
+    affected_verifier_handoffs: [][]u8 = &.{},
+    triage_penalty_count: usize = 0,
+    verifier_requirement_count: usize = 0,
+    suppression_count: usize = 0,
+    routing_warning_count: usize = 0,
+    trust_decay_candidate_count: usize = 0,
+    non_authorizing: bool = true,
+
+    pub fn deinit(self: *NegativeKnowledgeInfluenceSummary, allocator: std.mem.Allocator) void {
+        freeStringList(allocator, self.record_ids);
+        freeStringList(allocator, self.influence_kinds);
+        freeStringList(allocator, self.affected_hypotheses);
+        freeStringList(allocator, self.affected_routes);
+        freeStringList(allocator, self.affected_verifier_handoffs);
+        self.* = undefined;
+    }
+};
+
+pub const NegativeKnowledgeProtocol = struct {
+    influence_summary: NegativeKnowledgeInfluenceSummary = .{},
+    applied_records: [][]u8 = &.{},
+    proposed_candidates: [][]u8 = &.{},
+    trust_decay_candidates: [][]u8 = &.{},
+    items: []NegativeKnowledgeInfluenceItem = &.{},
+
+    pub fn deinit(self: *NegativeKnowledgeProtocol, allocator: std.mem.Allocator) void {
+        self.influence_summary.deinit(allocator);
+        freeStringList(allocator, self.applied_records);
+        freeStringList(allocator, self.proposed_candidates);
+        freeStringList(allocator, self.trust_decay_candidates);
+        for (self.items) |*item| item.deinit(allocator);
+        allocator.free(self.items);
+        self.* = undefined;
+    }
+};
+
 pub const SchedulerCandidateStatus = enum {
     considered,
     selected,
@@ -300,6 +423,11 @@ pub const ResponseResult = struct {
     /// are never treated as supported and cannot silently upgrade.
     draft: DraftContract = .{},
 
+    /// Correction and negative-knowledge projections explain contradictions
+    /// and prior failure influence. They are explicitly non-authorizing.
+    corrections: CorrectionProtocol = .{},
+    negative_knowledge: NegativeKnowledgeProtocol = .{},
+
     /// Timing metrics.
     latency: LatencyProfile = .{},
 
@@ -311,6 +439,8 @@ pub const ResponseResult = struct {
         self.allocator.free(self.partial_findings);
         self.speculative_scheduler.deinit(self.allocator);
         self.draft.deinit(self.allocator);
+        self.corrections.deinit(self.allocator);
+        self.negative_knowledge.deinit(self.allocator);
         self.* = undefined;
     }
 };
@@ -712,6 +842,219 @@ fn applyPolicyTrace(result: *ResponseResult, config: ResponseConfig, reason: Mod
     result.requested_reasoning_level = config.reasoning_level;
     result.mode_selection_reason = reason;
     result.user_override_detected = override_detected;
+}
+
+fn cloneStringList(allocator: std.mem.Allocator, source: []const []const u8) ![][]u8 {
+    if (source.len == 0) return &.{};
+    var out = try allocator.alloc([]u8, source.len);
+    errdefer {
+        for (out) |item| allocator.free(item);
+        allocator.free(out);
+    }
+    for (source, 0..) |item, idx| out[idx] = try allocator.dupe(u8, item);
+    return out;
+}
+
+fn freeStringList(allocator: std.mem.Allocator, source: [][]u8) void {
+    for (source) |item| allocator.free(item);
+    allocator.free(source);
+}
+
+fn appendUniqueOwned(list: *std.ArrayList([]u8), value: []const u8) !void {
+    for (list.items) |item| {
+        if (std.mem.eql(u8, item, value)) return;
+    }
+    try list.append(try list.allocator.dupe(u8, value));
+}
+
+fn influenceEffectText(allocator: std.mem.Allocator, entry: negative_knowledge.InfluenceTraceEntry) ![]u8 {
+    return switch (entry.influence_kind) {
+        .triage_penalty => try std.fmt.allocPrint(allocator, "triage penalty applied: {d}", .{entry.triage_delta}),
+        .verifier_requirement => try std.fmt.allocPrint(allocator, "stronger verifier required: {s}", .{entry.verifier_requirement orelse "unspecified"}),
+        .suppression_rule => try std.fmt.allocPrint(allocator, "exact repeat suppressed: {s}", .{entry.suppression_reason orelse "accepted negative knowledge suppression"}),
+        .routing_warning => try std.fmt.allocPrint(allocator, "routing warning: {s}", .{entry.warning orelse "accepted negative knowledge matched route"}),
+        .trust_decay_candidate => try std.fmt.allocPrint(allocator, "trust decay candidate proposed: {s}", .{entry.warning orelse entry.record_id}),
+    };
+}
+
+pub fn attachCorrectionEvents(
+    allocator: std.mem.Allocator,
+    result: *ResponseResult,
+    events: []const correction_hooks.CorrectionEvent,
+    candidates: []const correction_hooks.NegativeKnowledgeCandidate,
+) !void {
+    result.corrections.deinit(allocator);
+    result.corrections = .{};
+
+    var kinds = std.ArrayList([]u8).init(allocator);
+    errdefer freeStringList(allocator, kinds.items);
+    var contradicted = std.ArrayList([]u8).init(allocator);
+    errdefer freeStringList(allocator, contradicted.items);
+    var evidence = std.ArrayList([]u8).init(allocator);
+    errdefer freeStringList(allocator, evidence.items);
+    var nk_refs = std.ArrayList([]u8).init(allocator);
+    errdefer freeStringList(allocator, nk_refs.items);
+    var trust_refs = std.ArrayList([]u8).init(allocator);
+    errdefer freeStringList(allocator, trust_refs.items);
+    var summaries = std.ArrayList([]u8).init(allocator);
+    errdefer freeStringList(allocator, summaries.items);
+    var items = std.ArrayList(CorrectionItem).init(allocator);
+    errdefer {
+        for (items.items) |*item| item.deinit(allocator);
+        items.deinit();
+    }
+    var proposed = std.ArrayList([]u8).init(allocator);
+    errdefer freeStringList(allocator, proposed.items);
+
+    for (events) |event| {
+        if (items.items.len >= MAX_CORRECTION_ITEMS) break;
+        const candidate_ref = event.negative_knowledge_candidate_ref orelse candidateRefForCorrection(candidates, event.id);
+        try appendUniqueOwned(&kinds, @tagName(event.correction_kind));
+        try appendUniqueOwned(&contradicted, event.contradicted_ref);
+        try appendUniqueOwned(&evidence, event.contradicting_evidence_ref);
+        if (candidate_ref) |ref| {
+            try appendUniqueOwned(&nk_refs, ref);
+            try appendUniqueOwned(&proposed, ref);
+        }
+        if (event.trust_update_candidate_ref) |ref| try appendUniqueOwned(&trust_refs, ref);
+        try summaries.append(try allocator.dupe(u8, event.user_visible_summary));
+        try items.append(.{
+            .id = try allocator.dupe(u8, event.id),
+            .kind = try allocator.dupe(u8, @tagName(event.correction_kind)),
+            .previous_state = try allocator.dupe(u8, event.previous_state),
+            .updated_state = try allocator.dupe(u8, event.updated_state),
+            .contradicted_ref = try allocator.dupe(u8, event.contradicted_ref),
+            .evidence_ref = try allocator.dupe(u8, event.contradicting_evidence_ref),
+            .negative_knowledge_candidate_ref = if (candidate_ref) |ref| try allocator.dupe(u8, ref) else null,
+            .trust_decay_candidate_ref = if (event.trust_update_candidate_ref) |ref| try allocator.dupe(u8, ref) else null,
+            .user_visible_summary = try allocator.dupe(u8, event.user_visible_summary),
+            .non_authorizing = true,
+        });
+    }
+    for (candidates) |candidate| {
+        try appendUniqueOwned(&proposed, candidate.id);
+        try appendUniqueOwned(&nk_refs, candidate.id);
+    }
+
+    result.corrections = .{
+        .summary = .{
+            .correction_count = items.items.len,
+            .correction_kinds = try kinds.toOwnedSlice(),
+            .contradicted_refs = try contradicted.toOwnedSlice(),
+            .evidence_refs = try evidence.toOwnedSlice(),
+            .negative_knowledge_candidate_refs = try nk_refs.toOwnedSlice(),
+            .trust_decay_candidate_refs = try trust_refs.toOwnedSlice(),
+            .user_visible_summaries = try summaries.toOwnedSlice(),
+            .non_authorizing = true,
+        },
+        .items = try items.toOwnedSlice(),
+    };
+
+    freeStringList(allocator, result.negative_knowledge.proposed_candidates);
+    result.negative_knowledge.proposed_candidates = try proposed.toOwnedSlice();
+}
+
+fn candidateRefForCorrection(candidates: []const correction_hooks.NegativeKnowledgeCandidate, correction_id: []const u8) ?[]const u8 {
+    for (candidates) |candidate| {
+        if (std.mem.eql(u8, candidate.correction_event_id, correction_id)) return candidate.id;
+    }
+    return null;
+}
+
+pub fn attachNegativeKnowledgeInfluence(
+    allocator: std.mem.Allocator,
+    result: *ResponseResult,
+    influence: negative_knowledge.InfluenceResult,
+    target_kind: negative_knowledge.InfluenceKind,
+    target_ref: []const u8,
+) !void {
+    result.negative_knowledge.influence_summary.deinit(allocator);
+    for (result.negative_knowledge.items) |*item| item.deinit(allocator);
+    allocator.free(result.negative_knowledge.items);
+    freeStringList(allocator, result.negative_knowledge.applied_records);
+    freeStringList(allocator, result.negative_knowledge.trust_decay_candidates);
+    result.negative_knowledge.influence_summary = .{};
+    result.negative_knowledge.items = &.{};
+    result.negative_knowledge.applied_records = &.{};
+    result.negative_knowledge.trust_decay_candidates = &.{};
+
+    var record_ids = std.ArrayList([]u8).init(allocator);
+    errdefer freeStringList(allocator, record_ids.items);
+    var kinds = std.ArrayList([]u8).init(allocator);
+    errdefer freeStringList(allocator, kinds.items);
+    var hypotheses = std.ArrayList([]u8).init(allocator);
+    errdefer freeStringList(allocator, hypotheses.items);
+    var routes = std.ArrayList([]u8).init(allocator);
+    errdefer freeStringList(allocator, routes.items);
+    var handoffs = std.ArrayList([]u8).init(allocator);
+    errdefer freeStringList(allocator, handoffs.items);
+    var items = std.ArrayList(NegativeKnowledgeInfluenceItem).init(allocator);
+    errdefer {
+        for (items.items) |*item| item.deinit(allocator);
+        items.deinit();
+    }
+
+    var triage_penalties: usize = 0;
+    var verifier_requirements: usize = 0;
+    var suppressions: usize = 0;
+    var routing_warnings: usize = 0;
+    var trust_decay: usize = 0;
+
+    for (influence.trace_entries) |entry| {
+        if (items.items.len >= MAX_NEGATIVE_KNOWLEDGE_ITEMS) break;
+        try appendUniqueOwned(&record_ids, entry.record_id);
+        try appendUniqueOwned(&kinds, @tagName(entry.influence_kind));
+        switch (entry.influence_kind) {
+            .triage_penalty => {
+                triage_penalties += 1;
+                try appendUniqueOwned(&hypotheses, target_ref);
+            },
+            .verifier_requirement => {
+                verifier_requirements += 1;
+                try appendUniqueOwned(&handoffs, target_ref);
+            },
+            .suppression_rule => {
+                suppressions += 1;
+                try appendUniqueOwned(&hypotheses, target_ref);
+            },
+            .routing_warning => {
+                routing_warnings += 1;
+                try appendUniqueOwned(&routes, target_ref);
+            },
+            .trust_decay_candidate => trust_decay += 1,
+        }
+        try items.append(.{
+            .record_id = try allocator.dupe(u8, entry.record_id),
+            .influence_kind = try allocator.dupe(u8, @tagName(entry.influence_kind)),
+            .matched_scope = try allocator.dupe(u8, entry.matched_scope),
+            .target_ref = try allocator.dupe(u8, target_ref),
+            .effect = try influenceEffectText(allocator, entry),
+            .non_authorizing = true,
+        });
+    }
+
+    if (items.items.len == 0 and influence.matched_record_ids.len > 0) {
+        for (influence.matched_record_ids) |id| try appendUniqueOwned(&record_ids, id);
+        try appendUniqueOwned(&kinds, @tagName(target_kind));
+    }
+
+    result.negative_knowledge.applied_records = try cloneStringList(allocator, influence.matched_record_ids);
+    result.negative_knowledge.trust_decay_candidates = try cloneStringList(allocator, influence.trust_decay_candidates);
+    result.negative_knowledge.influence_summary = .{
+        .influence_count = record_ids.items.len,
+        .record_ids = try record_ids.toOwnedSlice(),
+        .influence_kinds = try kinds.toOwnedSlice(),
+        .affected_hypotheses = try hypotheses.toOwnedSlice(),
+        .affected_routes = try routes.toOwnedSlice(),
+        .affected_verifier_handoffs = try handoffs.toOwnedSlice(),
+        .triage_penalty_count = triage_penalties,
+        .verifier_requirement_count = verifier_requirements,
+        .suppression_count = suppressions,
+        .routing_warning_count = routing_warnings,
+        .trust_decay_candidate_count = trust_decay + influence.trust_decay_candidates.len,
+        .non_authorizing = true,
+    };
+    result.negative_knowledge.items = try items.toOwnedSlice();
 }
 
 // ── Fast Path Execution ───────────────────────────────────────────────
@@ -1407,6 +1750,10 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const ResponseResult) !
     }
     try writer.writeAll("]");
     try writer.writeAll("}");
+    try writer.writeAll(",\"corrections\":");
+    try writeCorrectionsJson(writer, result.corrections);
+    try writer.writeAll(",\"negative_knowledge\":");
+    try writeNegativeKnowledgeJson(writer, result.negative_knowledge);
     if (result.draft.mode.enabled) {
         try writer.writeAll(",\"assumptions\":");
         try writeJsonStringArray(writer, result.draft.assumptions);
@@ -1435,6 +1782,100 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const ResponseResult) !
     try writer.writeAll("}");
 
     return buf.toOwnedSlice();
+}
+
+fn writeCorrectionsJson(writer: anytype, corrections: CorrectionProtocol) !void {
+    try writer.writeAll("{\"summary\":{");
+    try std.fmt.format(writer, "\"correction_count\":{}", .{corrections.summary.correction_count});
+    try writer.writeAll(",\"correction_kinds\":");
+    try writeJsonStringArray(writer, corrections.summary.correction_kinds);
+    try writer.writeAll(",\"contradicted_refs\":");
+    try writeJsonStringArray(writer, corrections.summary.contradicted_refs);
+    try writer.writeAll(",\"evidence_refs\":");
+    try writeJsonStringArray(writer, corrections.summary.evidence_refs);
+    try writer.writeAll(",\"negative_knowledge_candidate_refs\":");
+    try writeJsonStringArray(writer, corrections.summary.negative_knowledge_candidate_refs);
+    try writer.writeAll(",\"trust_decay_candidate_refs\":");
+    try writeJsonStringArray(writer, corrections.summary.trust_decay_candidate_refs);
+    try writer.writeAll(",\"user_visible_summaries\":");
+    try writeJsonStringArray(writer, corrections.summary.user_visible_summaries);
+    try writer.writeAll(",\"non_authorizing\":true}");
+    try writer.writeAll(",\"items\":[");
+    for (corrections.items, 0..) |item, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try writer.writeAll("{\"id\":\"");
+        try writeJsonEscaped(writer, item.id);
+        try writer.writeAll("\",\"kind\":\"");
+        try writeJsonEscaped(writer, item.kind);
+        try writer.writeAll("\",\"previous_state\":\"");
+        try writeJsonEscaped(writer, item.previous_state);
+        try writer.writeAll("\",\"updated_state\":\"");
+        try writeJsonEscaped(writer, item.updated_state);
+        try writer.writeAll("\",\"contradicted_ref\":\"");
+        try writeJsonEscaped(writer, item.contradicted_ref);
+        try writer.writeAll("\",\"evidence_ref\":\"");
+        try writeJsonEscaped(writer, item.evidence_ref);
+        try writer.writeAll("\"");
+        if (item.negative_knowledge_candidate_ref) |value| {
+            try writer.writeAll(",\"negative_knowledge_candidate_ref\":\"");
+            try writeJsonEscaped(writer, value);
+            try writer.writeAll("\"");
+        }
+        if (item.trust_decay_candidate_ref) |value| {
+            try writer.writeAll(",\"trust_decay_candidate_ref\":\"");
+            try writeJsonEscaped(writer, value);
+            try writer.writeAll("\"");
+        }
+        try writer.writeAll(",\"user_visible_summary\":\"");
+        try writeJsonEscaped(writer, item.user_visible_summary);
+        try writer.writeAll("\",\"non_authorizing\":true}");
+    }
+    try writer.writeAll("]}");
+}
+
+fn writeNegativeKnowledgeJson(writer: anytype, protocol: NegativeKnowledgeProtocol) !void {
+    try writer.writeAll("{\"influence_summary\":{");
+    try std.fmt.format(writer, "\"influence_count\":{}", .{protocol.influence_summary.influence_count});
+    try writer.writeAll(",\"record_ids\":");
+    try writeJsonStringArray(writer, protocol.influence_summary.record_ids);
+    try writer.writeAll(",\"influence_kinds\":");
+    try writeJsonStringArray(writer, protocol.influence_summary.influence_kinds);
+    try writer.writeAll(",\"affected_hypotheses\":");
+    try writeJsonStringArray(writer, protocol.influence_summary.affected_hypotheses);
+    try writer.writeAll(",\"affected_routes\":");
+    try writeJsonStringArray(writer, protocol.influence_summary.affected_routes);
+    try writer.writeAll(",\"affected_verifier_handoffs\":");
+    try writeJsonStringArray(writer, protocol.influence_summary.affected_verifier_handoffs);
+    try std.fmt.format(writer, ",\"triage_penalty_count\":{},\"verifier_requirement_count\":{},\"suppression_count\":{},\"routing_warning_count\":{},\"trust_decay_candidate_count\":{}", .{
+        protocol.influence_summary.triage_penalty_count,
+        protocol.influence_summary.verifier_requirement_count,
+        protocol.influence_summary.suppression_count,
+        protocol.influence_summary.routing_warning_count,
+        protocol.influence_summary.trust_decay_candidate_count,
+    });
+    try writer.writeAll(",\"non_authorizing\":true}");
+    try writer.writeAll(",\"applied_records\":");
+    try writeJsonStringArray(writer, protocol.applied_records);
+    try writer.writeAll(",\"proposed_candidates\":");
+    try writeJsonStringArray(writer, protocol.proposed_candidates);
+    try writer.writeAll(",\"trust_decay_candidates\":");
+    try writeJsonStringArray(writer, protocol.trust_decay_candidates);
+    try writer.writeAll(",\"items\":[");
+    for (protocol.items, 0..) |item, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try writer.writeAll("{\"record_id\":\"");
+        try writeJsonEscaped(writer, item.record_id);
+        try writer.writeAll("\",\"influence_kind\":\"");
+        try writeJsonEscaped(writer, item.influence_kind);
+        try writer.writeAll("\",\"matched_scope\":\"");
+        try writeJsonEscaped(writer, item.matched_scope);
+        try writer.writeAll("\",\"target_ref\":\"");
+        try writeJsonEscaped(writer, item.target_ref);
+        try writer.writeAll("\",\"effect\":\"");
+        try writeJsonEscaped(writer, item.effect);
+        try writer.writeAll("\",\"non_authorizing\":true}");
+    }
+    try writer.writeAll("]}");
 }
 
 fn writeJsonEscaped(writer: anytype, text: []const u8) !void {
@@ -1754,6 +2195,110 @@ test "response engine: render json marks draft contract explicitly" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"stopReason\":\"supported\"") == null);
 }
 
+test "response engine: correction protocol appears in json and remains non-authorizing" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "explain src/main.zig", .{ .context_target = "src/main.zig" });
+    defer gi.deinit();
+    var result = try execute(allocator, &gi, .{ .mode = .draft_mode });
+    defer result.deinit();
+
+    var event = try testCorrectionEvent(allocator, "correction:test:1", .hypothesis_contradicted, "hypothesis:old", "verifier:evidence", "assumed_supported", "contradicted");
+    defer event.deinit();
+    var candidate = correction_hooks.NegativeKnowledgeCandidate{
+        .allocator = allocator,
+        .id = try allocator.dupe(u8, "nk:test:1"),
+        .correction_event_id = try allocator.dupe(u8, event.id),
+        .candidate_kind = .failed_hypothesis,
+        .scope = try allocator.dupe(u8, "hypothesis:old"),
+        .condition = try allocator.dupe(u8, "contradicted"),
+        .evidence_ref = try allocator.dupe(u8, "verifier:evidence"),
+    };
+    defer candidate.deinit();
+
+    try attachCorrectionEvents(allocator, &result, &.{event}, &.{candidate});
+    try std.testing.expectEqual(@as(usize, 1), result.corrections.summary.correction_count);
+    try std.testing.expect(result.corrections.summary.non_authorizing);
+    try std.testing.expectEqualStrings("nk:test:1", result.negative_knowledge.proposed_candidates[0]);
+
+    const rendered = try renderJson(allocator, &result);
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"corrections\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"negative_knowledge_candidate_ref\":\"nk:test:1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"non_authorizing\":true") != null);
+    try std.testing.expectEqual(StopReason.unresolved, result.stop_reason);
+}
+
+test "response engine: accepted negative knowledge influence renders explicit effects only" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "verify src/main.zig", .{ .context_target = "src/main.zig" });
+    defer gi.deinit();
+    var result = try execute(allocator, &gi, .{ .mode = .deep_path });
+    defer result.deinit();
+
+    var influence = negative_knowledge.InfluenceResult{ .allocator = allocator };
+    influence.matched_record_ids = try cloneStringList(allocator, &.{"nkr:failed_patch:123"});
+    influence.required_verifiers = try cloneStringList(allocator, &.{"build_and_runtime"});
+    influence.trust_decay_candidates = try cloneStringList(allocator, &.{"trust_decay:candidate:pack-runtime"});
+    influence.trace_entries = try allocator.alloc(negative_knowledge.InfluenceTraceEntry, 4);
+    influence.trace_entries[0] = .{
+        .allocator = allocator,
+        .record_id = try allocator.dupe(u8, "nkr:failed_patch:123"),
+        .matched_scope = try allocator.dupe(u8, "src/main.zig"),
+        .influence_kind = .triage_penalty,
+        .triage_delta = -12,
+    };
+    influence.trace_entries[1] = .{
+        .allocator = allocator,
+        .record_id = try allocator.dupe(u8, "nkr:failed_patch:123"),
+        .matched_scope = try allocator.dupe(u8, "src/main.zig"),
+        .influence_kind = .verifier_requirement,
+        .verifier_requirement = try allocator.dupe(u8, "build_and_runtime"),
+    };
+    influence.trace_entries[2] = .{
+        .allocator = allocator,
+        .record_id = try allocator.dupe(u8, "nkr:failed_patch:123"),
+        .matched_scope = try allocator.dupe(u8, "src/main.zig"),
+        .influence_kind = .suppression_rule,
+        .suppression_reason = try allocator.dupe(u8, "suppressed exact failed hypothesis"),
+    };
+    influence.trace_entries[3] = .{
+        .allocator = allocator,
+        .record_id = try allocator.dupe(u8, "nkr:failed_patch:123"),
+        .matched_scope = try allocator.dupe(u8, "src/main.zig"),
+        .influence_kind = .routing_warning,
+        .warning = try allocator.dupe(u8, "routing warning from prior failure"),
+    };
+    defer influence.deinit();
+
+    try attachNegativeKnowledgeInfluence(allocator, &result, influence, .verifier_requirement, "handoff:src/main.zig");
+    try std.testing.expectEqual(@as(usize, 1), result.negative_knowledge.influence_summary.influence_count);
+    try std.testing.expectEqual(@as(usize, 1), result.negative_knowledge.influence_summary.triage_penalty_count);
+    try std.testing.expectEqual(@as(usize, 1), result.negative_knowledge.influence_summary.verifier_requirement_count);
+    try std.testing.expectEqual(@as(usize, 1), result.negative_knowledge.influence_summary.suppression_count);
+    try std.testing.expectEqual(@as(usize, 1), result.negative_knowledge.influence_summary.routing_warning_count);
+    try std.testing.expectEqual(@as(usize, 1), result.negative_knowledge.influence_summary.trust_decay_candidate_count);
+    try std.testing.expect(result.negative_knowledge.influence_summary.non_authorizing);
+
+    const rendered = try renderJson(allocator, &result);
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "stronger verifier required") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "exact repeat suppressed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"non_authorizing\":true") != null);
+}
+
+test "response engine: empty correction and influence summaries render consistently" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "explain src/main.zig", .{ .context_target = "src/main.zig" });
+    defer gi.deinit();
+    var result = try execute(allocator, &gi, .{ .mode = .draft_mode });
+    defer result.deinit();
+    const rendered = try renderJson(allocator, &result);
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"correction_count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"influence_count\":0") != null);
+    try std.testing.expectEqual(StopReason.unresolved, result.stop_reason);
+}
+
 test "resolve budget: fast path maps to low tier" {
     const budget = resolveBudget(.{ .mode = .fast_path });
     try std.testing.expectEqual(compute_budget.Tier.low, budget.effective_tier);
@@ -2040,6 +2585,30 @@ fn writeJsonStringArray(writer: anytype, items: []const []u8) !void {
         try writer.writeAll("\"");
     }
     try writer.writeAll("]");
+}
+
+fn testCorrectionEvent(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    kind: correction_hooks.CorrectionKind,
+    contradicted_ref: []const u8,
+    evidence_ref: []const u8,
+    previous_state: []const u8,
+    updated_state: []const u8,
+) !correction_hooks.CorrectionEvent {
+    return .{
+        .allocator = allocator,
+        .id = try allocator.dupe(u8, id),
+        .correction_kind = kind,
+        .source_ref = try allocator.dupe(u8, "test:source"),
+        .contradicted_ref = try allocator.dupe(u8, contradicted_ref),
+        .contradicting_evidence_ref = try allocator.dupe(u8, evidence_ref),
+        .previous_state = try allocator.dupe(u8, previous_state),
+        .updated_state = try allocator.dupe(u8, updated_state),
+        .user_visible_summary = try allocator.dupe(u8, "Correction recorded: the previous hypothesis was contradicted by verifier evidence. Ghost will not reuse this pattern without stronger verification."),
+        .non_authorizing = true,
+        .trace = try allocator.dupe(u8, "test correction projection"),
+    };
 }
 
 test "response engine: speculative scheduler is disabled in fast path and active after deep escalation" {

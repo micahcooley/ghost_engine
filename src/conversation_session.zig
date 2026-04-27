@@ -1,5 +1,6 @@
 const std = @import("std");
 const compute_budget = @import("compute_budget.zig");
+const correction_hooks = @import("correction_hooks.zig");
 const feedback = @import("feedback.zig");
 const intent_grounding = @import("intent_grounding.zig");
 const response_engine = @import("response_engine.zig");
@@ -87,6 +88,61 @@ pub const LastResult = struct {
     }
 };
 
+pub const CorrectionProjection = struct {
+    correction_count: usize = 0,
+    correction_refs: [][]u8 = &.{},
+    correction_kinds: [][]u8 = &.{},
+    contradicted_refs: [][]u8 = &.{},
+    evidence_refs: [][]u8 = &.{},
+    negative_knowledge_candidate_refs: [][]u8 = &.{},
+    trust_decay_candidate_refs: [][]u8 = &.{},
+    user_visible_summaries: [][]u8 = &.{},
+    non_authorizing: bool = true,
+    projection_complete: bool = true,
+
+    pub fn deinit(self: *CorrectionProjection, allocator: std.mem.Allocator) void {
+        freeStringList(allocator, self.correction_refs);
+        freeStringList(allocator, self.correction_kinds);
+        freeStringList(allocator, self.contradicted_refs);
+        freeStringList(allocator, self.evidence_refs);
+        freeStringList(allocator, self.negative_knowledge_candidate_refs);
+        freeStringList(allocator, self.trust_decay_candidate_refs);
+        freeStringList(allocator, self.user_visible_summaries);
+        self.* = undefined;
+    }
+};
+
+pub const NegativeKnowledgeInfluenceProjection = struct {
+    influence_count: usize = 0,
+    record_ids: [][]u8 = &.{},
+    influence_kinds: [][]u8 = &.{},
+    affected_hypotheses: [][]u8 = &.{},
+    affected_routes: [][]u8 = &.{},
+    affected_verifier_handoffs: [][]u8 = &.{},
+    applied_records: [][]u8 = &.{},
+    proposed_candidates: [][]u8 = &.{},
+    trust_decay_candidates: [][]u8 = &.{},
+    triage_penalty_count: usize = 0,
+    verifier_requirement_count: usize = 0,
+    suppression_count: usize = 0,
+    routing_warning_count: usize = 0,
+    trust_decay_candidate_count: usize = 0,
+    non_authorizing: bool = true,
+    projection_complete: bool = true,
+
+    pub fn deinit(self: *NegativeKnowledgeInfluenceProjection, allocator: std.mem.Allocator) void {
+        freeStringList(allocator, self.record_ids);
+        freeStringList(allocator, self.influence_kinds);
+        freeStringList(allocator, self.affected_hypotheses);
+        freeStringList(allocator, self.affected_routes);
+        freeStringList(allocator, self.affected_verifier_handoffs);
+        freeStringList(allocator, self.applied_records);
+        freeStringList(allocator, self.proposed_candidates);
+        freeStringList(allocator, self.trust_decay_candidates);
+        self.* = undefined;
+    }
+};
+
 pub const PendingAmbiguity = struct {
     label: []u8,
     question: []u8,
@@ -145,6 +201,10 @@ pub const Session = struct {
     active_artifacts: []ArtifactRef = &.{},
     current_intent: ?IntentState = null,
     last_result: ?LastResult = null,
+    last_corrections: ?CorrectionProjection = null,
+    last_negative_knowledge_influence: ?NegativeKnowledgeInfluenceProjection = null,
+    correction_refs: [][]u8 = &.{},
+    negative_knowledge_candidate_refs: [][]u8 = &.{},
     pending_ambiguities: []PendingAmbiguity = &.{},
     pending_obligations: []PendingObligation = &.{},
 
@@ -160,6 +220,10 @@ pub const Session = struct {
         self.allocator.free(self.active_artifacts);
         if (self.current_intent) |*value| value.deinit(self.allocator);
         if (self.last_result) |*value| value.deinit(self.allocator);
+        if (self.last_corrections) |*value| value.deinit(self.allocator);
+        if (self.last_negative_knowledge_influence) |*value| value.deinit(self.allocator);
+        freeStringList(self.allocator, self.correction_refs);
+        freeStringList(self.allocator, self.negative_knowledge_candidate_refs);
         for (self.pending_ambiguities) |*item| item.deinit(self.allocator);
         self.allocator.free(self.pending_ambiguities);
         for (self.pending_obligations) |*item| item.deinit(self.allocator);
@@ -207,6 +271,7 @@ pub fn turn(allocator: std.mem.Allocator, options: TurnOptions) !TurnResult {
     if (isFeedback(options.message)) {
         const applied = try recordFeedback(&session, &paths, options.message);
         clearLastResult(&session);
+        clearCorrectionProjections(&session);
         session.last_result = .{
             .kind = .feedback,
             .selected_mode = .draft,
@@ -252,6 +317,7 @@ pub fn turn(allocator: std.mem.Allocator, options: TurnOptions) !TurnResult {
     if (!deep_blocked_by_ambiguity) try replacePending(&session, &response.grounded_intent);
     try updateArtifactsFromIntent(&session, &response.grounded_intent);
     try replaceLastResult(&session, &response, selected_mode, deep_blocked_by_ambiguity);
+    try replaceCorrectionProjections(&session, &response);
 
     const reply = try renderConversationReply(allocator, &session, transition);
     errdefer allocator.free(reply);
@@ -316,6 +382,10 @@ pub fn load(allocator: std.mem.Allocator, project_shard: ?[]const u8, session_id
         activeArtifacts: []const ArtifactRef,
         currentIntent: ?IntentState = null,
         lastResult: ?LastResult = null,
+        last_corrections: ?CorrectionProjection = null,
+        last_negative_knowledge_influence: ?NegativeKnowledgeInfluenceProjection = null,
+        correction_refs: []const []const u8 = &.{},
+        negative_knowledge_candidate_refs: []const []const u8 = &.{},
         pendingAmbiguities: []const PendingAmbiguity,
         pendingObligations: []const PendingObligation,
     };
@@ -336,6 +406,10 @@ pub fn load(allocator: std.mem.Allocator, project_shard: ?[]const u8, session_id
         .active_artifacts = try cloneArtifacts(allocator, parsed.value.activeArtifacts),
         .current_intent = if (parsed.value.currentIntent) |value| try cloneIntentState(allocator, value) else null,
         .last_result = if (parsed.value.lastResult) |value| try cloneLastResult(allocator, value) else null,
+        .last_corrections = if (parsed.value.last_corrections) |value| try cloneCorrectionProjection(allocator, value) else null,
+        .last_negative_knowledge_influence = if (parsed.value.last_negative_knowledge_influence) |value| try cloneNegativeKnowledgeInfluenceProjection(allocator, value) else null,
+        .correction_refs = try cloneConstStringList(allocator, parsed.value.correction_refs),
+        .negative_knowledge_candidate_refs = try cloneConstStringList(allocator, parsed.value.negative_knowledge_candidate_refs),
         .pending_ambiguities = try cloneAmbiguities(allocator, parsed.value.pendingAmbiguities),
         .pending_obligations = try cloneObligations(allocator, parsed.value.pendingObligations),
     };
@@ -363,6 +437,10 @@ pub fn renderJson(allocator: std.mem.Allocator, session: *const Session) ![]u8 {
         .activeArtifacts = session.active_artifacts,
         .currentIntent = session.current_intent,
         .lastResult = session.last_result,
+        .last_corrections = session.last_corrections,
+        .last_negative_knowledge_influence = session.last_negative_knowledge_influence,
+        .correction_refs = session.correction_refs,
+        .negative_knowledge_candidate_refs = session.negative_knowledge_candidate_refs,
         .pendingAmbiguities = session.pending_ambiguities,
         .pendingObligations = session.pending_obligations,
     }, .{}, out.writer());
@@ -396,6 +474,48 @@ fn renderConversationReply(allocator: std.mem.Allocator, session: *const Session
         try writer.print("summary={s}\n", .{last.summary});
         try writer.print("session={s}\n", .{session.session_id});
         if (last.artifact_path) |path| try writer.print("artifact={s}\n", .{path});
+    }
+
+    if (session.last_corrections) |corrections| {
+        if (corrections.correction_count > 0) {
+            try writer.writeAll("\n[correction_recorded]\n");
+            const count = @min(corrections.user_visible_summaries.len, 4);
+            for (corrections.user_visible_summaries[0..count], 0..) |summary, idx| {
+                const previous = if (idx < corrections.contradicted_refs.len) corrections.contradicted_refs[idx] else "unknown";
+                const evidence = if (idx < corrections.evidence_refs.len) corrections.evidence_refs[idx] else "unknown";
+                try writer.print("previous_assumption={s}\ncontradicting_evidence={s}\nupdated_state={s}\n", .{ previous, evidence, summary });
+            }
+            if (corrections.negative_knowledge_candidate_refs.len > 0) {
+                try writer.print("negative_knowledge_candidate_proposed={s}\nreview_required=true\n", .{corrections.negative_knowledge_candidate_refs[0]});
+            } else {
+                try writer.writeAll("negative_knowledge_candidate_proposed=false\nreview_required=false\n");
+            }
+            try writer.writeAll("non_authorizing=true\n");
+        }
+    }
+
+    if (session.last_negative_knowledge_influence) |influence| {
+        if (influence.influence_count > 0 or influence.trust_decay_candidate_count > 0) {
+            try writer.writeAll("\n[negative_knowledge_applied]\n");
+            const count = @min(influence.record_ids.len, 4);
+            for (influence.record_ids[0..count], 0..) |record_id, idx| {
+                const kind = if (idx < influence.influence_kinds.len) influence.influence_kinds[idx] else "accepted_negative_knowledge";
+                try writer.print("record={s}\ninfluence={s}\n", .{ record_id, kind });
+            }
+            if (influence.triage_penalty_count > 0) try writer.print("triage_penalty_count={d}\n", .{influence.triage_penalty_count});
+            if (influence.verifier_requirement_count > 0) try writer.print("stronger_verifier_required={d}\n", .{influence.verifier_requirement_count});
+            if (influence.suppression_count > 0) try writer.print("exact_repeat_suppressed={d}\n", .{influence.suppression_count});
+            if (influence.routing_warning_count > 0) try writer.print("routing_warning={d}\n", .{influence.routing_warning_count});
+            if (influence.trust_decay_candidate_count > 0) try writer.print("trust_decay_candidate_proposed={d}\n", .{influence.trust_decay_candidate_count});
+            try writer.writeAll("did_not_prove_claim=true\ndid_not_authorize_support=true\ndid_not_mutate_packs=true\nnon_authorizing=true\n");
+        } else if (influence.proposed_candidates.len > 0) {
+            try writer.writeAll("\n[negative_knowledge_candidate_proposed]\n");
+            const count = @min(influence.proposed_candidates.len, 4);
+            for (influence.proposed_candidates[0..count]) |candidate| {
+                try writer.print("candidate={s}\n", .{candidate});
+            }
+            try writer.writeAll("review_required=true\nnon_authorizing=true\n");
+        }
     }
 
     if (session.pending_ambiguities.len > 0) {
@@ -443,6 +563,71 @@ fn replaceLastResult(session: *Session, result: *const response_engine.ResponseR
         .stop_reason = result.stop_reason,
         .summary = summary,
     };
+}
+
+fn replaceCorrectionProjections(session: *Session, result: *const response_engine.ResponseResult) !void {
+    clearCorrectionProjections(session);
+    if (result.corrections.summary.correction_count > 0) {
+        var refs = try session.allocator.alloc([]u8, result.corrections.items.len);
+        errdefer {
+            for (refs) |item| session.allocator.free(item);
+            session.allocator.free(refs);
+        }
+        for (result.corrections.items, 0..) |item, idx| refs[idx] = try session.allocator.dupe(u8, item.id);
+        session.last_corrections = .{
+            .correction_count = result.corrections.summary.correction_count,
+            .correction_refs = try cloneStringList(session.allocator, refs),
+            .correction_kinds = try cloneStringList(session.allocator, result.corrections.summary.correction_kinds),
+            .contradicted_refs = try cloneStringList(session.allocator, result.corrections.summary.contradicted_refs),
+            .evidence_refs = try cloneStringList(session.allocator, result.corrections.summary.evidence_refs),
+            .negative_knowledge_candidate_refs = try cloneStringList(session.allocator, result.corrections.summary.negative_knowledge_candidate_refs),
+            .trust_decay_candidate_refs = try cloneStringList(session.allocator, result.corrections.summary.trust_decay_candidate_refs),
+            .user_visible_summaries = try cloneStringList(session.allocator, result.corrections.summary.user_visible_summaries),
+            .non_authorizing = true,
+            .projection_complete = result.corrections.items.len <= response_engine.MAX_CORRECTION_ITEMS,
+        };
+        session.correction_refs = refs;
+    } else {
+        session.last_corrections = .{ .projection_complete = true };
+    }
+
+    if (result.negative_knowledge.influence_summary.influence_count > 0 or
+        result.negative_knowledge.proposed_candidates.len > 0 or
+        result.negative_knowledge.trust_decay_candidates.len > 0)
+    {
+        session.last_negative_knowledge_influence = .{
+            .influence_count = result.negative_knowledge.influence_summary.influence_count,
+            .record_ids = try cloneStringList(session.allocator, result.negative_knowledge.influence_summary.record_ids),
+            .influence_kinds = try cloneStringList(session.allocator, result.negative_knowledge.influence_summary.influence_kinds),
+            .affected_hypotheses = try cloneStringList(session.allocator, result.negative_knowledge.influence_summary.affected_hypotheses),
+            .affected_routes = try cloneStringList(session.allocator, result.negative_knowledge.influence_summary.affected_routes),
+            .affected_verifier_handoffs = try cloneStringList(session.allocator, result.negative_knowledge.influence_summary.affected_verifier_handoffs),
+            .applied_records = try cloneStringList(session.allocator, result.negative_knowledge.applied_records),
+            .proposed_candidates = try cloneStringList(session.allocator, result.negative_knowledge.proposed_candidates),
+            .trust_decay_candidates = try cloneStringList(session.allocator, result.negative_knowledge.trust_decay_candidates),
+            .triage_penalty_count = result.negative_knowledge.influence_summary.triage_penalty_count,
+            .verifier_requirement_count = result.negative_knowledge.influence_summary.verifier_requirement_count,
+            .suppression_count = result.negative_knowledge.influence_summary.suppression_count,
+            .routing_warning_count = result.negative_knowledge.influence_summary.routing_warning_count,
+            .trust_decay_candidate_count = result.negative_knowledge.influence_summary.trust_decay_candidate_count,
+            .non_authorizing = true,
+            .projection_complete = result.negative_knowledge.items.len <= response_engine.MAX_NEGATIVE_KNOWLEDGE_ITEMS,
+        };
+        session.negative_knowledge_candidate_refs = try cloneStringList(session.allocator, result.negative_knowledge.proposed_candidates);
+    } else {
+        session.last_negative_knowledge_influence = .{ .projection_complete = true };
+    }
+}
+
+fn clearCorrectionProjections(session: *Session) void {
+    if (session.last_corrections) |*value| value.deinit(session.allocator);
+    session.last_corrections = null;
+    if (session.last_negative_knowledge_influence) |*value| value.deinit(session.allocator);
+    session.last_negative_knowledge_influence = null;
+    freeStringList(session.allocator, session.correction_refs);
+    session.correction_refs = &.{};
+    freeStringList(session.allocator, session.negative_knowledge_candidate_refs);
+    session.negative_knowledge_candidate_refs = &.{};
 }
 
 fn summarizeResponse(allocator: std.mem.Allocator, result: *const response_engine.ResponseResult, mode: ConversationMode, deep_blocked_by_ambiguity: bool) ![]u8 {
@@ -796,6 +981,69 @@ fn cloneLastResult(allocator: std.mem.Allocator, item: LastResult) !LastResult {
     };
 }
 
+fn cloneCorrectionProjection(allocator: std.mem.Allocator, item: CorrectionProjection) !CorrectionProjection {
+    return .{
+        .correction_count = item.correction_count,
+        .correction_refs = try cloneStringList(allocator, item.correction_refs),
+        .correction_kinds = try cloneStringList(allocator, item.correction_kinds),
+        .contradicted_refs = try cloneStringList(allocator, item.contradicted_refs),
+        .evidence_refs = try cloneStringList(allocator, item.evidence_refs),
+        .negative_knowledge_candidate_refs = try cloneStringList(allocator, item.negative_knowledge_candidate_refs),
+        .trust_decay_candidate_refs = try cloneStringList(allocator, item.trust_decay_candidate_refs),
+        .user_visible_summaries = try cloneStringList(allocator, item.user_visible_summaries),
+        .non_authorizing = item.non_authorizing,
+        .projection_complete = item.projection_complete,
+    };
+}
+
+fn cloneNegativeKnowledgeInfluenceProjection(allocator: std.mem.Allocator, item: NegativeKnowledgeInfluenceProjection) !NegativeKnowledgeInfluenceProjection {
+    return .{
+        .influence_count = item.influence_count,
+        .record_ids = try cloneStringList(allocator, item.record_ids),
+        .influence_kinds = try cloneStringList(allocator, item.influence_kinds),
+        .affected_hypotheses = try cloneStringList(allocator, item.affected_hypotheses),
+        .affected_routes = try cloneStringList(allocator, item.affected_routes),
+        .affected_verifier_handoffs = try cloneStringList(allocator, item.affected_verifier_handoffs),
+        .applied_records = try cloneStringList(allocator, item.applied_records),
+        .proposed_candidates = try cloneStringList(allocator, item.proposed_candidates),
+        .trust_decay_candidates = try cloneStringList(allocator, item.trust_decay_candidates),
+        .triage_penalty_count = item.triage_penalty_count,
+        .verifier_requirement_count = item.verifier_requirement_count,
+        .suppression_count = item.suppression_count,
+        .routing_warning_count = item.routing_warning_count,
+        .trust_decay_candidate_count = item.trust_decay_candidate_count,
+        .non_authorizing = item.non_authorizing,
+        .projection_complete = item.projection_complete,
+    };
+}
+
+fn cloneStringList(allocator: std.mem.Allocator, source: []const []u8) ![][]u8 {
+    if (source.len == 0) return &.{};
+    var out = try allocator.alloc([]u8, source.len);
+    errdefer {
+        for (out) |item| allocator.free(item);
+        allocator.free(out);
+    }
+    for (source, 0..) |item, idx| out[idx] = try allocator.dupe(u8, item);
+    return out;
+}
+
+fn cloneConstStringList(allocator: std.mem.Allocator, source: []const []const u8) ![][]u8 {
+    if (source.len == 0) return &.{};
+    var out = try allocator.alloc([]u8, source.len);
+    errdefer {
+        for (out) |item| allocator.free(item);
+        allocator.free(out);
+    }
+    for (source, 0..) |item, idx| out[idx] = try allocator.dupe(u8, item);
+    return out;
+}
+
+fn freeStringList(allocator: std.mem.Allocator, source: [][]u8) void {
+    for (source) |item| allocator.free(item);
+    allocator.free(source);
+}
+
 fn cloneAmbiguities(allocator: std.mem.Allocator, source: []const PendingAmbiguity) ![]PendingAmbiguity {
     const out = try allocator.alloc(PendingAmbiguity, source.len);
     errdefer allocator.free(out);
@@ -939,6 +1187,73 @@ test "conversation session carries artifact context, feedback, and deterministic
     const json2 = try renderJson(allocator, &loaded);
     defer allocator.free(json2);
     try std.testing.expect(std.mem.eql(u8, json1, json2));
+}
+
+test "conversation session preserves bounded correction and negative knowledge projection refs" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const project = "conversation-correction-projection-test";
+    try resetConversationTestShard(allocator, project);
+
+    var session = try create(allocator, .{
+        .repo_root = root,
+        .project_shard = project,
+        .session_id = "ux",
+        .context_artifacts = &.{"src/main.zig"},
+    });
+    defer session.deinit();
+
+    var gi = try intent_grounding.ground(allocator, "verify src/main.zig", .{ .context_target = "src/main.zig" });
+    defer gi.deinit();
+    var response = try response_engine.execute(allocator, &gi, .{ .mode = .deep_path });
+    defer response.deinit();
+
+    var event = correction_hooks.CorrectionEvent{
+        .allocator = allocator,
+        .id = try allocator.dupe(u8, "correction:session:1"),
+        .correction_kind = .hypothesis_contradicted,
+        .source_ref = try allocator.dupe(u8, "test:source"),
+        .contradicted_ref = try allocator.dupe(u8, "hypothesis:session"),
+        .contradicting_evidence_ref = try allocator.dupe(u8, "verifier:evidence"),
+        .previous_state = try allocator.dupe(u8, "assumed_supported"),
+        .updated_state = try allocator.dupe(u8, "contradicted"),
+        .user_visible_summary = try allocator.dupe(u8, "Correction recorded: verifier evidence contradicted the previous hypothesis."),
+        .non_authorizing = true,
+        .trace = try allocator.dupe(u8, "session projection test"),
+    };
+    defer event.deinit();
+    var candidate = correction_hooks.NegativeKnowledgeCandidate{
+        .allocator = allocator,
+        .id = try allocator.dupe(u8, "nk:session:1"),
+        .correction_event_id = try allocator.dupe(u8, event.id),
+        .candidate_kind = .failed_hypothesis,
+        .scope = try allocator.dupe(u8, "hypothesis:session"),
+        .condition = try allocator.dupe(u8, "contradicted"),
+        .evidence_ref = try allocator.dupe(u8, "verifier:evidence"),
+    };
+    defer candidate.deinit();
+    try response_engine.attachCorrectionEvents(allocator, &response, &.{event}, &.{candidate});
+    try replaceCorrectionProjections(&session, &response);
+
+    try std.testing.expectEqual(@as(usize, 1), session.last_corrections.?.correction_count);
+    try std.testing.expectEqual(@as(usize, 1), session.correction_refs.len);
+    try std.testing.expectEqual(@as(usize, 1), session.negative_knowledge_candidate_refs.len);
+    try std.testing.expect(session.last_corrections.?.non_authorizing);
+
+    const reply = try renderConversationReply(allocator, &session, null);
+    defer allocator.free(reply);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "[correction_recorded]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "review_required=true") != null);
+
+    try save(&session);
+    var loaded = try load(allocator, project, "ux");
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), loaded.correction_refs.len);
+    try std.testing.expectEqual(@as(usize, 1), loaded.negative_knowledge_candidate_refs.len);
+    try std.testing.expect(loaded.last_corrections.?.projection_complete);
 }
 
 fn resetConversationTestShard(allocator: std.mem.Allocator, shard_id: []const u8) !void {
