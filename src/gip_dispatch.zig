@@ -15,6 +15,7 @@ const knowledge_pack_store = @import("knowledge_pack_store.zig");
 const feedback = @import("feedback.zig");
 const shards = @import("shards.zig");
 const task_sessions = @import("task_sessions.zig");
+const project_autopsy = @import("project_autopsy.zig");
 
 pub const DispatchResult = struct {
     status: core.ProtocolStatus,
@@ -113,6 +114,7 @@ pub fn dispatch(
         .@"pack.inspect" => dispatchPackInspect(allocator, request_body),
         .@"feedback.summary" => dispatchFeedbackSummary(allocator, workspace_root, request_body),
         .@"session.get" => dispatchSessionGet(allocator, request_body),
+        .@"project.autopsy" => dispatchProjectAutopsy(allocator, workspace_root, request_body),
         else => .{
             .status = .unsupported,
             .err = .{
@@ -134,8 +136,8 @@ fn dispatchProtocolDescribe(allocator: std.mem.Allocator) !DispatchResult {
     try w.writeAll("{\"protocol\":{");
     try w.writeAll("\"version\":\"");
     try w.writeAll(core.PROTOCOL_VERSION);
-    try w.writeAll("\",\"implemented\":[\"protocol.describe\",\"capabilities.describe\",\"engine.status\",\"conversation.turn\",\"artifact.read\",\"artifact.list\",\"artifact.patch.propose\",\"hypothesis.list\",\"hypothesis.triage\",\"verifier.list\",\"verifier.candidate.execution.list\",\"verifier.candidate.execution.get\",\"correction.list\",\"correction.get\",\"negative_knowledge.candidate.list\",\"negative_knowledge.candidate.get\",\"negative_knowledge.record.list\",\"negative_knowledge.record.get\",\"negative_knowledge.influence.list\",\"trust_decay.candidate.list\",\"negative_knowledge.candidate.review\",\"negative_knowledge.record.expire\",\"negative_knowledge.record.supersede\",\"pack.list\",\"pack.inspect\",\"feedback.summary\",\"session.get\"]");
-    try w.writeAll(",\"maturity\":{\"hypothesis.list\":\"stateless\",\"hypothesis.triage\":\"stateless\",\"verifier.candidate.execution.list\":\"read_only_state_inspection\",\"verifier.candidate.execution.get\":\"read_only_state_inspection\",\"correction.list\":\"read_only_state_inspection\",\"correction.get\":\"read_only_state_inspection\",\"negative_knowledge.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.get\":\"read_only_state_inspection\",\"negative_knowledge.record.list\":\"read_only_state_inspection\",\"negative_knowledge.record.get\":\"read_only_state_inspection\",\"negative_knowledge.influence.list\":\"read_only_state_inspection\",\"trust_decay.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.review\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.expire\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.supersede\":\"structured_unsupported_without_persistence\",\"feedback.summary\":\"requires_workspace_metadata\",\"session.get\":\"requires_existing_session\"}");
+    try w.writeAll("\",\"implemented\":[\"protocol.describe\",\"capabilities.describe\",\"engine.status\",\"conversation.turn\",\"artifact.read\",\"artifact.list\",\"artifact.patch.propose\",\"hypothesis.list\",\"hypothesis.triage\",\"verifier.list\",\"verifier.candidate.execution.list\",\"verifier.candidate.execution.get\",\"correction.list\",\"correction.get\",\"negative_knowledge.candidate.list\",\"negative_knowledge.candidate.get\",\"negative_knowledge.record.list\",\"negative_knowledge.record.get\",\"negative_knowledge.influence.list\",\"trust_decay.candidate.list\",\"negative_knowledge.candidate.review\",\"negative_knowledge.record.expire\",\"negative_knowledge.record.supersede\",\"pack.list\",\"pack.inspect\",\"feedback.summary\",\"session.get\",\"project.autopsy\"]");
+    try w.writeAll(",\"maturity\":{\"hypothesis.list\":\"stateless\",\"hypothesis.triage\":\"stateless\",\"verifier.candidate.execution.list\":\"read_only_state_inspection\",\"verifier.candidate.execution.get\":\"read_only_state_inspection\",\"correction.list\":\"read_only_state_inspection\",\"correction.get\":\"read_only_state_inspection\",\"negative_knowledge.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.get\":\"read_only_state_inspection\",\"negative_knowledge.record.list\":\"read_only_state_inspection\",\"negative_knowledge.record.get\":\"read_only_state_inspection\",\"negative_knowledge.influence.list\":\"read_only_state_inspection\",\"trust_decay.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.review\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.expire\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.supersede\":\"structured_unsupported_without_persistence\",\"feedback.summary\":\"requires_workspace_metadata\",\"session.get\":\"requires_existing_session\",\"project.autopsy\":\"read_only_workspace_inspection\"}");
     try w.writeAll(",\"unsupported\":[\"artifact.patch.apply\",\"artifact.write.propose\",\"artifact.write.apply\",\"artifact.search\",\"conversation.replay\",\"intent.ground\",\"response.evaluate\",\"verifier.run\",\"verifier.candidate.execute\",\"hypothesis.generate\",\"hypothesis.verifier.schedule\",\"correction.apply\",\"negative_knowledge.promote\",\"pack.update_from_negative_knowledge\",\"trust_decay.apply\",\"pack.mount\",\"pack.unmount\",\"pack.import\",\"pack.export\",\"pack.distill.list\",\"pack.distill.show\",\"pack.distill.export\",\"feedback.record\",\"feedback.replay\",\"session.create\",\"session.update\",\"session.close\",\"command.run\"]");
     try w.writeAll("}}");
 
@@ -187,7 +189,8 @@ fn dispatchCapabilitiesDescribe(allocator: std.mem.Allocator) !DispatchResult {
     try w.writeAll("{\"capability\":\"pack.update_from_negative_knowledge\",\"policy\":\"denied\",\"mutation\":true,\"note\":\"future work; not implemented\"},");
     try w.writeAll("{\"capability\":\"trust_decay.apply\",\"policy\":\"denied\",\"mutation\":true,\"note\":\"future work; not implemented\"},");
     try w.writeAll("{\"capability\":\"command.run\",\"policy\":\"allowlist\",\"note\":\"not yet implemented\"},");
-    try w.writeAll("{\"capability\":\"network.access\",\"policy\":\"denied\"}");
+    try w.writeAll("{\"capability\":\"network.access\",\"policy\":\"denied\"},");
+    try w.writeAll("{\"capability\":\"project.autopsy\",\"policy\":\"allowed\",\"read_only\":true,\"note\":\"bounded read-only workspace inspection; no commands executed\"}");
     try w.writeAll("]}");
 
     return .{
@@ -2073,6 +2076,102 @@ fn dispatchSessionGet(allocator: std.mem.Allocator, request_body: ?[]const u8) !
     };
 }
 
+// ── Project Autopsy ───────────────────────────────────────────────────
+//
+// Read-only bounded workspace inspection.
+// No commands are executed. No files are mutated. No verifiers are
+// registered or scheduled. Output is always draft/non-authorizing.
+// Command candidates remain argv arrays with requires_user_confirmation=true.
+// Verifier plan candidates have executes_by_default=false.
+// Missing evidence is expressed as unknown/gap, not negative evidence.
+
+fn dispatchProjectAutopsy(allocator: std.mem.Allocator, workspace_root: ?[]const u8, request_body: ?[]const u8) !DispatchResult {
+    const root = workspace_root orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "workspace root is required for project.autopsy" },
+    };
+
+    // The workspace root is the analysis boundary. It is canonicalized using realpathAlloc
+    // inside project_autopsy.analyze. There is no subpath accepted by this operation.
+    // Therefore, if the canonicalized workspace root exists, analysis is safely bounded to it.
+
+    // Parse optional options from request body.
+    var max_entries: usize = project_autopsy.DEFAULT_MAX_ENTRIES;
+    var max_depth: usize = project_autopsy.DEFAULT_MAX_DEPTH;
+
+    if (request_body) |body| {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+            return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } };
+        };
+        defer parsed.deinit();
+        if (parsed.value == .object) {
+            const obj = parsed.value.object;
+            if (getInt(obj, "max_entries", "maxEntries")) |v| {
+                if (v > 0) max_entries = @min(@as(usize, @intCast(v)), project_autopsy.DEFAULT_MAX_ENTRIES);
+            }
+            if (getInt(obj, "max_depth", "maxDepth")) |v| {
+                if (v > 0) max_depth = @min(@as(usize, @intCast(v)), project_autopsy.DEFAULT_MAX_DEPTH);
+            }
+        }
+    }
+
+    const options: project_autopsy.AnalyzeOptions = .{
+        .max_entries = max_entries,
+        .max_depth = max_depth,
+    };
+
+    // Run the bounded read-only analysis in a sub-arena so that all analysis
+    // allocations are freed together after we stringify the result into the
+    // main allocator's output buffer. This prevents leaks in the GPA.
+    var analysis_arena = std.heap.ArenaAllocator.init(allocator);
+    defer analysis_arena.deinit();
+    const analysis_alloc = analysis_arena.allocator();
+
+    const autopsy_result = project_autopsy.analyze(analysis_alloc, root, options) catch |err| {
+        if (err == error.FileNotFound) {
+            return .{
+                .status = .rejected,
+                .err = .{ .code = .path_not_found, .message = "workspace root does not exist" },
+            };
+        }
+        return .{
+            .status = .failed,
+            .err = .{
+                .code = .internal_error,
+                .message = "project autopsy analysis failed",
+                .details = @errorName(err),
+            },
+        };
+    };
+
+    // Stringify into the main allocator's output buffer.
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+
+    // Wrap in a "projectAutopsy" result envelope.
+    try w.writeAll("{\"projectAutopsy\":");
+    try autopsy_result.writeJson(w);
+    try w.writeAll(",\"readOnly\":true,\"commandsExecuted\":false,\"verifiersRegistered\":false,\"non_authorizing\":true}");
+
+    // analysis_arena.deinit() is called by defer above; autopsy_result slices are gone.
+    // The out buffer (owned by main allocator) contains the serialized output.
+
+    var gip_state = schema.draftResultState();
+    // Autopsy is permanently draft; override the stop reason to make it clear
+    // the output is informational rather than unresolved.
+    gip_state.stop_reason = .none;
+    gip_state.unresolved_reason = null;
+    gip_state.non_authorization_notice = "project autopsy output is a draft profile; it does not constitute supported output or proof of any claim";
+
+    return .{
+        .status = .ok,
+        .result_state = gip_state,
+        .result_json = try out.toOwnedSlice(),
+        .allocated_result = true,
+    };
+}
+
 fn writeEscaped(w: anytype, s: []const u8) !void {
     for (s) |c| {
         switch (c) {
@@ -2869,4 +2968,93 @@ test "unsupported operations remain unsupported" {
     var r8 = try dispatch(allocator, "trust_decay.apply", core.PROTOCOL_VERSION, null, null, "{}");
     defer r8.deinit(allocator);
     try std.testing.expectEqual(core.ProtocolStatus.unsupported, r8.status);
+}
+
+// ── project.autopsy tests ─────────────────────────────────────────────
+
+test "project.autopsy valid request returns autopsy result" {
+    const allocator = std.testing.allocator;
+    var result = try dispatch(allocator, "project.autopsy", core.PROTOCOL_VERSION, "/tmp", null, null);
+    defer result.deinit(allocator);
+    // A real workspace analysis of /tmp should succeed (it exists on all Unix systems).
+    try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
+    const json = result.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"projectAutopsy\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"readOnly\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"commandsExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verifiersRegistered\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"non_authorizing\":true") != null);
+}
+
+test "project.autopsy missing workspace is rejected" {
+    const allocator = std.testing.allocator;
+    var result = try dispatch(allocator, "project.autopsy", core.PROTOCOL_VERSION, null, null, null);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, result.status);
+    try std.testing.expectEqual(core.ErrorCode.missing_required_field, result.err.?.code);
+}
+
+test "project.autopsy traversal in workspace root is canonicalized and accepted" {
+    const allocator = std.testing.allocator;
+    // /tmp/../tmp canonicalizes to /tmp (or the canonical temp path), which is valid.
+    var result = try dispatch(allocator, "project.autopsy", core.PROTOCOL_VERSION, "/tmp/../tmp", null, null);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
+    const json = result.result_json orelse return error.MissingResult;
+    // The output should contain the canonicalized workspace_root.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"projectAutopsy\"") != null);
+}
+
+test "project.autopsy output state is draft and non-authorizing" {
+    const allocator = std.testing.allocator;
+    var result = try dispatch(allocator, "project.autopsy", core.PROTOCOL_VERSION, "/tmp", null, null);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
+    const rs = result.result_state orelse return error.MissingResultState;
+    try std.testing.expectEqual(core.SemanticState.draft, rs.state);
+    try std.testing.expect(rs.is_draft);
+    try std.testing.expectEqual(core.Permission.none, rs.permission);
+    try std.testing.expectEqual(false, rs.support_minimum_met);
+    try std.testing.expect(rs.non_authorization_notice != null);
+}
+
+test "project.autopsy verifier candidates have executes_by_default false" {
+    const allocator = std.testing.allocator;
+    // Test with /tmp which has no known project structure — verifier_plan_candidates will be [].
+    var result = try dispatch(allocator, "project.autopsy", core.PROTOCOL_VERSION, "/tmp", null, null);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
+    const json = result.result_json orelse return error.MissingResult;
+    // executes_by_default must NEVER appear as true anywhere in the output.
+    // (Pretty-printed JSON uses ": " so search for the key without the value suffix.)
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"executes_by_default\": true") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"executes_by_default\":true") == null);
+    // The field "verifier_plan_candidates" must be present (even if empty).
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verifier_plan_candidates\"") != null);
+}
+
+test "project.autopsy does not appear in unsupported operations" {
+    const allocator = std.testing.allocator;
+    var result = try dispatch(allocator, "project.autopsy", core.PROTOCOL_VERSION, "/tmp", null, null);
+    defer result.deinit(allocator);
+    // Must NOT be unsupported.
+    try std.testing.expect(result.status != core.ProtocolStatus.unsupported);
+}
+
+test "protocol.describe lists project.autopsy as implemented" {
+    const allocator = std.testing.allocator;
+    var result = try dispatch(allocator, "protocol.describe", core.PROTOCOL_VERSION, null, null, null);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
+    const json = result.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"project.autopsy\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "read_only_workspace_inspection") != null);
+}
+
+test "capabilities.describe lists project.autopsy as allowed read-only" {
+    const allocator = std.testing.allocator;
+    var result = try dispatch(allocator, "capabilities.describe", core.PROTOCOL_VERSION, null, null, null);
+    defer result.deinit(allocator);
+    const json = result.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"project.autopsy\",\"policy\":\"allowed\",\"read_only\":true") != null);
 }

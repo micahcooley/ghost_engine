@@ -179,6 +179,7 @@ pub fn checkCapability(kind: core.RequestKind) struct { cap: ?core.CapabilityNam
         .@"feedback.record" => .@"feedback.record",
         .@"session.get" => .@"session.get",
         .@"session.create", .@"session.update", .@"session.close" => .@"session.write",
+        .@"project.autopsy" => .@"project.autopsy",
         else => null,
     };
 
