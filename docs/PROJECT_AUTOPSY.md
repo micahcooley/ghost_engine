@@ -81,10 +81,12 @@ and remain non-authorizing. Each plan includes:
 - `why_candidate_exists`
 - `unknowns`
 
-Zig workspaces may propose `zig build`, `zig build test`, and detected optional
-targets such as `zig build bench-serious-workflows`. Node plans come only from
-detected `package.json` scripts. Rust, Python, and Go plans come from
-`Cargo.toml`, Python packaging/pytest signals, and `go.mod` respectively.
+Zig workspaces may propose `zig build` from `build.zig`. Custom Zig step plans
+such as `zig build test`, `zig build bench-serious-workflows`, and
+`zig build test-parity` are emitted only when bounded `build.zig` inspection
+detects the corresponding step name. Node plans come only from detected
+`package.json` scripts. Rust, Python, and Go plans come from `Cargo.toml`,
+Python packaging/pytest signals, and `go.mod` respectively.
 
 Unknown confidence is represented in `unknowns`; it is not treated as evidence
 that a command is absent or invalid.

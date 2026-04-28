@@ -388,16 +388,18 @@ fn detectLanguagesAndCommands(builder: *Builder) !void {
         try builder.appendSignal(&builder.languages, "zig", path, "language", "high", "Zig project signal detected");
         try builder.appendSignal(&builder.build_systems, "zig_build", "build.zig", "build_system", "high", "build.zig exists");
         try builder.appendCommand("zig_build", &.{ "zig", "build" }, "build.zig", "Zig build candidate; not executed by autopsy", "medium");
-        try builder.appendCommand("zig_build_test", &.{ "zig", "build", "test" }, "build.zig", "Zig test candidate; not executed by autopsy", "medium");
-        try builder.appendSignal(&builder.test_commands, "zig build test", "build.zig", "test_command_candidate", "high", "Zig build file supports conventional test step candidate");
         try builder.appendSignal(&builder.possible_verifiers, "code.build.zig_build", "build.zig", "verifier_adapter_candidate", "high", "Zig build command candidate detected");
-        try builder.appendSignal(&builder.possible_verifiers, "code.test.zig_build_test", "build.zig", "verifier_adapter_candidate", "high", "Zig test command candidate detected");
         try builder.appendSignal(&builder.next_checks, "confirm_zig_targets", "build.zig", "next_check", "medium", "inspect build.zig targets before executing any verifier");
-        if (try fileContains(builder.allocator, builder.root_abs, "build.zig", "bench-serious-workflows")) {
+        if (try zigBuildStepExists(builder.allocator, builder.root_abs, "test")) {
+            try builder.appendCommand("zig_build_test", &.{ "zig", "build", "test" }, "build.zig", "Zig test step detected; not executed by autopsy", "medium");
+            try builder.appendSignal(&builder.test_commands, "zig build test", "build.zig", "test_command_candidate", "high", "Zig build test step exists");
+            try builder.appendSignal(&builder.possible_verifiers, "code.test.zig_build_test", "build.zig", "verifier_adapter_candidate", "high", "Zig test step detected");
+        }
+        if (try zigBuildStepExists(builder.allocator, builder.root_abs, "bench-serious-workflows")) {
             try builder.appendCommand("zig_build_bench_serious_workflows", &.{ "zig", "build", "bench-serious-workflows" }, "build.zig", "bench-serious-workflows target name detected; not executed by autopsy", "medium");
             try builder.appendSignal(&builder.possible_verifiers, "code.bench.zig_bench_serious_workflows", "build.zig", "verifier_adapter_candidate", "medium", "benchmark target name detected");
         }
-        if (try fileContains(builder.allocator, builder.root_abs, "build.zig", "test-parity")) {
+        if (try zigBuildStepExists(builder.allocator, builder.root_abs, "test-parity")) {
             try builder.appendCommand("zig_build_test_parity", &.{ "zig", "build", "test-parity" }, "build.zig", "test-parity target name detected; not executed by autopsy", "medium");
             try builder.appendSignal(&builder.possible_verifiers, "code.parity.zig_test_parity", "build.zig", "verifier_adapter_candidate", "medium", "parity test target name detected");
         }
@@ -622,6 +624,46 @@ fn fileContains(allocator: std.mem.Allocator, root_abs: []const u8, rel_path: []
     return std.mem.indexOf(u8, text, needle) != null;
 }
 
+fn zigBuildStepExists(allocator: std.mem.Allocator, root_abs: []const u8, step_name: []const u8) !bool {
+    const text = readSmallFile(allocator, root_abs, "build.zig") catch return false;
+    defer allocator.free(text);
+    return zigBuildStepExistsInText(text, step_name);
+}
+
+fn zigBuildStepExistsInText(text: []const u8, step_name: []const u8) bool {
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, text, cursor, "step")) |idx| {
+        if (idx == 0 or text[idx - 1] != '.' or lineHasCommentBefore(text, idx)) {
+            cursor = idx + "step".len;
+            continue;
+        }
+        var pos = idx + "step".len;
+        while (pos < text.len and std.ascii.isWhitespace(text[pos])) pos += 1;
+        if (pos >= text.len or text[pos] != '(') {
+            cursor = pos;
+            continue;
+        }
+        pos += 1;
+        while (pos < text.len and std.ascii.isWhitespace(text[pos])) pos += 1;
+        if (pos >= text.len or text[pos] != '"') {
+            cursor = pos;
+            continue;
+        }
+        pos += 1;
+        const name_start = pos;
+        while (pos < text.len and text[pos] != '"') pos += 1;
+        if (pos < text.len and std.mem.eql(u8, text[name_start..pos], step_name)) return true;
+        cursor = pos;
+    }
+    return false;
+}
+
+fn lineHasCommentBefore(text: []const u8, idx: usize) bool {
+    var line_start = idx;
+    while (line_start > 0 and text[line_start - 1] != '\n') line_start -= 1;
+    return std.mem.indexOf(u8, text[line_start..idx], "//") != null;
+}
+
 fn readSmallFile(allocator: std.mem.Allocator, root_abs: []const u8, rel_path: []const u8) ![]u8 {
     if (std.fs.path.isAbsolute(rel_path) or std.mem.indexOf(u8, rel_path, "..") != null) return error.PathOutsideWorkspace;
     var root = try std.fs.openDirAbsolute(root_abs, .{});
@@ -824,7 +866,7 @@ test "project autopsy detects Zig project from build.zig" {
 test "project autopsy proposes Zig build and test commands without execution" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try makeFile(tmp.dir, "build.zig", "pub fn build(b: *std.Build) void { _ = b.step(\"bench-serious-workflows\", \"\"); _ = b.step(\"test-parity\", \"\"); }");
+    try makeFile(tmp.dir, "build.zig", "pub fn build(b: *std.Build) void { _ = b.step(\"test\", \"\"); _ = b.step(\"bench-serious-workflows\", \"\"); _ = b.step(\"test-parity\", \"\"); }");
     const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
     defer std.heap.page_allocator.free(root);
     const result = try analyze(std.heap.page_allocator, root, .{});
@@ -832,6 +874,52 @@ test "project autopsy proposes Zig build and test commands without execution" {
     try std.testing.expect(containsCommand(result.project_profile.safe_command_candidates, "zig_build_test"));
     try std.testing.expect(containsCommand(result.project_profile.safe_command_candidates, "zig_build_bench_serious_workflows"));
     try std.testing.expect(containsCommand(result.project_profile.safe_command_candidates, "zig_build_test_parity"));
+}
+
+test "project autopsy requires explicit Zig test step evidence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "build.zig", "pub fn build(b: *std.Build) void { _ = b.step(\"bench-serious-workflows\", \"\"); }");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+    try std.testing.expect(containsCommand(result.project_profile.safe_command_candidates, "zig_build"));
+    try std.testing.expect(!containsCommand(result.project_profile.safe_command_candidates, "zig_build_test"));
+    try std.testing.expect(!containsNamedSignal(result.project_profile.test_commands, "zig build test"));
+    try std.testing.expect(findVerifierPlan(result.verifier_plan_candidates, "zig_build_test") == null);
+}
+
+test "project autopsy requires explicit optional Zig step evidence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "build.zig", "pub fn build(b: *std.Build) void { _ = b.step(\"test\", \"\"); }");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+    try std.testing.expect(containsCommand(result.project_profile.safe_command_candidates, "zig_build"));
+    try std.testing.expect(containsCommand(result.project_profile.safe_command_candidates, "zig_build_test"));
+    try std.testing.expect(!containsCommand(result.project_profile.safe_command_candidates, "zig_build_bench_serious_workflows"));
+    try std.testing.expect(!containsCommand(result.project_profile.safe_command_candidates, "zig_build_test_parity"));
+    try std.testing.expect(findVerifierPlan(result.verifier_plan_candidates, "zig_build_bench_serious_workflows") == null);
+    try std.testing.expect(findVerifierPlan(result.verifier_plan_candidates, "zig_build_test_parity") == null);
+}
+
+test "project autopsy ignores commented and non-step Zig target names" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "build.zig",
+        \\pub fn build(b: *std.Build) void {
+        \\    // _ = b.step("test", "");
+        \\    _ = not_step("bench-serious-workflows", "");
+        \\    _ = b.step_name;
+        \\}
+    );
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+    try std.testing.expect(containsCommand(result.project_profile.safe_command_candidates, "zig_build"));
+    try std.testing.expect(!containsCommand(result.project_profile.safe_command_candidates, "zig_build_test"));
+    try std.testing.expect(!containsCommand(result.project_profile.safe_command_candidates, "zig_build_bench_serious_workflows"));
 }
 
 test "project autopsy emits non-executing verifier plan candidates for Zig commands" {
@@ -952,6 +1040,22 @@ test "project autopsy safe command candidates are argv only and require confirma
     }
 }
 
+test "project autopsy rejects unsafe command candidates before verifier planning" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    var builder = Builder.init(std.heap.page_allocator, root, &.{});
+    try builder.appendCommand("unsafe_sudo", &.{ "sudo", "zig", "build" }, "manual", "unsafe test candidate", "high");
+    try builder.appendCommand("unsafe_install", &.{ "npm", "install" }, "manual", "unsafe test candidate", "high");
+    try builder.appendCommand("unsafe_shell_string", &.{"zig build; touch SHOULD_NOT_EXIST"}, "manual", "unsafe test candidate", "high");
+    try std.testing.expectEqual(@as(usize, 0), builder.safe_commands.items.len);
+    try std.testing.expectEqual(@as(usize, 0), builder.verifier_plans.items.len);
+    try std.testing.expect(containsNamedSignal(builder.unsafe_or_unknown_commands.items, "unsafe_sudo"));
+    try std.testing.expect(containsNamedSignal(builder.unsafe_or_unknown_commands.items, "unsafe_install"));
+    try std.testing.expect(containsNamedSignal(builder.unsafe_or_unknown_commands.items, "unsafe_shell_string"));
+}
+
 test "project autopsy detects build config security migration and runtime risks" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -974,6 +1078,21 @@ test "project autopsy gap report includes missing test command" {
     defer std.heap.page_allocator.free(root);
     const result = try analyze(std.heap.page_allocator, root, .{});
     try std.testing.expect(result.project_gap_report.missing_test_command != null);
+}
+
+test "project autopsy gap report records missing build ci and docs as gaps" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "notes.txt", "plain\n");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+    try std.testing.expect(result.project_gap_report.missing_build_command != null);
+    try std.testing.expect(result.project_gap_report.missing_ci != null);
+    try std.testing.expect(result.project_gap_report.missing_docs != null);
+    try std.testing.expect(result.project_gap_report.non_authorizing);
+    try std.testing.expect(containsNamedSignal(result.project_profile.unknowns, "project_type_unknown"));
+    try std.testing.expect(containsNamedSignal(result.project_profile.unknowns, "safe_command_candidates_unknown"));
 }
 
 test "project autopsy non-authorizing invariant is preserved" {
@@ -1001,6 +1120,45 @@ test "project autopsy output ordering is deterministic" {
     try std.testing.expectEqualStrings(a.project_profile.safe_command_candidates[0].id, b.project_profile.safe_command_candidates[0].id);
 }
 
+test "project autopsy JSON output keeps stable draft safety fields" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "build.zig", "pub fn build(b: *std.Build) void { _ = b.step(\"test\", \"\"); }");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+
+    var first = std.ArrayList(u8).init(std.testing.allocator);
+    defer first.deinit();
+    var second = std.ArrayList(u8).init(std.testing.allocator);
+    defer second.deinit();
+    try result.writeJson(first.writer());
+    try result.writeJson(second.writer());
+    try std.testing.expectEqualStrings(first.items, second.items);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, first.items, .{});
+    defer parsed.deinit();
+    const root_obj = parsed.value.object;
+    try std.testing.expectEqualStrings("draft", root_obj.get("state").?.string);
+    try std.testing.expect(root_obj.get("non_authorizing").?.bool);
+
+    const profile_obj = root_obj.get("project_profile").?.object;
+    try std.testing.expect(profile_obj.get("non_authorizing").?.bool);
+    for (profile_obj.get("safe_command_candidates").?.array.items) |candidate_value| {
+        const candidate = candidate_value.object;
+        try std.testing.expect(candidate.get("requires_user_confirmation").?.bool);
+        try std.testing.expect(candidate.get("non_authorizing").?.bool);
+        try std.testing.expect(candidate.get("argv").?.array.items.len > 0);
+    }
+
+    for (root_obj.get("verifier_plan_candidates").?.array.items) |plan_value| {
+        const plan = plan_value.object;
+        try std.testing.expect(plan.get("requires_user_confirmation").?.bool);
+        try std.testing.expect(plan.get("non_authorizing").?.bool);
+        try std.testing.expect(!plan.get("executes_by_default").?.bool);
+    }
+}
+
 test "project autopsy rejects traversal reads outside workspace" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1021,6 +1179,18 @@ test "project autopsy traversal is bounded" {
     defer std.heap.page_allocator.free(root);
     const result = try analyze(std.heap.page_allocator, root, .{ .max_entries = 5, .max_depth = 4 });
     try std.testing.expect(containsNamedSignal(result.project_profile.unknowns, "traversal_entry_limit_reached"));
+}
+
+test "project autopsy max depth keeps deeper evidence unknown" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "level1/build.zig", "pub fn build(b: *std.Build) void { _ = b.step(\"test\", \"\"); }");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{ .max_entries = 100, .max_depth = 0 });
+    try std.testing.expect(!containsCommand(result.project_profile.safe_command_candidates, "zig_build"));
+    try std.testing.expect(result.project_gap_report.missing_build_command != null);
+    try std.testing.expect(containsNamedSignal(result.project_profile.unknowns, "project_type_unknown"));
 }
 
 test "project autopsy does not execute commands" {
