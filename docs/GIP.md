@@ -114,6 +114,7 @@ results when GIP has no active session or workspace metadata:
 | `negative_knowledge.record.supersede` | Validates supersede requests but returns structured unsupported until safe append-only persistence is available | `structured_unsupported_without_persistence` |
 | `feedback.summary` | Returns event counts if workspace metadata resolves; otherwise `unsupported` flag | `requires_workspace_metadata` |
 | `session.get` | Returns session data if session file exists; otherwise `path_not_found` | `requires_existing_session` |
+| `project.autopsy` | Bounded read-only workspace inspection without command execution | `read_only_workspace_inspection` |
 
 Stateless operations do not fake data. They return structurally valid empty
 outputs that are safe for clients to consume.
@@ -155,6 +156,14 @@ promotion, or pack mutation.
 - `protocol.describe` — Protocol metadata, supported kinds, reasoning levels **(Implemented)**
 - `capabilities.describe` — Current capability policies **(Implemented)**
 - `engine.status` — Engine version, platform, operational status **(Implemented)**
+
+### Project Inspection
+- `project.autopsy` — Perform a read-only static analysis of the workspace **(Implemented)**
+  - **Request**: `{"workspaceRoot": string}` (Note: GIP `workspace` CLI arg often maps to this)
+  - **Response**: `{"projectAutopsy": {"workspace_root": "...", "project_type": "...", "build_system": "...", "source_directories": [...], "entry_points": [...], "readOnly": true, "commandsExecuted": false, "verifiersRegistered": false, "non_authorizing": true, "verifier_plan_candidates": [...]}}`
+  - Canonicalizes the workspace root and performs bounded static inspection.
+  - Does not execute commands, modify files, run verifiers, or mutate packs.
+  - Verifier plan candidates are returned with `executes_by_default: false`.
 
 ### Conversation
 - `conversation.turn` — Process a user message through the engine. **(Implemented)**
@@ -349,6 +358,7 @@ promote global authority.
 | `pack.inspect` | allowed | yes |
 | `feedback.summary` | allowed | yes |
 | `session.get` | allowed | yes |
+| `project.autopsy` | allowed | yes |
 | `command.run` | allowlist | no (not implemented) |
 | `verifier.run` | allowed | no (not implemented) |
 | `verifier.candidate.execute` | denied | no (not implemented) |
@@ -410,6 +420,7 @@ echo '{"gipVersion":"gip.v0.1","kind":"negative_knowledge.candidate.list"}' | gh
 echo '{"gipVersion":"gip.v0.1","kind":"pack.inspect","packId":"my-pack"}' | ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"feedback.summary"}' | ghost_gip --stdin --workspace /path/to/project
 echo '{"gipVersion":"gip.v0.1","kind":"session.get","sessionId":"my-session"}' | ghost_gip --stdin
+echo '{"gipVersion":"gip.v0.1","kind":"project.autopsy"}' | ghost_gip --stdin --workspace /path/to/project
 ```
 
 ## Examples

@@ -2994,6 +2994,14 @@ test "project.autopsy missing workspace is rejected" {
     try std.testing.expectEqual(core.ErrorCode.missing_required_field, result.err.?.code);
 }
 
+test "project.autopsy non-existent workspace returns path_not_found" {
+    const allocator = std.testing.allocator;
+    var result = try dispatch(allocator, "project.autopsy", core.PROTOCOL_VERSION, "/does/not/exist/12345", null, null);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, result.status);
+    try std.testing.expectEqual(core.ErrorCode.path_not_found, result.err.?.code);
+}
+
 test "project.autopsy traversal in workspace root is canonicalized and accepted" {
     const allocator = std.testing.allocator;
     // /tmp/../tmp canonicalizes to /tmp (or the canonical temp path), which is valid.
