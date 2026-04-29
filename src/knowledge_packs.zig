@@ -363,6 +363,7 @@ pub fn createPack(allocator: std.mem.Allocator, options: CreateOptions) !CreateR
             .reuse_catalog_rel_path = try allocator.dupe(u8, "abstractions/reuse.gabr"),
             .lineage_state_rel_path = try allocator.dupe(u8, "abstractions/lineage.gabs"),
             .influence_manifest_rel_path = try allocator.dupe(u8, "influence.json"),
+            .autopsy_guidance_rel_path = null,
         },
         .provenance = .{
             .pack_lineage_id = try std.fmt.allocPrint(allocator, "pack:{s}@{s}", .{ pack_id, pack_version }),
@@ -1791,6 +1792,7 @@ fn ensureDistillationPack(allocator: std.mem.Allocator, options: CreateOptions) 
             .reuse_catalog_rel_path = try allocator.dupe(u8, "abstractions/reuse.gabr"),
             .lineage_state_rel_path = try allocator.dupe(u8, "abstractions/lineage.gabs"),
             .influence_manifest_rel_path = try allocator.dupe(u8, "influence.json"),
+            .autopsy_guidance_rel_path = null,
         },
         .provenance = .{
             .pack_lineage_id = try std.fmt.allocPrint(allocator, "pack:{s}@{s}", .{ options.pack_id, options.pack_version }),

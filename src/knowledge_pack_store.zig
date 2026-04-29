@@ -38,6 +38,7 @@ pub const StorageLayout = struct {
     reuse_catalog_rel_path: []u8,
     lineage_state_rel_path: []u8,
     influence_manifest_rel_path: []u8,
+    autopsy_guidance_rel_path: ?[]u8 = null,
 
     pub fn deinit(self: *StorageLayout, allocator: std.mem.Allocator) void {
         allocator.free(self.corpus_manifest_rel_path);
@@ -46,6 +47,7 @@ pub const StorageLayout = struct {
         allocator.free(self.reuse_catalog_rel_path);
         allocator.free(self.lineage_state_rel_path);
         allocator.free(self.influence_manifest_rel_path);
+        if (self.autopsy_guidance_rel_path) |path| allocator.free(path);
         self.* = undefined;
     }
 };
@@ -152,6 +154,7 @@ pub const ResolvedMount = struct {
     reuse_catalog_abs_path: []u8,
     lineage_state_abs_path: []u8,
     influence_manifest_abs_path: []u8,
+    autopsy_guidance_abs_path: ?[]u8 = null,
 
     pub fn ownerId(self: *const ResolvedMount, allocator: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(allocator, "pack/{s}@{s}", .{ self.entry.pack_id, self.entry.pack_version });
@@ -172,6 +175,7 @@ pub const ResolvedMount = struct {
         self.allocator.free(self.reuse_catalog_abs_path);
         self.allocator.free(self.lineage_state_abs_path);
         self.allocator.free(self.influence_manifest_abs_path);
+        if (self.autopsy_guidance_abs_path) |path| self.allocator.free(path);
         self.* = undefined;
     }
 };
@@ -237,6 +241,7 @@ pub fn loadManifestFromPath(allocator: std.mem.Allocator, abs_path: []const u8) 
         reuseCatalogRelPath: []const u8,
         lineageStateRelPath: []const u8,
         influenceManifestRelPath: []const u8,
+        autopsyGuidanceRelPath: ?[]const u8 = null,
     };
     const DiskProvenance = struct {
         packLineageId: []const u8,
@@ -295,6 +300,7 @@ pub fn loadManifestFromPath(allocator: std.mem.Allocator, abs_path: []const u8) 
             .reuse_catalog_rel_path = try allocator.dupe(u8, parsed.value.storage.reuseCatalogRelPath),
             .lineage_state_rel_path = try allocator.dupe(u8, parsed.value.storage.lineageStateRelPath),
             .influence_manifest_rel_path = try allocator.dupe(u8, parsed.value.storage.influenceManifestRelPath),
+            .autopsy_guidance_rel_path = if (parsed.value.storage.autopsyGuidanceRelPath) |path| try allocator.dupe(u8, path) else null,
         },
         .provenance = .{
             .pack_lineage_id = try allocator.dupe(u8, parsed.value.provenance.packLineageId),
@@ -347,6 +353,7 @@ pub fn saveManifest(allocator: std.mem.Allocator, root_abs_path: []const u8, man
             .reuseCatalogRelPath = manifest.storage.reuse_catalog_rel_path,
             .lineageStateRelPath = manifest.storage.lineage_state_rel_path,
             .influenceManifestRelPath = manifest.storage.influence_manifest_rel_path,
+            .autopsyGuidanceRelPath = manifest.storage.autopsy_guidance_rel_path,
         },
         .provenance = .{
             .packLineageId = manifest.provenance.pack_lineage_id,
@@ -538,6 +545,11 @@ fn resolveMountFromManifest(
     errdefer allocator.free(lineage_state_abs_path);
     const influence_manifest_abs_path = try resolveContainedPath(allocator, root_abs_path, manifest.storage.influence_manifest_rel_path);
     errdefer allocator.free(influence_manifest_abs_path);
+    const autopsy_guidance_abs_path = if (manifest.storage.autopsy_guidance_rel_path) |rel_path|
+        try resolveContainedPath(allocator, root_abs_path, rel_path)
+    else
+        null;
+    errdefer if (autopsy_guidance_abs_path) |path| allocator.free(path);
 
     return .{
         .allocator = allocator,
@@ -551,6 +563,7 @@ fn resolveMountFromManifest(
         .reuse_catalog_abs_path = reuse_catalog_abs_path,
         .lineage_state_abs_path = lineage_state_abs_path,
         .influence_manifest_abs_path = influence_manifest_abs_path,
+        .autopsy_guidance_abs_path = autopsy_guidance_abs_path,
     };
 }
 
@@ -567,6 +580,10 @@ fn validateStorageLayout(allocator: std.mem.Allocator, manifest_root_abs_path: [
     defer allocator.free(lineage_state);
     const influence_manifest = try resolveContainedPath(allocator, manifest_root_abs_path, storage.influenceManifestRelPath);
     defer allocator.free(influence_manifest);
+    if (storage.autopsyGuidanceRelPath) |rel_path| {
+        const autopsy_guidance = try resolveContainedPath(allocator, manifest_root_abs_path, rel_path);
+        defer allocator.free(autopsy_guidance);
+    }
 }
 
 fn resolveContainedPath(allocator: std.mem.Allocator, root_abs_path: []const u8, rel_path: []const u8) ![]u8 {

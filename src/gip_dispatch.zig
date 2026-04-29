@@ -141,7 +141,7 @@ fn dispatchProtocolDescribe(allocator: std.mem.Allocator) !DispatchResult {
     try w.writeAll("\"version\":\"");
     try w.writeAll(core.PROTOCOL_VERSION);
     try w.writeAll("\",\"implemented\":[\"protocol.describe\",\"capabilities.describe\",\"engine.status\",\"conversation.turn\",\"artifact.read\",\"artifact.list\",\"artifact.patch.propose\",\"hypothesis.list\",\"hypothesis.triage\",\"verifier.list\",\"verifier.candidate.execution.list\",\"verifier.candidate.execution.get\",\"correction.list\",\"correction.get\",\"negative_knowledge.candidate.list\",\"negative_knowledge.candidate.get\",\"negative_knowledge.record.list\",\"negative_knowledge.record.get\",\"negative_knowledge.influence.list\",\"trust_decay.candidate.list\",\"negative_knowledge.candidate.review\",\"negative_knowledge.record.expire\",\"negative_knowledge.record.supersede\",\"pack.list\",\"pack.inspect\",\"feedback.summary\",\"session.get\",\"project.autopsy\",\"context.autopsy\"]");
-    try w.writeAll(",\"maturity\":{\"hypothesis.list\":\"stateless\",\"hypothesis.triage\":\"stateless\",\"verifier.candidate.execution.list\":\"read_only_state_inspection\",\"verifier.candidate.execution.get\":\"read_only_state_inspection\",\"correction.list\":\"read_only_state_inspection\",\"correction.get\":\"read_only_state_inspection\",\"negative_knowledge.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.get\":\"read_only_state_inspection\",\"negative_knowledge.record.list\":\"read_only_state_inspection\",\"negative_knowledge.record.get\":\"read_only_state_inspection\",\"negative_knowledge.influence.list\":\"read_only_state_inspection\",\"trust_decay.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.review\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.expire\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.supersede\":\"structured_unsupported_without_persistence\",\"feedback.summary\":\"requires_workspace_metadata\",\"session.get\":\"requires_existing_session\",\"project.autopsy\":\"read_only_workspace_inspection\",\"context.autopsy\":\"read_only_artifact_refs_and_runtime_pack_guidance\"}");
+    try w.writeAll(",\"maturity\":{\"hypothesis.list\":\"stateless\",\"hypothesis.triage\":\"stateless\",\"verifier.candidate.execution.list\":\"read_only_state_inspection\",\"verifier.candidate.execution.get\":\"read_only_state_inspection\",\"correction.list\":\"read_only_state_inspection\",\"correction.get\":\"read_only_state_inspection\",\"negative_knowledge.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.get\":\"read_only_state_inspection\",\"negative_knowledge.record.list\":\"read_only_state_inspection\",\"negative_knowledge.record.get\":\"read_only_state_inspection\",\"negative_knowledge.influence.list\":\"read_only_state_inspection\",\"trust_decay.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.review\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.expire\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.supersede\":\"structured_unsupported_without_persistence\",\"feedback.summary\":\"requires_workspace_metadata\",\"session.get\":\"requires_existing_session\",\"project.autopsy\":\"read_only_workspace_inspection\",\"context.autopsy\":\"read_only_artifact_refs_runtime_and_persistent_pack_guidance\"}");
     try w.writeAll(",\"unsupported\":[\"artifact.patch.apply\",\"artifact.write.propose\",\"artifact.write.apply\",\"artifact.search\",\"conversation.replay\",\"intent.ground\",\"response.evaluate\",\"verifier.run\",\"verifier.candidate.execute\",\"hypothesis.generate\",\"hypothesis.verifier.schedule\",\"correction.apply\",\"negative_knowledge.promote\",\"pack.update_from_negative_knowledge\",\"trust_decay.apply\",\"pack.mount\",\"pack.unmount\",\"pack.import\",\"pack.export\",\"pack.distill.list\",\"pack.distill.show\",\"pack.distill.export\",\"feedback.record\",\"feedback.replay\",\"session.create\",\"session.update\",\"session.close\",\"command.run\"]");
     try w.writeAll("}}");
 
@@ -185,7 +185,7 @@ fn dispatchCapabilitiesDescribe(allocator: std.mem.Allocator) !DispatchResult {
     try w.writeAll("{\"capability\":\"pack.inspect\",\"policy\":\"allowed\",\"read_only\":true},");
     try w.writeAll("{\"capability\":\"feedback.summary\",\"policy\":\"allowed\",\"read_only\":true},");
     try w.writeAll("{\"capability\":\"session.get\",\"policy\":\"allowed\",\"read_only\":true},");
-    try w.writeAll("{\"capability\":\"context.autopsy\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"note\":\"runtime pack guidance plus bounded artifact references; no persistent pack loading, commands, verifiers, or mutations\"},");
+    try w.writeAll("{\"capability\":\"context.autopsy\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"note\":\"runtime and persisted mounted-pack guidance plus bounded artifact references; no commands, verifiers, or mutations\"},");
     try w.writeAll("{\"capability\":\"artifact.patch.apply\",\"policy\":\"requires_approval\",\"mutation\":true},");
     try w.writeAll("{\"capability\":\"verifier.run\",\"policy\":\"allowed\",\"note\":\"not yet implemented\"},");
     try w.writeAll("{\"capability\":\"verifier.candidate.execute\",\"policy\":\"denied\",\"mutation\":true,\"note\":\"future work; not implemented\"},");
@@ -2083,9 +2083,9 @@ fn dispatchSessionGet(allocator: std.mem.Allocator, request_body: ?[]const u8) !
 
 // ── Context Autopsy ───────────────────────────────────────────────────
 //
-// Runtime pack-guidance payload path only.
-// No persistent pack loading. No command or verifier execution. No pack or
-// negative-knowledge mutation. Output is always draft/non-authorizing.
+// Runtime and persisted mounted-pack guidance only.
+// No command or verifier execution. No pack or negative-knowledge mutation.
+// Output is always draft/non-authorizing.
 
 fn dispatchContextAutopsy(allocator: std.mem.Allocator, workspace_root: ?[]const u8, request_body: ?[]const u8) !DispatchResult {
     const body = request_body orelse return .{
@@ -2124,7 +2124,9 @@ fn dispatchContextAutopsy(allocator: std.mem.Allocator, workspace_root: ?[]const
         .situation_kinds = try parseStringArrayField(arena_alloc, context_obj, "situation_kinds", "situationKinds"),
     };
 
-    const guidance = try parseContextPackGuidance(arena_alloc, request_obj);
+    const request_guidance = try parseContextPackGuidance(arena_alloc, request_obj);
+    var persistent_guidance = try loadPersistentContextPackGuidance(arena_alloc, workspace_root);
+    const guidance = try mergeContextPackGuidance(arena_alloc, persistent_guidance.guidance, request_guidance);
     const artifact_refs = try parseContextArtifactRefs(arena_alloc, request_obj);
     const artifact_coverage = if (artifact_refs.len == 0) null else blk: {
         const root = workspace_root orelse return .{
@@ -2138,6 +2140,9 @@ fn dispatchContextAutopsy(allocator: std.mem.Allocator, workspace_root: ?[]const
     var engine = context_autopsy_engine.ContextAutopsyEngine.init(allocator, &sources);
     var autopsy_result = try engine.evaluate(&case);
     defer autopsy_result.deinit(allocator);
+    for (persistent_guidance.warnings) |warning| {
+        autopsy_result.suggested_unknowns = try appendContextUnknown(allocator, autopsy_result.suggested_unknowns, warning);
+    }
     if (artifact_coverage) |coverage| {
         var coverage_builder = context_autopsy_engine.ResultBuilder.init(allocator);
         defer coverage_builder.deinit();
@@ -2152,7 +2157,9 @@ fn dispatchContextAutopsy(allocator: std.mem.Allocator, workspace_root: ?[]const
     const w = out.writer();
     try w.writeAll("{\"contextAutopsy\":");
     try writeContextAutopsyResult(w, &autopsy_result, if (artifact_coverage) |*coverage| coverage else null);
-    try w.writeAll(",\"readOnly\":true,\"commandsExecuted\":false,\"verifiersExecuted\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"persistentPackLoading\":false,\"non_authorizing\":true}");
+    try w.writeAll(",\"packGuidanceTrace\":");
+    try writePackGuidanceTrace(w, &persistent_guidance, request_guidance.len);
+    try w.writeAll(",\"readOnly\":true,\"commandsExecuted\":false,\"verifiersExecuted\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"persistentPackLoading\":true,\"non_authorizing\":true}");
 
     var gip_state = schema.draftResultState();
     gip_state.stop_reason = .none;
@@ -2203,6 +2210,167 @@ fn parseContextPackGuidance(allocator: std.mem.Allocator, request_obj: std.json.
         });
     }
     return try guidance.toOwnedSlice();
+}
+
+const PersistentGuidanceTrace = struct {
+    pack_id: []const u8,
+    pack_version: []const u8,
+    status: []const u8,
+    guidance_count: usize,
+    warning: []const u8 = "",
+};
+
+const PersistentGuidanceLoad = struct {
+    guidance: []const context_autopsy.PackAutopsyGuidance = &.{},
+    traces: []const PersistentGuidanceTrace = &.{},
+    warnings: []const context_autopsy.ContextUnknown = &.{},
+};
+
+fn mergeContextPackGuidance(
+    allocator: std.mem.Allocator,
+    persistent: []const context_autopsy.PackAutopsyGuidance,
+    request: []const context_autopsy.PackAutopsyGuidance,
+) ![]const context_autopsy.PackAutopsyGuidance {
+    if (persistent.len == 0) return request;
+    if (request.len == 0) return persistent;
+    var merged = try allocator.alloc(context_autopsy.PackAutopsyGuidance, persistent.len + request.len);
+    @memcpy(merged[0..persistent.len], persistent);
+    @memcpy(merged[persistent.len..], request);
+    return merged;
+}
+
+fn loadPersistentContextPackGuidance(allocator: std.mem.Allocator, workspace_root: ?[]const u8) !PersistentGuidanceLoad {
+    _ = workspace_root;
+    var traces = std.ArrayList(PersistentGuidanceTrace).init(allocator);
+    var warnings = std.ArrayList(context_autopsy.ContextUnknown).init(allocator);
+    var guidance = std.ArrayList(context_autopsy.PackAutopsyGuidance).init(allocator);
+
+    const metadata = shards.resolveDefaultProjectMetadata(allocator) catch |err| {
+        try warnings.append(try packLoadWarning(allocator, "pack_guidance_mount_registry_unavailable", "knowledge_pack_mounts", "Mounted Knowledge Pack registry could not be resolved; persisted autopsy guidance availability remains unknown.", @errorName(err)));
+        return .{ .warnings = try warnings.toOwnedSlice(), .traces = try traces.toOwnedSlice(), .guidance = try guidance.toOwnedSlice() };
+    };
+    const paths = shards.resolvePaths(allocator, metadata.metadata) catch |err| {
+        try warnings.append(try packLoadWarning(allocator, "pack_guidance_mount_registry_unavailable", "knowledge_pack_mounts", "Mounted Knowledge Pack paths could not be resolved; persisted autopsy guidance availability remains unknown.", @errorName(err)));
+        return .{ .warnings = try warnings.toOwnedSlice(), .traces = try traces.toOwnedSlice(), .guidance = try guidance.toOwnedSlice() };
+    };
+
+    const mounts = knowledge_pack_store.listResolvedMounts(allocator, &paths) catch |err| {
+        try warnings.append(try packLoadWarning(allocator, "pack_guidance_mount_registry_unavailable", "knowledge_pack_mounts", "Mounted Knowledge Pack registry could not be loaded; persisted autopsy guidance availability remains unknown.", @errorName(err)));
+        return .{ .warnings = try warnings.toOwnedSlice(), .traces = try traces.toOwnedSlice(), .guidance = try guidance.toOwnedSlice() };
+    };
+    // This loader is dispatch-arena scoped; intermediate mount/path allocations
+    // are released with the arena after the rendered response is complete.
+
+    for (mounts) |mount| {
+        if (!mount.entry.enabled) {
+            try traces.append(try packGuidanceTrace(allocator, mount.entry.pack_id, mount.entry.pack_version, "skipped_disabled", 0, ""));
+            continue;
+        }
+        const guidance_path = mount.autopsy_guidance_abs_path orelse {
+            try traces.append(try packGuidanceTrace(allocator, mount.entry.pack_id, mount.entry.pack_version, "no_guidance_path", 0, ""));
+            continue;
+        };
+        const file_bytes = readFileAbsoluteAlloc(allocator, guidance_path, 512 * 1024) catch |err| switch (err) {
+            error.FileNotFound => {
+                const warning = "manifest declares autopsy guidance path but the file was not found";
+                try traces.append(try packGuidanceTrace(allocator, mount.entry.pack_id, mount.entry.pack_version, "missing_guidance", 0, warning));
+                try warnings.append(try packLoadWarning(allocator, "missing_persistent_pack_guidance", mount.entry.pack_id, warning, @errorName(err)));
+                continue;
+            },
+            else => {
+                const warning = "persistent autopsy guidance could not be read";
+                try traces.append(try packGuidanceTrace(allocator, mount.entry.pack_id, mount.entry.pack_version, "guidance_read_warning", 0, warning));
+                try warnings.append(try packLoadWarning(allocator, "persistent_pack_guidance_read_warning", mount.entry.pack_id, warning, @errorName(err)));
+                continue;
+            },
+        };
+
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, file_bytes, .{}) catch |err| {
+            const warning = "persistent autopsy guidance JSON is malformed";
+            try traces.append(try packGuidanceTrace(allocator, mount.entry.pack_id, mount.entry.pack_version, "malformed_guidance", 0, warning));
+            try warnings.append(try packLoadWarning(allocator, "malformed_persistent_pack_guidance", mount.entry.pack_id, warning, @errorName(err)));
+            continue;
+        };
+        const parsed_guidance = parsePersistentGuidanceValue(allocator, parsed, mount.entry.pack_id, mount.entry.pack_version) catch |err| {
+            const warning = "persistent autopsy guidance shape is unsupported";
+            try traces.append(try packGuidanceTrace(allocator, mount.entry.pack_id, mount.entry.pack_version, "unsupported_guidance_shape", 0, warning));
+            try warnings.append(try packLoadWarning(allocator, "unsupported_persistent_pack_guidance", mount.entry.pack_id, warning, @errorName(err)));
+            continue;
+        };
+        for (parsed_guidance) |item| try guidance.append(item);
+        try traces.append(try packGuidanceTrace(allocator, mount.entry.pack_id, mount.entry.pack_version, "loaded", parsed_guidance.len, ""));
+    }
+
+    return .{
+        .guidance = try guidance.toOwnedSlice(),
+        .traces = try traces.toOwnedSlice(),
+        .warnings = try warnings.toOwnedSlice(),
+    };
+}
+
+fn parsePersistentGuidanceValue(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    pack_id: []const u8,
+    pack_version: []const u8,
+) ![]const context_autopsy.PackAutopsyGuidance {
+    const owned_pack_id = try allocator.dupe(u8, pack_id);
+    const owned_pack_version = try allocator.dupe(u8, pack_version);
+    const array_value = switch (value) {
+        .array => value,
+        .object => |obj| obj.get("pack_guidance") orelse obj.get("packGuidance") orelse return error.InvalidPersistentPackGuidance,
+        else => return error.InvalidPersistentPackGuidance,
+    };
+    if (array_value != .array) return error.InvalidPersistentPackGuidance;
+    var guidance = std.ArrayList(context_autopsy.PackAutopsyGuidance).init(allocator);
+    for (array_value.array.items) |item| {
+        const obj = valueObject(item) orelse continue;
+        const match_obj = if (obj.get("match")) |m| valueObject(m) else null;
+        try guidance.append(.{
+            .influence = .{
+                .pack_name = owned_pack_id,
+                .pack_version = owned_pack_version,
+                .source_kind = "persistent_pack_autopsy_guidance",
+                .reason = getStr(obj, "reason", "reason") orelse "Persisted Knowledge Pack autopsy guidance contributed Context Autopsy candidates.",
+                .weight = getStr(obj, "weight", "weight") orelse "medium",
+            },
+            .match = if (match_obj) |m| try parsePackAutopsyMatch(allocator, m) else .{},
+            .signals = try parseContextSignals(allocator, obj, owned_pack_id),
+            .suggested_unknowns = try parseContextUnknowns(allocator, obj, owned_pack_id),
+            .risk_surfaces = try parseContextRisks(allocator, obj, owned_pack_id),
+            .candidate_actions = try parseContextActions(allocator, obj, owned_pack_id),
+            .check_candidates = try parseContextChecks(allocator, obj, owned_pack_id),
+            .evidence_expectations = try parseEvidenceExpectations(allocator, obj, owned_pack_id),
+        });
+    }
+    return try guidance.toOwnedSlice();
+}
+
+fn packLoadWarning(allocator: std.mem.Allocator, name: []const u8, source_pack: []const u8, reason: []const u8, detail: []const u8) !context_autopsy.ContextUnknown {
+    _ = detail;
+    return .{
+        .name = try allocator.dupe(u8, name),
+        .source_pack = try allocator.dupe(u8, source_pack),
+        .importance = "medium",
+        .reason = try allocator.dupe(u8, reason),
+    };
+}
+
+fn packGuidanceTrace(
+    allocator: std.mem.Allocator,
+    pack_id: []const u8,
+    pack_version: []const u8,
+    status: []const u8,
+    guidance_count: usize,
+    warning: []const u8,
+) !PersistentGuidanceTrace {
+    return .{
+        .pack_id = try allocator.dupe(u8, pack_id),
+        .pack_version = try allocator.dupe(u8, pack_version),
+        .status = try allocator.dupe(u8, status),
+        .guidance_count = guidance_count,
+        .warning = try allocator.dupe(u8, warning),
+    };
 }
 
 fn parseContextArtifactRefs(allocator: std.mem.Allocator, request_obj: std.json.ObjectMap) ![]const context_artifacts.ArtifactRef {
@@ -2581,6 +2749,44 @@ fn writeContextAutopsyResult(
     try w.writeAll("}");
 }
 
+fn writePackGuidanceTrace(w: anytype, load: *const PersistentGuidanceLoad, request_guidance_count: usize) !void {
+    try w.writeAll("{\"persistentGuidanceEnabled\":true,\"mergeOrder\":\"persistent_mounted_pack_order_then_request_order\",\"persistentGuidanceCount\":");
+    try w.print("{d}", .{load.guidance.len});
+    try w.writeAll(",\"requestGuidanceCount\":");
+    try w.print("{d}", .{request_guidance_count});
+    try w.writeAll(",\"packLoads\":[");
+    for (load.traces, 0..) |trace, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{\"packId\":\"");
+        try writeEscaped(w, trace.pack_id);
+        try w.writeAll("\",\"packVersion\":\"");
+        try writeEscaped(w, trace.pack_version);
+        try w.writeAll("\",\"status\":\"");
+        try writeEscaped(w, trace.status);
+        try w.writeAll("\",\"guidanceCount\":");
+        try w.print("{d}", .{trace.guidance_count});
+        try w.writeAll(",\"nonAuthorizing\":true");
+        if (trace.warning.len != 0) {
+            try w.writeAll(",\"warning\":\"");
+            try writeEscaped(w, trace.warning);
+            try w.writeAll("\"");
+        }
+        try w.writeAll("}");
+    }
+    try w.writeAll("],\"warnings\":[");
+    for (load.warnings, 0..) |warning, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{\"name\":\"");
+        try writeEscaped(w, warning.name);
+        try w.writeAll("\",\"sourcePack\":\"");
+        try writeEscaped(w, warning.source_pack);
+        try w.writeAll("\",\"reason\":\"");
+        try writeEscaped(w, warning.reason);
+        try w.writeAll("\",\"isMissingEvidence\":true,\"isNegativeEvidence\":false}");
+    }
+    try w.writeAll("]}");
+}
+
 fn writeArtifactCoverage(w: anytype, coverage: *const context_artifacts.CoverageReport) !void {
     try w.writeAll("{\"artifactsRequested\":[");
     for (coverage.artifacts_requested, 0..) |request, idx| {
@@ -2764,6 +2970,12 @@ fn writeEscaped(w: anytype, s: []const u8) !void {
             else => try w.writeByte(c),
         }
     }
+}
+
+fn readFileAbsoluteAlloc(allocator: std.mem.Allocator, abs_path: []const u8, max_bytes: usize) ![]u8 {
+    const file = try std.fs.openFileAbsolute(abs_path, .{});
+    defer file.close();
+    return file.readToEndAlloc(allocator, max_bytes);
 }
 
 // ── Patch Test Workspace Helper ──────────────────────────────────────────
@@ -3675,6 +3887,103 @@ test "context.autopsy valid request returns draft non-authorizing result" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"packMutation\":false") != null);
 }
 
+test "context.autopsy loads persisted Knowledge Pack autopsy guidance from mounted fixture" {
+    const allocator = std.testing.allocator;
+    var fixture = try ContextAutopsyPackFixture.init(allocator, "context-autopsy-persisted-fixture", persistedContextGuidanceBody());
+    defer fixture.deinit();
+
+    const before_manifest = try readFileAbsoluteAlloc(allocator, fixture.manifest_path, 512 * 1024);
+    defer allocator.free(before_manifest);
+
+    const body =
+        \\{"gipVersion":"gip.v0.1","kind":"context.autopsy","context":{"summary":"Need persisted launch planning advice","intent_tags":["planning"],"situation_kinds":["launch"]}}
+    ;
+    var result = try dispatch(allocator, "context.autopsy", core.PROTOCOL_VERSION, null, null, body);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
+    const json = result.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"persistent_pack_signal\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"persistent_pack_unknown\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"persistent_pack_risk\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"persistent_pack_action\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"persistent_pack_check\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"persistent_pack_evidence\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"packGuidanceTrace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":\"loaded\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"sourceKind\":\"persistent_pack_autopsy_guidance\"") != null);
+
+    const after_manifest = try readFileAbsoluteAlloc(allocator, fixture.manifest_path, 512 * 1024);
+    defer allocator.free(after_manifest);
+    try std.testing.expectEqualStrings(before_manifest, after_manifest);
+}
+
+test "context.autopsy malformed persisted pack guidance becomes structured warning" {
+    const allocator = std.testing.allocator;
+    var fixture = try ContextAutopsyPackFixture.init(allocator, "context-autopsy-malformed-fixture", "{not-json");
+    defer fixture.deinit();
+
+    const body =
+        \\{"gipVersion":"gip.v0.1","kind":"context.autopsy","context":{"summary":"Need planning advice","intent_tags":["planning"],"situation_kinds":["launch"]}}
+    ;
+    var result = try dispatch(allocator, "context.autopsy", core.PROTOCOL_VERSION, null, null, body);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
+    const json = result.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"malformed_persistent_pack_guidance\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":\"malformed_guidance\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"isNegativeEvidence\":false") != null);
+}
+
+test "context.autopsy merges persisted guidance before request guidance deterministically" {
+    const allocator = std.testing.allocator;
+    var fixture = try ContextAutopsyPackFixture.init(allocator, "context-autopsy-merge-fixture", persistedContextGuidanceBody());
+    defer fixture.deinit();
+
+    const body =
+        \\{"gipVersion":"gip.v0.1","kind":"context.autopsy","context":{"summary":"Need persisted launch planning advice","intent_tags":["planning"],"situation_kinds":["launch"]},"pack_guidance":[{"pack_id":"request_pack","match":{"intent_tags_any":["planning"]},"signals":[{"name":"request_signal","kind":"generic_signal","confidence":"medium","reason":"request guidance"}]}]}
+    ;
+    var result = try dispatch(allocator, "context.autopsy", core.PROTOCOL_VERSION, null, null, body);
+    defer result.deinit(allocator);
+    const json = result.result_json orelse return error.MissingResult;
+    const persisted_idx = std.mem.indexOf(u8, json, "\"persistent_pack_signal\"") orelse return error.MissingPersistedSignal;
+    const request_idx = std.mem.indexOf(u8, json, "\"request_signal\"") orelse return error.MissingRequestSignal;
+    try std.testing.expect(persisted_idx < request_idx);
+    try std.testing.expect(std.mem.indexOf(u8, json, "persistent_mounted_pack_order_then_request_order") != null);
+}
+
+test "context.autopsy non-matching persisted guidance does not contribute" {
+    const allocator = std.testing.allocator;
+    var fixture = try ContextAutopsyPackFixture.init(allocator, "context-autopsy-nonmatch-fixture", persistedContextGuidanceBody());
+    defer fixture.deinit();
+
+    const body =
+        \\{"gipVersion":"gip.v0.1","kind":"context.autopsy","context":{"summary":"Need debugging advice","intent_tags":["debugging"],"situation_kinds":["incident"]}}
+    ;
+    var result = try dispatch(allocator, "context.autopsy", core.PROTOCOL_VERSION, null, null, body);
+    defer result.deinit(allocator);
+    const json = result.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"persistent_pack_signal\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":\"loaded\"") != null);
+}
+
+test "context.autopsy malicious persisted guidance is sanitized by finalization" {
+    const allocator = std.testing.allocator;
+    var fixture = try ContextAutopsyPackFixture.init(allocator, "context-autopsy-malicious-fixture", maliciousContextGuidanceBody());
+    defer fixture.deinit();
+
+    const body =
+        \\{"gipVersion":"gip.v0.1","kind":"context.autopsy","context":{"summary":"Need planning advice","intent_tags":["planning"],"situation_kinds":["launch"]}}
+    ;
+    var result = try dispatch(allocator, "context.autopsy", core.PROTOCOL_VERSION, null, null, body);
+    defer result.deinit(allocator);
+    const json = result.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"malicious_unknown\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"isNegativeEvidence\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"nonAuthorizing\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"executesByDefault\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"isProofAuthority\":false") != null);
+}
+
 test "context.autopsy accepts request larger than legacy 64KB stdin cap" {
     const allocator = std.testing.allocator;
     var summary = std.ArrayList(u8).init(allocator);
@@ -3858,6 +4167,96 @@ test "context.autopsy aggregate artifact budget hit is reported" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"budgetHits\":[\"aggregate_max_bytes\"]") != null);
 }
 
+const ContextAutopsyPackFixture = struct {
+    allocator: std.mem.Allocator,
+    pack_id: []const u8,
+    pack_version: []const u8,
+    root_abs_path: []const u8,
+    manifest_path: []const u8,
+    corpus_tmp: std.testing.TmpDir,
+
+    fn init(allocator: std.mem.Allocator, pack_id: []const u8, guidance_body: []const u8) !ContextAutopsyPackFixture {
+        const pack_version = "v1";
+        knowledge_packs.setMountedState(allocator, null, pack_id, pack_version, false, false) catch {};
+        knowledge_packs.removePack(allocator, pack_id, pack_version) catch {};
+
+        var corpus_tmp = std.testing.tmpDir(.{});
+        errdefer corpus_tmp.cleanup();
+        try corpus_tmp.dir.writeFile(.{ .sub_path = "context.md", .data = "context autopsy pack fixture\n" });
+        const corpus_root = try corpus_tmp.dir.realpathAlloc(allocator, ".");
+        defer allocator.free(corpus_root);
+
+        var pack = try knowledge_packs.createPack(allocator, .{
+            .pack_id = pack_id,
+            .pack_version = pack_version,
+            .domain_family = "context",
+            .trust_class = "project",
+            .source_summary = "context autopsy persisted guidance fixture",
+            .source_project_shard = null,
+            .source_state = .staged,
+            .corpus_path = corpus_root,
+            .corpus_label = "context-autopsy-fixture",
+        });
+        errdefer {
+            pack.manifest.deinit();
+            allocator.free(pack.root_abs_path);
+            knowledge_packs.removePack(allocator, pack_id, pack_version) catch {};
+        }
+
+        const guidance_rel = "autopsy/guidance.json";
+        const guidance_path = try std.fs.path.join(allocator, &.{ pack.root_abs_path, guidance_rel });
+        defer allocator.free(guidance_path);
+        try writeAbsoluteFile(allocator, guidance_path, guidance_body);
+        pack.manifest.storage.autopsy_guidance_rel_path = try allocator.dupe(u8, guidance_rel);
+        try knowledge_pack_store.saveManifest(allocator, pack.root_abs_path, &pack.manifest);
+        try knowledge_packs.setMountedState(allocator, null, pack_id, pack_version, true, true);
+
+        const manifest_path = try std.fs.path.join(allocator, &.{ pack.root_abs_path, "manifest.json" });
+        const owned_pack_id = try allocator.dupe(u8, pack.manifest.pack_id);
+        const owned_version = try allocator.dupe(u8, pack.manifest.pack_version);
+        const owned_root = try allocator.dupe(u8, pack.root_abs_path);
+        pack.manifest.deinit();
+        allocator.free(pack.root_abs_path);
+
+        return .{
+            .allocator = allocator,
+            .pack_id = owned_pack_id,
+            .pack_version = owned_version,
+            .root_abs_path = owned_root,
+            .manifest_path = manifest_path,
+            .corpus_tmp = corpus_tmp,
+        };
+    }
+
+    fn deinit(self: *ContextAutopsyPackFixture) void {
+        knowledge_packs.setMountedState(self.allocator, null, self.pack_id, self.pack_version, false, false) catch {};
+        knowledge_packs.removePack(self.allocator, self.pack_id, self.pack_version) catch {};
+        self.allocator.free(self.pack_id);
+        self.allocator.free(self.pack_version);
+        self.allocator.free(self.root_abs_path);
+        self.allocator.free(self.manifest_path);
+        self.corpus_tmp.cleanup();
+        self.* = undefined;
+    }
+};
+
+fn persistedContextGuidanceBody() []const u8 {
+    return "{\"packGuidance\":[{\"match\":{\"intent_tags_any\":[\"planning\"],\"situation_kinds_any\":[\"launch\"]},\"signals\":[{\"name\":\"persistent_pack_signal\",\"kind\":\"generic_signal\",\"confidence\":\"medium\",\"reason\":\"persisted guidance matched\"}],\"unknowns\":[{\"name\":\"persistent_pack_unknown\",\"importance\":\"high\",\"reason\":\"persisted guidance expects missing context\"}],\"risks\":[{\"risk_kind\":\"persistent_pack_risk\",\"reason\":\"persisted risk remains caution only\",\"suggested_caution\":\"collect evidence first\"}],\"candidate_actions\":[{\"id\":\"persistent_pack_action\",\"summary\":\"candidate only\",\"action_type\":\"generic_action\"}],\"check_candidates\":[{\"id\":\"persistent_pack_check\",\"summary\":\"check only\",\"check_kind\":\"soft\"}],\"evidence_expectations\":[{\"id\":\"persistent_pack_evidence\",\"summary\":\"evidence required\",\"expectation_kind\":\"soft\"}]}]}";
+}
+
+fn maliciousContextGuidanceBody() []const u8 {
+    return "{\"packGuidance\":[{\"match\":{\"intent_tags_any\":[\"planning\"]},\"reason\":\"malicious authority attempt\",\"signals\":[{\"name\":\"malicious_signal\",\"kind\":\"generic_signal\",\"confidence\":\"high\",\"reason\":\"signal only\"}],\"unknowns\":[{\"name\":\"malicious_unknown\",\"importance\":\"high\",\"reason\":\"must stay missing evidence\",\"is_negative_evidence\":true}],\"risks\":[{\"risk_kind\":\"malicious_risk\",\"reason\":\"must stay non-authorizing\",\"suggested_caution\":\"sanitize\",\"non_authorizing\":false}],\"candidate_actions\":[{\"id\":\"malicious_action\",\"summary\":\"must stay candidate\",\"action_type\":\"command\",\"non_authorizing\":false,\"requires_user_confirmation\":false}],\"check_candidates\":[{\"id\":\"malicious_check\",\"summary\":\"must not execute\",\"check_kind\":\"hard\",\"executes_by_default\":true,\"non_authorizing\":false}]}]}";
+}
+
+fn writeAbsoluteFile(allocator: std.mem.Allocator, abs_path: []const u8, bytes: []const u8) !void {
+    const parent = std.fs.path.dirname(abs_path) orelse return error.InvalidPath;
+    try std.fs.cwd().makePath(parent);
+    var file = try std.fs.createFileAbsolute(abs_path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(bytes);
+    _ = allocator;
+}
+
 test "protocol.describe lists context.autopsy as implemented" {
     const allocator = std.testing.allocator;
     var result = try dispatch(allocator, "protocol.describe", core.PROTOCOL_VERSION, null, null, null);
@@ -3865,7 +4264,7 @@ test "protocol.describe lists context.autopsy as implemented" {
     try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
     const json = result.result_json.?;
     try std.testing.expect(std.mem.indexOf(u8, json, "\"context.autopsy\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "read_only_artifact_refs_and_runtime_pack_guidance") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "read_only_artifact_refs_runtime_and_persistent_pack_guidance") != null);
 }
 
 test "capabilities.describe lists context.autopsy as allowed read-only" {

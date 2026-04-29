@@ -29,9 +29,10 @@ Ghost evaluates the user's situation against these pack rules. The engine remain
 ## 4. Runtime Status
 
 Context Autopsy now has a native runtime path through GIP as `context.autopsy`.
-The runtime accepts a generic `ContextCase` payload and request-supplied pack
-guidance, evaluates only guidance whose domain-neutral match criteria apply to
-the case, and returns a draft/non-authorizing `ContextAutopsyResult`.
+The runtime accepts a generic `ContextCase` payload, request-supplied pack
+guidance, and persisted autopsy guidance from mounted Knowledge Packs. It
+evaluates only guidance whose domain-neutral match criteria apply to the case
+and returns a draft/non-authorizing `ContextAutopsyResult`.
 
 Current match criteria are intentionally generic:
 - `intent_tags_any` / `intent_tags_all`
@@ -49,9 +50,12 @@ obligations. They are not executed, are not treated as proof, and remain
 non-authorizing. Hard verifier expectations and soft checks are classified as
 pending obligations only.
 
-The runtime path does not currently load persistent pack guidance files. This
-pass uses request-supplied pack guidance as the runtime source. Persistent pack
-loading remains future work.
+Persisted guidance is loaded from the optional Knowledge Pack manifest storage
+field `autopsyGuidanceRelPath`. The file may contain either a top-level
+guidance array or an object with `packGuidance` / `pack_guidance`. Missing or
+malformed guidance is reported as a warning/unknown and does not crash the
+request. Merge order is deterministic: persisted mounted-pack guidance first in
+mount registry order, then request-supplied guidance in request order.
 
 ## 5. Minimal Proposed Schema
 
