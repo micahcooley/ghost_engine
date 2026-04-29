@@ -759,6 +759,92 @@ test "result builder sanitizes direct field mutations before build" {
     try std.testing.expectEqual(true, result.candidate_actions[0].non_authorizing);
 }
 
+const DirectAppendMaliciousSource = struct {
+    pub fn contribute(_: *anyopaque, _: *const ContextCase, builder: *ResultBuilder) anyerror!void {
+        try builder.unknowns.append(.{
+            .name = "direct_source_unknown",
+            .source_pack = "direct_source_pack",
+            .importance = "high",
+            .reason = "direct source append tries to make missing evidence negative",
+            .is_missing_evidence = false,
+            .is_negative_evidence = true,
+        });
+        try builder.checks.append(.{
+            .id = "direct_source_check",
+            .source_pack = "direct_source_pack",
+            .check_type = "hard_verifier",
+            .purpose = "direct source append tries to execute",
+            .risk_level = "high",
+            .confidence = "high",
+            .evidence_strength = "absolute",
+            .requires_user_confirmation = false,
+            .non_authorizing = false,
+            .executes_by_default = true,
+            .why_candidate_exists = "unsafe direct append",
+        });
+        try builder.candidates.append(.{
+            .id = "direct_source_action",
+            .source_pack = "direct_source_pack",
+            .action_type = "command",
+            .payload = .{ .string = "not-executed" },
+            .reason = "direct source append tries to authorize an action",
+            .risk_level = "high",
+            .requires_user_confirmation = false,
+            .non_authorizing = false,
+        });
+        try builder.pending_evidence_obligations.append(.{
+            .id = "direct_source_obligation",
+            .source_pack = "direct_source_pack",
+            .summary = "direct source append tries to mark evidence complete",
+            .expectation_kind = "hard_verifier",
+            .obligation_kind = "hard_verifier",
+            .status = "complete",
+            .executed = true,
+            .treated_as_proof = true,
+            .non_authorizing = false,
+            .reason = "unsafe direct append",
+        });
+        try builder.pack_influences.append(.{
+            .pack_name = "direct_source_pack",
+            .pack_version = "v1",
+            .weight = "high",
+            .non_authorizing = false,
+            .is_proof_authority = true,
+        });
+    }
+
+    pub fn source() ContextSignalSource {
+        return .{ .ptr = undefined, .contributeFn = contribute };
+    }
+};
+
+test "result builder finalization sanitizes unsafe direct source appends" {
+    const sources = [_]ContextSignalSource{DirectAppendMaliciousSource.source()};
+    var engine = ContextAutopsyEngine.init(std.testing.allocator, &sources);
+    const case = ContextCase{
+        .description = "direct source finalization test",
+        .intake_data = .null,
+        .intake_type = "test",
+    };
+
+    var result = try engine.evaluate(&case);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("draft", result.state);
+    try std.testing.expectEqual(true, result.non_authorizing);
+    try std.testing.expectEqual(true, result.suggested_unknowns[0].is_missing_evidence);
+    try std.testing.expectEqual(false, result.suggested_unknowns[0].is_negative_evidence);
+    try std.testing.expectEqual(true, result.candidate_actions[0].non_authorizing);
+    try std.testing.expectEqual(true, result.check_candidates[0].non_authorizing);
+    try std.testing.expectEqual(false, result.check_candidates[0].executes_by_default);
+    try std.testing.expectEqualStrings("pending", result.pending_evidence_obligations[0].status);
+    try std.testing.expectEqual(false, result.pending_evidence_obligations[0].executed);
+    try std.testing.expectEqual(false, result.pending_evidence_obligations[0].treated_as_proof);
+    try std.testing.expectEqual(true, result.pending_evidence_obligations[0].non_authorizing);
+    try std.testing.expectEqual(true, result.pack_influences[0].non_authorizing);
+    try std.testing.expectEqual(false, result.pack_influences[0].is_proof_authority);
+}
+
 test "evidence expectations become pending unmet non-proof obligations" {
     const guidance = [_]context_autopsy.PackAutopsyGuidance{.{
         .influence = .{ .pack_name = "expectation_pack", .weight = "medium" },
