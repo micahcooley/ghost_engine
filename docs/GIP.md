@@ -178,6 +178,7 @@ promotion, or pack mutation.
   - Skipped, filtered, unsupported, unread, or truncated regions create explicit unknowns. They are not treated as false claims.
   - Loads only persisted autopsy guidance declared by mounted Knowledge Pack manifests; pack content remains a signal source, not proof.
   - Does not execute commands, run verifiers, mutate packs, or mutate negative knowledge.
+  - Persisted Knowledge Pack autopsy guidance can be preflighted through the read-only `ghost_knowledge_pack validate-autopsy-guidance` operator tool; this is outside the GIP request surface and does not change `context.autopsy` response authority.
 
 ### Conversation
 - `conversation.turn` — Process a user message through the engine. **(Implemented)**

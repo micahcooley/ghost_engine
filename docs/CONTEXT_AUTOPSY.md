@@ -57,6 +57,22 @@ malformed guidance is reported as a warning/unknown and does not crash the
 request. Merge order is deterministic: persisted mounted-pack guidance first in
 mount registry order, then request-supplied guidance in request order.
 
+Persisted guidance can be reviewed before runtime use with:
+
+```sh
+ghost_knowledge_pack validate-autopsy-guidance --pack-id=<id> --version=<v>
+ghost_knowledge_pack validate-autopsy-guidance --manifest=<path>
+ghost_knowledge_pack validate-autopsy-guidance --all-mounted --project-shard=<id>
+```
+
+The validator is read-only. It validates the declared guidance file exists,
+parses as JSON, uses one of the accepted top-level shapes, keeps bounded match
+criteria, includes required fields for contributed signals/unknowns/risks/
+candidate actions/check candidates/evidence expectations, and reports
+authorizing or execution-like fields as structured warnings. Validation errors
+return non-zero from the CLI; warnings alone do not. The tool does not mount,
+promote, fix, execute, or mutate packs.
+
 Artifact references may include bounded include/exclude filters. Filters use a
 small deterministic glob syntax over workspace-relative paths: `*` matches
 within one path segment, `?` matches one character within one path segment, `**`

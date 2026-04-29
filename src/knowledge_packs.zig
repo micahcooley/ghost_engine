@@ -1,5 +1,6 @@
 const std = @import("std");
 const abstractions = @import("abstractions.zig");
+const autopsy_guidance_validator = @import("autopsy_guidance_validator.zig");
 const config = @import("config.zig");
 const corpus_ingest = @import("corpus_ingest.zig");
 const feedback_distillation = @import("feedback_distillation.zig");
@@ -20,6 +21,7 @@ pub const Command = enum {
     @"export",
     import,
     verify,
+    @"validate-autopsy-guidance",
     @"list-versions",
     @"distill-list",
     @"distill-show",
@@ -69,6 +71,8 @@ pub fn main() !void {
     var as_json = false;
     var candidate_id: ?[]const u8 = null;
     var approve = false;
+    var manifest_path: ?[]const u8 = null;
+    var all_mounted = false;
 
     for (args[2..]) |arg| {
         if (std.mem.startsWith(u8, arg, "--pack-id=")) {
@@ -105,6 +109,10 @@ pub fn main() !void {
             clone_pack_version = arg["--to-version=".len..];
         } else if (std.mem.eql(u8, arg, "--json")) {
             as_json = true;
+        } else if (std.mem.startsWith(u8, arg, "--manifest=")) {
+            manifest_path = arg["--manifest=".len..];
+        } else if (std.mem.eql(u8, arg, "--all-mounted")) {
+            all_mounted = true;
         } else if (std.mem.startsWith(u8, arg, "--candidate-id=")) {
             candidate_id = arg["--candidate-id=".len..];
         } else if (std.mem.eql(u8, arg, "--approve")) {
@@ -242,6 +250,21 @@ pub fn main() !void {
             if (!result.integrity_ok or !result.compatibility_ok) {
                 return error.VerifyFailed;
             }
+        },
+        .@"validate-autopsy-guidance" => {
+            var summary = try validateAutopsyGuidanceForCli(allocator, .{
+                .pack_id = pack_id,
+                .pack_version = pack_version,
+                .manifest_path = manifest_path,
+                .all_mounted = all_mounted,
+                .project_shard = project_shard,
+            });
+            defer summary.deinit();
+            const rendered = try renderAutopsyGuidanceValidation(allocator, &summary, as_json);
+            defer allocator.free(rendered);
+            sys.printOut(rendered);
+            sys.printOut("\n");
+            if (!summary.ok()) return error.AutopsyGuidanceValidationFailed;
         },
         .@"list-versions" => {
             const id = pack_id orelse return error.InvalidArguments;
@@ -1530,6 +1553,170 @@ fn renderVerifyResult(allocator: std.mem.Allocator, result: *const VerifyResult)
     return out.toOwnedSlice();
 }
 
+const AutopsyGuidanceCliOptions = struct {
+    pack_id: ?[]const u8,
+    pack_version: ?[]const u8,
+    manifest_path: ?[]const u8,
+    all_mounted: bool,
+    project_shard: ?[]const u8,
+};
+
+fn validateAutopsyGuidanceForCli(allocator: std.mem.Allocator, options: AutopsyGuidanceCliOptions) !autopsy_guidance_validator.ValidationSummary {
+    const modes: usize = (if (options.all_mounted) @as(usize, 1) else 0) +
+        (if (options.manifest_path != null) @as(usize, 1) else 0) +
+        (if (options.pack_id != null or options.pack_version != null) @as(usize, 1) else 0);
+    if (modes != 1) return error.InvalidArguments;
+
+    if (options.all_mounted) {
+        var paths = try resolveProjectPathsForCli(allocator, options.project_shard);
+        defer paths.deinit();
+        return try autopsy_guidance_validator.validateMountedPacks(allocator, &paths);
+    }
+
+    var reports = std.ArrayList(autopsy_guidance_validator.GuidanceValidationReport).init(allocator);
+    errdefer {
+        for (reports.items) |*report| report.deinit();
+        reports.deinit();
+    }
+
+    const report = if (options.manifest_path) |path|
+        try autopsy_guidance_validator.validateManifestPath(allocator, path)
+    else
+        try autopsy_guidance_validator.validateInstalledPack(
+            allocator,
+            options.pack_id orelse return error.InvalidArguments,
+            options.pack_version orelse return error.InvalidArguments,
+        );
+
+    const error_count = report.error_count;
+    const warning_count = report.warning_count;
+    try reports.append(report);
+
+    return .{
+        .allocator = allocator,
+        .reports = try reports.toOwnedSlice(),
+        .error_count = error_count,
+        .warning_count = warning_count,
+    };
+}
+
+fn renderAutopsyGuidanceValidation(
+    allocator: std.mem.Allocator,
+    summary: *const autopsy_guidance_validator.ValidationSummary,
+    as_json: bool,
+) ![]u8 {
+    if (as_json) return renderAutopsyGuidanceValidationJson(allocator, summary);
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try out.writer().print("autopsy_guidance_valid={s}\nreports={d}\nerrors={d}\nwarnings={d}", .{
+        boolText(summary.ok()),
+        summary.reports.len,
+        summary.error_count,
+        summary.warning_count,
+    });
+    for (summary.reports) |report| {
+        try out.writer().print(
+            "\n\npack={s}@{s}\nmanifest={s}\nguidance_declared={s}\nguidance_path={s}\nguidance_entries={d}\nerrors={d}\nwarnings={d}",
+            .{
+                report.pack_id,
+                report.pack_version,
+                report.manifest_path,
+                boolText(report.declared_guidance_path),
+                report.guidance_path orelse "<none>",
+                report.guidance_count,
+                report.error_count,
+                report.warning_count,
+            },
+        );
+        if (report.issues.len == 0) {
+            try out.writer().writeAll("\n  pass");
+        } else {
+            for (report.issues) |issue| {
+                try out.writer().print("\n  - {s} {s} {s}: {s}", .{
+                    @tagName(issue.severity),
+                    issue.code,
+                    issue.path,
+                    issue.message,
+                });
+            }
+        }
+    }
+    return out.toOwnedSlice();
+}
+
+fn renderAutopsyGuidanceValidationJson(
+    allocator: std.mem.Allocator,
+    summary: *const autopsy_guidance_validator.ValidationSummary,
+) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"ok\":");
+    try w.writeAll(if (summary.ok()) "true" else "false");
+    try w.writeAll(",\"errorCount\":");
+    try w.print("{d}", .{summary.error_count});
+    try w.writeAll(",\"warningCount\":");
+    try w.print("{d}", .{summary.warning_count});
+    try w.writeAll(",\"reports\":[");
+    for (summary.reports, 0..) |report, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{\"packId\":");
+        try writeJsonString(w, report.pack_id);
+        try w.writeAll(",\"version\":");
+        try writeJsonString(w, report.pack_version);
+        try w.writeAll(",\"manifestPath\":");
+        try writeJsonString(w, report.manifest_path);
+        try w.writeAll(",\"guidanceDeclared\":");
+        try w.writeAll(if (report.declared_guidance_path) "true" else "false");
+        try w.writeAll(",\"guidancePath\":");
+        if (report.guidance_path) |path| try writeJsonString(w, path) else try w.writeAll("null");
+        try w.writeAll(",\"guidanceCount\":");
+        try w.print("{d}", .{report.guidance_count});
+        try w.writeAll(",\"errorCount\":");
+        try w.print("{d}", .{report.error_count});
+        try w.writeAll(",\"warningCount\":");
+        try w.print("{d}", .{report.warning_count});
+        try w.writeAll(",\"issues\":[");
+        for (report.issues, 0..) |issue, issue_idx| {
+            if (issue_idx != 0) try w.writeByte(',');
+            try w.writeAll("{\"severity\":");
+            try writeJsonString(w, @tagName(issue.severity));
+            try w.writeAll(",\"code\":");
+            try writeJsonString(w, issue.code);
+            try w.writeAll(",\"path\":");
+            try writeJsonString(w, issue.path);
+            try w.writeAll(",\"message\":");
+            try writeJsonString(w, issue.message);
+            try w.writeByte('}');
+        }
+        try w.writeAll("]}");
+    }
+    try w.writeAll("]}");
+    return out.toOwnedSlice();
+}
+
+fn writeJsonString(writer: anytype, text: []const u8) !void {
+    try writer.writeByte('"');
+    for (text) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => {
+                if (c < 0x20) {
+                    try writer.print("\\u{x:0>4}", .{c});
+                } else {
+                    try writer.writeByte(c);
+                }
+            },
+        }
+    }
+    try writer.writeByte('"');
+}
+
 fn renderVersionList(allocator: std.mem.Allocator, versions: []PackVersionInfo, as_json: bool) ![]u8 {
     if (as_json) {
         var out = std.ArrayList(u8).init(allocator);
@@ -1853,6 +2040,7 @@ fn parseCommand(text: []const u8) ?Command {
     if (std.mem.eql(u8, text, "export")) return .@"export";
     if (std.mem.eql(u8, text, "import")) return .import;
     if (std.mem.eql(u8, text, "verify")) return .verify;
+    if (std.mem.eql(u8, text, "validate-autopsy-guidance")) return .@"validate-autopsy-guidance";
     if (std.mem.eql(u8, text, "list-versions")) return .@"list-versions";
     if (std.mem.eql(u8, text, "distill-list")) return .@"distill-list";
     if (std.mem.eql(u8, text, "distill-show")) return .@"distill-show";
@@ -1866,7 +2054,7 @@ fn parseTrustClass(text: []const u8) ?abstractions.TrustClass {
 
 fn printUsage() void {
     sys.print(
-        "Usage: ghost_knowledge_pack <create|inspect|list|mount|unmount|clone|remove|diff|export|import|verify|list-versions|distill-list|distill-show|distill-export> [--pack-id=id] [--version=v] [--domain=family] [--trust-class=exploratory|project|promoted|core] [--source-summary=text] [--project-shard=id] [--source-project-shard=id] [--source-state=staged|live] [--corpus=/abs/or/rel/path] [--corpus-label=text] [--to-pack-id=id] [--to-version=v] [--left-pack=id] [--left-version=v] [--right-pack=id] [--right-version=v] [--candidate-id=id] [--approve] [--export-dir=/abs/path] [--force] [--export-reason=text] [--json]\n",
+        "Usage: ghost_knowledge_pack <create|inspect|list|mount|unmount|clone|remove|diff|export|import|verify|validate-autopsy-guidance|list-versions|distill-list|distill-show|distill-export> [--pack-id=id] [--version=v] [--domain=family] [--trust-class=exploratory|project|promoted|core] [--source-summary=text] [--project-shard=id] [--source-project-shard=id] [--source-state=staged|live] [--corpus=/abs/or/rel/path] [--corpus-label=text] [--to-pack-id=id] [--to-version=v] [--left-pack=id] [--left-version=v] [--right-pack=id] [--right-version=v] [--manifest=/abs/or/rel/manifest.json] [--all-mounted] [--candidate-id=id] [--approve] [--export-dir=/abs/path] [--force] [--export-reason=text] [--json]\n",
         .{},
     );
 }
