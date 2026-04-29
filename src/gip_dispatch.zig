@@ -3526,6 +3526,41 @@ test "context.autopsy valid request returns draft non-authorizing result" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"packMutation\":false") != null);
 }
 
+test "context.autopsy accepts request larger than legacy 64KB stdin cap" {
+    const allocator = std.testing.allocator;
+    var summary = std.ArrayList(u8).init(allocator);
+    defer summary.deinit();
+    try summary.appendNTimes('a', 70 * 1024);
+
+    var body = std.ArrayList(u8).init(allocator);
+    defer body.deinit();
+    try body.writer().print(
+        "{{\"gipVersion\":\"gip.v0.1\",\"kind\":\"context.autopsy\",\"context\":{{\"summary\":\"{s}\",\"intent_tags\":[\"planning\"]}},\"pack_guidance\":[{{\"pack_id\":\"large_pack\",\"match\":{{\"intent_tags_any\":[\"planning\"]}},\"signals\":[{{\"name\":\"large_signal\",\"kind\":\"generic_signal\",\"confidence\":\"medium\",\"reason\":\"matched large request\"}}]}}]}}",
+        .{summary.items},
+    );
+    try std.testing.expect(body.items.len > 64 * 1024);
+    try std.testing.expect(body.items.len < core.MAX_STDIN_REQUEST_BYTES);
+
+    var result = try dispatch(allocator, "context.autopsy", core.PROTOCOL_VERSION, null, null, body.items);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
+    const json = result.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"contextAutopsy\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"large_signal\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"commandsExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verifiersExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"packMutation\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"negativeKnowledgeMutation\":false") != null);
+}
+
+test "context.autopsy malformed JSON returns structured contract error" {
+    const allocator = std.testing.allocator;
+    var result = try dispatch(allocator, "context.autopsy", core.PROTOCOL_VERSION, null, null, "{\"gipVersion\":");
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, result.status);
+    try std.testing.expectEqual(core.ErrorCode.json_contract_error, result.err.?.code);
+}
+
 test "context.autopsy incomplete request returns explicit unknown gap" {
     const allocator = std.testing.allocator;
     const body = "{\"gipVersion\":\"gip.v0.1\",\"kind\":\"context.autopsy\",\"context\":{}}";

@@ -369,6 +369,7 @@ pub const SandboxPolicy = enum {
 pub const ErrorCode = enum {
     unsupported_gip_version,
     invalid_request,
+    request_too_large,
     missing_required_field,
     invalid_reasoning_level,
     unsupported_operation,
@@ -427,6 +428,7 @@ pub const MAX_COMMAND_TIMEOUT_MS: u32 = 30_000;
 pub const DEFAULT_COMMAND_TIMEOUT_MS: u32 = 10_000;
 pub const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 pub const MAX_ARTIFACT_READ_BYTES: usize = 1024 * 1024;
+pub const MAX_STDIN_REQUEST_BYTES: usize = 1024 * 1024;
 pub const MAX_LIST_ENTRIES: usize = 512;
 pub const MAX_SEARCH_RESULTS: usize = 64;
 pub const MAX_HYPOTHESIS_ITEMS: usize = 128;

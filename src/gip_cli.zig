@@ -67,13 +67,42 @@ pub fn main() !void {
     if (json_input != null or use_stdin) {
         const input = if (use_stdin) blk: {
             const stdin = std.io.getStdIn();
-            break :blk try stdin.readToEndAlloc(allocator, 64 * 1024);
+            break :blk readBoundedRequest(allocator, stdin.reader(), gip.core.MAX_STDIN_REQUEST_BYTES) catch |err| switch (err) {
+                error.RequestTooLarge => {
+                    const details = try std.fmt.allocPrint(
+                        allocator,
+                        "maximum stdin request size is {d} bytes",
+                        .{gip.core.MAX_STDIN_REQUEST_BYTES},
+                    );
+                    defer allocator.free(details);
+                    try writeStructuredErrorResponse(
+                        allocator,
+                        null,
+                        null,
+                        .rejected,
+                        .{
+                            .code = .request_too_large,
+                            .message = "stdin JSON request exceeds maximum size",
+                            .details = details,
+                            .fix_hint = "reduce the request payload or split it into smaller GIP requests",
+                        },
+                    );
+                    std.process.exit(1);
+                },
+                else => return err,
+            };
         } else json_input.?;
         defer if (use_stdin) allocator.free(input);
 
         // Extract fields from JSON
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, input, .{}) catch {
-            try writeErrorResponse("json_contract_error", "invalid JSON input");
+            try writeStructuredErrorResponse(
+                allocator,
+                request_id,
+                null,
+                .rejected,
+                .{ .code = .json_contract_error, .message = "invalid JSON input" },
+            );
             std.process.exit(1);
         };
         defer parsed.deinit();
@@ -148,6 +177,21 @@ pub fn main() !void {
     try stdout.writeByte('\n');
 }
 
+fn readBoundedRequest(
+    allocator: std.mem.Allocator,
+    reader: anytype,
+    max_bytes: usize,
+) ![]u8 {
+    const input = reader.readAllAlloc(allocator, max_bytes + 1) catch |err| switch (err) {
+        error.StreamTooLong => return error.RequestTooLarge,
+        else => return err,
+    };
+    errdefer allocator.free(input);
+
+    if (input.len > max_bytes) return error.RequestTooLarge;
+    return input;
+}
+
 fn printUsage() !void {
     const stderr = std.io.getStdErr().writer();
     try stderr.writeAll(
@@ -176,11 +220,76 @@ fn printUsage() !void {
     );
 }
 
-fn writeErrorResponse(code: []const u8, message: []const u8) !void {
-    const stdout = std.io.getStdOut().writer();
-    try stdout.print("{{\"gipVersion\":\"{s}\",\"status\":\"rejected\",\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\"}}}}\n", .{
+fn writeStructuredErrorResponse(
+    allocator: std.mem.Allocator,
+    request_id: ?[]const u8,
+    kind: ?gip.core.RequestKind,
+    status: gip.core.ProtocolStatus,
+    err: gip.schema.GipError,
+) !void {
+    const response = try gip.schema.renderResponse(
+        allocator,
         gip.core.PROTOCOL_VERSION,
-        code,
-        message,
-    });
+        request_id,
+        kind,
+        status,
+        null,
+        null,
+        err,
+        null,
+    );
+    defer allocator.free(response);
+
+    const stdout = std.io.getStdOut().writer();
+    try stdout.writeAll(response);
+    try stdout.writeByte('\n');
+}
+
+test "stdin request limit is named and larger than legacy 64KB cap" {
+    try std.testing.expect(gip.core.MAX_STDIN_REQUEST_BYTES == 1024 * 1024);
+    try std.testing.expect(gip.core.MAX_STDIN_REQUEST_BYTES > 64 * 1024);
+}
+
+test "bounded request reader accepts small stdin-style GIP request" {
+    const allocator = std.testing.allocator;
+    var stream = std.io.fixedBufferStream("{\"gipVersion\":\"gip.v0.1\",\"kind\":\"engine.status\"}");
+    const input = try readBoundedRequest(allocator, stream.reader(), gip.core.MAX_STDIN_REQUEST_BYTES);
+    defer allocator.free(input);
+
+    try std.testing.expect(std.mem.indexOf(u8, input, "\"engine.status\"") != null);
+}
+
+test "bounded request reader accepts context.autopsy payload larger than legacy 64KB cap" {
+    const allocator = std.testing.allocator;
+    var payload = std.ArrayList(u8).init(allocator);
+    defer payload.deinit();
+
+    try payload.appendNTimes('a', 70 * 1024);
+    var request = std.ArrayList(u8).init(allocator);
+    defer request.deinit();
+    try request.writer().print(
+        "{{\"gipVersion\":\"gip.v0.1\",\"kind\":\"context.autopsy\",\"context\":{{\"summary\":\"{s}\"}}}}",
+        .{payload.items},
+    );
+
+    var stream = std.io.fixedBufferStream(request.items);
+    const input = try readBoundedRequest(allocator, stream.reader(), gip.core.MAX_STDIN_REQUEST_BYTES);
+    defer allocator.free(input);
+
+    try std.testing.expect(input.len > 64 * 1024);
+    try std.testing.expect(input.len < gip.core.MAX_STDIN_REQUEST_BYTES);
+    try std.testing.expect(std.mem.indexOf(u8, input, "\"context.autopsy\"") != null);
+}
+
+test "bounded request reader rejects oversized stdin request" {
+    const allocator = std.testing.allocator;
+    const payload = try allocator.alloc(u8, gip.core.MAX_STDIN_REQUEST_BYTES + 1);
+    defer allocator.free(payload);
+    @memset(payload, 'x');
+
+    var stream = std.io.fixedBufferStream(payload);
+    try std.testing.expectError(
+        error.RequestTooLarge,
+        readBoundedRequest(allocator, stream.reader(), gip.core.MAX_STDIN_REQUEST_BYTES),
+    );
 }

@@ -247,6 +247,23 @@ pub fn build(b: *std.Build) void {
     const run_lifecycle_tests = b.addRunArtifact(lifecycle_tests);
     test_step.dependOn(&run_lifecycle_tests.step);
 
+    const gip_cli_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gip_cli.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    gip_cli_tests.root_module.addImport("ghost_core", ghost_core_test);
+    gip_cli_tests.root_module.addOptions("build_options", test_core_options);
+    gip_cli_tests.root_module.linkSystemLibrary("c", .{});
+    if (target.result.os.tag == .linux) {
+        gip_cli_tests.root_module.linkSystemLibrary("dl", .{});
+    }
+    addVulkanIncludes(gip_cli_tests.root_module, target.result.os, vulkan_sdk, b);
+    const run_gip_cli_tests = b.addRunArtifact(gip_cli_tests);
+    test_step.dependOn(&run_gip_cli_tests.step);
+
     // ── 10. Parity Test ──
     const parity_test = b.addTest(.{
         .root_module = b.createModule(.{
