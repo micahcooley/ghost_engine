@@ -67,6 +67,37 @@ precedence over include filters. If no include filters are provided, every
 non-excluded file remains eligible. Filtered, skipped, and truncated files still
 surface through artifact coverage and explicit unknowns.
 
+File-backed context input references provide a separate data-plane path for
+large textual context, logs, and transcript-style inputs that should not be
+embedded into the stdin JSON control plane. The canonical request shape is
+`context.input_refs` / `context.inputRefs`:
+
+```json
+{
+  "context": {
+    "summary": "Review a large transcript",
+    "input_refs": [
+      {
+        "kind": "file",
+        "path": "notes/transcript.txt",
+        "id": "transcript",
+        "label": "Interview transcript",
+        "purpose": "bounded transcript context",
+        "maxBytes": 65536
+      }
+    ]
+  }
+}
+```
+
+Input refs are file-only. Paths must resolve inside the workspace. Ghost reads
+only up to the declared byte budget, clamps excessive budgets, never executes
+anything, never mutates files, and does not echo raw input text in the response.
+`inputCoverage` reports requested refs, bytes read, skipped refs, truncation,
+budget hits, and explicit unknowns for unread or truncated regions. These
+unknowns remain missing evidence, not negative evidence, and the result remains
+draft/non-authorizing.
+
 ## 5. Minimal Proposed Schema
 
 ```zig

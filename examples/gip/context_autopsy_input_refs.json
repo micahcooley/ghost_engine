@@ -1,0 +1,19 @@
+{
+  "gipVersion": "gip.v0.1",
+  "kind": "context.autopsy",
+  "context": {
+    "summary": "Inspect large textual context without embedding it in stdin JSON",
+    "intentTags": ["inspection"],
+    "situationKinds": ["large_input"],
+    "inputRefs": [
+      {
+        "kind": "file",
+        "path": "notes/transcript.txt",
+        "id": "transcript",
+        "label": "Transcript",
+        "purpose": "bounded transcript context",
+        "maxBytes": 65536
+      }
+    ]
+  }
+}

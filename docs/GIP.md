@@ -115,7 +115,7 @@ results when GIP has no active session or workspace metadata:
 | `feedback.summary` | Returns event counts if workspace metadata resolves; otherwise `unsupported` flag | `requires_workspace_metadata` |
 | `session.get` | Returns session data if session file exists; otherwise `path_not_found` | `requires_existing_session` |
 | `project.autopsy` | Bounded read-only workspace inspection without command execution | `read_only_workspace_inspection` |
-| `context.autopsy` | Runtime and persisted mounted-pack guidance plus bounded workspace artifact references for large inputs | `read_only_artifact_refs_runtime_and_persistent_pack_guidance` |
+| `context.autopsy` | Runtime and persisted mounted-pack guidance plus bounded workspace artifact/input references for large inputs | `read_only_artifact_and_input_refs_runtime_and_persistent_pack_guidance` |
 
 Stateless operations do not fake data. They return structurally valid empty
 outputs that are safe for clients to consume.
@@ -166,13 +166,16 @@ promotion, or pack mutation.
   - Does not execute commands, modify files, run verifiers, or mutate packs.
   - Verifier plan candidates are returned with `executes_by_default: false`.
 
-- `context.autopsy` — Evaluate a context case with runtime/persisted mounted-pack guidance and optional bounded artifact references **(Implemented)**
-  - **Request**: small JSON control plane with `context`, optional `packGuidance`, and optional `artifactRefs`.
+- `context.autopsy` — Evaluate a context case with runtime/persisted mounted-pack guidance and optional bounded artifact/input references **(Implemented)**
+  - **Request**: small JSON control plane with `context`, optional `packGuidance`, optional `artifactRefs`, and optional `context.input_refs` / `context.inputRefs`.
   - **Artifact ref schema**: `{"kind":"file"|"directory","path":"relative/path","purpose":"...","reason":"...","include":["src/**/*.zig"],"exclude":[".git/**","zig-out/**",".zig-cache/**"],"maxFileBytes":65536,"maxChunkBytes":32768,"maxFiles":128,"maxEntries":512,"maxBytes":524288}`.
   - **Artifact ref filters**: deterministic glob-style filters over workspace-relative paths. `*` and `?` match within one path segment, `**` as a full segment matches across path segments, and `/` is a literal path separator. Exclude filters win over include filters. Empty include filters include all non-excluded files.
   - **Response coverage**: `artifactCoverage` reports `artifactsRequested`, `filesConsidered`, `filesRead`, `bytesRead`, `filesSkipped`, `skipReasons`, `filesTruncated`, `truncationReasons`, `budgetHits`, and `unknowns`.
+  - **Input ref schema**: `{"kind":"file","path":"relative/context.txt","id":"optional","label":"optional","purpose":"bounded transcript/log context","reason":"...","maxBytes":65536}`.
+  - **Input ref behavior**: input refs are file-only textual context/log/transcript inputs. They resolve inside the workspace, read only bounded bytes, never execute or mutate, and do not echo raw file content in the response.
+  - **Input coverage**: `inputCoverage` reports `inputRefsRequested`, `inputsConsidered`, `inputsRead`, `bytesRead`, `inputsSkipped`, `skipReasons`, `inputsTruncated`, `truncationReasons`, `budgetHits`, and `unknowns`.
   - The stdin JSON limit remains the 1 MiB control-plane boundary. Large content is referenced by path and read through bounded file/chunk/aggregate budgets.
-  - Skipped, filtered, unsupported, or truncated regions create explicit unknowns. They are not treated as false claims.
+  - Skipped, filtered, unsupported, unread, or truncated regions create explicit unknowns. They are not treated as false claims.
   - Loads only persisted autopsy guidance declared by mounted Knowledge Pack manifests; pack content remains a signal source, not proof.
   - Does not execute commands, run verifiers, mutate packs, or mutate negative knowledge.
 

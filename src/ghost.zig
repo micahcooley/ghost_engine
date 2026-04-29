@@ -45,6 +45,7 @@ pub const project_autopsy = @import("project_autopsy.zig");
 pub const context_autopsy = @import("context_autopsy.zig");
 pub const context_autopsy_engine = @import("context_autopsy_engine.zig");
 pub const context_artifacts = @import("context_artifacts.zig");
+pub const context_inputs = @import("context_inputs.zig");
 pub const gip = @import("gip.zig");
 
 pub const VERSION = @import("build_options").ghost_version;
