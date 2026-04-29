@@ -107,6 +107,29 @@ pub const ResultBuilder = struct {
     }
 
     pub fn build(self: *ResultBuilder, case: ContextCase) !ContextAutopsyResult {
+        // Enforce authority boundaries at the last possible moment,
+        // preventing sources from bypassing builder methods.
+        for (self.unknowns.items) |*unknown| {
+            unknown.is_missing_evidence = true;
+            unknown.is_negative_evidence = false;
+        }
+        for (self.risks.items) |*risk| risk.non_authorizing = true;
+        for (self.candidates.items) |*candidate| candidate.non_authorizing = true;
+        for (self.checks.items) |*check| {
+            check.non_authorizing = true;
+            check.executes_by_default = false;
+        }
+        for (self.pending_evidence_obligations.items) |*obl| {
+            obl.status = "pending";
+            obl.executed = false;
+            obl.treated_as_proof = false;
+            obl.non_authorizing = true;
+        }
+        for (self.pack_influences.items) |*influence| {
+            influence.non_authorizing = true;
+            influence.is_proof_authority = false;
+        }
+
         return ContextAutopsyResult{
             .context_case = case,
             .detected_signals = try self.signals.toOwnedSlice(),
@@ -699,6 +722,41 @@ test "result builder sanitizes malicious source authority flags" {
     try std.testing.expectEqual(false, result.check_candidates[0].executes_by_default);
     try std.testing.expectEqual(true, result.pack_influences[0].non_authorizing);
     try std.testing.expectEqual(false, result.pack_influences[0].is_proof_authority);
+}
+
+test "result builder sanitizes direct field mutations before build" {
+    var builder = ResultBuilder.init(std.testing.allocator);
+    defer builder.deinit();
+
+    try builder.unknowns.append(.{
+        .name = "direct_unknown",
+        .source_pack = "direct_test",
+        .importance = "high",
+        .reason = "direct append tries to make missing evidence negative",
+        .is_missing_evidence = false,
+        .is_negative_evidence = true,
+    });
+    try builder.candidates.append(.{
+        .id = "direct_candidate",
+        .source_pack = "direct_test",
+        .action_type = "command",
+        .payload = .null,
+        .reason = "direct append tries to authorize an action",
+        .risk_level = "high",
+        .requires_user_confirmation = false,
+        .non_authorizing = false,
+    });
+
+    var result = try builder.build(.{
+        .description = "test",
+        .intake_data = .null,
+        .intake_type = "test",
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(true, result.suggested_unknowns[0].is_missing_evidence);
+    try std.testing.expectEqual(false, result.suggested_unknowns[0].is_negative_evidence);
+    try std.testing.expectEqual(true, result.candidate_actions[0].non_authorizing);
 }
 
 test "evidence expectations become pending unmet non-proof obligations" {

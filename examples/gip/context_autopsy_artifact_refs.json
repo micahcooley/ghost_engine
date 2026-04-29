@@ -1,0 +1,24 @@
+{
+  "gipVersion": "gip.v0.1",
+  "kind": "context.autopsy",
+  "context": {
+    "summary": "Inspect bounded source artifacts without embedding their contents in stdin JSON",
+    "intentTags": ["inspection"],
+    "artifactKinds": ["source"],
+    "situationKinds": ["large_input"]
+  },
+  "artifactRefs": [
+    {
+      "kind": "directory",
+      "path": "src",
+      "purpose": "bounded Context Autopsy source material",
+      "include": ["*.zig"],
+      "exclude": ["zig-out", ".zig-cache"],
+      "maxChunkBytes": 32768,
+      "maxFileBytes": 65536,
+      "maxFiles": 64,
+      "maxEntries": 512,
+      "maxBytes": 524288
+    }
+  ]
+}

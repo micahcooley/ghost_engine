@@ -115,6 +115,7 @@ results when GIP has no active session or workspace metadata:
 | `feedback.summary` | Returns event counts if workspace metadata resolves; otherwise `unsupported` flag | `requires_workspace_metadata` |
 | `session.get` | Returns session data if session file exists; otherwise `path_not_found` | `requires_existing_session` |
 | `project.autopsy` | Bounded read-only workspace inspection without command execution | `read_only_workspace_inspection` |
+| `context.autopsy` | Runtime pack guidance plus bounded workspace artifact references for large inputs | `read_only_artifact_refs_and_runtime_pack_guidance` |
 
 Stateless operations do not fake data. They return structurally valid empty
 outputs that are safe for clients to consume.
@@ -164,6 +165,14 @@ promotion, or pack mutation.
   - Canonicalizes the workspace root and performs bounded static inspection.
   - Does not execute commands, modify files, run verifiers, or mutate packs.
   - Verifier plan candidates are returned with `executes_by_default: false`.
+
+- `context.autopsy` — Evaluate a context case with runtime pack guidance and optional bounded artifact references **(Implemented)**
+  - **Request**: small JSON control plane with `context`, optional `packGuidance`, and optional `artifactRefs`.
+  - **Artifact ref schema**: `{"kind":"file"|"directory","path":"relative/path","purpose":"...","reason":"...","include":["*.zig"],"exclude":["zig-out",".zig-cache"],"maxFileBytes":65536,"maxChunkBytes":32768,"maxFiles":128,"maxEntries":512,"maxBytes":524288}`.
+  - **Response coverage**: `artifactCoverage` reports `artifactsRequested`, `filesConsidered`, `filesRead`, `bytesRead`, `filesSkipped`, `skipReasons`, `filesTruncated`, `truncationReasons`, `budgetHits`, and `unknowns`.
+  - The stdin JSON limit remains the 1 MiB control-plane boundary. Large content is referenced by path and read through bounded file/chunk/aggregate budgets.
+  - Skipped, filtered, unsupported, or truncated regions create explicit unknowns. They are not treated as false claims.
+  - Does not execute commands, run verifiers, load persistent packs, mutate packs, or mutate negative knowledge.
 
 ### Conversation
 - `conversation.turn` — Process a user message through the engine. **(Implemented)**
@@ -359,6 +368,7 @@ promote global authority.
 | `feedback.summary` | allowed | yes |
 | `session.get` | allowed | yes |
 | `project.autopsy` | allowed | yes |
+| `context.autopsy` | allowed | yes |
 | `command.run` | allowlist | no (not implemented) |
 | `verifier.run` | allowed | no (not implemented) |
 | `verifier.candidate.execute` | denied | no (not implemented) |
@@ -394,6 +404,7 @@ Maximum timeout: 30 seconds. Maximum output: 256KB.
 9. **Corrections are not proof** — correction events only expose state transition evidence
 10. **Negative knowledge remains non-authorizing** — records and influence projections never support output
 11. **No automatic negative-knowledge mutation** — GIP does not mutate packs, apply trust decay, or promote global authority
+12. **Large input stays bounded** — `context.autopsy` uses artifact references, filters, chunked reads, budgets, coverage, and explicit unknowns rather than unbounded stdin JSON
 
 ## CLI Usage
 
@@ -421,6 +432,7 @@ echo '{"gipVersion":"gip.v0.1","kind":"pack.inspect","packId":"my-pack"}' | ghos
 echo '{"gipVersion":"gip.v0.1","kind":"feedback.summary"}' | ghost_gip --stdin --workspace /path/to/project
 echo '{"gipVersion":"gip.v0.1","kind":"session.get","sessionId":"my-session"}' | ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"project.autopsy"}' | ghost_gip --stdin --workspace /path/to/project
+echo '{"gipVersion":"gip.v0.1","kind":"context.autopsy","context":{"summary":"inspect source context"},"artifactRefs":[{"kind":"directory","path":"src","include":["*.zig"],"exclude":["zig-out",".zig-cache"],"maxChunkBytes":32768,"maxFiles":64}]}' | ghost_gip --stdin --workspace /path/to/project
 ```
 
 ## Examples
@@ -435,6 +447,7 @@ See `examples/gip/` for sample request JSON files:
 - `negative_knowledge_candidate_list.json` — negative_knowledge.candidate.list request
 - `pack_list.json` — pack.list request
 - `pack_inspect.json` — pack.inspect request
+- `context_autopsy_artifact_refs.json` — context.autopsy request using bounded artifact references
 
 ## Module Structure
 

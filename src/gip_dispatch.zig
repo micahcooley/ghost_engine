@@ -18,6 +18,7 @@ const task_sessions = @import("task_sessions.zig");
 const project_autopsy = @import("project_autopsy.zig");
 const context_autopsy = @import("context_autopsy.zig");
 const context_autopsy_engine = @import("context_autopsy_engine.zig");
+const context_artifacts = @import("context_artifacts.zig");
 
 pub const DispatchResult = struct {
     status: core.ProtocolStatus,
@@ -117,7 +118,7 @@ pub fn dispatch(
         .@"feedback.summary" => dispatchFeedbackSummary(allocator, workspace_root, request_body),
         .@"session.get" => dispatchSessionGet(allocator, request_body),
         .@"project.autopsy" => dispatchProjectAutopsy(allocator, workspace_root, request_body),
-        .@"context.autopsy" => dispatchContextAutopsy(allocator, request_body),
+        .@"context.autopsy" => dispatchContextAutopsy(allocator, workspace_root, request_body),
         else => .{
             .status = .unsupported,
             .err = .{
@@ -140,7 +141,7 @@ fn dispatchProtocolDescribe(allocator: std.mem.Allocator) !DispatchResult {
     try w.writeAll("\"version\":\"");
     try w.writeAll(core.PROTOCOL_VERSION);
     try w.writeAll("\",\"implemented\":[\"protocol.describe\",\"capabilities.describe\",\"engine.status\",\"conversation.turn\",\"artifact.read\",\"artifact.list\",\"artifact.patch.propose\",\"hypothesis.list\",\"hypothesis.triage\",\"verifier.list\",\"verifier.candidate.execution.list\",\"verifier.candidate.execution.get\",\"correction.list\",\"correction.get\",\"negative_knowledge.candidate.list\",\"negative_knowledge.candidate.get\",\"negative_knowledge.record.list\",\"negative_knowledge.record.get\",\"negative_knowledge.influence.list\",\"trust_decay.candidate.list\",\"negative_knowledge.candidate.review\",\"negative_knowledge.record.expire\",\"negative_knowledge.record.supersede\",\"pack.list\",\"pack.inspect\",\"feedback.summary\",\"session.get\",\"project.autopsy\",\"context.autopsy\"]");
-    try w.writeAll(",\"maturity\":{\"hypothesis.list\":\"stateless\",\"hypothesis.triage\":\"stateless\",\"verifier.candidate.execution.list\":\"read_only_state_inspection\",\"verifier.candidate.execution.get\":\"read_only_state_inspection\",\"correction.list\":\"read_only_state_inspection\",\"correction.get\":\"read_only_state_inspection\",\"negative_knowledge.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.get\":\"read_only_state_inspection\",\"negative_knowledge.record.list\":\"read_only_state_inspection\",\"negative_knowledge.record.get\":\"read_only_state_inspection\",\"negative_knowledge.influence.list\":\"read_only_state_inspection\",\"trust_decay.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.review\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.expire\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.supersede\":\"structured_unsupported_without_persistence\",\"feedback.summary\":\"requires_workspace_metadata\",\"session.get\":\"requires_existing_session\",\"project.autopsy\":\"read_only_workspace_inspection\",\"context.autopsy\":\"runtime_pack_guidance_payload\"}");
+    try w.writeAll(",\"maturity\":{\"hypothesis.list\":\"stateless\",\"hypothesis.triage\":\"stateless\",\"verifier.candidate.execution.list\":\"read_only_state_inspection\",\"verifier.candidate.execution.get\":\"read_only_state_inspection\",\"correction.list\":\"read_only_state_inspection\",\"correction.get\":\"read_only_state_inspection\",\"negative_knowledge.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.get\":\"read_only_state_inspection\",\"negative_knowledge.record.list\":\"read_only_state_inspection\",\"negative_knowledge.record.get\":\"read_only_state_inspection\",\"negative_knowledge.influence.list\":\"read_only_state_inspection\",\"trust_decay.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.review\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.expire\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.supersede\":\"structured_unsupported_without_persistence\",\"feedback.summary\":\"requires_workspace_metadata\",\"session.get\":\"requires_existing_session\",\"project.autopsy\":\"read_only_workspace_inspection\",\"context.autopsy\":\"read_only_artifact_refs_and_runtime_pack_guidance\"}");
     try w.writeAll(",\"unsupported\":[\"artifact.patch.apply\",\"artifact.write.propose\",\"artifact.write.apply\",\"artifact.search\",\"conversation.replay\",\"intent.ground\",\"response.evaluate\",\"verifier.run\",\"verifier.candidate.execute\",\"hypothesis.generate\",\"hypothesis.verifier.schedule\",\"correction.apply\",\"negative_knowledge.promote\",\"pack.update_from_negative_knowledge\",\"trust_decay.apply\",\"pack.mount\",\"pack.unmount\",\"pack.import\",\"pack.export\",\"pack.distill.list\",\"pack.distill.show\",\"pack.distill.export\",\"feedback.record\",\"feedback.replay\",\"session.create\",\"session.update\",\"session.close\",\"command.run\"]");
     try w.writeAll("}}");
 
@@ -184,7 +185,7 @@ fn dispatchCapabilitiesDescribe(allocator: std.mem.Allocator) !DispatchResult {
     try w.writeAll("{\"capability\":\"pack.inspect\",\"policy\":\"allowed\",\"read_only\":true},");
     try w.writeAll("{\"capability\":\"feedback.summary\",\"policy\":\"allowed\",\"read_only\":true},");
     try w.writeAll("{\"capability\":\"session.get\",\"policy\":\"allowed\",\"read_only\":true},");
-    try w.writeAll("{\"capability\":\"context.autopsy\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"note\":\"runtime pack guidance payload only; no persistent pack loading, commands, verifiers, or mutations\"},");
+    try w.writeAll("{\"capability\":\"context.autopsy\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"note\":\"runtime pack guidance plus bounded artifact references; no persistent pack loading, commands, verifiers, or mutations\"},");
     try w.writeAll("{\"capability\":\"artifact.patch.apply\",\"policy\":\"requires_approval\",\"mutation\":true},");
     try w.writeAll("{\"capability\":\"verifier.run\",\"policy\":\"allowed\",\"note\":\"not yet implemented\"},");
     try w.writeAll("{\"capability\":\"verifier.candidate.execute\",\"policy\":\"denied\",\"mutation\":true,\"note\":\"future work; not implemented\"},");
@@ -2086,7 +2087,7 @@ fn dispatchSessionGet(allocator: std.mem.Allocator, request_body: ?[]const u8) !
 // No persistent pack loading. No command or verifier execution. No pack or
 // negative-knowledge mutation. Output is always draft/non-authorizing.
 
-fn dispatchContextAutopsy(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
+fn dispatchContextAutopsy(allocator: std.mem.Allocator, workspace_root: ?[]const u8, request_body: ?[]const u8) !DispatchResult {
     const body = request_body orelse return .{
         .status = .rejected,
         .err = .{ .code = .missing_required_field, .message = "request body is required for context.autopsy" },
@@ -2124,17 +2125,33 @@ fn dispatchContextAutopsy(allocator: std.mem.Allocator, request_body: ?[]const u
     };
 
     const guidance = try parseContextPackGuidance(arena_alloc, request_obj);
+    const artifact_refs = try parseContextArtifactRefs(arena_alloc, request_obj);
+    const artifact_coverage = if (artifact_refs.len == 0) null else blk: {
+        const root = workspace_root orelse return .{
+            .status = .rejected,
+            .err = .{ .code = .missing_required_field, .message = "workspace root is required when context.autopsy uses artifactRefs" },
+        };
+        break :blk try context_artifacts.collect(arena_alloc, root, artifact_refs);
+    };
     var pack_source = context_autopsy_engine.PackGuidanceSource.init(guidance);
     const sources = [_]context_autopsy_engine.ContextSignalSource{pack_source.source()};
     var engine = context_autopsy_engine.ContextAutopsyEngine.init(allocator, &sources);
     var autopsy_result = try engine.evaluate(&case);
     defer autopsy_result.deinit(allocator);
+    if (artifact_coverage) |coverage| {
+        var coverage_builder = context_autopsy_engine.ResultBuilder.init(allocator);
+        defer coverage_builder.deinit();
+        try context_artifacts.appendUnknownsToBuilder(&coverage, &coverage_builder);
+        for (coverage_builder.unknowns.items) |unknown| {
+            autopsy_result.suggested_unknowns = try appendContextUnknown(allocator, autopsy_result.suggested_unknowns, unknown);
+        }
+    }
 
     var out = std.ArrayList(u8).init(allocator);
     errdefer out.deinit();
     const w = out.writer();
     try w.writeAll("{\"contextAutopsy\":");
-    try writeContextAutopsyResult(w, &autopsy_result);
+    try writeContextAutopsyResult(w, &autopsy_result, if (artifact_coverage) |*coverage| coverage else null);
     try w.writeAll(",\"readOnly\":true,\"commandsExecuted\":false,\"verifiersExecuted\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"persistentPackLoading\":false,\"non_authorizing\":true}");
 
     var gip_state = schema.draftResultState();
@@ -2186,6 +2203,64 @@ fn parseContextPackGuidance(allocator: std.mem.Allocator, request_obj: std.json.
         });
     }
     return try guidance.toOwnedSlice();
+}
+
+fn parseContextArtifactRefs(allocator: std.mem.Allocator, request_obj: std.json.ObjectMap) ![]const context_artifacts.ArtifactRef {
+    const value = request_obj.get("artifact_refs") orelse request_obj.get("artifactRefs") orelse return &.{};
+    if (value != .array) return &.{};
+    var refs = std.ArrayList(context_artifacts.ArtifactRef).init(allocator);
+    for (value.array.items) |item| {
+        const obj = valueObject(item) orelse continue;
+        const path = getStr(obj, "path", "path") orelse continue;
+        const kind_text = getStr(obj, "kind", "kind") orelse "file";
+        const kind: context_artifacts.ArtifactRefKind = if (std.mem.eql(u8, kind_text, "directory") or std.mem.eql(u8, kind_text, "dir")) .directory else .file;
+        try refs.append(.{
+            .kind = kind,
+            .path = path,
+            .purpose = getStr(obj, "purpose", "purpose") orelse "",
+            .reason = getStr(obj, "reason", "reason") orelse "",
+            .include_filters = try parseStringArrayAliases(allocator, obj, &.{ "include", "includes", "include_filters", "includeFilters" }),
+            .exclude_filters = try parseStringArrayAliases(allocator, obj, &.{ "exclude", "excludes", "exclude_filters", "excludeFilters" }),
+            .max_file_bytes = getOptionalUsize(obj, "max_file_bytes", "maxFileBytes") orelse context_artifacts.DEFAULT_MAX_FILE_BYTES,
+            .max_chunk_bytes = getOptionalUsize(obj, "max_chunk_bytes", "maxChunkBytes") orelse context_artifacts.DEFAULT_MAX_CHUNK_BYTES,
+            .max_files = getOptionalUsize(obj, "max_files", "maxFiles") orelse context_artifacts.DEFAULT_MAX_FILES,
+            .max_entries = getOptionalUsize(obj, "max_entries", "maxEntries") orelse context_artifacts.DEFAULT_MAX_ENTRIES,
+            .max_bytes = getOptionalUsize(obj, "max_bytes", "maxBytes") orelse context_artifacts.DEFAULT_MAX_BYTES,
+        });
+    }
+    return try refs.toOwnedSlice();
+}
+
+fn parseStringArrayAliases(allocator: std.mem.Allocator, obj: std.json.ObjectMap, names: []const []const u8) ![]const []const u8 {
+    for (names) |name| {
+        if (obj.get(name)) |value| {
+            if (value != .array) return &.{};
+            var items = std.ArrayList([]const u8).init(allocator);
+            for (value.array.items) |item| {
+                if (item == .string) try items.append(item.string);
+            }
+            return try items.toOwnedSlice();
+        }
+    }
+    return &.{};
+}
+
+fn getOptionalUsize(obj: std.json.ObjectMap, snake: []const u8, camel: []const u8) ?usize {
+    const raw = getInt(obj, snake, camel) orelse return null;
+    if (raw <= 0) return null;
+    return @as(usize, @intCast(raw));
+}
+
+fn appendContextUnknown(
+    allocator: std.mem.Allocator,
+    current: []context_autopsy.ContextUnknown,
+    unknown: context_autopsy.ContextUnknown,
+) ![]context_autopsy.ContextUnknown {
+    const next = try allocator.alloc(context_autopsy.ContextUnknown, current.len + 1);
+    @memcpy(next[0..current.len], current);
+    next[current.len] = unknown;
+    allocator.free(current);
+    return next;
 }
 
 fn parsePackAutopsyMatch(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !context_autopsy.PackAutopsyMatch {
@@ -2323,7 +2398,11 @@ fn parseEvidenceExpectations(allocator: std.mem.Allocator, obj: std.json.ObjectM
     return try out.toOwnedSlice();
 }
 
-fn writeContextAutopsyResult(w: anytype, result: *const context_autopsy.ContextAutopsyResult) !void {
+fn writeContextAutopsyResult(
+    w: anytype,
+    result: *const context_autopsy.ContextAutopsyResult,
+    artifact_coverage: ?*const context_artifacts.CoverageReport,
+) !void {
     try w.writeAll("{\"contextCase\":{\"description\":\"");
     try writeEscaped(w, result.context_case.description);
     try w.writeAll("\",\"intakeType\":\"");
@@ -2490,11 +2569,81 @@ fn writeContextAutopsyResult(w: anytype, result: *const context_autopsy.ContextA
         try w.writeAll(if (influence.is_proof_authority) "true" else "false");
         try w.writeAll("}");
     }
-    try w.writeAll("],\"state\":\"");
+    try w.writeAll("]");
+    if (artifact_coverage) |coverage| {
+        try w.writeAll(",\"artifactCoverage\":");
+        try writeArtifactCoverage(w, coverage);
+    }
+    try w.writeAll(",\"state\":\"");
     try writeEscaped(w, result.state);
     try w.writeAll("\",\"nonAuthorizing\":");
     try w.writeAll(if (result.non_authorizing) "true" else "false");
     try w.writeAll("}");
+}
+
+fn writeArtifactCoverage(w: anytype, coverage: *const context_artifacts.CoverageReport) !void {
+    try w.writeAll("{\"artifactsRequested\":[");
+    for (coverage.artifacts_requested, 0..) |request, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{\"kind\":\"");
+        try writeEscaped(w, request.kind);
+        try w.writeAll("\",\"path\":\"");
+        try writeEscaped(w, request.path);
+        try w.writeAll("\",\"purpose\":\"");
+        try writeEscaped(w, request.purpose);
+        try w.writeAll("\",\"reason\":\"");
+        try writeEscaped(w, request.reason);
+        try w.writeAll("\",\"includeFilters\":");
+        try writeStringList(w, request.include_filters);
+        try w.writeAll(",\"excludeFilters\":");
+        try writeStringList(w, request.exclude_filters);
+        try w.print(",\"maxFileBytes\":{d},\"maxChunkBytes\":{d},\"maxFiles\":{d},\"maxEntries\":{d},\"maxBytes\":{d}", .{
+            request.max_file_bytes,
+            request.max_chunk_bytes,
+            request.max_files,
+            request.max_entries,
+            request.max_bytes,
+        });
+        try w.writeAll("}");
+    }
+    try w.print("],\"filesConsidered\":{d},\"filesRead\":{d},\"bytesRead\":{d},\"filesSkipped\":{d},\"skipReasons\":[", .{
+        coverage.files_considered,
+        coverage.files_read,
+        coverage.bytes_read,
+        coverage.files_skipped,
+    });
+    for (coverage.skipped_inputs, 0..) |skip, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{\"path\":\"");
+        try writeEscaped(w, skip.path);
+        try w.writeAll("\",\"reason\":\"");
+        try writeEscaped(w, skip.reason);
+        try w.writeAll("\"}");
+    }
+    try w.print("],\"filesTruncated\":{d},\"truncationReasons\":[", .{coverage.files_truncated});
+    for (coverage.truncated_inputs, 0..) |truncated, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{\"path\":\"");
+        try writeEscaped(w, truncated.path);
+        try w.writeAll("\",\"reason\":\"");
+        try writeEscaped(w, truncated.reason);
+        try w.print("\",\"bytesRead\":{d}", .{truncated.bytes});
+        try w.writeAll("}");
+    }
+    try w.writeAll("],\"budgetHits\":");
+    try writeStringList(w, coverage.budget_hits);
+    try w.writeAll(",\"unknowns\":[");
+    for (coverage.unknowns, 0..) |unknown, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{\"name\":\"");
+        try writeEscaped(w, unknown.name);
+        try w.writeAll("\",\"path\":\"");
+        try writeEscaped(w, unknown.path);
+        try w.writeAll("\",\"reason\":\"");
+        try writeEscaped(w, unknown.reason);
+        try w.writeAll("\"}");
+    }
+    try w.writeAll("]}");
 }
 
 fn writeStringList(w: anytype, values: []const []const u8) !void {
@@ -3572,6 +3721,143 @@ test "context.autopsy incomplete request returns explicit unknown gap" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"isNegativeEvidence\":false") != null);
 }
 
+test "context.autopsy accepts artifact refs without embedding full content" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "artifact.txt", .data = "large input lives outside stdin json\n" });
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    const body =
+        \\{"gipVersion":"gip.v0.1","kind":"context.autopsy","context":{"summary":"artifact ref test"},"artifactRefs":[{"kind":"file","path":"artifact.txt","purpose":"test artifact"}]}
+    ;
+    var result = try dispatch(allocator, "context.autopsy", core.PROTOCOL_VERSION, root, null, body);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
+    const json = result.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"artifactCoverage\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"artifactsRequested\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"filesRead\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "large input lives outside stdin json") == null);
+}
+
+test "context.autopsy directory artifact ref enumerates files with filters" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "a.zig", .data = "const a = 1;\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "b.md", .data = "# ignored\n" });
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    const body =
+        \\{"gipVersion":"gip.v0.1","kind":"context.autopsy","context":{"summary":"dir ref test"},"artifact_refs":[{"kind":"directory","path":".","include":["*.zig"]}]}
+    ;
+    var result = try dispatch(allocator, "context.autopsy", core.PROTOCOL_VERSION, root, null, body);
+    defer result.deinit(allocator);
+    const json = result.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"filesRead\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "filtered_by_include") != null);
+}
+
+test "context.autopsy exclude filters skip ignored directories and files" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "keep.txt", .data = "keep\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "skip.txt", .data = "skip\n" });
+    try tmp.dir.makeDir("zig-out");
+    try tmp.dir.writeFile(.{ .sub_path = "zig-out/generated.txt", .data = "generated\n" });
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    const body =
+        \\{"gipVersion":"gip.v0.1","kind":"context.autopsy","context":{"summary":"exclude test"},"artifactRefs":[{"kind":"directory","path":".","include":["*.txt"],"exclude":["skip.txt","zig-out"]}]}
+    ;
+    var result = try dispatch(allocator, "context.autopsy", core.PROTOCOL_VERSION, root, null, body);
+    defer result.deinit(allocator);
+    const json = result.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"filesRead\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "excluded_by_filter") != null);
+}
+
+test "context.autopsy large artifact is chunk limited with coverage note" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const data = try allocator.alloc(u8, 2048);
+    defer allocator.free(data);
+    @memset(data, 'a');
+    try tmp.dir.writeFile(.{ .sub_path = "large.txt", .data = data });
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    const body =
+        \\{"gipVersion":"gip.v0.1","kind":"context.autopsy","context":{"summary":"large file test"},"artifactRefs":[{"kind":"file","path":"large.txt","maxChunkBytes":64,"maxFileBytes":64}]}
+    ;
+    var result = try dispatch(allocator, "context.autopsy", core.PROTOCOL_VERSION, root, null, body);
+    defer result.deinit(allocator);
+    const json = result.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"filesTruncated\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "artifact_region_truncated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"isNegativeEvidence\":false") != null);
+}
+
+test "context.autopsy skipped artifact files produce unknowns not false claims" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    const body =
+        \\{"gipVersion":"gip.v0.1","kind":"context.autopsy","context":{"summary":"missing file test"},"artifactRefs":[{"kind":"file","path":"missing.txt"}]}
+    ;
+    var result = try dispatch(allocator, "context.autopsy", core.PROTOCOL_VERSION, root, null, body);
+    defer result.deinit(allocator);
+    const json = result.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"filesSkipped\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "artifact_region_unread") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"isNegativeEvidence\":false") != null);
+}
+
+test "context.autopsy binary artifact files are skipped safely" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "binary.dat", .data = "a\x00b" });
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    const body =
+        \\{"gipVersion":"gip.v0.1","kind":"context.autopsy","context":{"summary":"binary test"},"artifactRefs":[{"kind":"file","path":"binary.dat"}]}
+    ;
+    var result = try dispatch(allocator, "context.autopsy", core.PROTOCOL_VERSION, root, null, body);
+    defer result.deinit(allocator);
+    const json = result.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"filesRead\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "binary_or_unsupported") != null);
+}
+
+test "context.autopsy aggregate artifact budget hit is reported" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "a.txt", .data = "aaaa" });
+    try tmp.dir.writeFile(.{ .sub_path = "b.txt", .data = "bbbb" });
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    const body =
+        \\{"gipVersion":"gip.v0.1","kind":"context.autopsy","context":{"summary":"budget test"},"artifactRefs":[{"kind":"directory","path":".","include":["*.txt"],"maxBytes":4}]}
+    ;
+    var result = try dispatch(allocator, "context.autopsy", core.PROTOCOL_VERSION, root, null, body);
+    defer result.deinit(allocator);
+    const json = result.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"budgetHits\":[\"aggregate_max_bytes\"]") != null);
+}
+
 test "protocol.describe lists context.autopsy as implemented" {
     const allocator = std.testing.allocator;
     var result = try dispatch(allocator, "protocol.describe", core.PROTOCOL_VERSION, null, null, null);
@@ -3579,7 +3865,7 @@ test "protocol.describe lists context.autopsy as implemented" {
     try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
     const json = result.result_json.?;
     try std.testing.expect(std.mem.indexOf(u8, json, "\"context.autopsy\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "runtime_pack_guidance_payload") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "read_only_artifact_refs_and_runtime_pack_guidance") != null);
 }
 
 test "capabilities.describe lists context.autopsy as allowed read-only" {
