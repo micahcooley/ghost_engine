@@ -16,6 +16,8 @@ const feedback = @import("feedback.zig");
 const shards = @import("shards.zig");
 const task_sessions = @import("task_sessions.zig");
 const project_autopsy = @import("project_autopsy.zig");
+const context_autopsy = @import("context_autopsy.zig");
+const context_autopsy_engine = @import("context_autopsy_engine.zig");
 
 pub const DispatchResult = struct {
     status: core.ProtocolStatus,
@@ -115,6 +117,7 @@ pub fn dispatch(
         .@"feedback.summary" => dispatchFeedbackSummary(allocator, workspace_root, request_body),
         .@"session.get" => dispatchSessionGet(allocator, request_body),
         .@"project.autopsy" => dispatchProjectAutopsy(allocator, workspace_root, request_body),
+        .@"context.autopsy" => dispatchContextAutopsy(allocator, request_body),
         else => .{
             .status = .unsupported,
             .err = .{
@@ -136,8 +139,8 @@ fn dispatchProtocolDescribe(allocator: std.mem.Allocator) !DispatchResult {
     try w.writeAll("{\"protocol\":{");
     try w.writeAll("\"version\":\"");
     try w.writeAll(core.PROTOCOL_VERSION);
-    try w.writeAll("\",\"implemented\":[\"protocol.describe\",\"capabilities.describe\",\"engine.status\",\"conversation.turn\",\"artifact.read\",\"artifact.list\",\"artifact.patch.propose\",\"hypothesis.list\",\"hypothesis.triage\",\"verifier.list\",\"verifier.candidate.execution.list\",\"verifier.candidate.execution.get\",\"correction.list\",\"correction.get\",\"negative_knowledge.candidate.list\",\"negative_knowledge.candidate.get\",\"negative_knowledge.record.list\",\"negative_knowledge.record.get\",\"negative_knowledge.influence.list\",\"trust_decay.candidate.list\",\"negative_knowledge.candidate.review\",\"negative_knowledge.record.expire\",\"negative_knowledge.record.supersede\",\"pack.list\",\"pack.inspect\",\"feedback.summary\",\"session.get\",\"project.autopsy\"]");
-    try w.writeAll(",\"maturity\":{\"hypothesis.list\":\"stateless\",\"hypothesis.triage\":\"stateless\",\"verifier.candidate.execution.list\":\"read_only_state_inspection\",\"verifier.candidate.execution.get\":\"read_only_state_inspection\",\"correction.list\":\"read_only_state_inspection\",\"correction.get\":\"read_only_state_inspection\",\"negative_knowledge.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.get\":\"read_only_state_inspection\",\"negative_knowledge.record.list\":\"read_only_state_inspection\",\"negative_knowledge.record.get\":\"read_only_state_inspection\",\"negative_knowledge.influence.list\":\"read_only_state_inspection\",\"trust_decay.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.review\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.expire\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.supersede\":\"structured_unsupported_without_persistence\",\"feedback.summary\":\"requires_workspace_metadata\",\"session.get\":\"requires_existing_session\",\"project.autopsy\":\"read_only_workspace_inspection\"}");
+    try w.writeAll("\",\"implemented\":[\"protocol.describe\",\"capabilities.describe\",\"engine.status\",\"conversation.turn\",\"artifact.read\",\"artifact.list\",\"artifact.patch.propose\",\"hypothesis.list\",\"hypothesis.triage\",\"verifier.list\",\"verifier.candidate.execution.list\",\"verifier.candidate.execution.get\",\"correction.list\",\"correction.get\",\"negative_knowledge.candidate.list\",\"negative_knowledge.candidate.get\",\"negative_knowledge.record.list\",\"negative_knowledge.record.get\",\"negative_knowledge.influence.list\",\"trust_decay.candidate.list\",\"negative_knowledge.candidate.review\",\"negative_knowledge.record.expire\",\"negative_knowledge.record.supersede\",\"pack.list\",\"pack.inspect\",\"feedback.summary\",\"session.get\",\"project.autopsy\",\"context.autopsy\"]");
+    try w.writeAll(",\"maturity\":{\"hypothesis.list\":\"stateless\",\"hypothesis.triage\":\"stateless\",\"verifier.candidate.execution.list\":\"read_only_state_inspection\",\"verifier.candidate.execution.get\":\"read_only_state_inspection\",\"correction.list\":\"read_only_state_inspection\",\"correction.get\":\"read_only_state_inspection\",\"negative_knowledge.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.get\":\"read_only_state_inspection\",\"negative_knowledge.record.list\":\"read_only_state_inspection\",\"negative_knowledge.record.get\":\"read_only_state_inspection\",\"negative_knowledge.influence.list\":\"read_only_state_inspection\",\"trust_decay.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.review\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.expire\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.supersede\":\"structured_unsupported_without_persistence\",\"feedback.summary\":\"requires_workspace_metadata\",\"session.get\":\"requires_existing_session\",\"project.autopsy\":\"read_only_workspace_inspection\",\"context.autopsy\":\"runtime_pack_guidance_payload\"}");
     try w.writeAll(",\"unsupported\":[\"artifact.patch.apply\",\"artifact.write.propose\",\"artifact.write.apply\",\"artifact.search\",\"conversation.replay\",\"intent.ground\",\"response.evaluate\",\"verifier.run\",\"verifier.candidate.execute\",\"hypothesis.generate\",\"hypothesis.verifier.schedule\",\"correction.apply\",\"negative_knowledge.promote\",\"pack.update_from_negative_knowledge\",\"trust_decay.apply\",\"pack.mount\",\"pack.unmount\",\"pack.import\",\"pack.export\",\"pack.distill.list\",\"pack.distill.show\",\"pack.distill.export\",\"feedback.record\",\"feedback.replay\",\"session.create\",\"session.update\",\"session.close\",\"command.run\"]");
     try w.writeAll("}}");
 
@@ -181,6 +184,7 @@ fn dispatchCapabilitiesDescribe(allocator: std.mem.Allocator) !DispatchResult {
     try w.writeAll("{\"capability\":\"pack.inspect\",\"policy\":\"allowed\",\"read_only\":true},");
     try w.writeAll("{\"capability\":\"feedback.summary\",\"policy\":\"allowed\",\"read_only\":true},");
     try w.writeAll("{\"capability\":\"session.get\",\"policy\":\"allowed\",\"read_only\":true},");
+    try w.writeAll("{\"capability\":\"context.autopsy\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"note\":\"runtime pack guidance payload only; no persistent pack loading, commands, verifiers, or mutations\"},");
     try w.writeAll("{\"capability\":\"artifact.patch.apply\",\"policy\":\"requires_approval\",\"mutation\":true},");
     try w.writeAll("{\"capability\":\"verifier.run\",\"policy\":\"allowed\",\"note\":\"not yet implemented\"},");
     try w.writeAll("{\"capability\":\"verifier.candidate.execute\",\"policy\":\"denied\",\"mutation\":true,\"note\":\"future work; not implemented\"},");
@@ -2076,6 +2080,434 @@ fn dispatchSessionGet(allocator: std.mem.Allocator, request_body: ?[]const u8) !
     };
 }
 
+// ── Context Autopsy ───────────────────────────────────────────────────
+//
+// Runtime pack-guidance payload path only.
+// No persistent pack loading. No command or verifier execution. No pack or
+// negative-knowledge mutation. Output is always draft/non-authorizing.
+
+fn dispatchContextAutopsy(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
+    const body = request_body orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "request body is required for context.autopsy" },
+    };
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } };
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) {
+        return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "context.autopsy request must be a JSON object" } };
+    }
+
+    const request_obj = parsed.value.object;
+    const context_value = request_obj.get("context") orelse parsed.value;
+    const context_obj = valueObject(context_value) orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .invalid_request, .message = "context must be an object" },
+    };
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    const description = getStr(context_obj, "summary", "summary") orelse getStr(context_obj, "description", "description") orelse "";
+    const intake_type = getStr(context_obj, "intake_type", "intakeType") orelse getStr(context_obj, "context_kind", "contextKind") orelse "context";
+    const case = context_autopsy.ContextCase{
+        .description = description,
+        .intake_data = context_value,
+        .intake_type = intake_type,
+        .intent_tags = try parseStringArrayField(arena_alloc, context_obj, "intent_tags", "intentTags"),
+        .artifact_kinds = try parseStringArrayField(arena_alloc, context_obj, "artifact_kinds", "artifactKinds"),
+        .situation_kinds = try parseStringArrayField(arena_alloc, context_obj, "situation_kinds", "situationKinds"),
+    };
+
+    const guidance = try parseContextPackGuidance(arena_alloc, request_obj);
+    var pack_source = context_autopsy_engine.PackGuidanceSource.init(guidance);
+    const sources = [_]context_autopsy_engine.ContextSignalSource{pack_source.source()};
+    var engine = context_autopsy_engine.ContextAutopsyEngine.init(allocator, &sources);
+    var autopsy_result = try engine.evaluate(&case);
+    defer autopsy_result.deinit(allocator);
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"contextAutopsy\":");
+    try writeContextAutopsyResult(w, &autopsy_result);
+    try w.writeAll(",\"readOnly\":true,\"commandsExecuted\":false,\"verifiersExecuted\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"persistentPackLoading\":false,\"non_authorizing\":true}");
+
+    var gip_state = schema.draftResultState();
+    gip_state.stop_reason = .none;
+    gip_state.unresolved_reason = null;
+    gip_state.non_authorization_notice = "context autopsy output is draft pack guidance; it does not constitute supported output or proof of any claim";
+
+    return .{
+        .status = .ok,
+        .result_state = gip_state,
+        .result_json = try out.toOwnedSlice(),
+        .allocated_result = true,
+    };
+}
+
+fn parseStringArrayField(allocator: std.mem.Allocator, obj: std.json.ObjectMap, snake: []const u8, camel: []const u8) ![]const []const u8 {
+    const value = obj.get(snake) orelse obj.get(camel) orelse return &.{};
+    if (value != .array) return &.{};
+    var items = std.ArrayList([]const u8).init(allocator);
+    for (value.array.items) |item| {
+        if (item == .string) try items.append(item.string);
+    }
+    return try items.toOwnedSlice();
+}
+
+fn parseContextPackGuidance(allocator: std.mem.Allocator, request_obj: std.json.ObjectMap) ![]const context_autopsy.PackAutopsyGuidance {
+    const value = request_obj.get("pack_guidance") orelse request_obj.get("packGuidance") orelse return &.{};
+    if (value != .array) return &.{};
+    var guidance = std.ArrayList(context_autopsy.PackAutopsyGuidance).init(allocator);
+    for (value.array.items) |item| {
+        const obj = valueObject(item) orelse continue;
+        const pack_id = getStr(obj, "pack_id", "packId") orelse "runtime_pack_guidance";
+        const pack_version = getStr(obj, "pack_version", "packVersion") orelse "runtime";
+        const match_obj = if (obj.get("match")) |m| valueObject(m) else null;
+        try guidance.append(.{
+            .influence = .{
+                .pack_name = pack_id,
+                .pack_version = pack_version,
+                .reason = getStr(obj, "reason", "reason") orelse "Runtime pack guidance payload contributed Context Autopsy candidates.",
+                .weight = getStr(obj, "weight", "weight") orelse "medium",
+            },
+            .match = if (match_obj) |m| try parsePackAutopsyMatch(allocator, m) else .{},
+            .signals = try parseContextSignals(allocator, obj, pack_id),
+            .suggested_unknowns = try parseContextUnknowns(allocator, obj, pack_id),
+            .risk_surfaces = try parseContextRisks(allocator, obj, pack_id),
+            .candidate_actions = try parseContextActions(allocator, obj, pack_id),
+            .check_candidates = try parseContextChecks(allocator, obj, pack_id),
+            .evidence_expectations = try parseEvidenceExpectations(allocator, obj, pack_id),
+        });
+    }
+    return try guidance.toOwnedSlice();
+}
+
+fn parsePackAutopsyMatch(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !context_autopsy.PackAutopsyMatch {
+    return .{
+        .intent_tags_any = try parseStringArrayField(allocator, obj, "intent_tags_any", "intentTagsAny"),
+        .intent_tags_all = try parseStringArrayField(allocator, obj, "intent_tags_all", "intentTagsAll"),
+        .context_keywords_any = try parseStringArrayField(allocator, obj, "context_keywords_any", "contextKeywordsAny"),
+        .context_keywords_all = try parseStringArrayField(allocator, obj, "context_keywords_all", "contextKeywordsAll"),
+        .artifact_kinds_any = try parseStringArrayField(allocator, obj, "artifact_kinds_any", "artifactKindsAny"),
+        .artifact_kinds_all = try parseStringArrayField(allocator, obj, "artifact_kinds_all", "artifactKindsAll"),
+        .situation_kinds_any = try parseStringArrayField(allocator, obj, "situation_kinds_any", "situationKindsAny"),
+        .situation_kinds_all = try parseStringArrayField(allocator, obj, "situation_kinds_all", "situationKindsAll"),
+        .required_context_fields = try parseStringArrayField(allocator, obj, "required_context_fields", "requiredContextFields"),
+    };
+}
+
+fn guidanceArray(obj: std.json.ObjectMap, snake: []const u8, camel: []const u8) ?std.json.Array {
+    const value = obj.get(snake) orelse obj.get(camel) orelse return null;
+    return if (value == .array) value.array else null;
+}
+
+fn parseContextSignals(allocator: std.mem.Allocator, obj: std.json.ObjectMap, pack_id: []const u8) ![]const context_autopsy.ContextSignal {
+    var out = std.ArrayList(context_autopsy.ContextSignal).init(allocator);
+    if (guidanceArray(obj, "signals", "signals")) |items| {
+        for (items.items) |item| {
+            const signal = valueObject(item) orelse continue;
+            try out.append(.{
+                .name = getStr(signal, "name", "name") orelse "unnamed_signal",
+                .source_pack = getStr(signal, "source_pack", "sourcePack") orelse pack_id,
+                .kind = getStr(signal, "kind", "kind") orelse "generic_signal",
+                .confidence = getStr(signal, "confidence", "confidence") orelse "low",
+                .reason = getStr(signal, "reason", "reason") orelse "Pack guidance signal.",
+            });
+        }
+    }
+    return try out.toOwnedSlice();
+}
+
+fn parseContextUnknowns(allocator: std.mem.Allocator, obj: std.json.ObjectMap, pack_id: []const u8) ![]const context_autopsy.ContextUnknown {
+    var out = std.ArrayList(context_autopsy.ContextUnknown).init(allocator);
+    if (guidanceArray(obj, "unknowns", "unknowns")) |items| {
+        for (items.items) |item| {
+            const unknown = valueObject(item) orelse continue;
+            try out.append(.{
+                .name = getStr(unknown, "name", "name") orelse "unnamed_unknown",
+                .source_pack = getStr(unknown, "source_pack", "sourcePack") orelse pack_id,
+                .importance = getStr(unknown, "importance", "importance") orelse "medium",
+                .reason = getStr(unknown, "reason", "reason") orelse "Pack guidance expects missing context.",
+            });
+        }
+    }
+    return try out.toOwnedSlice();
+}
+
+fn parseContextRisks(allocator: std.mem.Allocator, obj: std.json.ObjectMap, pack_id: []const u8) ![]const context_autopsy.ContextRiskSurface {
+    var out = std.ArrayList(context_autopsy.ContextRiskSurface).init(allocator);
+    if (guidanceArray(obj, "risks", "risks")) |items| {
+        for (items.items) |item| {
+            const risk = valueObject(item) orelse continue;
+            const reason = getStr(risk, "reason", "reason") orelse "Pack guidance risk surface.";
+            try out.append(.{
+                .risk_kind = getStr(risk, "risk_kind", "riskKind") orelse getStr(risk, "name", "name") orelse "unnamed_risk",
+                .source_pack = getStr(risk, "source_pack", "sourcePack") orelse pack_id,
+                .reason = reason,
+                .suggested_caution = getStr(risk, "suggested_caution", "suggestedCaution") orelse reason,
+            });
+        }
+    }
+    return try out.toOwnedSlice();
+}
+
+fn parseContextActions(allocator: std.mem.Allocator, obj: std.json.ObjectMap, pack_id: []const u8) ![]const context_autopsy.ContextCandidateAction {
+    var out = std.ArrayList(context_autopsy.ContextCandidateAction).init(allocator);
+    if (guidanceArray(obj, "candidate_actions", "candidateActions")) |items| {
+        for (items.items) |item| {
+            const action = valueObject(item) orelse continue;
+            const summary = getStr(action, "summary", "summary") orelse getStr(action, "reason", "reason") orelse "Pack guidance candidate action.";
+            try out.append(.{
+                .id = getStr(action, "id", "id") orelse "unnamed_candidate_action",
+                .source_pack = getStr(action, "source_pack", "sourcePack") orelse pack_id,
+                .action_type = getStr(action, "action_type", "actionType") orelse "generic_action",
+                .payload = action.get("payload") orelse .null,
+                .reason = summary,
+                .risk_level = getStr(action, "risk_level", "riskLevel") orelse "medium",
+                .requires_user_confirmation = getBool(action, "requires_user_confirmation", "requiresUserConfirmation") orelse true,
+                .non_authorizing = getBool(action, "non_authorizing", "nonAuthorizing") orelse true,
+            });
+        }
+    }
+    return try out.toOwnedSlice();
+}
+
+fn parseContextChecks(allocator: std.mem.Allocator, obj: std.json.ObjectMap, pack_id: []const u8) ![]const context_autopsy.ContextCheckCandidate {
+    var out = std.ArrayList(context_autopsy.ContextCheckCandidate).init(allocator);
+    if (guidanceArray(obj, "check_candidates", "checkCandidates")) |items| {
+        for (items.items) |item| {
+            const check = valueObject(item) orelse continue;
+            const check_kind = getStr(check, "check_kind", "checkKind") orelse getStr(check, "check_type", "checkType") orelse "soft";
+            const check_type = if (std.mem.eql(u8, check_kind, "hard") or std.mem.eql(u8, check_kind, "hard_verifier")) "hard_verifier" else "soft_real_world_check";
+            try out.append(.{
+                .id = getStr(check, "id", "id") orelse "unnamed_check_candidate",
+                .source_pack = getStr(check, "source_pack", "sourcePack") orelse pack_id,
+                .check_type = check_type,
+                .purpose = getStr(check, "summary", "summary") orelse getStr(check, "purpose", "purpose") orelse "Pack guidance check candidate.",
+                .risk_level = getStr(check, "risk_level", "riskLevel") orelse "medium",
+                .confidence = getStr(check, "confidence", "confidence") orelse "medium",
+                .evidence_strength = getStr(check, "evidence_strength", "evidenceStrength") orelse if (std.mem.eql(u8, check_type, "hard_verifier")) "absolute" else "heuristic",
+                .requires_user_confirmation = true,
+                .non_authorizing = getBool(check, "non_authorizing", "nonAuthorizing") orelse true,
+                .executes_by_default = getBool(check, "executes_by_default", "executesByDefault") orelse false,
+                .why_candidate_exists = getStr(check, "why_candidate_exists", "whyCandidateExists") orelse "Pack guidance expects evidence before claims.",
+            });
+        }
+    }
+    return try out.toOwnedSlice();
+}
+
+fn parseEvidenceExpectations(allocator: std.mem.Allocator, obj: std.json.ObjectMap, pack_id: []const u8) ![]const context_autopsy.EvidenceExpectation {
+    var out = std.ArrayList(context_autopsy.EvidenceExpectation).init(allocator);
+    if (guidanceArray(obj, "evidence_expectations", "evidenceExpectations")) |items| {
+        for (items.items) |item| {
+            const expectation = valueObject(item) orelse continue;
+            const id = getStr(expectation, "id", "id") orelse getStr(expectation, "expected_signal", "expectedSignal") orelse "unnamed_evidence_expectation";
+            const summary = getStr(expectation, "summary", "summary") orelse getStr(expectation, "reason", "reason") orelse "Pending evidence expectation.";
+            try out.append(.{
+                .id = id,
+                .summary = summary,
+                .expectation_kind = getStr(expectation, "expectation_kind", "expectationKind") orelse "soft",
+                .expected_signal = getStr(expectation, "expected_signal", "expectedSignal") orelse id,
+                .source_pack = getStr(expectation, "source_pack", "sourcePack") orelse pack_id,
+                .reason = getStr(expectation, "reason", "reason") orelse summary,
+            });
+        }
+    }
+    return try out.toOwnedSlice();
+}
+
+fn writeContextAutopsyResult(w: anytype, result: *const context_autopsy.ContextAutopsyResult) !void {
+    try w.writeAll("{\"contextCase\":{\"description\":\"");
+    try writeEscaped(w, result.context_case.description);
+    try w.writeAll("\",\"intakeType\":\"");
+    try writeEscaped(w, result.context_case.intake_type);
+    try w.writeAll("\",\"intentTags\":");
+    try writeStringList(w, result.context_case.intent_tags);
+    try w.writeAll(",\"artifactKinds\":");
+    try writeStringList(w, result.context_case.artifact_kinds);
+    try w.writeAll(",\"situationKinds\":");
+    try writeStringList(w, result.context_case.situation_kinds);
+    try w.writeAll("},\"detectedSignals\":[");
+    for (result.detected_signals, 0..) |signal, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{\"name\":\"");
+        try writeEscaped(w, signal.name);
+        try w.writeAll("\",\"sourcePack\":\"");
+        try writeEscaped(w, signal.source_pack);
+        try w.writeAll("\",\"kind\":\"");
+        try writeEscaped(w, signal.kind);
+        try w.writeAll("\",\"confidence\":\"");
+        try writeEscaped(w, signal.confidence);
+        try w.writeAll("\",\"reason\":\"");
+        try writeEscaped(w, signal.reason);
+        try w.writeAll("\"}");
+    }
+    try w.writeAll("],\"suggestedUnknowns\":[");
+    for (result.suggested_unknowns, 0..) |unknown, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{\"name\":\"");
+        try writeEscaped(w, unknown.name);
+        try w.writeAll("\",\"sourcePack\":\"");
+        try writeEscaped(w, unknown.source_pack);
+        try w.writeAll("\",\"importance\":\"");
+        try writeEscaped(w, unknown.importance);
+        try w.writeAll("\",\"reason\":\"");
+        try writeEscaped(w, unknown.reason);
+        try w.writeAll("\",\"isMissingEvidence\":");
+        try w.writeAll(if (unknown.is_missing_evidence) "true" else "false");
+        try w.writeAll(",\"isNegativeEvidence\":");
+        try w.writeAll(if (unknown.is_negative_evidence) "true" else "false");
+        try w.writeAll("}");
+    }
+    try w.writeAll("],\"riskSurfaces\":[");
+    for (result.risk_surfaces, 0..) |risk, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{\"riskKind\":\"");
+        try writeEscaped(w, risk.risk_kind);
+        try w.writeAll("\",\"sourcePack\":\"");
+        try writeEscaped(w, risk.source_pack);
+        try w.writeAll("\",\"reason\":\"");
+        try writeEscaped(w, risk.reason);
+        try w.writeAll("\",\"suggestedCaution\":\"");
+        try writeEscaped(w, risk.suggested_caution);
+        try w.writeAll("\",\"nonAuthorizing\":");
+        try w.writeAll(if (risk.non_authorizing) "true" else "false");
+        try w.writeAll("}");
+    }
+    try w.writeAll("],\"candidateActions\":[");
+    for (result.candidate_actions, 0..) |action, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{\"id\":\"");
+        try writeEscaped(w, action.id);
+        try w.writeAll("\",\"sourcePack\":\"");
+        try writeEscaped(w, action.source_pack);
+        try w.writeAll("\",\"actionType\":\"");
+        try writeEscaped(w, action.action_type);
+        try w.writeAll("\",\"payload\":");
+        try std.json.stringify(action.payload, .{}, w);
+        try w.writeAll(",\"reason\":\"");
+        try writeEscaped(w, action.reason);
+        try w.writeAll("\",\"riskLevel\":\"");
+        try writeEscaped(w, action.risk_level);
+        try w.writeAll("\",\"requiresUserConfirmation\":");
+        try w.writeAll(if (action.requires_user_confirmation) "true" else "false");
+        try w.writeAll(",\"nonAuthorizing\":");
+        try w.writeAll(if (action.non_authorizing) "true" else "false");
+        try w.writeAll("}");
+    }
+    try w.writeAll("],\"checkCandidates\":[");
+    for (result.check_candidates, 0..) |check, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{\"id\":\"");
+        try writeEscaped(w, check.id);
+        try w.writeAll("\",\"sourcePack\":\"");
+        try writeEscaped(w, check.source_pack);
+        try w.writeAll("\",\"checkType\":\"");
+        try writeEscaped(w, check.check_type);
+        try w.writeAll("\",\"purpose\":\"");
+        try writeEscaped(w, check.purpose);
+        try w.writeAll("\",\"riskLevel\":\"");
+        try writeEscaped(w, check.risk_level);
+        try w.writeAll("\",\"confidence\":\"");
+        try writeEscaped(w, check.confidence);
+        try w.writeAll("\",\"evidenceStrength\":\"");
+        try writeEscaped(w, check.evidence_strength);
+        try w.writeAll("\",\"requiresUserConfirmation\":");
+        try w.writeAll(if (check.requires_user_confirmation) "true" else "false");
+        try w.writeAll(",\"nonAuthorizing\":");
+        try w.writeAll(if (check.non_authorizing) "true" else "false");
+        try w.writeAll(",\"executesByDefault\":");
+        try w.writeAll(if (check.executes_by_default) "true" else "false");
+        try w.writeAll(",\"whyCandidateExists\":\"");
+        try writeEscaped(w, check.why_candidate_exists);
+        try w.writeAll("\"}");
+    }
+    try w.writeAll("],\"evidenceExpectations\":[");
+    for (result.evidence_expectations, 0..) |expectation, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{\"id\":\"");
+        try writeEscaped(w, expectation.id);
+        try w.writeAll("\",\"summary\":\"");
+        try writeEscaped(w, expectation.summary);
+        try w.writeAll("\",\"expectationKind\":\"");
+        try writeEscaped(w, expectation.expectation_kind);
+        try w.writeAll("\",\"expectedSignal\":\"");
+        try writeEscaped(w, expectation.expected_signal);
+        try w.writeAll("\",\"sourcePack\":\"");
+        try writeEscaped(w, expectation.source_pack);
+        try w.writeAll("\",\"reason\":\"");
+        try writeEscaped(w, expectation.reason);
+        try w.writeAll("\"}");
+    }
+    try w.writeAll("],\"pendingEvidenceObligations\":[");
+    for (result.pending_evidence_obligations, 0..) |obligation, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{\"id\":\"");
+        try writeEscaped(w, obligation.id);
+        try w.writeAll("\",\"sourcePack\":\"");
+        try writeEscaped(w, obligation.source_pack);
+        try w.writeAll("\",\"summary\":\"");
+        try writeEscaped(w, obligation.summary);
+        try w.writeAll("\",\"expectationKind\":\"");
+        try writeEscaped(w, obligation.expectation_kind);
+        try w.writeAll("\",\"obligationKind\":\"");
+        try writeEscaped(w, obligation.obligation_kind);
+        try w.writeAll("\",\"status\":\"");
+        try writeEscaped(w, obligation.status);
+        try w.writeAll("\",\"executed\":");
+        try w.writeAll(if (obligation.executed) "true" else "false");
+        try w.writeAll(",\"treatedAsProof\":");
+        try w.writeAll(if (obligation.treated_as_proof) "true" else "false");
+        try w.writeAll(",\"nonAuthorizing\":");
+        try w.writeAll(if (obligation.non_authorizing) "true" else "false");
+        try w.writeAll(",\"reason\":\"");
+        try writeEscaped(w, obligation.reason);
+        try w.writeAll("\"}");
+    }
+    try w.writeAll("],\"packInfluences\":[");
+    for (result.pack_influences, 0..) |influence, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{\"packName\":\"");
+        try writeEscaped(w, influence.pack_name);
+        try w.writeAll("\",\"packVersion\":\"");
+        try writeEscaped(w, influence.pack_version);
+        try w.writeAll("\",\"sourceKind\":\"");
+        try writeEscaped(w, influence.source_kind);
+        try w.writeAll("\",\"reason\":\"");
+        try writeEscaped(w, influence.reason);
+        try w.writeAll("\",\"weight\":\"");
+        try writeEscaped(w, influence.weight);
+        try w.writeAll("\",\"nonAuthorizing\":");
+        try w.writeAll(if (influence.non_authorizing) "true" else "false");
+        try w.writeAll(",\"isProofAuthority\":");
+        try w.writeAll(if (influence.is_proof_authority) "true" else "false");
+        try w.writeAll("}");
+    }
+    try w.writeAll("],\"state\":\"");
+    try writeEscaped(w, result.state);
+    try w.writeAll("\",\"nonAuthorizing\":");
+    try w.writeAll(if (result.non_authorizing) "true" else "false");
+    try w.writeAll("}");
+}
+
+fn writeStringList(w: anytype, values: []const []const u8) !void {
+    try w.writeByte('[');
+    for (values, 0..) |value, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeByte('"');
+        try writeEscaped(w, value);
+        try w.writeByte('"');
+    }
+    try w.writeByte(']');
+}
+
 // ── Project Autopsy ───────────────────────────────────────────────────
 //
 // Read-only bounded workspace inspection.
@@ -3065,4 +3497,60 @@ test "capabilities.describe lists project.autopsy as allowed read-only" {
     defer result.deinit(allocator);
     const json = result.result_json.?;
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"project.autopsy\",\"policy\":\"allowed\",\"read_only\":true") != null);
+}
+
+// ── context.autopsy tests ─────────────────────────────────────────────
+
+test "context.autopsy valid request returns draft non-authorizing result" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"gipVersion":"gip.v0.1","kind":"context.autopsy","context":{"summary":"Need planning advice","intent_tags":["planning"],"situation_kinds":["launch"]},"pack_guidance":[{"pack_id":"test_pack","match":{"intent_tags_any":["planning"]},"signals":[{"name":"planning_signal","kind":"generic_signal","confidence":"medium","reason":"matched planning"}],"candidate_actions":[{"id":"clarify_goal","summary":"Clarify goal first","non_authorizing":false}],"check_candidates":[{"id":"goal_check","summary":"Check whether goal is measurable","check_kind":"soft","executes_by_default":true}],"evidence_expectations":[{"id":"goal_evidence","summary":"Need evidence before claiming success","expectation_kind":"soft"}]}]}
+    ;
+    var result = try dispatch(allocator, "context.autopsy", core.PROTOCOL_VERSION, null, null, body);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
+    const rs = result.result_state orelse return error.MissingResultState;
+    try std.testing.expectEqual(core.SemanticState.draft, rs.state);
+    try std.testing.expectEqual(core.Permission.none, rs.permission);
+    try std.testing.expectEqual(false, rs.support_minimum_met);
+    const json = result.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"contextAutopsy\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"planning_signal\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"nonAuthorizing\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"executesByDefault\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"pendingEvidenceObligations\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"executed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"treatedAsProof\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"commandsExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verifiersExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"packMutation\":false") != null);
+}
+
+test "context.autopsy incomplete request returns explicit unknown gap" {
+    const allocator = std.testing.allocator;
+    const body = "{\"gipVersion\":\"gip.v0.1\",\"kind\":\"context.autopsy\",\"context\":{}}";
+    var result = try dispatch(allocator, "context.autopsy", core.PROTOCOL_VERSION, null, null, body);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
+    const json = result.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"empty_pack_autopsy_guidance\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"isNegativeEvidence\":false") != null);
+}
+
+test "protocol.describe lists context.autopsy as implemented" {
+    const allocator = std.testing.allocator;
+    var result = try dispatch(allocator, "protocol.describe", core.PROTOCOL_VERSION, null, null, null);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
+    const json = result.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"context.autopsy\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "runtime_pack_guidance_payload") != null);
+}
+
+test "capabilities.describe lists context.autopsy as allowed read-only" {
+    const allocator = std.testing.allocator;
+    var result = try dispatch(allocator, "capabilities.describe", core.PROTOCOL_VERSION, null, null, null);
+    defer result.deinit(allocator);
+    const json = result.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"context.autopsy\",\"policy\":\"allowed\",\"read_only\":true") != null);
 }

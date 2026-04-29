@@ -21,6 +21,7 @@ pub const ResultBuilder = struct {
     checks: std.ArrayList(context_autopsy.ContextCheckCandidate),
     constraints: std.ArrayList(context_autopsy.ContextConstraint),
     evidence_expectations: std.ArrayList(context_autopsy.EvidenceExpectation),
+    pending_evidence_obligations: std.ArrayList(context_autopsy.PendingEvidenceObligation),
     pack_influences: std.ArrayList(context_autopsy.PackInfluence),
 
     pub fn init(allocator: std.mem.Allocator) ResultBuilder {
@@ -33,6 +34,7 @@ pub const ResultBuilder = struct {
             .checks = std.ArrayList(context_autopsy.ContextCheckCandidate).init(allocator),
             .constraints = std.ArrayList(context_autopsy.ContextConstraint).init(allocator),
             .evidence_expectations = std.ArrayList(context_autopsy.EvidenceExpectation).init(allocator),
+            .pending_evidence_obligations = std.ArrayList(context_autopsy.PendingEvidenceObligation).init(allocator),
             .pack_influences = std.ArrayList(context_autopsy.PackInfluence).init(allocator),
         };
     }
@@ -45,11 +47,15 @@ pub const ResultBuilder = struct {
         self.checks.deinit();
         self.constraints.deinit();
         self.evidence_expectations.deinit();
+        self.pending_evidence_obligations.deinit();
         self.pack_influences.deinit();
     }
 
     pub fn addUnknown(self: *ResultBuilder, unknown: context_autopsy.ContextUnknown) !void {
-        try self.unknowns.append(unknown);
+        var sanitized = unknown;
+        sanitized.is_missing_evidence = true;
+        sanitized.is_negative_evidence = false;
+        try self.unknowns.append(sanitized);
     }
 
     pub fn addSignal(self: *ResultBuilder, signal: context_autopsy.ContextSignal) !void {
@@ -57,15 +63,22 @@ pub const ResultBuilder = struct {
     }
 
     pub fn addRisk(self: *ResultBuilder, risk: context_autopsy.ContextRiskSurface) !void {
-        try self.risks.append(risk);
+        var sanitized = risk;
+        sanitized.non_authorizing = true;
+        try self.risks.append(sanitized);
     }
 
     pub fn addCandidate(self: *ResultBuilder, candidate: context_autopsy.ContextCandidateAction) !void {
-        try self.candidates.append(candidate);
+        var sanitized = candidate;
+        sanitized.non_authorizing = true;
+        try self.candidates.append(sanitized);
     }
 
     pub fn addCheck(self: *ResultBuilder, check: context_autopsy.ContextCheckCandidate) !void {
-        try self.checks.append(check);
+        var sanitized = check;
+        sanitized.non_authorizing = true;
+        sanitized.executes_by_default = false;
+        try self.checks.append(sanitized);
     }
 
     pub fn addConstraint(self: *ResultBuilder, constraint: context_autopsy.ContextConstraint) !void {
@@ -74,10 +87,23 @@ pub const ResultBuilder = struct {
 
     pub fn addEvidenceExpectation(self: *ResultBuilder, expectation: context_autopsy.EvidenceExpectation) !void {
         try self.evidence_expectations.append(expectation);
+        try self.addPendingEvidenceObligation(expectationToPendingObligation(expectation));
+    }
+
+    pub fn addPendingEvidenceObligation(self: *ResultBuilder, obligation: context_autopsy.PendingEvidenceObligation) !void {
+        var sanitized = obligation;
+        sanitized.status = "pending";
+        sanitized.executed = false;
+        sanitized.treated_as_proof = false;
+        sanitized.non_authorizing = true;
+        try self.pending_evidence_obligations.append(sanitized);
     }
 
     pub fn addPackInfluence(self: *ResultBuilder, influence: context_autopsy.PackInfluence) !void {
-        try self.pack_influences.append(influence);
+        var sanitized = influence;
+        sanitized.non_authorizing = true;
+        sanitized.is_proof_authority = false;
+        try self.pack_influences.append(sanitized);
     }
 
     pub fn build(self: *ResultBuilder, case: ContextCase) !ContextAutopsyResult {
@@ -90,10 +116,31 @@ pub const ResultBuilder = struct {
             .check_candidates = try self.checks.toOwnedSlice(),
             .constraints = try self.constraints.toOwnedSlice(),
             .evidence_expectations = try self.evidence_expectations.toOwnedSlice(),
+            .pending_evidence_obligations = try self.pending_evidence_obligations.toOwnedSlice(),
             .pack_influences = try self.pack_influences.toOwnedSlice(),
         };
     }
 };
+
+fn expectationToPendingObligation(expectation: context_autopsy.EvidenceExpectation) context_autopsy.PendingEvidenceObligation {
+    const id = if (expectation.id.len != 0) expectation.id else expectation.expected_signal;
+    const summary = if (expectation.summary.len != 0) expectation.summary else expectation.reason;
+    const obligation_kind = if (isHardExpectation(expectation.expectation_kind)) "hard_verifier" else "soft_check";
+    return .{
+        .id = if (id.len != 0) id else "unnamed_evidence_expectation",
+        .source_pack = expectation.source_pack,
+        .summary = summary,
+        .expectation_kind = expectation.expectation_kind,
+        .obligation_kind = obligation_kind,
+        .reason = expectation.reason,
+    };
+}
+
+fn isHardExpectation(kind: []const u8) bool {
+    return std.mem.eql(u8, kind, "hard") or
+        std.mem.eql(u8, kind, "hard_verifier") or
+        std.mem.eql(u8, kind, "verifier");
+}
 
 pub const PackGuidanceSource = struct {
     guidance: []const context_autopsy.PackAutopsyGuidance,
@@ -109,7 +156,7 @@ pub const PackGuidanceSource = struct {
         };
     }
 
-    fn contribute(ptr: *anyopaque, _: *const ContextCase, builder: *ResultBuilder) anyerror!void {
+    fn contribute(ptr: *anyopaque, case: *const ContextCase, builder: *ResultBuilder) anyerror!void {
         const self: *PackGuidanceSource = @ptrCast(@alignCast(ptr));
         if (self.guidance.len == 0) {
             try builder.addUnknown(.{
@@ -121,61 +168,129 @@ pub const PackGuidanceSource = struct {
             return;
         }
 
+        var applied_count: usize = 0;
         for (self.guidance) |guidance| {
-            try builder.addPackInfluence(.{
-                .pack_name = guidance.influence.pack_name,
-                .pack_version = guidance.influence.pack_version,
-                .source_kind = guidance.influence.source_kind,
-                .reason = guidance.influence.reason,
-                .weight = guidance.influence.weight,
-                .non_authorizing = true,
-                .is_proof_authority = false,
-            });
+            if (!guidanceApplies(case, guidance.match)) continue;
+            applied_count += 1;
+
+            try builder.addPackInfluence(guidance.influence);
 
             for (guidance.signals) |signal| try builder.addSignal(signal);
-            for (guidance.suggested_unknowns) |unknown| try builder.addUnknown(.{
-                .name = unknown.name,
-                .source_pack = unknown.source_pack,
-                .importance = unknown.importance,
-                .reason = unknown.reason,
-                .is_missing_evidence = true,
-                .is_negative_evidence = false,
-            });
+            for (guidance.suggested_unknowns) |unknown| try builder.addUnknown(unknown);
             for (guidance.constraints) |constraint| try builder.addConstraint(constraint);
-            for (guidance.risk_surfaces) |risk| try builder.addRisk(.{
-                .risk_kind = risk.risk_kind,
-                .source_pack = risk.source_pack,
-                .reason = risk.reason,
-                .suggested_caution = risk.suggested_caution,
-                .non_authorizing = true,
-            });
-            for (guidance.candidate_actions) |candidate| try builder.addCandidate(.{
-                .id = candidate.id,
-                .source_pack = candidate.source_pack,
-                .action_type = candidate.action_type,
-                .payload = candidate.payload,
-                .reason = candidate.reason,
-                .risk_level = candidate.risk_level,
-                .requires_user_confirmation = candidate.requires_user_confirmation,
-                .non_authorizing = true,
-            });
-            for (guidance.check_candidates) |check| try builder.addCheck(.{
-                .id = check.id,
-                .source_pack = check.source_pack,
-                .check_type = check.check_type,
-                .purpose = check.purpose,
-                .risk_level = check.risk_level,
-                .confidence = check.confidence,
-                .evidence_strength = check.evidence_strength,
-                .requires_user_confirmation = check.requires_user_confirmation,
-                .non_authorizing = true,
-                .executes_by_default = false,
-                .why_candidate_exists = check.why_candidate_exists,
-            });
+            for (guidance.risk_surfaces) |risk| try builder.addRisk(risk);
+            for (guidance.candidate_actions) |candidate| try builder.addCandidate(candidate);
+            for (guidance.check_candidates) |check| try builder.addCheck(check);
             for (guidance.evidence_expectations) |expectation| try builder.addEvidenceExpectation(expectation);
+        }
+
+        if (applied_count == 0) {
+            try builder.addUnknown(.{
+                .name = "no_applicable_pack_guidance",
+                .source_pack = "pack_guidance_source",
+                .importance = "medium",
+                .reason = "Pack guidance entries were present, but none matched this ContextCase. Applicability remains unknown, not false.",
+            });
         }
     }
 };
+
+fn guidanceApplies(case: *const ContextCase, match: context_autopsy.PackAutopsyMatch) bool {
+    if (!matchesAny(case.intent_tags, match.intent_tags_any)) return false;
+    if (!matchesAll(case.intent_tags, match.intent_tags_all)) return false;
+    if (!matchesAny(case.artifact_kinds, match.artifact_kinds_any)) return false;
+    if (!matchesAll(case.artifact_kinds, match.artifact_kinds_all)) return false;
+    if (!matchesAny(case.situation_kinds, match.situation_kinds_any)) return false;
+    if (!matchesAll(case.situation_kinds, match.situation_kinds_all)) return false;
+    if (!matchesAnyContextKeyword(case, match.context_keywords_any)) return false;
+    if (!matchesAllContextKeywords(case, match.context_keywords_all)) return false;
+    if (!hasRequiredContextFields(case, match.required_context_fields)) return false;
+    return true;
+}
+
+fn matchesAny(case_values: []const []const u8, criteria: []const []const u8) bool {
+    if (criteria.len == 0) return true;
+    for (criteria) |criterion| {
+        if (containsText(case_values, criterion)) return true;
+    }
+    return false;
+}
+
+fn matchesAll(case_values: []const []const u8, criteria: []const []const u8) bool {
+    for (criteria) |criterion| {
+        if (!containsText(case_values, criterion)) return false;
+    }
+    return true;
+}
+
+fn containsText(values: []const []const u8, wanted: []const u8) bool {
+    for (values) |value| {
+        if (std.mem.eql(u8, value, wanted)) return true;
+    }
+    return false;
+}
+
+fn matchesAnyContextKeyword(case: *const ContextCase, keywords: []const []const u8) bool {
+    if (keywords.len == 0) return true;
+    for (keywords) |keyword| {
+        if (contextContains(case, keyword)) return true;
+    }
+    return false;
+}
+
+fn matchesAllContextKeywords(case: *const ContextCase, keywords: []const []const u8) bool {
+    for (keywords) |keyword| {
+        if (!contextContains(case, keyword)) return false;
+    }
+    return true;
+}
+
+fn contextContains(case: *const ContextCase, keyword: []const u8) bool {
+    if (std.mem.indexOf(u8, case.description, keyword) != null) return true;
+    if (std.mem.indexOf(u8, case.intake_type, keyword) != null) return true;
+    return jsonStringValueContains(case.intake_data, keyword);
+}
+
+fn jsonStringValueContains(value: std.json.Value, keyword: []const u8) bool {
+    return switch (value) {
+        .string => |s| std.mem.indexOf(u8, s, keyword) != null,
+        .array => |arr| {
+            for (arr.items) |item| {
+                if (jsonStringValueContains(item, keyword)) return true;
+            }
+            return false;
+        },
+        .object => |obj| {
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.indexOf(u8, entry.key_ptr.*, keyword) != null) return true;
+                if (jsonStringValueContains(entry.value_ptr.*, keyword)) return true;
+            }
+            return false;
+        },
+        else => false,
+    };
+}
+
+fn hasRequiredContextFields(case: *const ContextCase, fields: []const []const u8) bool {
+    for (fields) |field| {
+        if (std.mem.eql(u8, field, "description") or std.mem.eql(u8, field, "summary")) {
+            if (case.description.len == 0) return false;
+            continue;
+        }
+        if (std.mem.eql(u8, field, "intake_type") or std.mem.eql(u8, field, "intakeType")) {
+            if (case.intake_type.len == 0) return false;
+            continue;
+        }
+        if (!jsonObjectHasField(case.intake_data, field)) return false;
+    }
+    return true;
+}
+
+fn jsonObjectHasField(value: std.json.Value, field: []const u8) bool {
+    if (value != .object) return false;
+    return value.object.get(field) != null;
+}
 
 pub const ContextAutopsyEngine = struct {
     allocator: std.mem.Allocator,
@@ -358,6 +473,10 @@ test "pack guidance source contributes generic context autopsy surfaces without 
     try std.testing.expectEqual(true, result.check_candidates[0].non_authorizing);
     try std.testing.expectEqual(@as(usize, 1), result.constraints.len);
     try std.testing.expectEqual(@as(usize, 1), result.evidence_expectations.len);
+    try std.testing.expectEqual(@as(usize, 1), result.pending_evidence_obligations.len);
+    try std.testing.expectEqualStrings("pending", result.pending_evidence_obligations[0].status);
+    try std.testing.expectEqual(false, result.pending_evidence_obligations[0].executed);
+    try std.testing.expectEqual(false, result.pending_evidence_obligations[0].treated_as_proof);
     try std.testing.expectEqual(@as(usize, 1), result.pack_influences.len);
     try std.testing.expectEqualStrings("test_context_pack", result.pack_influences[0].pack_name);
     try std.testing.expectEqual(false, result.pack_influences[0].is_proof_authority);
@@ -431,4 +550,186 @@ test "pack guidance source does not execute commands verifiers or mutate pack st
     try std.testing.expectEqual(true, result.candidate_actions[0].non_authorizing);
     try std.testing.expectEqual(@as(usize, 1), result.check_candidates.len);
     try std.testing.expectEqual(false, result.check_candidates[0].executes_by_default);
+}
+
+test "pack guidance source applies only matching case-aware guidance" {
+    const guidance = [_]context_autopsy.PackAutopsyGuidance{
+        .{
+            .influence = .{ .pack_name = "matching_pack", .weight = "high" },
+            .match = .{ .intent_tags_any = &.{"planning"}, .situation_kinds_all = &.{"launch"} },
+            .signals = &.{.{
+                .name = "matched_signal",
+                .source_pack = "matching_pack",
+                .kind = "generic_signal",
+                .confidence = "medium",
+                .reason = "case matched",
+            }},
+        },
+        .{
+            .influence = .{ .pack_name = "nonmatching_pack", .weight = "high" },
+            .match = .{ .intent_tags_any = &.{"debugging"} },
+            .signals = &.{.{
+                .name = "nonmatching_signal",
+                .source_pack = "nonmatching_pack",
+                .kind = "generic_signal",
+                .confidence = "medium",
+                .reason = "case should not match",
+            }},
+        },
+    };
+    var pack_source = PackGuidanceSource.init(&guidance);
+    const sources = [_]ContextSignalSource{pack_source.source()};
+    var engine = ContextAutopsyEngine.init(std.testing.allocator, &sources);
+    const case = ContextCase{
+        .description = "generic launch planning",
+        .intake_data = .null,
+        .intake_type = "test",
+        .intent_tags = &.{"planning"},
+        .situation_kinds = &.{"launch"},
+    };
+
+    var result = try engine.evaluate(&case);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), result.detected_signals.len);
+    try std.testing.expectEqualStrings("matched_signal", result.detected_signals[0].name);
+    try std.testing.expectEqual(@as(usize, 1), result.pack_influences.len);
+    try std.testing.expectEqualStrings("matching_pack", result.pack_influences[0].pack_name);
+}
+
+test "nonmatching pack guidance produces explicit unknown gap" {
+    const guidance = [_]context_autopsy.PackAutopsyGuidance{.{
+        .influence = .{ .pack_name = "nonmatching_pack", .weight = "high" },
+        .match = .{ .intent_tags_any = &.{"debugging"} },
+        .signals = &.{.{
+            .name = "should_not_emit",
+            .source_pack = "nonmatching_pack",
+            .kind = "generic_signal",
+            .confidence = "medium",
+            .reason = "case should not match",
+        }},
+    }};
+    var pack_source = PackGuidanceSource.init(&guidance);
+    const sources = [_]ContextSignalSource{pack_source.source()};
+    var engine = ContextAutopsyEngine.init(std.testing.allocator, &sources);
+    const case = ContextCase{
+        .description = "generic launch planning",
+        .intake_data = .null,
+        .intake_type = "test",
+        .intent_tags = &.{"planning"},
+    };
+
+    var result = try engine.evaluate(&case);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), result.detected_signals.len);
+    try std.testing.expectEqual(@as(usize, 1), result.suggested_unknowns.len);
+    try std.testing.expectEqualStrings("no_applicable_pack_guidance", result.suggested_unknowns[0].name);
+    try std.testing.expectEqual(false, result.suggested_unknowns[0].is_negative_evidence);
+}
+
+const MaliciousSource = struct {
+    pub fn contribute(_: *anyopaque, _: *const ContextCase, builder: *ResultBuilder) anyerror!void {
+        try builder.addUnknown(.{
+            .name = "malicious_unknown",
+            .source_pack = "malicious_pack",
+            .importance = "high",
+            .reason = "tries to make missing evidence negative",
+            .is_missing_evidence = false,
+            .is_negative_evidence = true,
+        });
+        try builder.addRisk(.{
+            .risk_kind = "malicious_risk",
+            .source_pack = "malicious_pack",
+            .reason = "tries to authorize risk",
+            .suggested_caution = "none",
+            .non_authorizing = false,
+        });
+        try builder.addCandidate(.{
+            .id = "malicious_action",
+            .source_pack = "malicious_pack",
+            .action_type = "generic_action",
+            .payload = .null,
+            .reason = "tries to authorize action",
+            .risk_level = "high",
+            .non_authorizing = false,
+        });
+        try builder.addCheck(.{
+            .id = "malicious_check",
+            .source_pack = "malicious_pack",
+            .check_type = "hard_verifier",
+            .purpose = "tries to execute by default",
+            .risk_level = "high",
+            .confidence = "high",
+            .evidence_strength = "absolute",
+            .non_authorizing = false,
+            .executes_by_default = true,
+            .why_candidate_exists = "malicious input",
+        });
+        try builder.addPackInfluence(.{
+            .pack_name = "malicious_pack",
+            .weight = "high",
+            .non_authorizing = false,
+            .is_proof_authority = true,
+        });
+    }
+
+    pub fn source() ContextSignalSource {
+        return .{ .ptr = undefined, .contributeFn = contribute };
+    }
+};
+
+test "result builder sanitizes malicious source authority flags" {
+    const sources = [_]ContextSignalSource{MaliciousSource.source()};
+    var engine = ContextAutopsyEngine.init(std.testing.allocator, &sources);
+    const case = ContextCase{
+        .description = "test case",
+        .intake_data = .null,
+        .intake_type = "test",
+    };
+
+    var result = try engine.evaluate(&case);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(true, result.suggested_unknowns[0].is_missing_evidence);
+    try std.testing.expectEqual(false, result.suggested_unknowns[0].is_negative_evidence);
+    try std.testing.expectEqual(true, result.risk_surfaces[0].non_authorizing);
+    try std.testing.expectEqual(true, result.candidate_actions[0].non_authorizing);
+    try std.testing.expectEqual(true, result.check_candidates[0].non_authorizing);
+    try std.testing.expectEqual(false, result.check_candidates[0].executes_by_default);
+    try std.testing.expectEqual(true, result.pack_influences[0].non_authorizing);
+    try std.testing.expectEqual(false, result.pack_influences[0].is_proof_authority);
+}
+
+test "evidence expectations become pending unmet non-proof obligations" {
+    const guidance = [_]context_autopsy.PackAutopsyGuidance{.{
+        .influence = .{ .pack_name = "expectation_pack", .weight = "medium" },
+        .evidence_expectations = &.{.{
+            .id = "hard_signal",
+            .summary = "Need deterministic evidence before claiming success.",
+            .expectation_kind = "hard_verifier",
+            .expected_signal = "hard_signal",
+            .source_pack = "expectation_pack",
+            .reason = "Expect evidence only, do not execute it.",
+        }},
+    }};
+    var pack_source = PackGuidanceSource.init(&guidance);
+    const sources = [_]ContextSignalSource{pack_source.source()};
+    var engine = ContextAutopsyEngine.init(std.testing.allocator, &sources);
+    const case = ContextCase{
+        .description = "test case",
+        .intake_data = .null,
+        .intake_type = "test",
+    };
+
+    var result = try engine.evaluate(&case);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), result.evidence_expectations.len);
+    try std.testing.expectEqual(@as(usize, 1), result.pending_evidence_obligations.len);
+    try std.testing.expectEqualStrings("hard_verifier", result.pending_evidence_obligations[0].obligation_kind);
+    try std.testing.expectEqualStrings("pending", result.pending_evidence_obligations[0].status);
+    try std.testing.expectEqual(false, result.pending_evidence_obligations[0].executed);
+    try std.testing.expectEqual(false, result.pending_evidence_obligations[0].treated_as_proof);
+    try std.testing.expectEqual(true, result.pending_evidence_obligations[0].non_authorizing);
 }

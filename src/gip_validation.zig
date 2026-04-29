@@ -180,6 +180,7 @@ pub fn checkCapability(kind: core.RequestKind) struct { cap: ?core.CapabilityNam
         .@"session.get" => .@"session.get",
         .@"session.create", .@"session.update", .@"session.close" => .@"session.write",
         .@"project.autopsy" => .@"project.autopsy",
+        .@"context.autopsy" => .@"context.autopsy",
         else => null,
     };
 

@@ -26,7 +26,34 @@ Instead of Ghost hardcoding what to look for, Knowledge Packs provide declarativ
 
 Ghost evaluates the user's situation against these pack rules. The engine remains ignorant of baking or marketing, only understanding how to unify signals, risks, checks, and candidates into a unified `ContextAutopsyResult`.
 
-## 4. Minimal Proposed Schema
+## 4. Runtime Status
+
+Context Autopsy now has a native runtime path through GIP as `context.autopsy`.
+The runtime accepts a generic `ContextCase` payload and request-supplied pack
+guidance, evaluates only guidance whose domain-neutral match criteria apply to
+the case, and returns a draft/non-authorizing `ContextAutopsyResult`.
+
+Current match criteria are intentionally generic:
+- `intent_tags_any` / `intent_tags_all`
+- `context_keywords_any` / `context_keywords_all`
+- `artifact_kinds_any` / `artifact_kinds_all`
+- `situation_kinds_any` / `situation_kinds_all`
+- `required_context_fields`
+
+If pack guidance is present but none of it applies, the engine emits an explicit
+unknown/gap. It does not treat non-matching guidance as proof that a concept is
+absent.
+
+Evidence expectations from pack guidance are surfaced as pending evidence
+obligations. They are not executed, are not treated as proof, and remain
+non-authorizing. Hard verifier expectations and soft checks are classified as
+pending obligations only.
+
+The runtime path does not currently load persistent pack guidance files. This
+pass uses request-supplied pack guidance as the runtime source. Persistent pack
+loading remains future work.
+
+## 5. Minimal Proposed Schema
 
 ```zig
 pub const ContextCase = struct {
@@ -94,7 +121,7 @@ pub const ContextAutopsyResult = struct {
 };
 ```
 
-## 5. Migration Plan
+## 6. Migration Plan
 - **Phase 1: docs/spec only**
   - Establish the universal Context Autopsy design and constraints (this document).
 - **Phase 2: generic internal types**
@@ -106,14 +133,14 @@ pub const ContextAutopsyResult = struct {
 - **Phase 5: correction/negative-knowledge feedback loop**
   - Feed results of checks (both soft and hard) back into the knowledge packs to improve signal detection and refine negative knowledge.
 
-## 6. Explicit Non-Goals
+## 7. Explicit Non-Goals
 - **No domain-specific hardcoded adapters:** Ghost core will not contain logic for baking, marketing, relationship advice, etc.
 - **No hidden execution:** Context Autopsy does not execute commands or perform actions automatically.
 - **No automatic pack mutation:** Autopsy is read-only; it observes and generates draft results without modifying the packs.
 - **No treating pack content as proof:** Packs are signal sources, not truth authorities.
 - **No replacing verifier/support gates:** Autopsy only produces candidates; it does not authorize correctness claims or bypass verifier/support checks.
 
-## 7. Authority Rules
+## 8. Authority Rules
 - **Packs are signal sources, not truth authorities:** They guide the autopsy but do not dictate absolute facts about the current context.
 - **Candidate actions are non-authorizing:** They are suggestions requiring user or system confirmation.
 - **Checks produce evidence, not automatic truth:** The results of a check must be evaluated; they do not automatically prove correctness.

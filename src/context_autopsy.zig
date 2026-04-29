@@ -4,6 +4,9 @@ pub const ContextCase = struct {
     description: []const u8,
     intake_data: std.json.Value, // Raw situational data
     intake_type: []const u8, // e.g., "workspace", "chat", "document"
+    intent_tags: []const []const u8 = &.{},
+    artifact_kinds: []const []const u8 = &.{},
+    situation_kinds: []const []const u8 = &.{},
 };
 
 pub const ContextSignal = struct {
@@ -64,8 +67,24 @@ pub const ContextCheckCandidate = struct {
 };
 
 pub const EvidenceExpectation = struct {
-    expected_signal: []const u8,
+    id: []const u8 = "",
+    summary: []const u8 = "",
+    expectation_kind: []const u8 = "soft",
+    expected_signal: []const u8 = "",
     source_pack: []const u8,
+    reason: []const u8,
+};
+
+pub const PendingEvidenceObligation = struct {
+    id: []const u8,
+    source_pack: []const u8,
+    summary: []const u8,
+    expectation_kind: []const u8,
+    obligation_kind: []const u8,
+    status: []const u8 = "pending",
+    executed: bool = false,
+    treated_as_proof: bool = false,
+    non_authorizing: bool = true,
     reason: []const u8,
 };
 
@@ -79,8 +98,21 @@ pub const PackInfluence = struct {
     is_proof_authority: bool = false,
 };
 
+pub const PackAutopsyMatch = struct {
+    intent_tags_any: []const []const u8 = &.{},
+    intent_tags_all: []const []const u8 = &.{},
+    context_keywords_any: []const []const u8 = &.{},
+    context_keywords_all: []const []const u8 = &.{},
+    artifact_kinds_any: []const []const u8 = &.{},
+    artifact_kinds_all: []const []const u8 = &.{},
+    situation_kinds_any: []const []const u8 = &.{},
+    situation_kinds_all: []const []const u8 = &.{},
+    required_context_fields: []const []const u8 = &.{},
+};
+
 pub const PackAutopsyGuidance = struct {
     influence: PackInfluence,
+    match: PackAutopsyMatch = .{},
     signals: []const ContextSignal = &.{},
     suggested_unknowns: []const ContextUnknown = &.{},
     constraints: []const ContextConstraint = &.{},
@@ -99,6 +131,7 @@ pub const ContextAutopsyResult = struct {
     check_candidates: []ContextCheckCandidate = &.{},
     constraints: []ContextConstraint = &.{},
     evidence_expectations: []EvidenceExpectation = &.{},
+    pending_evidence_obligations: []PendingEvidenceObligation = &.{},
     pack_influences: []PackInfluence = &.{},
     state: []const u8 = "draft",
     non_authorizing: bool = true,
@@ -111,6 +144,7 @@ pub const ContextAutopsyResult = struct {
         allocator.free(self.check_candidates);
         allocator.free(self.constraints);
         allocator.free(self.evidence_expectations);
+        allocator.free(self.pending_evidence_obligations);
         allocator.free(self.pack_influences);
         self.* = undefined;
     }

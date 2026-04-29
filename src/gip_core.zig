@@ -97,6 +97,7 @@ pub const RequestKind = enum {
 
     // Project inspection
     @"project.autopsy",
+    @"context.autopsy",
 
     pub fn name(self: RequestKind) []const u8 {
         return @tagName(self);
@@ -249,6 +250,7 @@ pub const CapabilityName = enum {
     @"session.write",
     @"network.access",
     @"project.autopsy",
+    @"context.autopsy",
 
     pub fn asText(self: CapabilityName) []const u8 {
         return @tagName(self);
@@ -272,7 +274,7 @@ pub const CapabilityEntry = struct {
     policy: CapabilityPolicy,
 };
 
-pub fn defaultCapabilities() [43]CapabilityEntry {
+pub fn defaultCapabilities() [44]CapabilityEntry {
     return .{
         .{ .capability = .@"artifact.read", .policy = .allowed },
         .{ .capability = .@"artifact.list", .policy = .allowed },
@@ -317,6 +319,7 @@ pub fn defaultCapabilities() [43]CapabilityEntry {
         .{ .capability = .@"session.write", .policy = .allowed },
         .{ .capability = .@"network.access", .policy = .denied },
         .{ .capability = .@"project.autopsy", .policy = .allowed },
+        .{ .capability = .@"context.autopsy", .policy = .allowed },
     };
 }
 
@@ -480,6 +483,7 @@ pub const IMPLEMENTED_KINDS = [_]RequestKind{
     .@"feedback.summary",
     .@"session.get",
     .@"project.autopsy",
+    .@"context.autopsy",
 };
 
 pub fn isImplemented(kind: RequestKind) bool {
@@ -522,6 +526,8 @@ test "default capabilities have safe defaults" {
     try std.testing.expectEqual(CapabilityPolicy.denied, caps[41].policy);
     // project.autopsy should be allowed (read-only)
     try std.testing.expectEqual(CapabilityPolicy.allowed, caps[42].policy);
+    // context.autopsy should be allowed (read-only/non-authorizing)
+    try std.testing.expectEqual(CapabilityPolicy.allowed, caps[43].policy);
 }
 
 test "command allowlist rejects arbitrary commands" {
