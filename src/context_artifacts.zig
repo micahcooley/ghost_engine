@@ -414,13 +414,100 @@ fn matchesAny(path: []const u8, filters: []const []const u8) bool {
 
 fn matchesFilter(path: []const u8, filter: []const u8) bool {
     if (filter.len == 0) return false;
-    if (std.mem.eql(u8, filter, "*")) return true;
-    if (std.mem.indexOfScalar(u8, filter, '*')) |star| {
-        const before = filter[0..star];
-        const after = filter[star + 1 ..];
-        return std.mem.startsWith(u8, path, before) and std.mem.endsWith(u8, path, after);
+    if (globMatches(path, filter)) return true;
+    if (!hasGlobMeta(filter)) return std.mem.indexOf(u8, path, filter) != null;
+    return false;
+}
+
+const MAX_GLOB_SEGMENTS: usize = 256;
+
+fn globMatches(path: []const u8, pattern: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, path, 0) != null or std.mem.indexOfScalar(u8, pattern, 0) != null) return false;
+
+    var path_storage: [MAX_GLOB_SEGMENTS][]const u8 = undefined;
+    var pattern_storage: [MAX_GLOB_SEGMENTS][]const u8 = undefined;
+    const path_segments = splitGlobSegments(path, &path_storage) orelse return false;
+    const pattern_segments = splitGlobSegments(pattern, &pattern_storage) orelse return false;
+
+    var path_idx: usize = 0;
+    var pattern_idx: usize = 0;
+    var doublestar_idx: ?usize = null;
+    var doublestar_path_idx: usize = 0;
+
+    while (path_idx < path_segments.len) {
+        if (pattern_idx < pattern_segments.len and std.mem.eql(u8, pattern_segments[pattern_idx], "**")) {
+            doublestar_idx = pattern_idx;
+            pattern_idx += 1;
+            doublestar_path_idx = path_idx;
+            continue;
+        }
+        if (pattern_idx < pattern_segments.len and segmentMatches(path_segments[path_idx], pattern_segments[pattern_idx])) {
+            path_idx += 1;
+            pattern_idx += 1;
+            continue;
+        }
+        if (doublestar_idx) |star_idx| {
+            pattern_idx = star_idx + 1;
+            doublestar_path_idx += 1;
+            path_idx = doublestar_path_idx;
+            continue;
+        }
+        return false;
     }
-    return std.mem.eql(u8, path, filter) or std.mem.indexOf(u8, path, filter) != null;
+
+    while (pattern_idx < pattern_segments.len and std.mem.eql(u8, pattern_segments[pattern_idx], "**")) {
+        pattern_idx += 1;
+    }
+    return pattern_idx == pattern_segments.len;
+}
+
+fn splitGlobSegments(input: []const u8, storage: *[MAX_GLOB_SEGMENTS][]const u8) ?[]const []const u8 {
+    var count: usize = 0;
+    var it = std.mem.splitScalar(u8, input, '/');
+    while (it.next()) |segment| {
+        if (segment.len == 0 or std.mem.eql(u8, segment, ".")) continue;
+        if (count >= storage.len) return null;
+        storage[count] = segment;
+        count += 1;
+    }
+    return storage[0..count];
+}
+
+fn segmentMatches(text: []const u8, pattern: []const u8) bool {
+    var text_idx: usize = 0;
+    var pattern_idx: usize = 0;
+    var star_idx: ?usize = null;
+    var star_text_idx: usize = 0;
+
+    while (text_idx < text.len) {
+        if (pattern_idx < pattern.len and (pattern[pattern_idx] == '?' or pattern[pattern_idx] == text[text_idx])) {
+            text_idx += 1;
+            pattern_idx += 1;
+            continue;
+        }
+        if (pattern_idx < pattern.len and pattern[pattern_idx] == '*') {
+            star_idx = pattern_idx;
+            pattern_idx += 1;
+            star_text_idx = text_idx;
+            continue;
+        }
+        if (star_idx) |star| {
+            pattern_idx = star + 1;
+            star_text_idx += 1;
+            text_idx = star_text_idx;
+            continue;
+        }
+        return false;
+    }
+
+    while (pattern_idx < pattern.len and pattern[pattern_idx] == '*') {
+        pattern_idx += 1;
+    }
+    return pattern_idx == pattern.len;
+}
+
+fn hasGlobMeta(pattern: []const u8) bool {
+    return std.mem.indexOfAny(u8, pattern, "*?") != null;
 }
 
 fn isDefaultExcluded(name: []const u8) bool {
@@ -470,6 +557,169 @@ test "directory reference enumerates files with include and exclude filters" {
     try std.testing.expectEqual(@as(usize, 1), report.files_read);
     try std.testing.expect(report.files_skipped >= 1);
     try std.testing.expect(report.bytes_read > 0);
+}
+
+test "glob filters support recursive and segment-local source patterns" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.makePath("src/nested");
+    try tmp.dir.writeFile(.{ .sub_path = "src/main.zig", .data = "const root = 1;\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "src/nested/deep.zig", .data = "const deep = 1;\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "src/nested/deep.md", .data = "ignore\n" });
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const recursive_refs = [_]ArtifactRef{.{
+        .kind = .directory,
+        .path = ".",
+        .include_filters = &.{"src/**/*.zig"},
+    }};
+    const recursive_report = try collect(arena.allocator(), root, &recursive_refs);
+    try std.testing.expectEqual(@as(usize, 2), recursive_report.files_read);
+
+    const segment_refs = [_]ArtifactRef{.{
+        .kind = .directory,
+        .path = ".",
+        .include_filters = &.{"src/*.zig"},
+    }};
+    const segment_report = try collect(arena.allocator(), root, &segment_refs);
+    try std.testing.expectEqual(@as(usize, 1), segment_report.files_read);
+    try std.testing.expect(hasSkipReason(&segment_report, "filtered_by_include"));
+}
+
+test "glob filters support basename star and question mark" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "a.zig", .data = "const a = 1;\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "ab.zig", .data = "const ab = 1;\n" });
+    try tmp.dir.makePath("nested");
+    try tmp.dir.writeFile(.{ .sub_path = "nested/c.zig", .data = "const c = 1;\n" });
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const extension_refs = [_]ArtifactRef{.{
+        .kind = .directory,
+        .path = ".",
+        .include_filters = &.{"*.zig"},
+    }};
+    const extension_report = try collect(arena.allocator(), root, &extension_refs);
+    try std.testing.expectEqual(@as(usize, 2), extension_report.files_read);
+
+    const question_refs = [_]ArtifactRef{.{
+        .kind = .directory,
+        .path = ".",
+        .include_filters = &.{"?.zig"},
+    }};
+    const question_report = try collect(arena.allocator(), root, &question_refs);
+    try std.testing.expectEqual(@as(usize, 1), question_report.files_read);
+}
+
+test "glob exclude filters skip common generated roots recursively" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "keep.txt", .data = "keep\n" });
+    try tmp.dir.makePath(".git/objects");
+    try tmp.dir.makePath("zig-out/bin");
+    try tmp.dir.makePath(".zig-cache/o");
+    try tmp.dir.makePath("node_modules/pkg");
+    try tmp.dir.writeFile(.{ .sub_path = ".git/objects/ignored.txt", .data = "ignore\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "zig-out/bin/ignored.txt", .data = "ignore\n" });
+    try tmp.dir.writeFile(.{ .sub_path = ".zig-cache/o/ignored.txt", .data = "ignore\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "node_modules/pkg/ignored.txt", .data = "ignore\n" });
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const refs = [_]ArtifactRef{.{
+        .kind = .directory,
+        .path = ".",
+        .exclude_filters = &.{ ".git/**", "zig-out/**", ".zig-cache/**", "node_modules/**" },
+    }};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const report = try collect(arena.allocator(), root, &refs);
+
+    try std.testing.expectEqual(@as(usize, 1), report.files_read);
+    try std.testing.expect(report.files_skipped >= 4);
+    try std.testing.expect(hasSkippedPathWithReason(&report, ".git", "excluded_by_filter"));
+    try std.testing.expect(hasSkippedPathWithReason(&report, "zig-out", "excluded_by_filter"));
+    try std.testing.expect(hasSkippedPathWithReason(&report, ".zig-cache", "excluded_by_filter"));
+    try std.testing.expect(hasSkippedPathWithReason(&report, "node_modules", "excluded_by_filter"));
+}
+
+test "exclude glob wins over include glob" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.makePath("src/generated");
+    try tmp.dir.writeFile(.{ .sub_path = "src/main.zig", .data = "const main = 1;\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "src/generated/out.zig", .data = "const generated = 1;\n" });
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const refs = [_]ArtifactRef{.{
+        .kind = .directory,
+        .path = ".",
+        .include_filters = &.{"src/**/*.zig"},
+        .exclude_filters = &.{"src/generated/**"},
+    }};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const report = try collect(arena.allocator(), root, &refs);
+
+    try std.testing.expectEqual(@as(usize, 1), report.files_read);
+    try std.testing.expect(hasSkippedPathWithReason(&report, "src/generated", "excluded_by_filter"));
+}
+
+test "empty include filters read all non-excluded files" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "a.txt", .data = "a\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "b.md", .data = "b\n" });
+    try tmp.dir.makePath("skip");
+    try tmp.dir.writeFile(.{ .sub_path = "skip/c.txt", .data = "c\n" });
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const refs = [_]ArtifactRef{.{
+        .kind = .directory,
+        .path = ".",
+        .exclude_filters = &.{"skip/**"},
+    }};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const report = try collect(arena.allocator(), root, &refs);
+
+    try std.testing.expectEqual(@as(usize, 2), report.files_read);
+    try std.testing.expect(hasSkippedPathWithReason(&report, "skip", "excluded_by_filter"));
+}
+
+test "filtered glob coverage reports skipped files" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "keep.zig", .data = "const keep = 1;\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "skip.md", .data = "skip\n" });
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const refs = [_]ArtifactRef{.{
+        .kind = .directory,
+        .path = ".",
+        .include_filters = &.{"*.zig"},
+    }};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const report = try collect(arena.allocator(), root, &refs);
+
+    try std.testing.expectEqual(@as(usize, 1), report.files_read);
+    try std.testing.expectEqual(@as(usize, 1), report.files_skipped);
+    try std.testing.expectEqualStrings("skip.md", report.skipped_inputs[0].path);
+    try std.testing.expectEqualStrings("filtered_by_include", report.skipped_inputs[0].reason);
+    try std.testing.expectEqual(@as(usize, 1), report.unknowns.len);
 }
 
 test "large file is chunk limited and creates unknown" {
@@ -557,4 +807,18 @@ test "directory enumeration is bounded by max entries" {
 
     try std.testing.expectEqual(@as(usize, 1), report.files_read);
     try std.testing.expectEqualStrings("max_entries", report.budget_hits[0]);
+}
+
+fn hasSkipReason(report: *const CoverageReport, reason: []const u8) bool {
+    for (report.skipped_inputs) |skip| {
+        if (std.mem.eql(u8, skip.reason, reason)) return true;
+    }
+    return false;
+}
+
+fn hasSkippedPathWithReason(report: *const CoverageReport, path: []const u8, reason: []const u8) bool {
+    for (report.skipped_inputs) |skip| {
+        if (std.mem.eql(u8, skip.path, path) and std.mem.eql(u8, skip.reason, reason)) return true;
+    }
+    return false;
 }

@@ -168,7 +168,8 @@ promotion, or pack mutation.
 
 - `context.autopsy` — Evaluate a context case with runtime/persisted mounted-pack guidance and optional bounded artifact references **(Implemented)**
   - **Request**: small JSON control plane with `context`, optional `packGuidance`, and optional `artifactRefs`.
-  - **Artifact ref schema**: `{"kind":"file"|"directory","path":"relative/path","purpose":"...","reason":"...","include":["*.zig"],"exclude":["zig-out",".zig-cache"],"maxFileBytes":65536,"maxChunkBytes":32768,"maxFiles":128,"maxEntries":512,"maxBytes":524288}`.
+  - **Artifact ref schema**: `{"kind":"file"|"directory","path":"relative/path","purpose":"...","reason":"...","include":["src/**/*.zig"],"exclude":[".git/**","zig-out/**",".zig-cache/**"],"maxFileBytes":65536,"maxChunkBytes":32768,"maxFiles":128,"maxEntries":512,"maxBytes":524288}`.
+  - **Artifact ref filters**: deterministic glob-style filters over workspace-relative paths. `*` and `?` match within one path segment, `**` as a full segment matches across path segments, and `/` is a literal path separator. Exclude filters win over include filters. Empty include filters include all non-excluded files.
   - **Response coverage**: `artifactCoverage` reports `artifactsRequested`, `filesConsidered`, `filesRead`, `bytesRead`, `filesSkipped`, `skipReasons`, `filesTruncated`, `truncationReasons`, `budgetHits`, and `unknowns`.
   - The stdin JSON limit remains the 1 MiB control-plane boundary. Large content is referenced by path and read through bounded file/chunk/aggregate budgets.
   - Skipped, filtered, unsupported, or truncated regions create explicit unknowns. They are not treated as false claims.
@@ -433,7 +434,7 @@ echo '{"gipVersion":"gip.v0.1","kind":"pack.inspect","packId":"my-pack"}' | ghos
 echo '{"gipVersion":"gip.v0.1","kind":"feedback.summary"}' | ghost_gip --stdin --workspace /path/to/project
 echo '{"gipVersion":"gip.v0.1","kind":"session.get","sessionId":"my-session"}' | ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"project.autopsy"}' | ghost_gip --stdin --workspace /path/to/project
-echo '{"gipVersion":"gip.v0.1","kind":"context.autopsy","context":{"summary":"inspect source context"},"artifactRefs":[{"kind":"directory","path":"src","include":["*.zig"],"exclude":["zig-out",".zig-cache"],"maxChunkBytes":32768,"maxFiles":64}]}' | ghost_gip --stdin --workspace /path/to/project
+echo '{"gipVersion":"gip.v0.1","kind":"context.autopsy","context":{"summary":"inspect source context"},"artifactRefs":[{"kind":"directory","path":".","include":["src/**/*.zig"],"exclude":[".git/**","zig-out/**",".zig-cache/**","node_modules/**"],"maxChunkBytes":32768,"maxFiles":64}]}' | ghost_gip --stdin --workspace /path/to/project
 ```
 
 ## Examples

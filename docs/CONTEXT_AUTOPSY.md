@@ -57,6 +57,16 @@ malformed guidance is reported as a warning/unknown and does not crash the
 request. Merge order is deterministic: persisted mounted-pack guidance first in
 mount registry order, then request-supplied guidance in request order.
 
+Artifact references may include bounded include/exclude filters. Filters use a
+small deterministic glob syntax over workspace-relative paths: `*` matches
+within one path segment, `?` matches one character within one path segment, `**`
+as a full path segment matches across path segments, and `/` is a literal
+separator. Examples include `*.zig`, `src/*.zig`, `src/**/*.zig`, `.git/**`,
+`zig-out/**`, `.zig-cache/**`, and `node_modules/**`. Exclude filters take
+precedence over include filters. If no include filters are provided, every
+non-excluded file remains eligible. Filtered, skipped, and truncated files still
+surface through artifact coverage and explicit unknowns.
+
 ## 5. Minimal Proposed Schema
 
 ```zig

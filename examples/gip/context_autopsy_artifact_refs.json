@@ -10,10 +10,10 @@
   "artifactRefs": [
     {
       "kind": "directory",
-      "path": "src",
+      "path": ".",
       "purpose": "bounded Context Autopsy source material",
-      "include": ["*.zig"],
-      "exclude": ["zig-out", ".zig-cache"],
+      "include": ["src/**/*.zig"],
+      "exclude": [".git/**", "zig-out/**", ".zig-cache/**", "node_modules/**"],
       "maxChunkBytes": 32768,
       "maxFileBytes": 65536,
       "maxFiles": 64,

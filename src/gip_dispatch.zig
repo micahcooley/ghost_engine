@@ -4070,6 +4070,38 @@ test "context.autopsy directory artifact ref enumerates files with filters" {
     try std.testing.expect(std.mem.indexOf(u8, json, "filtered_by_include") != null);
 }
 
+test "context.autopsy artifact refs use deterministic recursive glob filters" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.makePath("src/nested");
+    try tmp.dir.writeFile(.{ .sub_path = "src/main.zig", .data = "const main = 1;\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "src/nested/deep.zig", .data = "const deep = 1;\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "src/nested/deep.md", .data = "ignored\n" });
+    try tmp.dir.makePath(".git/objects");
+    try tmp.dir.makePath("zig-out/bin");
+    try tmp.dir.makePath(".zig-cache/o");
+    try tmp.dir.writeFile(.{ .sub_path = ".git/objects/config.txt", .data = "ignore\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "zig-out/bin/generated.zig", .data = "ignore\n" });
+    try tmp.dir.writeFile(.{ .sub_path = ".zig-cache/o/generated.zig", .data = "ignore\n" });
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    const body =
+        \\{"gipVersion":"gip.v0.1","kind":"context.autopsy","context":{"summary":"recursive glob ref test"},"artifactRefs":[{"kind":"directory","path":".","include":["src/**/*.zig"],"exclude":[".git/**","zig-out/**",".zig-cache/**"]}]}
+    ;
+    var result = try dispatch(allocator, "context.autopsy", core.PROTOCOL_VERSION, root, null, body);
+    defer result.deinit(allocator);
+    const json = result.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"filesRead\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "filtered_by_include") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "excluded_by_filter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"commandsExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verifiersExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"packMutation\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"negativeKnowledgeMutation\":false") != null);
+}
+
 test "context.autopsy exclude filters skip ignored directories and files" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
