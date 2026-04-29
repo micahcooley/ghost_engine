@@ -71,8 +71,23 @@ pub const EvidenceExpectation = struct {
 
 pub const PackInfluence = struct {
     pack_name: []const u8,
+    pack_version: []const u8 = "unknown",
+    source_kind: []const u8 = "pack_autopsy_guidance",
+    reason: []const u8 = "Pack guidance contributed Context Autopsy candidates.",
     weight: []const u8,
+    non_authorizing: bool = true,
     is_proof_authority: bool = false,
+};
+
+pub const PackAutopsyGuidance = struct {
+    influence: PackInfluence,
+    signals: []const ContextSignal = &.{},
+    suggested_unknowns: []const ContextUnknown = &.{},
+    constraints: []const ContextConstraint = &.{},
+    risk_surfaces: []const ContextRiskSurface = &.{},
+    candidate_actions: []const ContextCandidateAction = &.{},
+    check_candidates: []const ContextCheckCandidate = &.{},
+    evidence_expectations: []const EvidenceExpectation = &.{},
 };
 
 pub const ContextAutopsyResult = struct {
@@ -87,6 +102,18 @@ pub const ContextAutopsyResult = struct {
     pack_influences: []PackInfluence = &.{},
     state: []const u8 = "draft",
     non_authorizing: bool = true,
+
+    pub fn deinit(self: *ContextAutopsyResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.detected_signals);
+        allocator.free(self.suggested_unknowns);
+        allocator.free(self.risk_surfaces);
+        allocator.free(self.candidate_actions);
+        allocator.free(self.check_candidates);
+        allocator.free(self.constraints);
+        allocator.free(self.evidence_expectations);
+        allocator.free(self.pack_influences);
+        self.* = undefined;
+    }
 };
 
 test "candidate actions default non_authorizing=true" {
@@ -121,6 +148,7 @@ test "pack influence cannot be marked proof/authority by default" {
         .weight = "high",
     };
     try std.testing.expectEqual(false, influence.is_proof_authority);
+    try std.testing.expectEqual(true, influence.non_authorizing);
 }
 
 test "unknown records represent missing/unknown, not false" {

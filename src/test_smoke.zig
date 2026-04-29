@@ -36,9 +36,13 @@ const support_routing = @import("support_routing.zig");
 const repo_hygiene = @import("repo_hygiene.zig");
 const hypothesis_core = @import("hypothesis_core.zig");
 const project_autopsy = @import("project_autopsy.zig");
+const context_autopsy = @import("context_autopsy.zig");
+const context_autopsy_engine = @import("context_autopsy_engine.zig");
 const gip = @import("gip.zig");
 
 comptime {
+    _ = context_autopsy;
+    _ = context_autopsy_engine;
     _ = project_autopsy;
     _ = repo_hygiene;
     _ = hypothesis_core;
