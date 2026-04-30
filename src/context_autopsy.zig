@@ -7,6 +7,11 @@ pub const ContextCase = struct {
     intent_tags: []const []const u8 = &.{},
     artifact_kinds: []const []const u8 = &.{},
     situation_kinds: []const []const u8 = &.{},
+    input_ref_labels: []const []const u8 = &.{},
+    input_ref_purposes: []const []const u8 = &.{},
+    input_ref_reasons: []const []const u8 = &.{},
+    artifact_ref_purposes: []const []const u8 = &.{},
+    artifact_ref_reasons: []const []const u8 = &.{},
 };
 
 pub const ContextSignal = struct {
@@ -93,6 +98,7 @@ pub const PackInfluence = struct {
     pack_version: []const u8 = "unknown",
     source_kind: []const u8 = "pack_autopsy_guidance",
     reason: []const u8 = "Pack guidance contributed Context Autopsy candidates.",
+    match_trace: []const u8 = "",
     weight: []const u8,
     non_authorizing: bool = true,
     is_proof_authority: bool = false,

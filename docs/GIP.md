@@ -177,9 +177,10 @@ promotion, or pack mutation.
   - The stdin JSON limit remains the 1 MiB control-plane boundary. Large content is referenced by path and read through bounded file/chunk/aggregate budgets.
   - Skipped, filtered, unsupported, unread, or truncated regions create explicit unknowns. They are not treated as false claims.
   - Loads only persisted autopsy guidance declared by mounted Knowledge Pack manifests; pack content remains a signal source, not proof.
+  - Guidance matching is bounded and deterministic: structured tags/kinds/required fields are matched case-insensitively, keywords prefer structured context and artifact/input ref metadata before bounded JSON string/key inspection, and applied pack influences include non-authorizing `matchTrace` metadata.
   - Does not execute commands, run verifiers, mutate packs, or mutate negative knowledge.
   - Persisted Knowledge Pack autopsy guidance can be preflighted through the read-only `ghost_knowledge_pack validate-autopsy-guidance` operator tool; this is outside the GIP request surface and does not change `context.autopsy` response authority.
-  - Preferred persisted guidance uses schema `ghost.autopsy_guidance.v1` with `packGuidance`; legacy unversioned array / `packGuidance` / `pack_guidance` shapes remain tolerated with validation warnings.
+  - Preferred persisted guidance uses schema `ghost.autopsy_guidance.v1` with `packGuidance`; `pack_guidance` remains an accepted alias, and legacy unversioned array / `packGuidance` / `pack_guidance` shapes remain tolerated with validation warnings.
   - `ghost_knowledge_pack capabilities --json` exposes the binary version, command list, validate-autopsy-guidance flags, supported guidance schemas, and validation limit defaults/hard caps for CLI compatibility checks.
 
 ### Conversation

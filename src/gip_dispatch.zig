@@ -2115,6 +2115,11 @@ fn dispatchContextAutopsy(allocator: std.mem.Allocator, workspace_root: ?[]const
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
+    const request_guidance = try parseContextPackGuidance(arena_alloc, request_obj);
+    var persistent_guidance = try loadPersistentContextPackGuidance(arena_alloc, workspace_root);
+    const guidance = try mergeContextPackGuidance(arena_alloc, persistent_guidance.guidance, request_guidance);
+    const artifact_refs = try parseContextArtifactRefs(arena_alloc, request_obj);
+    const input_refs = try parseContextInputRefs(arena_alloc, request_obj, context_obj);
     const description = getStr(context_obj, "summary", "summary") orelse getStr(context_obj, "description", "description") orelse "";
     const intake_type = getStr(context_obj, "intake_type", "intakeType") orelse getStr(context_obj, "context_kind", "contextKind") orelse "context";
     const case = context_autopsy.ContextCase{
@@ -2124,13 +2129,12 @@ fn dispatchContextAutopsy(allocator: std.mem.Allocator, workspace_root: ?[]const
         .intent_tags = try parseStringArrayField(arena_alloc, context_obj, "intent_tags", "intentTags"),
         .artifact_kinds = try parseStringArrayField(arena_alloc, context_obj, "artifact_kinds", "artifactKinds"),
         .situation_kinds = try parseStringArrayField(arena_alloc, context_obj, "situation_kinds", "situationKinds"),
+        .input_ref_labels = try inputRefStringFieldList(arena_alloc, input_refs, .label),
+        .input_ref_purposes = try inputRefStringFieldList(arena_alloc, input_refs, .purpose),
+        .input_ref_reasons = try inputRefStringFieldList(arena_alloc, input_refs, .reason),
+        .artifact_ref_purposes = try artifactRefStringFieldList(arena_alloc, artifact_refs, .purpose),
+        .artifact_ref_reasons = try artifactRefStringFieldList(arena_alloc, artifact_refs, .reason),
     };
-
-    const request_guidance = try parseContextPackGuidance(arena_alloc, request_obj);
-    var persistent_guidance = try loadPersistentContextPackGuidance(arena_alloc, workspace_root);
-    const guidance = try mergeContextPackGuidance(arena_alloc, persistent_guidance.guidance, request_guidance);
-    const artifact_refs = try parseContextArtifactRefs(arena_alloc, request_obj);
-    const input_refs = try parseContextInputRefs(arena_alloc, request_obj, context_obj);
     const artifact_coverage = if (artifact_refs.len == 0) null else blk: {
         const root = workspace_root orelse return .{
             .status = .rejected,
@@ -2472,6 +2476,34 @@ fn parseContextInputRefs(
         });
     }
     return try refs.toOwnedSlice();
+}
+
+const InputRefStringField = enum { label, purpose, reason };
+const ArtifactRefStringField = enum { purpose, reason };
+
+fn inputRefStringFieldList(allocator: std.mem.Allocator, refs: []const context_inputs.InputRef, field: InputRefStringField) ![]const []const u8 {
+    var out = std.ArrayList([]const u8).init(allocator);
+    for (refs) |ref| {
+        const value = switch (field) {
+            .label => ref.label,
+            .purpose => ref.purpose,
+            .reason => ref.reason,
+        };
+        if (value.len != 0) try out.append(value);
+    }
+    return try out.toOwnedSlice();
+}
+
+fn artifactRefStringFieldList(allocator: std.mem.Allocator, refs: []const context_artifacts.ArtifactRef, field: ArtifactRefStringField) ![]const []const u8 {
+    var out = std.ArrayList([]const u8).init(allocator);
+    for (refs) |ref| {
+        const value = switch (field) {
+            .purpose => ref.purpose,
+            .reason => ref.reason,
+        };
+        if (value.len != 0) try out.append(value);
+    }
+    return try out.toOwnedSlice();
 }
 
 fn inputCoverageHasSkipReason(coverage: *const context_inputs.InputCoverageReport, reason: []const u8) bool {
@@ -2848,6 +2880,8 @@ fn writeContextAutopsyResult(
         try writeEscaped(w, influence.source_kind);
         try w.writeAll("\",\"reason\":\"");
         try writeEscaped(w, influence.reason);
+        try w.writeAll("\",\"matchTrace\":\"");
+        try writeEscaped(w, influence.match_trace);
         try w.writeAll("\",\"weight\":\"");
         try writeEscaped(w, influence.weight);
         try w.writeAll("\",\"nonAuthorizing\":");
@@ -4071,6 +4105,7 @@ test "context.autopsy valid request returns draft non-authorizing result" {
     const json = result.result_json orelse return error.MissingResult;
     try std.testing.expect(std.mem.indexOf(u8, json, "\"contextAutopsy\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"planning_signal\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"matchTrace\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"nonAuthorizing\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"executesByDefault\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"pendingEvidenceObligations\"") != null);
@@ -4079,6 +4114,40 @@ test "context.autopsy valid request returns draft non-authorizing result" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"commandsExecuted\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"verifiersExecuted\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"packMutation\":false") != null);
+}
+
+test "context.autopsy guidance matching uses case-insensitive structured criteria" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"gipVersion":"gip.v0.1","kind":"context.autopsy","context":{"summary":"Need launch planning","intent_tags":["planning"],"situation_kinds":["launch"],"artifact_kinds":["DesignDoc"]},"packGuidance":[{"pack_id":"case_pack","match":{"intent_tags_any":["PLANNING"],"situation_kinds_any":["LAUNCH"],"artifact_kinds_any":["designdoc"],"context_keywords_any":["LAUNCH"]},"signals":[{"name":"case_structured_signal","kind":"generic_signal","confidence":"medium","reason":"matched structured fields"}]}]}
+    ;
+    var result = try dispatch(allocator, "context.autopsy", core.PROTOCOL_VERSION, null, null, body);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
+    const json = result.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"case_structured_signal\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "matched: intent_tags") != null);
+}
+
+test "context.autopsy guidance matching uses input and artifact ref metadata" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "input.txt", .data = "metadata only\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "artifact.txt", .data = "artifact\n" });
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    const body =
+        \\{"gipVersion":"gip.v0.1","kind":"context.autopsy","context":{"summary":"metadata matching","inputRefs":[{"kind":"file","path":"input.txt","label":"Transcript","purpose":"support ticket transcript"}]},"artifactRefs":[{"kind":"file","path":"artifact.txt","purpose":"Build Log"}],"packGuidance":[{"pack_id":"metadata_pack","match":{"context_keywords_all":["transcript","build log"],"required_context_fields":["input_refs","artifact_refs"]},"signals":[{"name":"metadata_match_signal","kind":"generic_signal","confidence":"medium","reason":"matched ref metadata"}]}]}
+    ;
+    var result = try dispatch(allocator, "context.autopsy", core.PROTOCOL_VERSION, root, null, body);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
+    const json = result.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"metadata_match_signal\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"inputCoverage\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"artifactCoverage\"") != null);
 }
 
 test "context.autopsy loads persisted Knowledge Pack autopsy guidance from mounted fixture" {

@@ -161,12 +161,96 @@ pub fn validateManifestPathWithLimits(
     limits: AutopsyGuidanceValidationLimits,
 ) !GuidanceValidationReport {
     try limits.validate();
-    const manifest_path = try std.fs.path.resolve(allocator, &.{manifest_path_raw});
+    const manifest_path = try resolveManifestPath(allocator, manifest_path_raw);
     defer allocator.free(manifest_path);
-    var manifest = try store.loadManifestFromPath(allocator, manifest_path);
+
+    const file = std.fs.openFileAbsolute(manifest_path, .{}) catch |err| {
+        return invalidManifestPathReport(allocator, manifest_path, err);
+    };
+    const stat = file.stat() catch |err| {
+        file.close();
+        return invalidManifestPathReport(allocator, manifest_path, err);
+    };
+    file.close();
+    if (stat.kind != .file) {
+        return invalidManifestReport(allocator, manifest_path, "manifest_path_not_file", "$", "manifest path must point to a regular file");
+    }
+
+    var manifest = store.loadManifestFromPath(allocator, manifest_path) catch |err| {
+        return invalidManifestLoadReport(allocator, manifest_path, err);
+    };
     defer manifest.deinit();
     const root = std.fs.path.dirname(manifest_path) orelse return error.InvalidKnowledgePackManifest;
     return validateManifestGuidanceWithLimits(allocator, &manifest, root, manifest_path, limits);
+}
+
+fn resolveManifestPath(allocator: std.mem.Allocator, manifest_path_raw: []const u8) ![]u8 {
+    if (std.fs.path.isAbsolute(manifest_path_raw)) {
+        return try std.fs.path.resolve(allocator, &.{manifest_path_raw});
+    }
+    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    return try std.fs.path.resolve(allocator, &.{ cwd, manifest_path_raw });
+}
+
+fn invalidManifestPathReport(allocator: std.mem.Allocator, manifest_path: []const u8, err: anyerror) !GuidanceValidationReport {
+    const code = switch (err) {
+        error.FileNotFound => "manifest_file_missing",
+        error.AccessDenied => "manifest_file_inaccessible",
+        else => "manifest_file_unreadable",
+    };
+    const message = switch (err) {
+        error.FileNotFound => "manifest file was not found",
+        error.AccessDenied => "manifest file could not be accessed",
+        else => "manifest file could not be opened",
+    };
+    return invalidManifestReport(allocator, manifest_path, code, "$", message);
+}
+
+fn invalidManifestLoadReport(allocator: std.mem.Allocator, manifest_path: []const u8, err: anyerror) !GuidanceValidationReport {
+    const code = switch (err) {
+        error.InvalidKnowledgePackManifest => "manifest_invalid_shape",
+        error.SyntaxError => "manifest_json_malformed",
+        error.UnexpectedEndOfInput => "manifest_json_malformed",
+        error.InvalidNumber => "manifest_json_malformed",
+        error.FileNotFound => "manifest_file_missing",
+        error.AccessDenied => "manifest_file_inaccessible",
+        else => "manifest_invalid_shape",
+    };
+    const message = switch (err) {
+        error.InvalidKnowledgePackManifest => "knowledge pack manifest has an invalid shape, schema, or storage layout",
+        error.SyntaxError, error.UnexpectedEndOfInput, error.InvalidNumber => "manifest file must be valid JSON",
+        error.FileNotFound => "manifest file was not found",
+        error.AccessDenied => "manifest file could not be accessed",
+        else => "knowledge pack manifest could not be parsed or validated",
+    };
+    return invalidManifestReport(allocator, manifest_path, code, "$", message);
+}
+
+fn invalidManifestReport(
+    allocator: std.mem.Allocator,
+    manifest_path: []const u8,
+    code: []const u8,
+    path: []const u8,
+    message: []const u8,
+) !GuidanceValidationReport {
+    var issues = IssueBuilder.init(allocator);
+    errdefer issues.deinit();
+    try issues.add(.@"error", code, path, message);
+    return .{
+        .allocator = allocator,
+        .pack_id = try allocator.dupe(u8, "<unknown>"),
+        .pack_version = try allocator.dupe(u8, "<unknown>"),
+        .manifest_path = try allocator.dupe(u8, manifest_path),
+        .guidance_path = null,
+        .declared_guidance_path = false,
+        .schema = null,
+        .legacy_unversioned_schema = false,
+        .guidance_count = 0,
+        .error_count = issues.errors,
+        .warning_count = issues.warnings,
+        .issues = try issues.toOwnedSlice(),
+    };
 }
 
 pub fn validateMountedPacks(allocator: std.mem.Allocator, paths: anytype) !ValidationSummary {
@@ -827,6 +911,18 @@ test "versioned autopsy guidance v1 validates without legacy warning" {
     try std.testing.expectEqual(@as(usize, 0), report.warning_count);
 }
 
+test "versioned autopsy guidance accepts pack_guidance snake alias" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"schema":"ghost.autopsy_guidance.v1","pack_guidance":[{"pack_id":"pack-a","match":{"intent_tags_any":["planning"]},"signals":[{"name":"sig","kind":"generic_signal","confidence":"medium","reason":"matched"}]}]}
+    ;
+    var report = try validateGuidanceBytes(allocator, body, "pack-a", "v1");
+    defer report.deinit();
+    try std.testing.expect(report.ok());
+    try std.testing.expectEqualStrings(AUTOPSY_GUIDANCE_SCHEMA_V1, report.schema.?);
+    try std.testing.expectEqual(@as(usize, 1), report.guidance_count);
+}
+
 test "legacy unversioned autopsy guidance validates with schema warning" {
     const allocator = std.testing.allocator;
     var report = try validateGuidanceBytes(allocator, valid_guidance, "pack-a", "v1");
@@ -885,6 +981,30 @@ test "malformed JSON and unsupported shape fail validation without crashing" {
     try std.testing.expect(hasIssueCode(unsupported.issues, "guidance_top_level_unsupported"));
 }
 
+test "missing manifest path returns structured validation report" {
+    const allocator = std.testing.allocator;
+    var report = try validateManifestPath(allocator, "does-not-exist/manifest.json");
+    defer report.deinit();
+    try std.testing.expect(!report.ok());
+    try std.testing.expectEqualStrings("manifest_file_missing", report.issues[0].code);
+}
+
+test "invalid manifest structure returns structured validation report" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "manifest.json", .data = "{\"not\":\"a pack manifest\"}" });
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const manifest_path = try std.fs.path.join(allocator, &.{ root, "manifest.json" });
+    defer allocator.free(manifest_path);
+
+    var report = try validateManifestPath(allocator, manifest_path);
+    defer report.deinit();
+    try std.testing.expect(!report.ok());
+    try std.testing.expect(hasIssueCode(report.issues, "manifest_invalid_shape"));
+}
+
 fn hasIssueCode(issues: []const ValidationIssue, code: []const u8) bool {
     for (issues) |issue| {
         if (std.mem.eql(u8, issue.code, code)) return true;
@@ -919,6 +1039,18 @@ test "non-matching guidance can still be valid" {
     var report = try validateGuidanceBytes(allocator, body, "pack-a", "v1");
     defer report.deinit();
     try std.testing.expect(report.ok());
+}
+
+test "invalid and unknown match criteria are reported cleanly" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"packGuidance":[{"pack_id":"pack-a","match":{"intent_tags_any":["planning",42],"unknownCriterion":["x"]},"signals":[{"name":"sig","kind":"generic_signal","reason":"valid guidance","confidence":"low"}]}]}
+    ;
+    var report = try validateGuidanceBytes(allocator, body, "pack-a", "v1");
+    defer report.deinit();
+    try std.testing.expect(!report.ok());
+    try std.testing.expect(hasIssueCode(report.issues, "match_field_invalid_item"));
+    try std.testing.expect(hasIssueCode(report.issues, "match_field_unknown"));
 }
 
 test "missing guidance file declared by manifest fails validation" {

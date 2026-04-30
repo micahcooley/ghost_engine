@@ -242,6 +242,7 @@ pub fn loadManifestFromPath(allocator: std.mem.Allocator, abs_path: []const u8) 
         lineageStateRelPath: []const u8,
         influenceManifestRelPath: []const u8,
         autopsyGuidanceRelPath: ?[]const u8 = null,
+        autopsy_guidance_rel_path: ?[]const u8 = null,
     };
     const DiskProvenance = struct {
         packLineageId: []const u8,
@@ -278,6 +279,7 @@ pub fn loadManifestFromPath(allocator: std.mem.Allocator, abs_path: []const u8) 
     defer parsed.deinit();
     if (!std.mem.eql(u8, parsed.value.schemaVersion, PACK_SCHEMA_VERSION)) return error.InvalidKnowledgePackManifest;
     const manifest_dir = std.fs.path.dirname(abs_path) orelse return error.InvalidKnowledgePackManifest;
+    const autopsy_guidance_rel_path = guidanceRelPathFromDiskStorage(parsed.value.storage) catch return error.InvalidKnowledgePackManifest;
     try validateStorageLayout(allocator, manifest_dir, parsed.value.storage);
 
     return .{
@@ -300,7 +302,7 @@ pub fn loadManifestFromPath(allocator: std.mem.Allocator, abs_path: []const u8) 
             .reuse_catalog_rel_path = try allocator.dupe(u8, parsed.value.storage.reuseCatalogRelPath),
             .lineage_state_rel_path = try allocator.dupe(u8, parsed.value.storage.lineageStateRelPath),
             .influence_manifest_rel_path = try allocator.dupe(u8, parsed.value.storage.influenceManifestRelPath),
-            .autopsy_guidance_rel_path = if (parsed.value.storage.autopsyGuidanceRelPath) |path| try allocator.dupe(u8, path) else null,
+            .autopsy_guidance_rel_path = if (autopsy_guidance_rel_path) |path| try allocator.dupe(u8, path) else null,
         },
         .provenance = .{
             .pack_lineage_id = try allocator.dupe(u8, parsed.value.provenance.packLineageId),
@@ -580,10 +582,22 @@ fn validateStorageLayout(allocator: std.mem.Allocator, manifest_root_abs_path: [
     defer allocator.free(lineage_state);
     const influence_manifest = try resolveContainedPath(allocator, manifest_root_abs_path, storage.influenceManifestRelPath);
     defer allocator.free(influence_manifest);
-    if (storage.autopsyGuidanceRelPath) |rel_path| {
+    if (try guidanceRelPathFromDiskStorage(storage)) |rel_path| {
         const autopsy_guidance = try resolveContainedPath(allocator, manifest_root_abs_path, rel_path);
         defer allocator.free(autopsy_guidance);
     }
+}
+
+fn guidanceRelPathFromDiskStorage(storage: anytype) !?[]const u8 {
+    const camel = storage.autopsyGuidanceRelPath;
+    const snake = storage.autopsy_guidance_rel_path;
+    if (camel) |camel_path| {
+        if (snake) |snake_path| {
+            if (!std.mem.eql(u8, camel_path, snake_path)) return error.InvalidKnowledgePackManifest;
+        }
+        return camel_path;
+    }
+    return snake;
 }
 
 fn resolveContainedPath(allocator: std.mem.Allocator, root_abs_path: []const u8, rel_path: []const u8) ![]u8 {

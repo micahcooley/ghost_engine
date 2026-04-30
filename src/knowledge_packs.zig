@@ -63,6 +63,7 @@ pub fn main() !void {
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
+    const json_requested = argsContain(args, "--json");
     if (args.len < 2) {
         printUsage();
         std.process.exit(2);
@@ -145,15 +146,15 @@ pub fn main() !void {
             all_mounted = true;
         } else if (std.mem.startsWith(u8, arg, "--max-guidance-bytes=")) {
             validation_limits.max_guidance_bytes = parseLimitArg(arg, "--max-guidance-bytes=") catch |err| {
-                printLimitErrorAndExit(err, "--max-guidance-bytes", validation_limits.max_guidance_bytes);
+                printLimitErrorAndExit(err, "--max-guidance-bytes", validation_limits.max_guidance_bytes, json_requested);
             };
         } else if (std.mem.startsWith(u8, arg, "--max-array-items=")) {
             validation_limits.max_array_items = parseLimitArg(arg, "--max-array-items=") catch |err| {
-                printLimitErrorAndExit(err, "--max-array-items", validation_limits.max_array_items);
+                printLimitErrorAndExit(err, "--max-array-items", validation_limits.max_array_items, json_requested);
             };
         } else if (std.mem.startsWith(u8, arg, "--max-string-bytes=")) {
             validation_limits.max_string_bytes = parseLimitArg(arg, "--max-string-bytes=") catch |err| {
-                printLimitErrorAndExit(err, "--max-string-bytes", validation_limits.max_string_bytes);
+                printLimitErrorAndExit(err, "--max-string-bytes", validation_limits.max_string_bytes, json_requested);
             };
         } else if (std.mem.startsWith(u8, arg, "--candidate-id=")) {
             candidate_id = arg["--candidate-id=".len..];
@@ -171,7 +172,7 @@ pub fn main() !void {
             std.process.exit(2);
         }
     }
-    validateLimitsOrExit(validation_limits);
+    validateLimitsOrExit(validation_limits, json_requested);
 
     switch (command) {
         .create => {
@@ -296,14 +297,20 @@ pub fn main() !void {
             }
         },
         .@"validate-autopsy-guidance" => {
-            var summary = try validateAutopsyGuidanceForCli(allocator, .{
+            var summary = validateAutopsyGuidanceForCli(allocator, .{
                 .pack_id = pack_id,
                 .pack_version = pack_version,
                 .manifest_path = manifest_path,
                 .all_mounted = all_mounted,
                 .project_shard = project_shard,
                 .limits = validation_limits,
-            });
+            }) catch |err| {
+                const rendered = try renderAutopsyGuidanceCliError(allocator, err, as_json);
+                defer allocator.free(rendered);
+                sys.printOut(rendered);
+                sys.printOut("\n");
+                std.process.exit(1);
+            };
             defer summary.deinit();
             const rendered = try renderAutopsyGuidanceValidation(allocator, &summary, as_json);
             defer allocator.free(rendered);
@@ -1764,6 +1771,29 @@ fn renderAutopsyGuidanceValidationJson(
     return out.toOwnedSlice();
 }
 
+fn renderAutopsyGuidanceCliError(allocator: std.mem.Allocator, err: anyerror, as_json: bool) ![]u8 {
+    const code = switch (err) {
+        error.InvalidArguments => "invalid_arguments",
+        else => "validation_internal_error",
+    };
+    const message = switch (err) {
+        error.InvalidArguments => "validate-autopsy-guidance requires exactly one of --manifest, --all-mounted, or --pack-id with --version",
+        else => "validate-autopsy-guidance could not complete",
+    };
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    if (as_json) {
+        try out.writer().writeAll("{\"ok\":false,\"error\":{\"code\":");
+        try writeJsonString(out.writer(), code);
+        try out.writer().writeAll(",\"message\":");
+        try writeJsonString(out.writer(), message);
+        try out.writer().writeAll("}}");
+    } else {
+        try out.writer().print("autopsy_guidance_valid=false\nerror {s}: {s}", .{ code, message });
+    }
+    return out.toOwnedSlice();
+}
+
 fn renderCapabilities(allocator: std.mem.Allocator, as_json: bool) ![]u8 {
     if (!as_json) {
         var out = std.ArrayList(u8).init(allocator);
@@ -2156,27 +2186,55 @@ fn parseLimitArg(arg: []const u8, prefix: []const u8) !usize {
     return std.fmt.parseInt(usize, raw, 10) catch error.InvalidLimit;
 }
 
-fn printLimitErrorAndExit(err: anyerror, label: []const u8, value: usize) noreturn {
+fn printLimitErrorAndExit(err: anyerror, label: []const u8, value: usize, as_json: bool) noreturn {
     const limits = autopsy_guidance_validator.AutopsyGuidanceValidationLimits;
-    switch (err) {
-        error.GuidanceBytesLimitOutOfRange => std.debug.print("{s} out of range: value={d} hard_cap={d}\n", .{ label, value, limits.hard_cap_guidance_bytes }),
-        error.GuidanceEntriesLimitOutOfRange => std.debug.print("{s} out of range: value={d} hard_cap={d}\n", .{ label, value, limits.hard_cap_guidance_entries }),
-        error.GuidanceArrayItemsLimitOutOfRange => std.debug.print("{s} out of range: value={d} hard_cap={d}\n", .{ label, value, limits.hard_cap_array_items }),
-        error.GuidanceStringBytesLimitOutOfRange => std.debug.print("{s} out of range: value={d} hard_cap={d}\n", .{ label, value, limits.hard_cap_string_bytes }),
-        else => std.debug.print("{s} must be a positive decimal integer\n", .{label}),
+    const hard_cap = switch (err) {
+        error.GuidanceBytesLimitOutOfRange => limits.hard_cap_guidance_bytes,
+        error.GuidanceEntriesLimitOutOfRange => limits.hard_cap_guidance_entries,
+        error.GuidanceArrayItemsLimitOutOfRange => limits.hard_cap_array_items,
+        error.GuidanceStringBytesLimitOutOfRange => limits.hard_cap_string_bytes,
+        else => 0,
+    };
+    if (as_json) {
+        if (hard_cap == 0) {
+            sys.printOut("{\"ok\":false,\"error\":{\"code\":\"invalid_limit\",\"message\":\"validation limit must be a positive decimal integer\",\"flag\":\"");
+            sys.printOut(label);
+            sys.printOut("\"}}\n");
+        } else {
+            sys.printOut("{\"ok\":false,\"error\":{\"code\":\"validation_limit_out_of_range\",\"message\":\"validation limit is outside supported bounds\",\"flag\":\"");
+            sys.printOut(label);
+            sys.printOut("\",\"value\":");
+            sys.print("{d}", .{value});
+            sys.printOut(",\"hardCap\":");
+            sys.print("{d}", .{hard_cap});
+            sys.printOut("}}\n");
+        }
+    } else {
+        if (hard_cap == 0) {
+            std.debug.print("{s} must be a positive decimal integer\n", .{label});
+        } else {
+            std.debug.print("{s} out of range: value={d} hard_cap={d}\n", .{ label, value, hard_cap });
+        }
     }
     std.process.exit(2);
 }
 
-fn validateLimitsOrExit(limits: autopsy_guidance_validator.AutopsyGuidanceValidationLimits) void {
+fn validateLimitsOrExit(limits: autopsy_guidance_validator.AutopsyGuidanceValidationLimits, as_json: bool) void {
     limits.validate() catch |err| {
         switch (err) {
-            error.GuidanceBytesLimitOutOfRange => printLimitErrorAndExit(err, "--max-guidance-bytes", limits.max_guidance_bytes),
-            error.GuidanceEntriesLimitOutOfRange => printLimitErrorAndExit(err, "--max-guidance-entries", limits.max_guidance_entries),
-            error.GuidanceArrayItemsLimitOutOfRange => printLimitErrorAndExit(err, "--max-array-items", limits.max_array_items),
-            error.GuidanceStringBytesLimitOutOfRange => printLimitErrorAndExit(err, "--max-string-bytes", limits.max_string_bytes),
+            error.GuidanceBytesLimitOutOfRange => printLimitErrorAndExit(err, "--max-guidance-bytes", limits.max_guidance_bytes, as_json),
+            error.GuidanceEntriesLimitOutOfRange => printLimitErrorAndExit(err, "--max-guidance-entries", limits.max_guidance_entries, as_json),
+            error.GuidanceArrayItemsLimitOutOfRange => printLimitErrorAndExit(err, "--max-array-items", limits.max_array_items, as_json),
+            error.GuidanceStringBytesLimitOutOfRange => printLimitErrorAndExit(err, "--max-string-bytes", limits.max_string_bytes, as_json),
         }
     };
+}
+
+fn argsContain(args: []const []const u8, needle: []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, needle)) return true;
+    }
+    return false;
 }
 
 fn parseCommand(text: []const u8) ?Command {

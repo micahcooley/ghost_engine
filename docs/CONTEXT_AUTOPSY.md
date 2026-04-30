@@ -34,12 +34,20 @@ guidance, and persisted autopsy guidance from mounted Knowledge Packs. It
 evaluates only guidance whose domain-neutral match criteria apply to the case
 and returns a draft/non-authorizing `ContextAutopsyResult`.
 
-Current match criteria are intentionally generic:
+Current match criteria are intentionally generic, deterministic, bounded, and
+case-insensitive for tags and keyword matching:
 - `intent_tags_any` / `intent_tags_all`
 - `context_keywords_any` / `context_keywords_all`
 - `artifact_kinds_any` / `artifact_kinds_all`
 - `situation_kinds_any` / `situation_kinds_all`
 - `required_context_fields`
+
+Keyword matching first checks structured case data such as description/summary,
+intent tags, situation kinds, artifact kinds, and declared artifact/input ref
+labels, purposes, and reasons. Bounded JSON string/key inspection remains a
+fallback for request-provided context values. Applied guidance includes
+non-authorizing match trace metadata on pack influence records so operators can
+inspect why a guidance entry applied.
 
 If pack guidance is present but none of it applies, the engine emits an explicit
 unknown/gap. It does not treat non-matching guidance as proof that a concept is
@@ -62,7 +70,9 @@ field `autopsyGuidanceRelPath`. The preferred file shape is versioned:
 
 Legacy unversioned shapes remain accepted for compatibility: a top-level
 guidance array, an object with `packGuidance`, or an object with
-`pack_guidance`. The validator warns on legacy unversioned guidance and rejects
+`pack_guidance`. Versioned guidance may also use the `pack_guidance` alias.
+Guidance entry fields keep existing camelCase/snake_case aliases where they are
+unambiguous. The validator warns on legacy unversioned guidance and rejects
 unknown/future schema strings. Runtime loading still treats missing, malformed,
 or unsupported persisted guidance as warning/unknown and does not crash the
 request. Merge order is deterministic: persisted mounted-pack guidance first in
@@ -83,8 +93,10 @@ parses as JSON, uses one of the accepted top-level shapes, keeps bounded match
 criteria, includes required fields for contributed signals/unknowns/risks/
 candidate actions/check candidates/evidence expectations, and reports
 authorizing or execution-like fields as structured warnings. Validation errors
-return non-zero from the CLI; warnings alone do not. The tool does not mount,
-promote, fix, execute, or mutate packs.
+return non-zero from the CLI; warnings alone do not. Expected path, manifest,
+schema, and guidance validation failures are rendered as clean human output or
+structured JSON, without Zig stack traces. The tool does not mount, promote,
+fix, execute, or mutate packs.
 
 Default validation limits are named policy values: `maxGuidanceBytes=524288`,
 `maxGuidanceEntries=256`, `maxArrayItems=128`, and `maxStringBytes=2048`.

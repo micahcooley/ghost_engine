@@ -196,7 +196,9 @@ pub const PackGuidanceSource = struct {
             if (!guidanceApplies(case, guidance.match)) continue;
             applied_count += 1;
 
-            try builder.addPackInfluence(guidance.influence);
+            var influence = guidance.influence;
+            influence.match_trace = buildMatchTrace(case, guidance.match);
+            try builder.addPackInfluence(influence);
 
             for (guidance.signals) |signal| try builder.addSignal(signal);
             for (guidance.suggested_unknowns) |unknown| try builder.addUnknown(unknown);
@@ -234,21 +236,21 @@ fn guidanceApplies(case: *const ContextCase, match: context_autopsy.PackAutopsyM
 fn matchesAny(case_values: []const []const u8, criteria: []const []const u8) bool {
     if (criteria.len == 0) return true;
     for (criteria) |criterion| {
-        if (containsText(case_values, criterion)) return true;
+        if (containsTextIgnoreCase(case_values, criterion)) return true;
     }
     return false;
 }
 
 fn matchesAll(case_values: []const []const u8, criteria: []const []const u8) bool {
     for (criteria) |criterion| {
-        if (!containsText(case_values, criterion)) return false;
+        if (!containsTextIgnoreCase(case_values, criterion)) return false;
     }
     return true;
 }
 
-fn containsText(values: []const []const u8, wanted: []const u8) bool {
+fn containsTextIgnoreCase(values: []const []const u8, wanted: []const u8) bool {
     for (values) |value| {
-        if (std.mem.eql(u8, value, wanted)) return true;
+        if (std.ascii.eqlIgnoreCase(value, wanted)) return true;
     }
     return false;
 }
@@ -269,14 +271,22 @@ fn matchesAllContextKeywords(case: *const ContextCase, keywords: []const []const
 }
 
 fn contextContains(case: *const ContextCase, keyword: []const u8) bool {
-    if (std.mem.indexOf(u8, case.description, keyword) != null) return true;
-    if (std.mem.indexOf(u8, case.intake_type, keyword) != null) return true;
+    if (containsIgnoreCase(case.description, keyword)) return true;
+    if (containsIgnoreCase(case.intake_type, keyword)) return true;
+    if (containsTextIgnoreCase(case.intent_tags, keyword)) return true;
+    if (containsTextIgnoreCase(case.artifact_kinds, keyword)) return true;
+    if (containsTextIgnoreCase(case.situation_kinds, keyword)) return true;
+    if (containsTextIgnoreCase(case.input_ref_labels, keyword)) return true;
+    if (containsTextIgnoreCase(case.input_ref_purposes, keyword)) return true;
+    if (containsTextIgnoreCase(case.input_ref_reasons, keyword)) return true;
+    if (containsTextIgnoreCase(case.artifact_ref_purposes, keyword)) return true;
+    if (containsTextIgnoreCase(case.artifact_ref_reasons, keyword)) return true;
     return jsonStringValueContains(case.intake_data, keyword);
 }
 
 fn jsonStringValueContains(value: std.json.Value, keyword: []const u8) bool {
     return switch (value) {
-        .string => |s| std.mem.indexOf(u8, s, keyword) != null,
+        .string => |s| containsIgnoreCase(s, keyword),
         .array => |arr| {
             for (arr.items) |item| {
                 if (jsonStringValueContains(item, keyword)) return true;
@@ -286,7 +296,7 @@ fn jsonStringValueContains(value: std.json.Value, keyword: []const u8) bool {
         .object => |obj| {
             var it = obj.iterator();
             while (it.next()) |entry| {
-                if (std.mem.indexOf(u8, entry.key_ptr.*, keyword) != null) return true;
+                if (containsIgnoreCase(entry.key_ptr.*, keyword)) return true;
                 if (jsonStringValueContains(entry.value_ptr.*, keyword)) return true;
             }
             return false;
@@ -295,14 +305,44 @@ fn jsonStringValueContains(value: std.json.Value, keyword: []const u8) bool {
     };
 }
 
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var idx: usize = 0;
+    while (idx + needle.len <= haystack.len) : (idx += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[idx .. idx + needle.len], needle)) return true;
+    }
+    return false;
+}
+
 fn hasRequiredContextFields(case: *const ContextCase, fields: []const []const u8) bool {
     for (fields) |field| {
-        if (std.mem.eql(u8, field, "description") or std.mem.eql(u8, field, "summary")) {
+        if (std.ascii.eqlIgnoreCase(field, "description") or std.ascii.eqlIgnoreCase(field, "summary")) {
             if (case.description.len == 0) return false;
             continue;
         }
-        if (std.mem.eql(u8, field, "intake_type") or std.mem.eql(u8, field, "intakeType")) {
+        if (std.ascii.eqlIgnoreCase(field, "intake_type") or std.ascii.eqlIgnoreCase(field, "intakeType")) {
             if (case.intake_type.len == 0) return false;
+            continue;
+        }
+        if (std.ascii.eqlIgnoreCase(field, "intent_tags") or std.ascii.eqlIgnoreCase(field, "intentTags")) {
+            if (case.intent_tags.len == 0) return false;
+            continue;
+        }
+        if (std.ascii.eqlIgnoreCase(field, "situation_kinds") or std.ascii.eqlIgnoreCase(field, "situationKinds")) {
+            if (case.situation_kinds.len == 0) return false;
+            continue;
+        }
+        if (std.ascii.eqlIgnoreCase(field, "artifact_kinds") or std.ascii.eqlIgnoreCase(field, "artifactKinds")) {
+            if (case.artifact_kinds.len == 0) return false;
+            continue;
+        }
+        if (std.ascii.eqlIgnoreCase(field, "input_refs") or std.ascii.eqlIgnoreCase(field, "inputRefs")) {
+            if (case.input_ref_labels.len == 0 and case.input_ref_purposes.len == 0 and case.input_ref_reasons.len == 0) return false;
+            continue;
+        }
+        if (std.ascii.eqlIgnoreCase(field, "artifact_refs") or std.ascii.eqlIgnoreCase(field, "artifactRefs")) {
+            if (case.artifact_ref_purposes.len == 0 and case.artifact_ref_reasons.len == 0) return false;
             continue;
         }
         if (!jsonObjectHasField(case.intake_data, field)) return false;
@@ -312,7 +352,21 @@ fn hasRequiredContextFields(case: *const ContextCase, fields: []const []const u8
 
 fn jsonObjectHasField(value: std.json.Value, field: []const u8) bool {
     if (value != .object) return false;
-    return value.object.get(field) != null;
+    var it = value.object.iterator();
+    while (it.next()) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, field)) return true;
+    }
+    return false;
+}
+
+fn buildMatchTrace(case: *const ContextCase, match: context_autopsy.PackAutopsyMatch) []const u8 {
+    _ = case;
+    if (match.intent_tags_any.len != 0 or match.intent_tags_all.len != 0) return "matched: intent_tags";
+    if (match.situation_kinds_any.len != 0 or match.situation_kinds_all.len != 0) return "matched: situation_kinds";
+    if (match.artifact_kinds_any.len != 0 or match.artifact_kinds_all.len != 0) return "matched: artifact_kinds";
+    if (match.context_keywords_any.len != 0 or match.context_keywords_all.len != 0) return "matched: context_keywords";
+    if (match.required_context_fields.len != 0) return "matched: required_context_fields";
+    return "matched: general_guidance";
 }
 
 pub const ContextAutopsyEngine = struct {
@@ -618,6 +672,76 @@ test "pack guidance source applies only matching case-aware guidance" {
     try std.testing.expectEqualStrings("matched_signal", result.detected_signals[0].name);
     try std.testing.expectEqual(@as(usize, 1), result.pack_influences.len);
     try std.testing.expectEqualStrings("matching_pack", result.pack_influences[0].pack_name);
+    try std.testing.expectEqualStrings("matched: intent_tags", result.pack_influences[0].match_trace);
+}
+
+test "pack guidance matching is case-insensitive for structured tags and keywords" {
+    const guidance = [_]context_autopsy.PackAutopsyGuidance{.{
+        .influence = .{ .pack_name = "case_pack", .weight = "medium" },
+        .match = .{
+            .intent_tags_any = &.{"Planning"},
+            .situation_kinds_any = &.{"Launch"},
+            .context_keywords_any = &.{"ROADMAP"},
+        },
+        .signals = &.{.{
+            .name = "case_insensitive_signal",
+            .source_pack = "case_pack",
+            .kind = "generic_signal",
+            .confidence = "medium",
+            .reason = "case-insensitive match",
+        }},
+    }};
+    var pack_source = PackGuidanceSource.init(&guidance);
+    const sources = [_]ContextSignalSource{pack_source.source()};
+    var engine = ContextAutopsyEngine.init(std.testing.allocator, &sources);
+    const case = ContextCase{
+        .description = "roadmap planning",
+        .intake_data = .null,
+        .intake_type = "test",
+        .intent_tags = &.{"planning"},
+        .situation_kinds = &.{"launch"},
+    };
+
+    var result = try engine.evaluate(&case);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), result.detected_signals.len);
+    try std.testing.expectEqualStrings("case_insensitive_signal", result.detected_signals[0].name);
+    try std.testing.expectEqualStrings("matched: intent_tags", result.pack_influences[0].match_trace);
+}
+
+test "pack guidance keywords match input and artifact ref metadata" {
+    const guidance = [_]context_autopsy.PackAutopsyGuidance{.{
+        .influence = .{ .pack_name = "metadata_pack", .weight = "medium" },
+        .match = .{
+            .context_keywords_all = &.{ "transcript", "build log" },
+            .required_context_fields = &.{ "input_refs", "artifact_refs" },
+        },
+        .signals = &.{.{
+            .name = "metadata_signal",
+            .source_pack = "metadata_pack",
+            .kind = "generic_signal",
+            .confidence = "medium",
+            .reason = "metadata matched",
+        }},
+    }};
+    var pack_source = PackGuidanceSource.init(&guidance);
+    const sources = [_]ContextSignalSource{pack_source.source()};
+    var engine = ContextAutopsyEngine.init(std.testing.allocator, &sources);
+    const case = ContextCase{
+        .description = "metadata test",
+        .intake_data = .null,
+        .intake_type = "test",
+        .input_ref_labels = &.{"Transcript"},
+        .artifact_ref_purposes = &.{"Build Log"},
+    };
+
+    var result = try engine.evaluate(&case);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), result.detected_signals.len);
+    try std.testing.expectEqualStrings("metadata_signal", result.detected_signals[0].name);
+    try std.testing.expectEqualStrings("matched: context_keywords", result.pack_influences[0].match_trace);
 }
 
 test "nonmatching pack guidance produces explicit unknown gap" {
