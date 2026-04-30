@@ -4,6 +4,16 @@ const sys = core.sys;
 const task_intent = core.task_intent;
 
 pub fn main() !void {
+    mainImpl() catch |err| switch (err) {
+        error.InvalidArguments => {
+            std.debug.print("ghost_task_intent: invalid arguments\nUse --help for usage.\n", .{});
+            std.process.exit(2);
+        },
+        else => return err,
+    };
+}
+
+fn mainImpl() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();

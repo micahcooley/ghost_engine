@@ -14,6 +14,24 @@ const OutputFormat = enum {
 };
 
 pub fn main() !void {
+    mainImpl() catch |err| switch (err) {
+        error.InvalidArguments => {
+            std.debug.print("ghost_code_intel: invalid arguments\nUse --help for usage.\n", .{});
+            std.process.exit(2);
+        },
+        error.FileNotFound => {
+            std.debug.print("ghost_code_intel: repository path was not found\nUse --help for usage.\n", .{});
+            std.process.exit(1);
+        },
+        error.AccessDenied => {
+            std.debug.print("ghost_code_intel: repository path could not be accessed\nUse --help for usage.\n", .{});
+            std.process.exit(1);
+        },
+        else => return err,
+    };
+}
+
+fn mainImpl() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();

@@ -4,6 +4,24 @@ const corpus_ingest = core.corpus_ingest;
 const sys = core.sys;
 
 pub fn main() !void {
+    mainImpl() catch |err| switch (err) {
+        error.InvalidArguments, error.InvalidCharacter, error.Overflow => {
+            std.debug.print("ghost_corpus_ingest: invalid arguments\nUse --help for usage.\n", .{});
+            std.process.exit(2);
+        },
+        error.FileNotFound => {
+            std.debug.print("ghost_corpus_ingest: corpus path was not found\nUse --help for usage.\n", .{});
+            std.process.exit(1);
+        },
+        error.AccessDenied => {
+            std.debug.print("ghost_corpus_ingest: corpus path could not be accessed\nUse --help for usage.\n", .{});
+            std.process.exit(1);
+        },
+        else => return err,
+    };
+}
+
+fn mainImpl() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
