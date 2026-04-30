@@ -107,12 +107,68 @@ pub fn main() !void {
         };
         defer parsed.deinit();
 
+        if (parsed.value != .object) {
+            try writeStructuredErrorResponse(
+                allocator,
+                request_id,
+                null,
+                .rejected,
+                .{ .code = .json_contract_error, .message = "GIP request must be a JSON object" },
+            );
+            std.process.exit(1);
+        }
+
         const obj = parsed.value.object;
-        const j_version = if (obj.get("gipVersion")) |v| v.string else null;
-        const j_kind = if (obj.get("kind")) |v| v.string else null;
-        const j_path = if (obj.get("path")) |v| v.string else null;
-        const j_workspace = if (obj.get("workspace")) |v| v.string else null;
-        const j_request_id = if (obj.get("requestId")) |v| v.string else null;
+        const j_request_id = jsonStringField(obj, "requestId") catch {
+            try writeStructuredErrorResponse(
+                allocator,
+                request_id,
+                null,
+                .rejected,
+                .{ .code = .json_contract_error, .message = "requestId must be a string when present" },
+            );
+            std.process.exit(1);
+        };
+        const j_version = jsonStringField(obj, "gipVersion") catch {
+            try writeStructuredErrorResponse(
+                allocator,
+                j_request_id orelse request_id,
+                null,
+                .rejected,
+                .{ .code = .json_contract_error, .message = "gipVersion must be a string when present" },
+            );
+            std.process.exit(1);
+        };
+        const j_kind = jsonStringField(obj, "kind") catch {
+            try writeStructuredErrorResponse(
+                allocator,
+                j_request_id orelse request_id,
+                null,
+                .rejected,
+                .{ .code = .json_contract_error, .message = "kind must be a string when present" },
+            );
+            std.process.exit(1);
+        };
+        const j_path = jsonStringField(obj, "path") catch {
+            try writeStructuredErrorResponse(
+                allocator,
+                j_request_id orelse request_id,
+                null,
+                .rejected,
+                .{ .code = .json_contract_error, .message = "path must be a string when present" },
+            );
+            std.process.exit(1);
+        };
+        const j_workspace = jsonStringField(obj, "workspace") catch {
+            try writeStructuredErrorResponse(
+                allocator,
+                j_request_id orelse request_id,
+                null,
+                .rejected,
+                .{ .code = .json_contract_error, .message = "workspace must be a string when present" },
+            );
+            std.process.exit(1);
+        };
 
         var result = try gip.dispatch.dispatch(
             allocator,
@@ -220,6 +276,12 @@ fn printUsage() !void {
     );
 }
 
+fn jsonStringField(obj: std.json.ObjectMap, field: []const u8) !?[]const u8 {
+    const value = obj.get(field) orelse return null;
+    if (value != .string) return error.JsonFieldMustBeString;
+    return value.string;
+}
+
 fn writeStructuredErrorResponse(
     allocator: std.mem.Allocator,
     request_id: ?[]const u8,
@@ -243,6 +305,22 @@ fn writeStructuredErrorResponse(
     const stdout = std.io.getStdOut().writer();
     try stdout.writeAll(response);
     try stdout.writeByte('\n');
+}
+
+test "json string field rejects non-string GIP envelope fields" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"kind\":42}", .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expectError(error.JsonFieldMustBeString, jsonStringField(parsed.value.object, "kind"));
+}
+
+test "json string field accepts missing and string GIP envelope fields" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"kind\":\"engine.status\"}", .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("engine.status", (try jsonStringField(parsed.value.object, "kind")).?);
+    try std.testing.expect((try jsonStringField(parsed.value.object, "workspace")) == null);
 }
 
 test "stdin request limit is named and larger than legacy 64KB cap" {

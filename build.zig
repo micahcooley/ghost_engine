@@ -264,6 +264,39 @@ pub fn build(b: *std.Build) void {
     const run_gip_cli_tests = b.addRunArtifact(gip_cli_tests);
     test_step.dependOn(&run_gip_cli_tests.step);
 
+    const knowledge_pack_cli_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/knowledge_packs.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    knowledge_pack_cli_tests.root_module.addOptions("build_options", test_core_options);
+    knowledge_pack_cli_tests.root_module.linkSystemLibrary("c", .{});
+    if (target.result.os.tag == .linux) {
+        knowledge_pack_cli_tests.root_module.linkSystemLibrary("dl", .{});
+    }
+    addVulkanIncludes(knowledge_pack_cli_tests.root_module, target.result.os, vulkan_sdk, b);
+    const run_knowledge_pack_cli_tests = b.addRunArtifact(knowledge_pack_cli_tests);
+    test_step.dependOn(&run_knowledge_pack_cli_tests.step);
+
+    const project_autopsy_cli_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/project_autopsy_cli.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    project_autopsy_cli_tests.root_module.addImport("ghost_core", ghost_core_test);
+    project_autopsy_cli_tests.root_module.addOptions("build_options", test_core_options);
+    project_autopsy_cli_tests.root_module.linkSystemLibrary("c", .{});
+    if (target.result.os.tag == .linux) {
+        project_autopsy_cli_tests.root_module.linkSystemLibrary("dl", .{});
+    }
+    addVulkanIncludes(project_autopsy_cli_tests.root_module, target.result.os, vulkan_sdk, b);
+    const run_project_autopsy_cli_tests = b.addRunArtifact(project_autopsy_cli_tests);
+    test_step.dependOn(&run_project_autopsy_cli_tests.step);
+
     // ── 10. Parity Test ──
     const parity_test = b.addTest(.{
         .root_module = b.createModule(.{

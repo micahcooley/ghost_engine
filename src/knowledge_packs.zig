@@ -57,6 +57,28 @@ const command_registry = [_]CommandSpec{
 };
 
 pub fn main() !void {
+    mainImpl() catch |err| switch (err) {
+        error.InvalidArguments => {
+            printCliExpectedError("invalid arguments; use --help to list required flags for each command");
+            std.process.exit(2);
+        },
+        error.FileNotFound => {
+            printCliExpectedError("required file or knowledge pack was not found");
+            std.process.exit(1);
+        },
+        error.PathAlreadyExists => {
+            printCliExpectedError("target knowledge pack path already exists");
+            std.process.exit(1);
+        },
+        error.AccessDenied => {
+            printCliExpectedError("required file or knowledge pack could not be accessed");
+            std.process.exit(1);
+        },
+        else => return err,
+    };
+}
+
+fn mainImpl() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -376,6 +398,21 @@ pub fn main() !void {
             sys.printOut("\n");
         },
     }
+}
+
+fn printCliExpectedError(message: []const u8) void {
+    std.debug.print("ghost_knowledge_pack: {s}\nUse --help to list supported commands and flags.\n", .{message});
+}
+
+fn isExpectedCliError(err: anyerror) bool {
+    return switch (err) {
+        error.InvalidArguments,
+        error.FileNotFound,
+        error.PathAlreadyExists,
+        error.AccessDenied,
+        => true,
+        else => false,
+    };
 }
 
 pub const CreateOptions = struct {
@@ -2295,6 +2332,14 @@ test "ghost_knowledge_pack command registry drives parsing and help" {
         }
     }
     try std.testing.expect(parseCommand("not-a-command") == null);
+}
+
+test "ghost_knowledge_pack expected CLI errors are classified for clean output" {
+    try std.testing.expect(isExpectedCliError(error.InvalidArguments));
+    try std.testing.expect(isExpectedCliError(error.FileNotFound));
+    try std.testing.expect(isExpectedCliError(error.PathAlreadyExists));
+    try std.testing.expect(isExpectedCliError(error.AccessDenied));
+    try std.testing.expect(!isExpectedCliError(error.OutOfMemory));
 }
 
 test "ghost_knowledge_pack capabilities json lists validation compatibility surface" {
