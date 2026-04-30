@@ -1,10 +1,33 @@
 const std = @import("std");
 const store = @import("knowledge_pack_store.zig");
 
-const MAX_GUIDANCE_BYTES: usize = 512 * 1024;
-const MAX_GUIDANCE_ENTRIES: usize = 256;
-const MAX_ARRAY_ITEMS: usize = 128;
-const MAX_STRING_BYTES: usize = 2048;
+pub const AUTOPSY_GUIDANCE_SCHEMA_V1 = "ghost.autopsy_guidance.v1";
+pub const EXPECTED_GUIDANCE_SCHEMA = "expected schema: {\"schema\":\"ghost.autopsy_guidance.v1\",\"packGuidance\":[...]}";
+
+pub const AutopsyGuidanceValidationLimits = struct {
+    // Defaults keep persisted guidance small enough for deterministic CLI and
+    // context.autopsy preflight while still allowing normal curated pack data.
+    max_guidance_bytes: usize = 512 * 1024,
+    max_guidance_entries: usize = 256,
+    max_array_items: usize = 128,
+    max_string_bytes: usize = 2048,
+
+    pub const hard_cap_guidance_bytes: usize = 4 * 1024 * 1024;
+    pub const hard_cap_guidance_entries: usize = 1024;
+    pub const hard_cap_array_items: usize = 1024;
+    pub const hard_cap_string_bytes: usize = 16 * 1024;
+
+    pub fn default() AutopsyGuidanceValidationLimits {
+        return .{};
+    }
+
+    pub fn validate(self: AutopsyGuidanceValidationLimits) !void {
+        if (self.max_guidance_bytes == 0 or self.max_guidance_bytes > hard_cap_guidance_bytes) return error.GuidanceBytesLimitOutOfRange;
+        if (self.max_guidance_entries == 0 or self.max_guidance_entries > hard_cap_guidance_entries) return error.GuidanceEntriesLimitOutOfRange;
+        if (self.max_array_items == 0 or self.max_array_items > hard_cap_array_items) return error.GuidanceArrayItemsLimitOutOfRange;
+        if (self.max_string_bytes == 0 or self.max_string_bytes > hard_cap_string_bytes) return error.GuidanceStringBytesLimitOutOfRange;
+    }
+};
 
 pub const IssueSeverity = enum {
     @"error",
@@ -32,6 +55,8 @@ pub const GuidanceValidationReport = struct {
     manifest_path: []u8,
     guidance_path: ?[]u8,
     declared_guidance_path: bool,
+    schema: ?[]u8,
+    legacy_unversioned_schema: bool,
     guidance_count: usize,
     error_count: usize,
     warning_count: usize,
@@ -46,6 +71,7 @@ pub const GuidanceValidationReport = struct {
         self.allocator.free(self.pack_version);
         self.allocator.free(self.manifest_path);
         if (self.guidance_path) |path| self.allocator.free(path);
+        if (self.schema) |schema| self.allocator.free(schema);
         for (self.issues) |*issue| issue.deinit(self.allocator);
         self.allocator.free(self.issues);
         self.* = undefined;
@@ -106,25 +132,53 @@ const IssueBuilder = struct {
 };
 
 pub fn validateInstalledPack(allocator: std.mem.Allocator, pack_id: []const u8, pack_version: []const u8) !GuidanceValidationReport {
+    return validateInstalledPackWithLimits(allocator, pack_id, pack_version, .default());
+}
+
+pub fn validateInstalledPackWithLimits(
+    allocator: std.mem.Allocator,
+    pack_id: []const u8,
+    pack_version: []const u8,
+    limits: AutopsyGuidanceValidationLimits,
+) !GuidanceValidationReport {
+    try limits.validate();
     var manifest = try store.loadManifest(allocator, pack_id, pack_version);
     defer manifest.deinit();
     const root = try store.packRootAbsPath(allocator, manifest.pack_id, manifest.pack_version);
     defer allocator.free(root);
     const manifest_path = try store.manifestAbsPath(allocator, manifest.pack_id, manifest.pack_version);
     defer allocator.free(manifest_path);
-    return validateManifestGuidance(allocator, &manifest, root, manifest_path);
+    return validateManifestGuidanceWithLimits(allocator, &manifest, root, manifest_path, limits);
 }
 
 pub fn validateManifestPath(allocator: std.mem.Allocator, manifest_path_raw: []const u8) !GuidanceValidationReport {
+    return validateManifestPathWithLimits(allocator, manifest_path_raw, .default());
+}
+
+pub fn validateManifestPathWithLimits(
+    allocator: std.mem.Allocator,
+    manifest_path_raw: []const u8,
+    limits: AutopsyGuidanceValidationLimits,
+) !GuidanceValidationReport {
+    try limits.validate();
     const manifest_path = try std.fs.path.resolve(allocator, &.{manifest_path_raw});
     defer allocator.free(manifest_path);
     var manifest = try store.loadManifestFromPath(allocator, manifest_path);
     defer manifest.deinit();
     const root = std.fs.path.dirname(manifest_path) orelse return error.InvalidKnowledgePackManifest;
-    return validateManifestGuidance(allocator, &manifest, root, manifest_path);
+    return validateManifestGuidanceWithLimits(allocator, &manifest, root, manifest_path, limits);
 }
 
 pub fn validateMountedPacks(allocator: std.mem.Allocator, paths: anytype) !ValidationSummary {
+    return validateMountedPacksWithLimits(allocator, paths, .default());
+}
+
+pub fn validateMountedPacksWithLimits(
+    allocator: std.mem.Allocator,
+    paths: anytype,
+    limits: AutopsyGuidanceValidationLimits,
+) !ValidationSummary {
+    try limits.validate();
     const mounts = try store.listResolvedMounts(allocator, paths);
     defer {
         for (mounts) |*mount| mount.deinit();
@@ -141,7 +195,7 @@ pub fn validateMountedPacks(allocator: std.mem.Allocator, paths: anytype) !Valid
 
     for (mounts) |*mount| {
         if (!mount.entry.enabled) continue;
-        const report = try validateResolvedMount(allocator, mount);
+        const report = try validateResolvedMountWithLimits(allocator, mount, limits);
         errors += report.error_count;
         warnings += report.warning_count;
         try reports.append(report);
@@ -156,7 +210,15 @@ pub fn validateMountedPacks(allocator: std.mem.Allocator, paths: anytype) !Valid
 }
 
 pub fn validateResolvedMount(allocator: std.mem.Allocator, mount: *const store.ResolvedMount) !GuidanceValidationReport {
-    return validateManifestGuidance(allocator, &mount.manifest, mount.root_abs_path, mount.manifest_abs_path);
+    return validateResolvedMountWithLimits(allocator, mount, .default());
+}
+
+pub fn validateResolvedMountWithLimits(
+    allocator: std.mem.Allocator,
+    mount: *const store.ResolvedMount,
+    limits: AutopsyGuidanceValidationLimits,
+) !GuidanceValidationReport {
+    return validateManifestGuidanceWithLimits(allocator, &mount.manifest, mount.root_abs_path, mount.manifest_abs_path, limits);
 }
 
 pub fn validateManifestGuidance(
@@ -165,6 +227,17 @@ pub fn validateManifestGuidance(
     pack_root_abs_path: []const u8,
     manifest_abs_path: []const u8,
 ) !GuidanceValidationReport {
+    return validateManifestGuidanceWithLimits(allocator, manifest, pack_root_abs_path, manifest_abs_path, .default());
+}
+
+pub fn validateManifestGuidanceWithLimits(
+    allocator: std.mem.Allocator,
+    manifest: *const store.Manifest,
+    pack_root_abs_path: []const u8,
+    manifest_abs_path: []const u8,
+    limits: AutopsyGuidanceValidationLimits,
+) !GuidanceValidationReport {
+    try limits.validate();
     var issues = IssueBuilder.init(allocator);
     errdefer issues.deinit();
 
@@ -173,6 +246,9 @@ pub fn validateManifestGuidance(
     errdefer if (guidance_path) |path| allocator.free(path);
     defer if (guidance_path) |path| allocator.free(path);
     var guidance_count: usize = 0;
+    var schema_version: ?[]u8 = null;
+    errdefer if (schema_version) |schema| allocator.free(schema);
+    var legacy_unversioned_schema = false;
 
     if (guidance_rel) |rel_path| {
         guidance_path = std.fs.path.resolve(allocator, &.{ pack_root_abs_path, rel_path }) catch |err| blk: {
@@ -183,7 +259,10 @@ pub fn validateManifestGuidance(
             if (!pathWithinRoot(pack_root_abs_path, path)) {
                 try issues.add(.@"error", "guidance_path_outside_pack", "$.storage.autopsyGuidanceRelPath", "autopsy guidance path must stay inside the pack root");
             } else {
-                guidance_count = try validateGuidanceFile(allocator, path, manifest.pack_id, manifest.pack_version, &issues);
+                const result = try validateGuidanceFile(allocator, path, manifest.pack_id, manifest.pack_version, limits, &issues);
+                guidance_count = result.count;
+                schema_version = result.schema;
+                legacy_unversioned_schema = result.legacy_unversioned_schema;
             }
         }
     }
@@ -195,6 +274,8 @@ pub fn validateManifestGuidance(
         .manifest_path = try allocator.dupe(u8, manifest_abs_path),
         .guidance_path = if (guidance_path) |path| try allocator.dupe(u8, path) else null,
         .declared_guidance_path = guidance_rel != null,
+        .schema = schema_version,
+        .legacy_unversioned_schema = legacy_unversioned_schema,
         .guidance_count = guidance_count,
         .error_count = issues.errors,
         .warning_count = issues.warnings,
@@ -202,27 +283,43 @@ pub fn validateManifestGuidance(
     };
 }
 
+const GuidanceShapeResult = struct {
+    count: usize,
+    schema: ?[]u8,
+    legacy_unversioned_schema: bool,
+};
+
 fn validateGuidanceFile(
     allocator: std.mem.Allocator,
     guidance_path: []const u8,
     manifest_pack_id: []const u8,
     manifest_pack_version: []const u8,
+    limits: AutopsyGuidanceValidationLimits,
     issues: *IssueBuilder,
-) !usize {
-    const bytes = readFileAbsoluteAlloc(allocator, guidance_path, MAX_GUIDANCE_BYTES) catch |err| {
-        const code = if (err == error.FileNotFound) "guidance_file_missing" else "guidance_file_read_failed";
-        try issues.add(.@"error", code, "$.storage.autopsyGuidanceRelPath", "manifest declares autopsy guidance, but the file could not be read");
-        return 0;
+) !GuidanceShapeResult {
+    const bytes = readFileAbsoluteAlloc(allocator, guidance_path, limits.max_guidance_bytes) catch |err| {
+        const code = switch (err) {
+            error.FileNotFound => "guidance_file_missing",
+            error.FileTooLarge => "guidance_file_exceeds_byte_limit",
+            else => "guidance_file_read_failed",
+        };
+        const message = if (err == error.FileTooLarge)
+            try std.fmt.allocPrint(allocator, "autopsy guidance file exceeds max_guidance_bytes={d}", .{limits.max_guidance_bytes})
+        else
+            try allocator.dupe(u8, "manifest declares autopsy guidance, but the file could not be read");
+        defer allocator.free(message);
+        try issues.add(.@"error", code, "$.storage.autopsyGuidanceRelPath", message);
+        return .{ .count = 0, .schema = null, .legacy_unversioned_schema = false };
     };
     defer allocator.free(bytes);
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch {
         try issues.add(.@"error", "guidance_json_malformed", "$", "autopsy guidance file must be valid JSON");
-        return 0;
+        return .{ .count = 0, .schema = null, .legacy_unversioned_schema = false };
     };
     defer parsed.deinit();
 
-    return validateGuidanceValue(allocator, parsed.value, manifest_pack_id, manifest_pack_version, issues);
+    return validateGuidanceValue(allocator, parsed.value, manifest_pack_id, manifest_pack_version, limits, issues);
 }
 
 pub fn validateGuidanceBytes(
@@ -231,9 +328,43 @@ pub fn validateGuidanceBytes(
     manifest_pack_id: []const u8,
     manifest_pack_version: []const u8,
 ) !GuidanceValidationReport {
+    return validateGuidanceBytesWithLimits(allocator, bytes, manifest_pack_id, manifest_pack_version, .default());
+}
+
+pub fn validateGuidanceBytesWithLimits(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    manifest_pack_id: []const u8,
+    manifest_pack_version: []const u8,
+    limits: AutopsyGuidanceValidationLimits,
+) !GuidanceValidationReport {
+    try limits.validate();
     var issues = IssueBuilder.init(allocator);
     errdefer issues.deinit();
     var guidance_count: usize = 0;
+    var schema_version: ?[]u8 = null;
+    errdefer if (schema_version) |schema| allocator.free(schema);
+    var legacy_unversioned_schema = false;
+
+    if (bytes.len > limits.max_guidance_bytes) {
+        const message = try std.fmt.allocPrint(allocator, "autopsy guidance bytes exceed max_guidance_bytes={d}; observed={d}", .{ limits.max_guidance_bytes, bytes.len });
+        defer allocator.free(message);
+        try issues.add(.@"error", "guidance_bytes_exceed_limit", "$", message);
+        return .{
+            .allocator = allocator,
+            .pack_id = try allocator.dupe(u8, manifest_pack_id),
+            .pack_version = try allocator.dupe(u8, manifest_pack_version),
+            .manifest_path = try allocator.dupe(u8, "<memory>"),
+            .guidance_path = null,
+            .declared_guidance_path = true,
+            .schema = null,
+            .legacy_unversioned_schema = false,
+            .guidance_count = 0,
+            .error_count = issues.errors,
+            .warning_count = issues.warnings,
+            .issues = try issues.toOwnedSlice(),
+        };
+    }
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch {
         try issues.add(.@"error", "guidance_json_malformed", "$", "autopsy guidance file must be valid JSON");
@@ -244,6 +375,8 @@ pub fn validateGuidanceBytes(
             .manifest_path = try allocator.dupe(u8, "<memory>"),
             .guidance_path = null,
             .declared_guidance_path = true,
+            .schema = null,
+            .legacy_unversioned_schema = false,
             .guidance_count = 0,
             .error_count = issues.errors,
             .warning_count = issues.warnings,
@@ -251,7 +384,10 @@ pub fn validateGuidanceBytes(
         };
     };
     defer parsed.deinit();
-    guidance_count = try validateGuidanceValue(allocator, parsed.value, manifest_pack_id, manifest_pack_version, &issues);
+    const result = try validateGuidanceValue(allocator, parsed.value, manifest_pack_id, manifest_pack_version, limits, &issues);
+    guidance_count = result.count;
+    schema_version = result.schema;
+    legacy_unversioned_schema = result.legacy_unversioned_schema;
 
     return .{
         .allocator = allocator,
@@ -260,6 +396,8 @@ pub fn validateGuidanceBytes(
         .manifest_path = try allocator.dupe(u8, "<memory>"),
         .guidance_path = null,
         .declared_guidance_path = true,
+        .schema = schema_version,
+        .legacy_unversioned_schema = legacy_unversioned_schema,
         .guidance_count = guidance_count,
         .error_count = issues.errors,
         .warning_count = issues.warnings,
@@ -272,30 +410,58 @@ fn validateGuidanceValue(
     value: std.json.Value,
     manifest_pack_id: []const u8,
     manifest_pack_version: []const u8,
+    limits: AutopsyGuidanceValidationLimits,
     issues: *IssueBuilder,
-) !usize {
+) !GuidanceShapeResult {
     _ = manifest_pack_version;
+    var schema_version: ?[]u8 = null;
+    errdefer if (schema_version) |schema| allocator.free(schema);
+    var legacy_unversioned_schema = false;
+
     const array = switch (value) {
-        .array => |arr| arr,
+        .array => |arr| blk: {
+            legacy_unversioned_schema = true;
+            try issues.add(.warning, "legacy_unversioned_guidance", "$", EXPECTED_GUIDANCE_SCHEMA ++ "; legacy top-level array remains accepted for compatibility");
+            break :blk arr;
+        },
         .object => |obj| blk: {
+            if (obj.get("schema")) |schema_value| {
+                if (schema_value != .string) {
+                    try issues.add(.@"error", "schema_invalid", "$.schema", EXPECTED_GUIDANCE_SCHEMA ++ "; schema must be a string");
+                    return .{ .count = 0, .schema = null, .legacy_unversioned_schema = false };
+                }
+                if (!std.mem.eql(u8, schema_value.string, AUTOPSY_GUIDANCE_SCHEMA_V1)) {
+                    const message = try std.fmt.allocPrint(allocator, "unsupported autopsy guidance schema '{s}'; {s}", .{ schema_value.string, EXPECTED_GUIDANCE_SCHEMA });
+                    defer allocator.free(message);
+                    try issues.add(.@"error", "unsupported_schema", "$.schema", message);
+                    schema_version = try allocator.dupe(u8, schema_value.string);
+                    return .{ .count = 0, .schema = schema_version, .legacy_unversioned_schema = false };
+                }
+                schema_version = try allocator.dupe(u8, schema_value.string);
+            } else {
+                legacy_unversioned_schema = true;
+                try issues.add(.warning, "legacy_unversioned_guidance", "$.schema", EXPECTED_GUIDANCE_SCHEMA ++ "; legacy object guidance remains accepted for compatibility");
+            }
             const nested = obj.get("packGuidance") orelse obj.get("pack_guidance") orelse {
-                try issues.add(.@"error", "guidance_top_level_unsupported", "$", "guidance JSON must be an array or an object with packGuidance/pack_guidance array");
-                return 0;
+                try issues.add(.@"error", "guidance_top_level_unsupported", "$", EXPECTED_GUIDANCE_SCHEMA ++ "; guidance JSON must be an array or an object with packGuidance/pack_guidance array");
+                return .{ .count = 0, .schema = schema_version, .legacy_unversioned_schema = legacy_unversioned_schema };
             };
             if (nested != .array) {
-                try issues.add(.@"error", "guidance_top_level_unsupported", "$.packGuidance", "packGuidance/pack_guidance must be an array");
-                return 0;
+                try issues.add(.@"error", "guidance_top_level_unsupported", "$.packGuidance", EXPECTED_GUIDANCE_SCHEMA ++ "; packGuidance/pack_guidance must be an array");
+                return .{ .count = 0, .schema = schema_version, .legacy_unversioned_schema = legacy_unversioned_schema };
             }
             break :blk nested.array;
         },
         else => {
-            try issues.add(.@"error", "guidance_top_level_unsupported", "$", "guidance JSON must be an array or an object with packGuidance/pack_guidance array");
-            return 0;
+            try issues.add(.@"error", "guidance_top_level_unsupported", "$", EXPECTED_GUIDANCE_SCHEMA ++ "; guidance JSON must be an array or an object with packGuidance/pack_guidance array");
+            return .{ .count = 0, .schema = null, .legacy_unversioned_schema = false };
         },
     };
 
-    if (array.items.len > MAX_GUIDANCE_ENTRIES) {
-        try issues.add(.@"error", "guidance_entry_count_exceeds_bound", "$", "guidance file has too many entries");
+    if (array.items.len > limits.max_guidance_entries) {
+        const message = try std.fmt.allocPrint(allocator, "guidance file has too many entries; limit={d} observed={d}", .{ limits.max_guidance_entries, array.items.len });
+        defer allocator.free(message);
+        try issues.add(.@"error", "guidance_entry_count_exceeds_bound", "$.packGuidance", message);
     }
 
     for (array.items, 0..) |item, idx| {
@@ -305,9 +471,9 @@ fn validateGuidanceValue(
             try issues.add(.@"error", "guidance_entry_not_object", entry_path, "each guidance entry must be an object");
             continue;
         };
-        try validateGuidanceEntry(allocator, obj, idx, manifest_pack_id, issues);
+        try validateGuidanceEntry(allocator, obj, idx, manifest_pack_id, limits, issues);
     }
-    return array.items.len;
+    return .{ .count = array.items.len, .schema = schema_version, .legacy_unversioned_schema = legacy_unversioned_schema };
 }
 
 fn validateGuidanceEntry(
@@ -315,6 +481,7 @@ fn validateGuidanceEntry(
     obj: std.json.ObjectMap,
     idx: usize,
     manifest_pack_id: []const u8,
+    limits: AutopsyGuidanceValidationLimits,
     issues: *IssueBuilder,
 ) !void {
     if (!hasUsableIdentity(obj, manifest_pack_id)) {
@@ -326,15 +493,15 @@ fn validateGuidanceEntry(
             try addEntryIssue(allocator, issues, .@"error", idx, ".match", "match_not_object", "match must be an object when present");
             return;
         };
-        try validateMatch(allocator, match_obj, idx, issues);
+        try validateMatch(allocator, match_obj, idx, limits, issues);
     }
 
-    try validateGuidanceArray(allocator, obj, idx, "signals", "signals", issues, validateSignal);
-    try validateGuidanceArray(allocator, obj, idx, "unknowns", "unknowns", issues, validateUnknown);
-    try validateGuidanceArray(allocator, obj, idx, "risks", "risks", issues, validateRisk);
-    try validateGuidanceArray(allocator, obj, idx, "candidate_actions", "candidateActions", issues, validateAction);
-    try validateGuidanceArray(allocator, obj, idx, "check_candidates", "checkCandidates", issues, validateCheck);
-    try validateGuidanceArray(allocator, obj, idx, "evidence_expectations", "evidenceExpectations", issues, validateEvidenceExpectation);
+    try validateGuidanceArray(allocator, obj, idx, "signals", "signals", limits, issues, validateSignal);
+    try validateGuidanceArray(allocator, obj, idx, "unknowns", "unknowns", limits, issues, validateUnknown);
+    try validateGuidanceArray(allocator, obj, idx, "risks", "risks", limits, issues, validateRisk);
+    try validateGuidanceArray(allocator, obj, idx, "candidate_actions", "candidateActions", limits, issues, validateAction);
+    try validateGuidanceArray(allocator, obj, idx, "check_candidates", "checkCandidates", limits, issues, validateCheck);
+    try validateGuidanceArray(allocator, obj, idx, "evidence_expectations", "evidenceExpectations", limits, issues, validateEvidenceExpectation);
 
     if (obj.get("influence")) |influence_value| {
         const influence = valueObject(influence_value) orelse {
@@ -353,7 +520,13 @@ fn validateGuidanceEntry(
     }
 }
 
-fn validateMatch(allocator: std.mem.Allocator, obj: std.json.ObjectMap, idx: usize, issues: *IssueBuilder) !void {
+fn validateMatch(
+    allocator: std.mem.Allocator,
+    obj: std.json.ObjectMap,
+    idx: usize,
+    limits: AutopsyGuidanceValidationLimits,
+    issues: *IssueBuilder,
+) !void {
     const fields = [_][]const u8{
         "intent_tags_any",
         "intentTagsAny",
@@ -386,18 +559,24 @@ fn validateMatch(allocator: std.mem.Allocator, obj: std.json.ObjectMap, idx: usi
             continue;
         }
         const arr = entry.value_ptr.array;
-        if (arr.items.len > MAX_ARRAY_ITEMS) {
-            try addEntryIssue(allocator, issues, .@"error", idx, ".match", "match_field_exceeds_bound", "match criteria array exceeds validator bound");
+        if (arr.items.len > limits.max_array_items) {
+            const message = try std.fmt.allocPrint(allocator, "match criteria array exceeds max_array_items={d}; observed={d}", .{ limits.max_array_items, arr.items.len });
+            defer allocator.free(message);
+            try addEntryIssue(allocator, issues, .@"error", idx, ".match", "match_field_exceeds_bound", message);
         }
         total_items += arr.items.len;
         for (arr.items) |item| {
-            if (!validStringValue(item)) {
-                try addEntryIssue(allocator, issues, .@"error", idx, ".match", "match_field_invalid_item", "match criteria arrays must contain non-empty bounded strings");
+            if (!validStringValue(item, limits)) {
+                const message = try std.fmt.allocPrint(allocator, "match criteria arrays must contain non-empty strings no larger than max_string_bytes={d}", .{limits.max_string_bytes});
+                defer allocator.free(message);
+                try addEntryIssue(allocator, issues, .@"error", idx, ".match", "match_field_invalid_item", message);
             }
         }
     }
-    if (total_items > MAX_ARRAY_ITEMS) {
-        try addEntryIssue(allocator, issues, .@"error", idx, ".match", "match_total_exceeds_bound", "combined match criteria exceed validator bound");
+    if (total_items > limits.max_array_items) {
+        const message = try std.fmt.allocPrint(allocator, "combined match criteria exceed max_array_items={d}; observed={d}", .{ limits.max_array_items, total_items });
+        defer allocator.free(message);
+        try addEntryIssue(allocator, issues, .@"error", idx, ".match", "match_total_exceeds_bound", message);
     }
 }
 
@@ -407,57 +586,60 @@ fn validateGuidanceArray(
     idx: usize,
     snake: []const u8,
     camel: []const u8,
+    limits: AutopsyGuidanceValidationLimits,
     issues: *IssueBuilder,
-    comptime validateItem: fn (std.mem.Allocator, std.json.ObjectMap, usize, usize, *IssueBuilder) anyerror!void,
+    comptime validateItem: fn (std.mem.Allocator, std.json.ObjectMap, usize, usize, AutopsyGuidanceValidationLimits, *IssueBuilder) anyerror!void,
 ) !void {
     const value = obj.get(snake) orelse obj.get(camel) orelse return;
     if (value != .array) {
         try addEntryIssue(allocator, issues, .@"error", idx, snake, "guidance_section_not_array", "guidance sections must be arrays");
         return;
     }
-    if (value.array.items.len > MAX_ARRAY_ITEMS) {
-        try addEntryIssue(allocator, issues, .@"error", idx, snake, "guidance_section_exceeds_bound", "guidance section exceeds validator bound");
+    if (value.array.items.len > limits.max_array_items) {
+        const message = try std.fmt.allocPrint(allocator, "guidance section exceeds max_array_items={d}; observed={d}", .{ limits.max_array_items, value.array.items.len });
+        defer allocator.free(message);
+        try addEntryIssue(allocator, issues, .@"error", idx, snake, "guidance_section_exceeds_bound", message);
     }
     for (value.array.items, 0..) |item, item_idx| {
         const item_obj = valueObject(item) orelse {
             try addEntryIssue(allocator, issues, .@"error", idx, snake, "guidance_section_item_not_object", "guidance section items must be objects");
             continue;
         };
-        try validateItem(allocator, item_obj, idx, item_idx, issues);
+        try validateItem(allocator, item_obj, idx, item_idx, limits, issues);
     }
 }
 
-fn validateSignal(allocator: std.mem.Allocator, obj: std.json.ObjectMap, entry_idx: usize, item_idx: usize, issues: *IssueBuilder) !void {
-    try requireString(allocator, obj, entry_idx, item_idx, "signals", "name", "name", "signal_missing_name", issues);
-    try requireString(allocator, obj, entry_idx, item_idx, "signals", "kind", "kind", "signal_missing_kind", issues);
-    try requireString(allocator, obj, entry_idx, item_idx, "signals", "reason", "reason", "signal_missing_reason", issues);
-    try optionalString(allocator, obj, entry_idx, item_idx, "signals", "confidence", "confidence", "signal_invalid_confidence", issues);
+fn validateSignal(allocator: std.mem.Allocator, obj: std.json.ObjectMap, entry_idx: usize, item_idx: usize, limits: AutopsyGuidanceValidationLimits, issues: *IssueBuilder) !void {
+    try requireString(allocator, obj, entry_idx, item_idx, "signals", "name", "name", "signal_missing_name", limits, issues);
+    try requireString(allocator, obj, entry_idx, item_idx, "signals", "kind", "kind", "signal_missing_kind", limits, issues);
+    try requireString(allocator, obj, entry_idx, item_idx, "signals", "reason", "reason", "signal_missing_reason", limits, issues);
+    try optionalString(allocator, obj, entry_idx, item_idx, "signals", "confidence", "confidence", "signal_invalid_confidence", limits, issues);
 }
 
-fn validateUnknown(allocator: std.mem.Allocator, obj: std.json.ObjectMap, entry_idx: usize, item_idx: usize, issues: *IssueBuilder) !void {
-    try requireString(allocator, obj, entry_idx, item_idx, "unknowns", "name", "name", "unknown_missing_name", issues);
-    try requireString(allocator, obj, entry_idx, item_idx, "unknowns", "importance", "importance", "unknown_missing_importance", issues);
-    try requireString(allocator, obj, entry_idx, item_idx, "unknowns", "reason", "reason", "unknown_missing_reason", issues);
+fn validateUnknown(allocator: std.mem.Allocator, obj: std.json.ObjectMap, entry_idx: usize, item_idx: usize, limits: AutopsyGuidanceValidationLimits, issues: *IssueBuilder) !void {
+    try requireString(allocator, obj, entry_idx, item_idx, "unknowns", "name", "name", "unknown_missing_name", limits, issues);
+    try requireString(allocator, obj, entry_idx, item_idx, "unknowns", "importance", "importance", "unknown_missing_importance", limits, issues);
+    try requireString(allocator, obj, entry_idx, item_idx, "unknowns", "reason", "reason", "unknown_missing_reason", limits, issues);
     if (getBoolAny(obj, &.{ "is_negative_evidence", "isNegativeEvidence" }) orelse false) {
         try addItemIssue(allocator, issues, .warning, entry_idx, item_idx, "unknowns", "unknown_negative_evidence_clamped", "missing context cannot be negative evidence; runtime finalization clamps this to false");
     }
 }
 
-fn validateRisk(allocator: std.mem.Allocator, obj: std.json.ObjectMap, entry_idx: usize, item_idx: usize, issues: *IssueBuilder) !void {
-    if (!hasStringAny(obj, &.{ "risk_kind", "riskKind", "name" })) {
+fn validateRisk(allocator: std.mem.Allocator, obj: std.json.ObjectMap, entry_idx: usize, item_idx: usize, limits: AutopsyGuidanceValidationLimits, issues: *IssueBuilder) !void {
+    if (!hasStringAny(obj, &.{ "risk_kind", "riskKind", "name" }, limits)) {
         try addItemIssue(allocator, issues, .@"error", entry_idx, item_idx, "risks", "risk_missing_kind", "risk must have risk_kind/riskKind or name");
     }
-    try requireString(allocator, obj, entry_idx, item_idx, "risks", "reason", "reason", "risk_missing_reason", issues);
-    try requireString(allocator, obj, entry_idx, item_idx, "risks", "suggested_caution", "suggestedCaution", "risk_missing_caution", issues);
+    try requireString(allocator, obj, entry_idx, item_idx, "risks", "reason", "reason", "risk_missing_reason", limits, issues);
+    try requireString(allocator, obj, entry_idx, item_idx, "risks", "suggested_caution", "suggestedCaution", "risk_missing_caution", limits, issues);
     if (getBoolAny(obj, &.{ "non_authorizing", "nonAuthorizing" })) |value| {
         if (!value) try addItemIssue(allocator, issues, .warning, entry_idx, item_idx, "risks", "risk_authorizing_clamped", "risk surfaces cannot authorize support; runtime finalization clamps this to non-authorizing");
     }
 }
 
-fn validateAction(allocator: std.mem.Allocator, obj: std.json.ObjectMap, entry_idx: usize, item_idx: usize, issues: *IssueBuilder) !void {
-    try requireString(allocator, obj, entry_idx, item_idx, "candidate_actions", "id", "id", "action_missing_id", issues);
-    try requireString(allocator, obj, entry_idx, item_idx, "candidate_actions", "summary", "summary", "action_missing_summary", issues);
-    try requireString(allocator, obj, entry_idx, item_idx, "candidate_actions", "action_type", "actionType", "action_missing_type", issues);
+fn validateAction(allocator: std.mem.Allocator, obj: std.json.ObjectMap, entry_idx: usize, item_idx: usize, limits: AutopsyGuidanceValidationLimits, issues: *IssueBuilder) !void {
+    try requireString(allocator, obj, entry_idx, item_idx, "candidate_actions", "id", "id", "action_missing_id", limits, issues);
+    try requireString(allocator, obj, entry_idx, item_idx, "candidate_actions", "summary", "summary", "action_missing_summary", limits, issues);
+    try requireString(allocator, obj, entry_idx, item_idx, "candidate_actions", "action_type", "actionType", "action_missing_type", limits, issues);
     if (getBoolAny(obj, &.{ "non_authorizing", "nonAuthorizing" })) |value| {
         if (!value) try addItemIssue(allocator, issues, .warning, entry_idx, item_idx, "candidate_actions", "action_authorizing_clamped", "candidate actions cannot authorize execution or support; runtime finalization clamps this to non-authorizing");
     }
@@ -466,15 +648,15 @@ fn validateAction(allocator: std.mem.Allocator, obj: std.json.ObjectMap, entry_i
     }
 }
 
-fn validateCheck(allocator: std.mem.Allocator, obj: std.json.ObjectMap, entry_idx: usize, item_idx: usize, issues: *IssueBuilder) !void {
-    try requireString(allocator, obj, entry_idx, item_idx, "check_candidates", "id", "id", "check_missing_id", issues);
-    if (!hasStringAny(obj, &.{ "summary", "purpose" })) {
+fn validateCheck(allocator: std.mem.Allocator, obj: std.json.ObjectMap, entry_idx: usize, item_idx: usize, limits: AutopsyGuidanceValidationLimits, issues: *IssueBuilder) !void {
+    try requireString(allocator, obj, entry_idx, item_idx, "check_candidates", "id", "id", "check_missing_id", limits, issues);
+    if (!hasStringAny(obj, &.{ "summary", "purpose" }, limits)) {
         try addItemIssue(allocator, issues, .@"error", entry_idx, item_idx, "check_candidates", "check_missing_purpose", "check candidates must have summary or purpose");
     }
-    if (!hasStringAny(obj, &.{ "check_kind", "checkKind", "check_type", "checkType" })) {
+    if (!hasStringAny(obj, &.{ "check_kind", "checkKind", "check_type", "checkType" }, limits)) {
         try addItemIssue(allocator, issues, .@"error", entry_idx, item_idx, "check_candidates", "check_missing_type", "check candidates must have check_kind/checkKind or check_type/checkType");
     }
-    if (!hasStringAny(obj, &.{ "why_candidate_exists", "whyCandidateExists" })) {
+    if (!hasStringAny(obj, &.{ "why_candidate_exists", "whyCandidateExists" }, limits)) {
         try addItemIssue(allocator, issues, .@"error", entry_idx, item_idx, "check_candidates", "check_missing_why", "check candidates must explain why the candidate exists");
     }
     if (getBoolAny(obj, &.{ "executes_by_default", "executesByDefault" }) orelse false) {
@@ -485,12 +667,12 @@ fn validateCheck(allocator: std.mem.Allocator, obj: std.json.ObjectMap, entry_id
     }
 }
 
-fn validateEvidenceExpectation(allocator: std.mem.Allocator, obj: std.json.ObjectMap, entry_idx: usize, item_idx: usize, issues: *IssueBuilder) !void {
-    try requireString(allocator, obj, entry_idx, item_idx, "evidence_expectations", "id", "id", "evidence_missing_id", issues);
-    try requireString(allocator, obj, entry_idx, item_idx, "evidence_expectations", "summary", "summary", "evidence_missing_summary", issues);
-    try requireString(allocator, obj, entry_idx, item_idx, "evidence_expectations", "expectation_kind", "expectationKind", "evidence_missing_kind", issues);
-    try requireString(allocator, obj, entry_idx, item_idx, "evidence_expectations", "expected_signal", "expectedSignal", "evidence_missing_expected_signal", issues);
-    try requireString(allocator, obj, entry_idx, item_idx, "evidence_expectations", "reason", "reason", "evidence_missing_reason", issues);
+fn validateEvidenceExpectation(allocator: std.mem.Allocator, obj: std.json.ObjectMap, entry_idx: usize, item_idx: usize, limits: AutopsyGuidanceValidationLimits, issues: *IssueBuilder) !void {
+    try requireString(allocator, obj, entry_idx, item_idx, "evidence_expectations", "id", "id", "evidence_missing_id", limits, issues);
+    try requireString(allocator, obj, entry_idx, item_idx, "evidence_expectations", "summary", "summary", "evidence_missing_summary", limits, issues);
+    try requireString(allocator, obj, entry_idx, item_idx, "evidence_expectations", "expectation_kind", "expectationKind", "evidence_missing_kind", limits, issues);
+    try requireString(allocator, obj, entry_idx, item_idx, "evidence_expectations", "expected_signal", "expectedSignal", "evidence_missing_expected_signal", limits, issues);
+    try requireString(allocator, obj, entry_idx, item_idx, "evidence_expectations", "reason", "reason", "evidence_missing_reason", limits, issues);
 }
 
 fn requireString(
@@ -502,14 +684,17 @@ fn requireString(
     snake: []const u8,
     camel: []const u8,
     code: []const u8,
+    limits: AutopsyGuidanceValidationLimits,
     issues: *IssueBuilder,
 ) !void {
     const value = obj.get(snake) orelse obj.get(camel) orelse {
         try addItemIssue(allocator, issues, .@"error", entry_idx, item_idx, section, code, "required string field is missing");
         return;
     };
-    if (!validStringValue(value)) {
-        try addItemIssue(allocator, issues, .@"error", entry_idx, item_idx, section, code, "required field must be a non-empty bounded string");
+    if (!validStringValue(value, limits)) {
+        const message = try std.fmt.allocPrint(allocator, "required field must be a non-empty string no larger than max_string_bytes={d}", .{limits.max_string_bytes});
+        defer allocator.free(message);
+        try addItemIssue(allocator, issues, .@"error", entry_idx, item_idx, section, code, message);
     }
 }
 
@@ -522,23 +707,26 @@ fn optionalString(
     snake: []const u8,
     camel: []const u8,
     code: []const u8,
+    limits: AutopsyGuidanceValidationLimits,
     issues: *IssueBuilder,
 ) !void {
     const value = obj.get(snake) orelse obj.get(camel) orelse return;
-    if (!validStringValue(value)) {
-        try addItemIssue(allocator, issues, .@"error", entry_idx, item_idx, section, code, "optional string field must be a non-empty bounded string when present");
+    if (!validStringValue(value, limits)) {
+        const message = try std.fmt.allocPrint(allocator, "optional string field must be a non-empty string no larger than max_string_bytes={d} when present", .{limits.max_string_bytes});
+        defer allocator.free(message);
+        try addItemIssue(allocator, issues, .@"error", entry_idx, item_idx, section, code, message);
     }
 }
 
 fn hasUsableIdentity(obj: std.json.ObjectMap, manifest_pack_id: []const u8) bool {
     if (manifest_pack_id.len != 0) return true;
-    return hasStringAny(obj, &.{ "pack_id", "packId", "source_pack", "sourcePack", "source_id", "sourceId", "source", "sourceKind" });
+    return hasStringAny(obj, &.{ "pack_id", "packId", "source_pack", "sourcePack", "source_id", "sourceId", "source", "sourceKind" }, .default());
 }
 
-fn hasStringAny(obj: std.json.ObjectMap, names: []const []const u8) bool {
+fn hasStringAny(obj: std.json.ObjectMap, names: []const []const u8, limits: AutopsyGuidanceValidationLimits) bool {
     for (names) |name| {
         if (obj.get(name)) |value| {
-            if (validStringValue(value)) return true;
+            if (validStringValue(value, limits)) return true;
         }
     }
     return false;
@@ -557,10 +745,10 @@ fn valueObject(value: std.json.Value) ?std.json.ObjectMap {
     return if (value == .object) value.object else null;
 }
 
-fn validStringValue(value: std.json.Value) bool {
+fn validStringValue(value: std.json.Value, limits: AutopsyGuidanceValidationLimits) bool {
     if (value != .string) return false;
     const trimmed = std.mem.trim(u8, value.string, " \r\n\t");
-    return trimmed.len > 0 and trimmed.len <= MAX_STRING_BYTES;
+    return trimmed.len > 0 and trimmed.len <= limits.max_string_bytes;
 }
 
 fn containsName(names: []const []const u8, needle: []const u8) bool {
@@ -603,6 +791,8 @@ fn addItemIssue(
 fn readFileAbsoluteAlloc(allocator: std.mem.Allocator, abs_path: []const u8, max_bytes: usize) ![]u8 {
     const file = try std.fs.openFileAbsolute(abs_path, .{});
     defer file.close();
+    const end = try file.getEndPos();
+    if (end > max_bytes) return error.FileTooLarge;
     return file.readToEndAlloc(allocator, max_bytes);
 }
 
@@ -625,6 +815,63 @@ test "valid persisted autopsy guidance passes validation" {
     try std.testing.expectEqual(@as(usize, 1), report.guidance_count);
 }
 
+test "versioned autopsy guidance v1 validates without legacy warning" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"schema":"ghost.autopsy_guidance.v1","packGuidance":[{"pack_id":"pack-a","signals":[{"name":"sig","kind":"generic_signal","confidence":"medium","reason":"matched"}]}]}
+    ;
+    var report = try validateGuidanceBytes(allocator, body, "pack-a", "v1");
+    defer report.deinit();
+    try std.testing.expect(report.ok());
+    try std.testing.expectEqualStrings(AUTOPSY_GUIDANCE_SCHEMA_V1, report.schema.?);
+    try std.testing.expectEqual(@as(usize, 0), report.warning_count);
+}
+
+test "legacy unversioned autopsy guidance validates with schema warning" {
+    const allocator = std.testing.allocator;
+    var report = try validateGuidanceBytes(allocator, valid_guidance, "pack-a", "v1");
+    defer report.deinit();
+    try std.testing.expect(report.ok());
+    try std.testing.expect(report.legacy_unversioned_schema);
+    try std.testing.expectEqualStrings("legacy_unversioned_guidance", report.issues[0].code);
+}
+
+test "unsupported autopsy guidance schema fails with structured unsupported_schema" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"schema":"ghost.autopsy_guidance.v99","packGuidance":[]}
+    ;
+    var report = try validateGuidanceBytes(allocator, body, "pack-a", "v1");
+    defer report.deinit();
+    try std.testing.expect(!report.ok());
+    try std.testing.expectEqualStrings("unsupported_schema", report.issues[0].code);
+    try std.testing.expect(std.mem.indexOf(u8, report.issues[0].message, EXPECTED_GUIDANCE_SCHEMA) != null);
+}
+
+test "validation limits enforce defaults and safe overrides" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"schema":"ghost.autopsy_guidance.v1","packGuidance":[{"pack_id":"pack-a","match":{"intent_tags_any":["a","b"]},"signals":[{"name":"sig","kind":"generic_signal","confidence":"medium","reason":"matched"}]}]}
+    ;
+    var strict = AutopsyGuidanceValidationLimits.default();
+    strict.max_array_items = 1;
+    var strict_report = try validateGuidanceBytesWithLimits(allocator, body, "pack-a", "v1", strict);
+    defer strict_report.deinit();
+    try std.testing.expect(!strict_report.ok());
+    try std.testing.expectEqualStrings("match_field_exceeds_bound", strict_report.issues[0].code);
+    try std.testing.expect(std.mem.indexOf(u8, strict_report.issues[0].message, "limit=1") != null or std.mem.indexOf(u8, strict_report.issues[0].message, "max_array_items=1") != null);
+
+    var override = strict;
+    override.max_array_items = 4;
+    var override_report = try validateGuidanceBytesWithLimits(allocator, body, "pack-a", "v1", override);
+    defer override_report.deinit();
+    try std.testing.expect(override_report.ok());
+
+    var too_large = AutopsyGuidanceValidationLimits.default();
+    too_large.max_array_items = AutopsyGuidanceValidationLimits.hard_cap_array_items + 1;
+    try std.testing.expectError(error.GuidanceArrayItemsLimitOutOfRange, too_large.validate());
+}
+
 test "malformed JSON and unsupported shape fail validation without crashing" {
     const allocator = std.testing.allocator;
     var malformed = try validateGuidanceBytes(allocator, "{not-json", "pack-a", "v1");
@@ -635,7 +882,14 @@ test "malformed JSON and unsupported shape fail validation without crashing" {
     var unsupported = try validateGuidanceBytes(allocator, "{\"guidance\":[]}", "pack-a", "v1");
     defer unsupported.deinit();
     try std.testing.expect(!unsupported.ok());
-    try std.testing.expectEqualStrings("guidance_top_level_unsupported", unsupported.issues[0].code);
+    try std.testing.expect(hasIssueCode(unsupported.issues, "guidance_top_level_unsupported"));
+}
+
+fn hasIssueCode(issues: []const ValidationIssue, code: []const u8) bool {
+    for (issues) |issue| {
+        if (std.mem.eql(u8, issue.code, code)) return true;
+    }
+    return false;
 }
 
 test "missing required fields produce validation errors" {
@@ -730,18 +984,18 @@ test "validator does not mutate manifest or guidance files" {
     const guidance_path = try std.fs.path.join(allocator, &.{ root, "autopsy/guidance.json" });
     defer allocator.free(guidance_path);
 
-    const before_manifest = try readFileAbsoluteAlloc(allocator, manifest_path, MAX_GUIDANCE_BYTES);
+    const before_manifest = try readFileAbsoluteAlloc(allocator, manifest_path, AutopsyGuidanceValidationLimits.default().max_guidance_bytes);
     defer allocator.free(before_manifest);
-    const before_guidance = try readFileAbsoluteAlloc(allocator, guidance_path, MAX_GUIDANCE_BYTES);
+    const before_guidance = try readFileAbsoluteAlloc(allocator, guidance_path, AutopsyGuidanceValidationLimits.default().max_guidance_bytes);
     defer allocator.free(before_guidance);
 
     var report = try validateManifestPath(allocator, manifest_path);
     defer report.deinit();
     try std.testing.expect(report.ok());
 
-    const after_manifest = try readFileAbsoluteAlloc(allocator, manifest_path, MAX_GUIDANCE_BYTES);
+    const after_manifest = try readFileAbsoluteAlloc(allocator, manifest_path, AutopsyGuidanceValidationLimits.default().max_guidance_bytes);
     defer allocator.free(after_manifest);
-    const after_guidance = try readFileAbsoluteAlloc(allocator, guidance_path, MAX_GUIDANCE_BYTES);
+    const after_guidance = try readFileAbsoluteAlloc(allocator, guidance_path, AutopsyGuidanceValidationLimits.default().max_guidance_bytes);
     defer allocator.free(after_guidance);
     try std.testing.expectEqualStrings(before_manifest, after_manifest);
     try std.testing.expectEqualStrings(before_guidance, after_guidance);

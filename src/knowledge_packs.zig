@@ -22,10 +22,38 @@ pub const Command = enum {
     import,
     verify,
     @"validate-autopsy-guidance",
+    capabilities,
     @"list-versions",
     @"distill-list",
     @"distill-show",
     @"distill-export",
+};
+
+const CommandSpec = struct {
+    command: Command,
+    name: []const u8,
+    aliases: []const []const u8 = &.{},
+    summary: []const u8,
+};
+
+const command_registry = [_]CommandSpec{
+    .{ .command = .create, .name = "create", .summary = "create a staged knowledge pack" },
+    .{ .command = .inspect, .name = "inspect", .summary = "inspect a knowledge pack" },
+    .{ .command = .list, .name = "list", .summary = "list installed knowledge packs" },
+    .{ .command = .mount, .name = "mount", .summary = "mount a pack for a project" },
+    .{ .command = .unmount, .name = "unmount", .summary = "unmount a pack for a project" },
+    .{ .command = .clone, .name = "clone", .summary = "clone a knowledge pack" },
+    .{ .command = .remove, .name = "remove", .summary = "remove a knowledge pack" },
+    .{ .command = .diff, .name = "diff", .summary = "diff two pack versions" },
+    .{ .command = .@"export", .name = "export", .summary = "export a pack artifact" },
+    .{ .command = .import, .name = "import", .summary = "import a pack artifact" },
+    .{ .command = .verify, .name = "verify", .summary = "verify an exported pack artifact" },
+    .{ .command = .@"validate-autopsy-guidance", .name = "validate-autopsy-guidance", .summary = "validate persisted Context Autopsy guidance" },
+    .{ .command = .capabilities, .name = "capabilities", .summary = "print machine-readable binary capabilities" },
+    .{ .command = .@"list-versions", .name = "list-versions", .summary = "list versions for a pack" },
+    .{ .command = .@"distill-list", .name = "distill-list", .summary = "list feedback distillation candidates" },
+    .{ .command = .@"distill-show", .name = "distill-show", .summary = "show a feedback distillation candidate" },
+    .{ .command = .@"distill-export", .name = "distill-export", .summary = "export an approved distillation candidate into a pack" },
 };
 
 pub fn main() !void {
@@ -37,7 +65,7 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
     if (args.len < 2) {
         printUsage();
-        return error.InvalidArguments;
+        std.process.exit(2);
     }
     if (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h")) {
         printUsage();
@@ -45,8 +73,9 @@ pub fn main() !void {
     }
 
     const command = parseCommand(args[1]) orelse {
+        std.debug.print("unknown command: {s}\nUse --help to list supported ghost_knowledge_pack commands.\n", .{args[1]});
         printUsage();
-        return error.InvalidArguments;
+        std.process.exit(2);
     };
 
     var pack_id: ?[]const u8 = null;
@@ -73,6 +102,7 @@ pub fn main() !void {
     var approve = false;
     var manifest_path: ?[]const u8 = null;
     var all_mounted = false;
+    var validation_limits = autopsy_guidance_validator.AutopsyGuidanceValidationLimits.default();
 
     for (args[2..]) |arg| {
         if (std.mem.startsWith(u8, arg, "--pack-id=")) {
@@ -113,6 +143,18 @@ pub fn main() !void {
             manifest_path = arg["--manifest=".len..];
         } else if (std.mem.eql(u8, arg, "--all-mounted")) {
             all_mounted = true;
+        } else if (std.mem.startsWith(u8, arg, "--max-guidance-bytes=")) {
+            validation_limits.max_guidance_bytes = parseLimitArg(arg, "--max-guidance-bytes=") catch |err| {
+                printLimitErrorAndExit(err, "--max-guidance-bytes", validation_limits.max_guidance_bytes);
+            };
+        } else if (std.mem.startsWith(u8, arg, "--max-array-items=")) {
+            validation_limits.max_array_items = parseLimitArg(arg, "--max-array-items=") catch |err| {
+                printLimitErrorAndExit(err, "--max-array-items", validation_limits.max_array_items);
+            };
+        } else if (std.mem.startsWith(u8, arg, "--max-string-bytes=")) {
+            validation_limits.max_string_bytes = parseLimitArg(arg, "--max-string-bytes=") catch |err| {
+                printLimitErrorAndExit(err, "--max-string-bytes", validation_limits.max_string_bytes);
+            };
         } else if (std.mem.startsWith(u8, arg, "--candidate-id=")) {
             candidate_id = arg["--candidate-id=".len..];
         } else if (std.mem.eql(u8, arg, "--approve")) {
@@ -124,10 +166,12 @@ pub fn main() !void {
         } else if (std.mem.startsWith(u8, arg, "--export-reason=")) {
             export_reason = arg["--export-reason=".len..];
         } else {
+            std.debug.print("unknown flag: {s}\nUse --help to list supported ghost_knowledge_pack flags.\n", .{arg});
             printUsage();
-            return error.InvalidArguments;
+            std.process.exit(2);
         }
     }
+    validateLimitsOrExit(validation_limits);
 
     switch (command) {
         .create => {
@@ -258,13 +302,20 @@ pub fn main() !void {
                 .manifest_path = manifest_path,
                 .all_mounted = all_mounted,
                 .project_shard = project_shard,
+                .limits = validation_limits,
             });
             defer summary.deinit();
             const rendered = try renderAutopsyGuidanceValidation(allocator, &summary, as_json);
             defer allocator.free(rendered);
             sys.printOut(rendered);
             sys.printOut("\n");
-            if (!summary.ok()) return error.AutopsyGuidanceValidationFailed;
+            if (!summary.ok()) std.process.exit(1);
+        },
+        .capabilities => {
+            const rendered = try renderCapabilities(allocator, as_json);
+            defer allocator.free(rendered);
+            sys.printOut(rendered);
+            sys.printOut("\n");
         },
         .@"list-versions" => {
             const id = pack_id orelse return error.InvalidArguments;
@@ -1559,6 +1610,7 @@ const AutopsyGuidanceCliOptions = struct {
     manifest_path: ?[]const u8,
     all_mounted: bool,
     project_shard: ?[]const u8,
+    limits: autopsy_guidance_validator.AutopsyGuidanceValidationLimits,
 };
 
 fn validateAutopsyGuidanceForCli(allocator: std.mem.Allocator, options: AutopsyGuidanceCliOptions) !autopsy_guidance_validator.ValidationSummary {
@@ -1570,7 +1622,7 @@ fn validateAutopsyGuidanceForCli(allocator: std.mem.Allocator, options: AutopsyG
     if (options.all_mounted) {
         var paths = try resolveProjectPathsForCli(allocator, options.project_shard);
         defer paths.deinit();
-        return try autopsy_guidance_validator.validateMountedPacks(allocator, &paths);
+        return try autopsy_guidance_validator.validateMountedPacksWithLimits(allocator, &paths, options.limits);
     }
 
     var reports = std.ArrayList(autopsy_guidance_validator.GuidanceValidationReport).init(allocator);
@@ -1580,12 +1632,13 @@ fn validateAutopsyGuidanceForCli(allocator: std.mem.Allocator, options: AutopsyG
     }
 
     const report = if (options.manifest_path) |path|
-        try autopsy_guidance_validator.validateManifestPath(allocator, path)
+        try autopsy_guidance_validator.validateManifestPathWithLimits(allocator, path, options.limits)
     else
-        try autopsy_guidance_validator.validateInstalledPack(
+        try autopsy_guidance_validator.validateInstalledPackWithLimits(
             allocator,
             options.pack_id orelse return error.InvalidArguments,
             options.pack_version orelse return error.InvalidArguments,
+            options.limits,
         );
 
     const error_count = report.error_count;
@@ -1615,6 +1668,7 @@ fn renderAutopsyGuidanceValidation(
         summary.error_count,
         summary.warning_count,
     });
+    try out.writer().print("\nexpected_schema={s}", .{autopsy_guidance_validator.EXPECTED_GUIDANCE_SCHEMA});
     for (summary.reports) |report| {
         try out.writer().print(
             "\n\npack={s}@{s}\nmanifest={s}\nguidance_declared={s}\nguidance_path={s}\nguidance_entries={d}\nerrors={d}\nwarnings={d}",
@@ -1629,6 +1683,11 @@ fn renderAutopsyGuidanceValidation(
                 report.warning_count,
             },
         );
+        if (report.schema) |schema| {
+            try out.writer().print("\nschema={s}", .{schema});
+        } else if (report.legacy_unversioned_schema) {
+            try out.writer().writeAll("\nschema=<legacy-unversioned>");
+        }
         if (report.issues.len == 0) {
             try out.writer().writeAll("\n  pass");
         } else {
@@ -1654,6 +1713,11 @@ fn renderAutopsyGuidanceValidationJson(
     const w = out.writer();
     try w.writeAll("{\"ok\":");
     try w.writeAll(if (summary.ok()) "true" else "false");
+    try w.writeAll(",\"expectedSchema\":");
+    try writeJsonString(w, autopsy_guidance_validator.EXPECTED_GUIDANCE_SCHEMA);
+    try w.writeAll(",\"supportedSchemaVersions\":[");
+    try writeJsonString(w, autopsy_guidance_validator.AUTOPSY_GUIDANCE_SCHEMA_V1);
+    try w.writeAll("]");
     try w.writeAll(",\"errorCount\":");
     try w.print("{d}", .{summary.error_count});
     try w.writeAll(",\"warningCount\":");
@@ -1673,6 +1737,10 @@ fn renderAutopsyGuidanceValidationJson(
         if (report.guidance_path) |path| try writeJsonString(w, path) else try w.writeAll("null");
         try w.writeAll(",\"guidanceCount\":");
         try w.print("{d}", .{report.guidance_count});
+        try w.writeAll(",\"schema\":");
+        if (report.schema) |schema| try writeJsonString(w, schema) else try w.writeAll("null");
+        try w.writeAll(",\"legacyUnversionedSchema\":");
+        try w.writeAll(if (report.legacy_unversioned_schema) "true" else "false");
         try w.writeAll(",\"errorCount\":");
         try w.print("{d}", .{report.error_count});
         try w.writeAll(",\"warningCount\":");
@@ -1693,6 +1761,60 @@ fn renderAutopsyGuidanceValidationJson(
         try w.writeAll("]}");
     }
     try w.writeAll("]}");
+    return out.toOwnedSlice();
+}
+
+fn renderCapabilities(allocator: std.mem.Allocator, as_json: bool) ![]u8 {
+    if (!as_json) {
+        var out = std.ArrayList(u8).init(allocator);
+        errdefer out.deinit();
+        try out.writer().writeAll("binary=ghost_knowledge_pack\n");
+        try out.writer().print("ghost_version={s}\ncommands=", .{@import("ghost.zig").VERSION});
+        for (command_registry, 0..) |spec, idx| {
+            if (idx != 0) try out.writer().writeAll(",");
+            try out.writer().writeAll(spec.name);
+        }
+        try out.writer().print("\nautopsy_guidance_schema={s}", .{autopsy_guidance_validator.AUTOPSY_GUIDANCE_SCHEMA_V1});
+        return out.toOwnedSlice();
+    }
+
+    const defaults = autopsy_guidance_validator.AutopsyGuidanceValidationLimits.default();
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"binaryName\":\"ghost_knowledge_pack\",\"ghostVersion\":");
+    try writeJsonString(w, @import("ghost.zig").VERSION);
+    try w.writeAll(",\"commands\":[");
+    for (command_registry, 0..) |spec, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{\"name\":");
+        try writeJsonString(w, spec.name);
+        try w.writeAll(",\"summary\":");
+        try writeJsonString(w, spec.summary);
+        try w.writeAll(",\"aliases\":[");
+        for (spec.aliases, 0..) |alias, alias_idx| {
+            if (alias_idx != 0) try w.writeByte(',');
+            try writeJsonString(w, alias);
+        }
+        try w.writeAll("]}");
+    }
+    try w.writeAll("],\"validateAutopsyGuidance\":{\"flags\":[\"--pack-id\",\"--version\",\"--manifest\",\"--all-mounted\",\"--project-shard\",\"--json\",\"--max-guidance-bytes\",\"--max-array-items\",\"--max-string-bytes\"],\"supportedSchemaVersions\":[");
+    try writeJsonString(w, autopsy_guidance_validator.AUTOPSY_GUIDANCE_SCHEMA_V1);
+    try w.writeAll("],\"preferredShape\":\"{\\\"schema\\\":\\\"ghost.autopsy_guidance.v1\\\",\\\"packGuidance\\\":[...]}\",\"legacyShapes\":[\"top_level_array\",\"packGuidance\",\"pack_guidance\"],\"validationLimits\":{\"defaults\":{");
+    try w.print("\"maxGuidanceBytes\":{d},\"maxGuidanceEntries\":{d},\"maxArrayItems\":{d},\"maxStringBytes\":{d}", .{
+        defaults.max_guidance_bytes,
+        defaults.max_guidance_entries,
+        defaults.max_array_items,
+        defaults.max_string_bytes,
+    });
+    try w.writeAll("},\"hardCaps\":{");
+    try w.print("\"maxGuidanceBytes\":{d},\"maxGuidanceEntries\":{d},\"maxArrayItems\":{d},\"maxStringBytes\":{d}", .{
+        autopsy_guidance_validator.AutopsyGuidanceValidationLimits.hard_cap_guidance_bytes,
+        autopsy_guidance_validator.AutopsyGuidanceValidationLimits.hard_cap_guidance_entries,
+        autopsy_guidance_validator.AutopsyGuidanceValidationLimits.hard_cap_array_items,
+        autopsy_guidance_validator.AutopsyGuidanceValidationLimits.hard_cap_string_bytes,
+    });
+    try w.writeAll("}}}}");
     return out.toOwnedSlice();
 }
 
@@ -2028,23 +2150,42 @@ fn resolveProjectPathsForCli(allocator: std.mem.Allocator, project_shard: ?[]con
     return try shards.resolvePaths(allocator, metadata.metadata);
 }
 
+fn parseLimitArg(arg: []const u8, prefix: []const u8) !usize {
+    const raw = arg[prefix.len..];
+    if (raw.len == 0) return error.InvalidLimit;
+    return std.fmt.parseInt(usize, raw, 10) catch error.InvalidLimit;
+}
+
+fn printLimitErrorAndExit(err: anyerror, label: []const u8, value: usize) noreturn {
+    const limits = autopsy_guidance_validator.AutopsyGuidanceValidationLimits;
+    switch (err) {
+        error.GuidanceBytesLimitOutOfRange => std.debug.print("{s} out of range: value={d} hard_cap={d}\n", .{ label, value, limits.hard_cap_guidance_bytes }),
+        error.GuidanceEntriesLimitOutOfRange => std.debug.print("{s} out of range: value={d} hard_cap={d}\n", .{ label, value, limits.hard_cap_guidance_entries }),
+        error.GuidanceArrayItemsLimitOutOfRange => std.debug.print("{s} out of range: value={d} hard_cap={d}\n", .{ label, value, limits.hard_cap_array_items }),
+        error.GuidanceStringBytesLimitOutOfRange => std.debug.print("{s} out of range: value={d} hard_cap={d}\n", .{ label, value, limits.hard_cap_string_bytes }),
+        else => std.debug.print("{s} must be a positive decimal integer\n", .{label}),
+    }
+    std.process.exit(2);
+}
+
+fn validateLimitsOrExit(limits: autopsy_guidance_validator.AutopsyGuidanceValidationLimits) void {
+    limits.validate() catch |err| {
+        switch (err) {
+            error.GuidanceBytesLimitOutOfRange => printLimitErrorAndExit(err, "--max-guidance-bytes", limits.max_guidance_bytes),
+            error.GuidanceEntriesLimitOutOfRange => printLimitErrorAndExit(err, "--max-guidance-entries", limits.max_guidance_entries),
+            error.GuidanceArrayItemsLimitOutOfRange => printLimitErrorAndExit(err, "--max-array-items", limits.max_array_items),
+            error.GuidanceStringBytesLimitOutOfRange => printLimitErrorAndExit(err, "--max-string-bytes", limits.max_string_bytes),
+        }
+    };
+}
+
 fn parseCommand(text: []const u8) ?Command {
-    if (std.mem.eql(u8, text, "create")) return .create;
-    if (std.mem.eql(u8, text, "inspect")) return .inspect;
-    if (std.mem.eql(u8, text, "list")) return .list;
-    if (std.mem.eql(u8, text, "mount")) return .mount;
-    if (std.mem.eql(u8, text, "unmount")) return .unmount;
-    if (std.mem.eql(u8, text, "clone")) return .clone;
-    if (std.mem.eql(u8, text, "remove")) return .remove;
-    if (std.mem.eql(u8, text, "diff")) return .diff;
-    if (std.mem.eql(u8, text, "export")) return .@"export";
-    if (std.mem.eql(u8, text, "import")) return .import;
-    if (std.mem.eql(u8, text, "verify")) return .verify;
-    if (std.mem.eql(u8, text, "validate-autopsy-guidance")) return .@"validate-autopsy-guidance";
-    if (std.mem.eql(u8, text, "list-versions")) return .@"list-versions";
-    if (std.mem.eql(u8, text, "distill-list")) return .@"distill-list";
-    if (std.mem.eql(u8, text, "distill-show")) return .@"distill-show";
-    if (std.mem.eql(u8, text, "distill-export")) return .@"distill-export";
+    for (command_registry) |spec| {
+        if (std.mem.eql(u8, text, spec.name)) return spec.command;
+        for (spec.aliases) |alias| {
+            if (std.mem.eql(u8, text, alias)) return spec.command;
+        }
+    }
     return null;
 }
 
@@ -2053,10 +2194,16 @@ fn parseTrustClass(text: []const u8) ?abstractions.TrustClass {
 }
 
 fn printUsage() void {
-    sys.print(
-        "Usage: ghost_knowledge_pack <create|inspect|list|mount|unmount|clone|remove|diff|export|import|verify|validate-autopsy-guidance|list-versions|distill-list|distill-show|distill-export> [--pack-id=id] [--version=v] [--domain=family] [--trust-class=exploratory|project|promoted|core] [--source-summary=text] [--project-shard=id] [--source-project-shard=id] [--source-state=staged|live] [--corpus=/abs/or/rel/path] [--corpus-label=text] [--to-pack-id=id] [--to-version=v] [--left-pack=id] [--left-version=v] [--right-pack=id] [--right-version=v] [--manifest=/abs/or/rel/manifest.json] [--all-mounted] [--candidate-id=id] [--approve] [--export-dir=/abs/path] [--force] [--export-reason=text] [--json]\n",
-        .{},
-    );
+    const stdout = std.io.getStdOut().writer();
+    writeUsage(stdout) catch {};
+}
+
+fn writeUsage(writer: anytype) !void {
+    try writer.writeAll("Usage: ghost_knowledge_pack <command> [flags]\n\nCommands:\n");
+    for (command_registry) |spec| {
+        try writer.print("  {s} - {s}\n", .{ spec.name, spec.summary });
+    }
+    try writer.writeAll("\nFlags: [--pack-id=id] [--version=v] [--domain=family] [--trust-class=exploratory|project|promoted|core] [--source-summary=text] [--project-shard=id] [--source-project-shard=id] [--source-state=staged|live] [--corpus=/abs/or/rel/path] [--corpus-label=text] [--to-pack-id=id] [--to-version=v] [--left-pack=id] [--left-version=v] [--right-pack=id] [--right-version=v] [--manifest=/abs/or/rel/manifest.json] [--all-mounted] [--max-guidance-bytes=n] [--max-array-items=n] [--max-string-bytes=n] [--candidate-id=id] [--approve] [--export-dir=/abs/path] [--force] [--export-reason=text] [--json]\n");
 }
 
 fn joinPreview(allocator: std.mem.Allocator, items: []const []const u8) ![]u8 {
@@ -2075,6 +2222,31 @@ fn rewriteSyntheticPath(allocator: std.mem.Allocator, pack_id: []const u8, pack_
         return std.fmt.allocPrint(allocator, "@pack/{s}/{s}/{s}", .{ pack_id, pack_version, path[corpus_ingest.CORPUS_REL_PREFIX.len + 1 ..] });
     }
     return std.fmt.allocPrint(allocator, "@pack/{s}/{s}/{s}", .{ pack_id, pack_version, path });
+}
+
+test "ghost_knowledge_pack command registry drives parsing and help" {
+    var usage = std.ArrayList(u8).init(std.testing.allocator);
+    defer usage.deinit();
+    try writeUsage(usage.writer());
+
+    for (command_registry) |spec| {
+        try std.testing.expectEqual(spec.command, parseCommand(spec.name).?);
+        try std.testing.expect(std.mem.indexOf(u8, usage.items, spec.name) != null);
+        for (spec.aliases) |alias| {
+            try std.testing.expectEqual(spec.command, parseCommand(alias).?);
+        }
+    }
+    try std.testing.expect(parseCommand("not-a-command") == null);
+}
+
+test "ghost_knowledge_pack capabilities json lists validation compatibility surface" {
+    const rendered = try renderCapabilities(std.testing.allocator, true);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"binaryName\":\"ghost_knowledge_pack\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"name\":\"validate-autopsy-guidance\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"--max-guidance-bytes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, autopsy_guidance_validator.AUTOPSY_GUIDANCE_SCHEMA_V1) != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"validationLimits\"") != null);
 }
 
 fn boolText(value: bool) []const u8 {

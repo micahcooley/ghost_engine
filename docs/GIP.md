@@ -179,6 +179,8 @@ promotion, or pack mutation.
   - Loads only persisted autopsy guidance declared by mounted Knowledge Pack manifests; pack content remains a signal source, not proof.
   - Does not execute commands, run verifiers, mutate packs, or mutate negative knowledge.
   - Persisted Knowledge Pack autopsy guidance can be preflighted through the read-only `ghost_knowledge_pack validate-autopsy-guidance` operator tool; this is outside the GIP request surface and does not change `context.autopsy` response authority.
+  - Preferred persisted guidance uses schema `ghost.autopsy_guidance.v1` with `packGuidance`; legacy unversioned array / `packGuidance` / `pack_guidance` shapes remain tolerated with validation warnings.
+  - `ghost_knowledge_pack capabilities --json` exposes the binary version, command list, validate-autopsy-guidance flags, supported guidance schemas, and validation limit defaults/hard caps for CLI compatibility checks.
 
 ### Conversation
 - `conversation.turn` — Process a user message through the engine. **(Implemented)**

@@ -51,9 +51,20 @@ non-authorizing. Hard verifier expectations and soft checks are classified as
 pending obligations only.
 
 Persisted guidance is loaded from the optional Knowledge Pack manifest storage
-field `autopsyGuidanceRelPath`. The file may contain either a top-level
-guidance array or an object with `packGuidance` / `pack_guidance`. Missing or
-malformed guidance is reported as a warning/unknown and does not crash the
+field `autopsyGuidanceRelPath`. The preferred file shape is versioned:
+
+```json
+{
+  "schema": "ghost.autopsy_guidance.v1",
+  "packGuidance": []
+}
+```
+
+Legacy unversioned shapes remain accepted for compatibility: a top-level
+guidance array, an object with `packGuidance`, or an object with
+`pack_guidance`. The validator warns on legacy unversioned guidance and rejects
+unknown/future schema strings. Runtime loading still treats missing, malformed,
+or unsupported persisted guidance as warning/unknown and does not crash the
 request. Merge order is deterministic: persisted mounted-pack guidance first in
 mount registry order, then request-supplied guidance in request order.
 
@@ -63,6 +74,8 @@ Persisted guidance can be reviewed before runtime use with:
 ghost_knowledge_pack validate-autopsy-guidance --pack-id=<id> --version=<v>
 ghost_knowledge_pack validate-autopsy-guidance --manifest=<path>
 ghost_knowledge_pack validate-autopsy-guidance --all-mounted --project-shard=<id>
+ghost_knowledge_pack validate-autopsy-guidance --json --manifest=<path>
+ghost_knowledge_pack capabilities --json
 ```
 
 The validator is read-only. It validates the declared guidance file exists,
@@ -72,6 +85,14 @@ candidate actions/check candidates/evidence expectations, and reports
 authorizing or execution-like fields as structured warnings. Validation errors
 return non-zero from the CLI; warnings alone do not. The tool does not mount,
 promote, fix, execute, or mutate packs.
+
+Default validation limits are named policy values: `maxGuidanceBytes=524288`,
+`maxGuidanceEntries=256`, `maxArrayItems=128`, and `maxStringBytes=2048`.
+Operator overrides are available for byte, array-item, and string-byte limits:
+`--max-guidance-bytes=<n>`, `--max-array-items=<n>`, and
+`--max-string-bytes=<n>`. Overrides remain bounded by hard caps reported by
+`ghost_knowledge_pack capabilities --json`; unlimited validation is not
+supported.
 
 Artifact references may include bounded include/exclude filters. Filters use a
 small deterministic glob syntax over workspace-relative paths: `*` matches

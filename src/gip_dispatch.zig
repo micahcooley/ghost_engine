@@ -12,6 +12,7 @@ const hypothesis_core = @import("hypothesis_core.zig");
 const verifier_adapter = @import("verifier_adapter.zig");
 const knowledge_packs = @import("knowledge_packs.zig");
 const knowledge_pack_store = @import("knowledge_pack_store.zig");
+const autopsy_guidance_validator = @import("autopsy_guidance_validator.zig");
 const feedback = @import("feedback.zig");
 const shards = @import("shards.zig");
 const task_sessions = @import("task_sessions.zig");
@@ -2360,7 +2361,13 @@ fn parsePersistentGuidanceValue(
     const owned_pack_version = try allocator.dupe(u8, pack_version);
     const array_value = switch (value) {
         .array => value,
-        .object => |obj| obj.get("pack_guidance") orelse obj.get("packGuidance") orelse return error.InvalidPersistentPackGuidance,
+        .object => |obj| blk: {
+            if (obj.get("schema")) |schema_value| {
+                if (schema_value != .string) return error.InvalidPersistentPackGuidance;
+                if (!std.mem.eql(u8, schema_value.string, autopsy_guidance_validator.AUTOPSY_GUIDANCE_SCHEMA_V1)) return error.UnsupportedPersistentPackGuidanceSchema;
+            }
+            break :blk obj.get("pack_guidance") orelse obj.get("packGuidance") orelse return error.InvalidPersistentPackGuidance;
+        },
         else => return error.InvalidPersistentPackGuidance,
     };
     if (array_value != .array) return error.InvalidPersistentPackGuidance;
@@ -4119,6 +4126,22 @@ test "context.autopsy malformed persisted pack guidance becomes structured warni
     try std.testing.expect(std.mem.indexOf(u8, json, "\"malformed_persistent_pack_guidance\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":\"malformed_guidance\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"isNegativeEvidence\":false") != null);
+}
+
+test "context.autopsy unsupported persisted guidance schema becomes warning unknown" {
+    const allocator = std.testing.allocator;
+    var fixture = try ContextAutopsyPackFixture.init(allocator, "context-autopsy-unsupported-schema-fixture", "{\"schema\":\"ghost.autopsy_guidance.v99\",\"packGuidance\":[]}");
+    defer fixture.deinit();
+
+    const body =
+        \\{"gipVersion":"gip.v0.1","kind":"context.autopsy","context":{"summary":"Need planning advice","intent_tags":["planning"],"situation_kinds":["launch"]}}
+    ;
+    var result = try dispatch(allocator, "context.autopsy", core.PROTOCOL_VERSION, null, null, body);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
+    const json = result.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"unsupported_persistent_pack_guidance\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":\"unsupported_guidance_shape\"") != null);
 }
 
 test "context.autopsy merges persisted guidance before request guidance deterministically" {
