@@ -6,5 +6,6 @@
   "question": "what does the corpus say about retention?",
   "maxResults": 3,
   "maxSnippetBytes": 320,
-  "requireCitations": true
+  "requireCitations": true,
+  "note": "answerDraft requires exact evidence; similarCandidates, when present, are approximate non-authorizing SimHash routing hints"
 }

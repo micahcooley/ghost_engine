@@ -1,6 +1,7 @@
 const std = @import("std");
 const abstractions = @import("abstractions.zig");
 const corpus_ingest = @import("corpus_ingest.zig");
+const corpus_sketch = @import("corpus_sketch.zig");
 const shards = @import("shards.zig");
 
 pub const DEFAULT_MAX_RESULTS: usize = 3;
@@ -10,6 +11,8 @@ pub const MAX_SNIPPET_BYTES: usize = 1024;
 const MAX_FILE_READ_BYTES: usize = 64 * 1024;
 const MAX_QUERY_TOKENS: usize = 16;
 const MIN_TOKEN_LEN: usize = 3;
+const MAX_SKETCH_CANDIDATES: usize = 8;
+const MAX_SIMHASH_DISTANCE: u7 = 24;
 
 pub const AskStatus = enum {
     answered,
@@ -117,6 +120,31 @@ pub const LearningCandidate = struct {
     }
 };
 
+pub const SimilarCandidate = struct {
+    item_id: []u8,
+    path: []u8,
+    source_path: []u8,
+    source_label: []u8,
+    trust_class: []u8,
+    sketch_hash: []u8,
+    hamming_distance: u7,
+    similarity_score: u16,
+    reason: []u8,
+    non_authorizing: bool = true,
+    rank: usize,
+
+    fn deinit(self: *SimilarCandidate, allocator: std.mem.Allocator) void {
+        allocator.free(self.item_id);
+        allocator.free(self.path);
+        allocator.free(self.source_path);
+        allocator.free(self.source_label);
+        allocator.free(self.trust_class);
+        allocator.free(self.sketch_hash);
+        allocator.free(self.reason);
+        self.* = undefined;
+    }
+};
+
 pub const Result = struct {
     allocator: std.mem.Allocator,
     status: AskStatus,
@@ -130,6 +158,7 @@ pub const Result = struct {
     unknowns: []Unknown = &.{},
     candidate_followups: []CandidateFollowup = &.{},
     learning_candidates: []LearningCandidate = &.{},
+    similar_candidates: []SimilarCandidate = &.{},
     safety_flags: SafetyFlags = .{},
     corpus_entries_considered: usize = 0,
     max_results: usize = DEFAULT_MAX_RESULTS,
@@ -151,6 +180,8 @@ pub const Result = struct {
         self.allocator.free(self.candidate_followups);
         for (self.learning_candidates) |*item| item.deinit(self.allocator);
         self.allocator.free(self.learning_candidates);
+        for (self.similar_candidates) |*item| item.deinit(self.allocator);
+        self.allocator.free(self.similar_candidates);
         self.* = undefined;
     }
 };
@@ -186,6 +217,13 @@ const Candidate = struct {
         if (self.matched_phrase) |phrase| allocator.free(phrase);
         self.* = undefined;
     }
+};
+
+const SketchCandidate = struct {
+    entry_index: usize,
+    sketch_hash: u64,
+    hamming_distance: u7,
+    similarity_score: u16,
 };
 
 const TextToken = struct {
@@ -276,10 +314,27 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         for (candidates.items) |*candidate| candidate.deinit(allocator);
         candidates.deinit();
     }
+    var sketch_candidates = std.ArrayList(SketchCandidate).init(allocator);
+    defer sketch_candidates.deinit();
+    const query_sketch = try corpus_sketch.simHash64(allocator, options.question);
 
     for (entries, 0..) |entry, idx| {
         const file_text = readEntryText(allocator, entry.abs_path) catch continue;
         errdefer allocator.free(file_text);
+        if (query_sketch.valid()) {
+            const entry_sketch = try corpus_sketch.simHash64(allocator, file_text);
+            if (entry_sketch.valid()) {
+                const distance = corpus_sketch.hammingDistance(query_sketch.hash, entry_sketch.hash);
+                if (distance <= MAX_SIMHASH_DISTANCE) {
+                    try sketch_candidates.append(.{
+                        .entry_index = idx,
+                        .sketch_hash = entry_sketch.hash,
+                        .hamming_distance = distance,
+                        .similarity_score = corpus_sketch.similarityScore(distance),
+                    });
+                }
+            }
+        }
         const text_tokens = try tokenizeText(allocator, file_text);
         defer freeTextTokens(allocator, text_tokens);
         var scored = try scoreText(allocator, text_tokens, tokens.tokens);
@@ -308,7 +363,10 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     }
 
     if (candidates.items.len == 0) {
-        return unknownResult(allocator, options, &paths, .insufficient_evidence, "no live corpus item matched the question terms", entries.len, max_results, max_snippet);
+        var result = try unknownResult(allocator, options, &paths, .insufficient_evidence, "no live corpus item matched the question terms", entries.len, max_results, max_snippet);
+        errdefer result.deinit();
+        result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
+        return result;
     }
 
     std.mem.sort(Candidate, candidates.items, {}, candidateLessThan);
@@ -318,6 +376,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         var result = try buildBaseResult(allocator, options, &paths, .unknown, "unresolved", "unresolved", entries.len, max_results, max_snippet);
         errdefer result.deinit();
         result.evidence_used = try buildEvidence(allocator, candidates.items[0..top_count], entries, max_snippet, "selected because it matched question terms but conflicts with another selected corpus item");
+        result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
         result.unknowns = try singleUnknown(allocator, .conflicting_evidence, "selected corpus evidence contains conflicting affirmative and negative signals");
         result.candidate_followups = try singleFollowup(allocator, "evidence_to_collect", "provide or ingest an authoritative corpus item that resolves the conflict");
         result.learning_candidates = try singleLearningCandidate(allocator, "correction_candidate", "review the conflicting corpus items and propose a correction or corpus update through an explicit lifecycle", "conflicting evidence cannot authorize an answer");
@@ -326,12 +385,16 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
 
     const top = candidates.items[0];
     if (top.score < requiredScore(tokens.tokens.len) and top.matched_phrase == null) {
-        return unknownResult(allocator, options, &paths, .insufficient_evidence, "matched corpus evidence was too weak to support an answer draft", entries.len, max_results, max_snippet);
+        var result = try unknownResult(allocator, options, &paths, .insufficient_evidence, "matched corpus evidence was too weak to support an answer draft", entries.len, max_results, max_snippet);
+        errdefer result.deinit();
+        result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
+        return result;
     }
 
     var result = try buildBaseResult(allocator, options, &paths, .answered, "draft", "none", entries.len, max_results, max_snippet);
     errdefer result.deinit();
     result.evidence_used = try buildEvidence(allocator, candidates.items[0..top_count], entries, max_snippet, "selected because it matched bounded question terms");
+    result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
     result.answer_draft = try std.fmt.allocPrint(
         allocator,
         "Draft answer from corpus evidence: {s}",
@@ -482,6 +545,46 @@ fn buildEvidence(
         };
     }
     return out;
+}
+
+fn buildSimilarCandidates(
+    allocator: std.mem.Allocator,
+    candidates: []SketchCandidate,
+    entries: []const corpus_ingest.IndexedEntry,
+    max_results: usize,
+) ![]SimilarCandidate {
+    std.mem.sort(SketchCandidate, candidates, {}, sketchCandidateLessThan);
+    const count = @min(@min(max_results, MAX_SKETCH_CANDIDATES), candidates.len);
+    var out = try allocator.alloc(SimilarCandidate, count);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |*item| item.deinit(allocator);
+        allocator.free(out);
+    }
+
+    for (candidates[0..count], 0..) |candidate, idx| {
+        const entry = entries[candidate.entry_index];
+        out[idx] = .{
+            .item_id = try allocator.dupe(u8, entry.corpus_meta.lineage_id),
+            .path = try allocator.dupe(u8, entry.rel_path),
+            .source_path = try allocator.dupe(u8, entry.corpus_meta.source_rel_path),
+            .source_label = try allocator.dupe(u8, entry.corpus_meta.source_label),
+            .trust_class = try allocator.dupe(u8, abstractions.trustClassName(entry.corpus_meta.trust_class)),
+            .sketch_hash = try std.fmt.allocPrint(allocator, "simhash64:{x:0>16}", .{candidate.sketch_hash}),
+            .hamming_distance = candidate.hamming_distance,
+            .similarity_score = candidate.similarity_score,
+            .reason = try allocator.dupe(u8, "simhash_near_duplicate"),
+            .rank = idx + 1,
+        };
+        built += 1;
+    }
+    return out;
+}
+
+fn sketchCandidateLessThan(_: void, lhs: SketchCandidate, rhs: SketchCandidate) bool {
+    if (lhs.hamming_distance != rhs.hamming_distance) return lhs.hamming_distance < rhs.hamming_distance;
+    if (lhs.similarity_score != rhs.similarity_score) return lhs.similarity_score > rhs.similarity_score;
+    return lhs.entry_index < rhs.entry_index;
 }
 
 fn readEntryText(allocator: std.mem.Allocator, abs_path: []const u8) ![]u8 {
@@ -843,6 +946,23 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
         try writeField(w, "provenance", evidence.provenance, false);
         try w.print(",\"score\":{d}", .{evidence.score});
         try w.print(",\"rank\":{d}", .{evidence.rank});
+        try w.writeAll("}");
+    }
+    try w.writeAll("],\"similarCandidates\":[");
+    for (result.similar_candidates, 0..) |candidate, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{");
+        try writeField(w, "itemId", candidate.item_id, true);
+        try writeField(w, "path", candidate.path, false);
+        try writeField(w, "sourcePath", candidate.source_path, false);
+        try writeField(w, "sourceLabel", candidate.source_label, false);
+        try writeField(w, "trustClass", candidate.trust_class, false);
+        try writeField(w, "sketchHash", candidate.sketch_hash, false);
+        try w.print(",\"hammingDistance\":{d}", .{candidate.hamming_distance});
+        try w.print(",\"similarityScore\":{d}", .{candidate.similarity_score});
+        try writeField(w, "reason", candidate.reason, false);
+        try w.print(",\"nonAuthorizing\":{s}", .{if (candidate.non_authorizing) "true" else "false"});
+        try w.print(",\"rank\":{d}", .{candidate.rank});
         try w.writeAll("}");
     }
     try w.writeAll("],\"unknowns\":[");

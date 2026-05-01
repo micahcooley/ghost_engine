@@ -99,7 +99,7 @@ results when GIP has no active session or workspace metadata:
 |-----------|------------------------|----------|
 | `hypothesis.list` | Returns empty hypotheses + zero counts | `stateless` |
 | `hypothesis.triage` | Returns empty triage summary with scoring policy version | `stateless` |
-| `corpus.ask` | Reads existing live shard corpus; returns explicit unknown when no corpus/evidence is visible | `read_only_live_corpus_grounded_draft` |
+| `corpus.ask` | Reads existing live shard corpus; returns explicit unknown when no corpus/evidence is visible; may include non-authorizing local sketch candidates | `read_only_live_corpus_grounded_draft` |
 | `verifier.candidate.execution.list` | Reads existing task/result support-graph state; returns empty when no state is visible | `read_only_state_inspection` |
 | `verifier.candidate.execution.get` | Reads one existing execution job/result projection; missing IDs return `path_not_found` | `read_only_state_inspection` |
 | `correction.list` | Reads existing correction-event state; returns empty when no state is visible | `read_only_state_inspection` |
@@ -178,6 +178,12 @@ promotion, or pack mutation.
   - The stdin JSON limit remains the 1 MiB control-plane boundary. Large content is referenced by path and read through bounded file/chunk/aggregate budgets.
   - Skipped, filtered, unsupported, unread, or truncated regions create explicit unknowns. They are not treated as false claims.
   - Loads only persisted autopsy guidance declared by mounted Knowledge Pack manifests; pack content remains a signal source, not proof.
+
+### Corpus Ask
+- `corpus.ask` reads only the selected live shard corpus. It does not ingest, mutate packs, mutate negative knowledge, run commands, run verifiers, or treat staged corpus as active knowledge.
+- `answerDraft` remains gated by exact local recall only: case-insensitive exact token overlap and adjacent exact phrase evidence. Drafts cite `evidenceUsed`; approximate-only matches return `unresolved`.
+- `similarCandidates` are approximate SimHash routing hints. They include Hamming distance, similarity score, reason, rank, and `nonAuthorizing: true`.
+- Similarity candidates are not proof, are not semantic search, do not populate `evidenceUsed`, and cannot authorize an answer. No Transformers, embeddings, model adapters, or network calls are used.
   - Guidance matching is bounded and deterministic: structured tags/kinds/required fields are matched case-insensitively, keywords prefer structured context and artifact/input ref metadata before bounded JSON string/key inspection, and applied pack influences include non-authorizing `matchTrace` metadata.
   - Does not execute commands, run verifiers, mutate packs, or mutate negative knowledge.
   - Persisted Knowledge Pack autopsy guidance can be preflighted through the read-only `ghost_knowledge_pack validate-autopsy-guidance` operator tool; this is outside the GIP request surface and does not change `context.autopsy` response authority.

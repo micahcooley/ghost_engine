@@ -14,6 +14,7 @@ const panic_dump = @import("panic_dump.zig");
 const code_intel = @import("code_intel.zig");
 const corpus_ingest = @import("corpus_ingest.zig");
 const corpus_ask = @import("corpus_ask.zig");
+const corpus_sketch = @import("corpus_sketch.zig");
 const external_evidence = @import("external_evidence.zig");
 const execution = @import("execution.zig");
 const abstractions = @import("abstractions.zig");
@@ -47,6 +48,7 @@ comptime {
     _ = context_autopsy_engine;
     _ = context_inputs;
     _ = project_autopsy;
+    _ = corpus_sketch;
     _ = repo_hygiene;
     _ = hypothesis_core;
     _ = gip;
@@ -5685,6 +5687,76 @@ test "corpus ask returns draft answer with bounded evidence and weak matches sta
     try std.testing.expectEqual(corpus_ask.AskStatus.unknown, weak.status);
     try std.testing.expectEqual(corpus_ask.UnknownKind.insufficient_evidence, weak.unknowns[0].kind);
     try std.testing.expect(weak.answer_draft == null);
+}
+
+test "corpus ask reports deterministic non-authorizing sketch candidates without drafting" {
+    const allocator = std.testing.allocator;
+    const project_shard = "corpus-ask-sketch-routing-test";
+    var corpus_fixture = std.testing.tmpDir(.{});
+    defer corpus_fixture.cleanup();
+    const corpus_root = try corpus_fixture.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+    try writeFixtureFile(corpus_fixture.dir, "a.md",
+        \\# Sketch Route A
+        \\Frobulator quiescence window requires bounded local recurrence detection for duplicate corpus chunks.
+        \\
+    );
+    try writeFixtureFile(corpus_fixture.dir, "b.md",
+        \\# Sketch Route B
+        \\Frobulator quiescence window requires bounded local recurrence detection for duplicate corpus chunk review.
+        \\
+    );
+    try writeFixtureFile(corpus_fixture.dir, "c.md",
+        \\# Unrelated
+        \\Shader compilation diagnostics belong to graphics startup logs and runtime driver setup.
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path) catch {};
+
+    var stage_result = try corpus_ingest.stage(allocator, .{
+        .corpus_path = corpus_root,
+        .project_shard = project_shard,
+        .trust_class = .project,
+        .source_label = "sketch-corpus",
+    });
+    defer stage_result.deinit();
+    try corpus_ingest.applyStaged(allocator, &project_paths);
+
+    var result = try corpus_ask.ask(allocator, .{
+        .question = "frobulatr quiescense windos requir boundid lokel recurence detecton duplikate korpus chonks",
+        .project_shard = project_shard,
+        .max_results = 3,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(corpus_ask.AskStatus.unknown, result.status);
+    try std.testing.expectEqual(corpus_ask.UnknownKind.insufficient_evidence, result.unknowns[0].kind);
+    try std.testing.expect(result.answer_draft == null);
+    try std.testing.expectEqual(@as(usize, 0), result.evidence_used.len);
+    try std.testing.expect(result.similar_candidates.len >= 2);
+    try std.testing.expect(std.mem.eql(u8, result.similar_candidates[0].source_label, "sketch-corpus"));
+    try std.testing.expect(result.similar_candidates[0].hamming_distance <= result.similar_candidates[1].hamming_distance);
+    try std.testing.expectEqual(@as(usize, 1), result.similar_candidates[0].rank);
+    try std.testing.expect(result.similar_candidates[0].non_authorizing);
+    try std.testing.expect(std.mem.eql(u8, result.similar_candidates[0].reason, "simhash_near_duplicate"));
+    try std.testing.expect(!result.safety_flags.corpus_mutation);
+    try std.testing.expect(!result.safety_flags.pack_mutation);
+    try std.testing.expect(!result.safety_flags.negative_knowledge_mutation);
+    try std.testing.expect(!result.safety_flags.commands_executed);
+    try std.testing.expect(!result.safety_flags.verifiers_executed);
+
+    const rendered = try corpus_ask.renderJson(allocator, &result);
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"similarCandidates\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"nonAuthorizing\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"answerDraft\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"evidenceUsed\":[]") != null);
 }
 
 test "corpus ask respects max results and snippet bounds in exact evidence" {
