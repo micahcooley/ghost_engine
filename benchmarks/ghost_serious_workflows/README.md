@@ -60,6 +60,10 @@ It is built around real local fixture repos and Ghost's shipped deterministic fl
   - most recent Linux benchmark output produced by the runner
 - `results/latest-linux.md`
   - human-readable summary of the most recent Linux run
+- `../../zig-out/bench/compute_dominance.json`
+  - generated machine-readable Phase 6 compute-dominance report
+- `../../zig-out/bench/compute_dominance.md`
+  - generated human-readable Phase 6 compute-dominance report
 
 ### Run
 
@@ -67,7 +71,13 @@ It is built around real local fixture repos and Ghost's shipped deterministic fl
 zig build bench-serious-workflows
 ```
 
-The runner writes fresh reports under `benchmarks/ghost_serious_workflows/results/`.
+The serious-workflow runner writes fresh reports under `benchmarks/ghost_serious_workflows/results/`. It also runs the Phase 6 compute-dominance benchmark, which writes `zig-out/bench/compute_dominance.json` and `zig-out/bench/compute_dominance.md`.
+
+The Phase 6 benchmark can be run directly:
+
+```sh
+zig build bench-compute-dominance
+```
 
 ### Outcome Buckets
 
@@ -89,8 +99,8 @@ The latest Linux run in this workspace reports:
 - patch compile-pass rate: 84% (16/19 candidate build attempts)
 - test-pass rate: 87% (14/16 candidate test attempts)
 - runtime-pass rate: 83% (5/6 attempted runtime steps)
-- latency per verified result: 7509 ms
-- cold start / warm start: 276 ms / 360 ms
+- latency per verified result: 7485 ms
+- cold start / warm start: 267 ms / 335 ms
 - cold cache changed files / warm cache changed files: 15 / 0
 - partial-finding preservation rate: 100% (5/5)
 - ambiguity preservation rate: 100% (1/1)
@@ -101,7 +111,7 @@ The latest Linux run in this workspace reports:
 - pack budget cap hits / local-truth wins: 4 / 1
 - response mode distribution: draft=1, fast=1, deep=1
 - measured response mode selection / draft path / fast path / deep path: 0 / 2 / 1 / 1 ms
-- measured artifact schema pipeline / verifier adapter dispatch: 3 / 15 ms
+- measured artifact schema pipeline / verifier adapter dispatch: 8 / 10 ms
 - verifier domains: code=36, non_code=2
 
 Workflow cases now explicitly measure:
@@ -125,3 +135,4 @@ Workflow cases now explicitly measure:
 - The cold/warm case measures shard-local cache behavior and changed-file counts; it does not guarantee warm latency will always be lower on every machine.
 - External evidence now resolves against both the staged corpus path Ghost writes and stable source-basename aliases such as `@corpus/docs/runbook.md`.
 - Phase 3 response-mode and verifier-adapter probes are measured with real local execution; timings are reported as observed, not normalized or padded.
+- Phase 6 compute-dominance metrics are local workflow measurements for exact corpus evidence, cheap similarity hints, deterministic rules, explicit unknowns, and review-required correction candidates. They do not claim cloud, Transformer, embedding, LLM-adapter, or data-center comparisons.

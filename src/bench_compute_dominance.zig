@@ -1,0 +1,801 @@
+const std = @import("std");
+const builtin = @import("builtin");
+const core = @import("ghost_core");
+
+const config = core.config;
+const corpus_ask = core.corpus_ask;
+const corpus_ingest = core.corpus_ingest;
+const correction_candidates = core.correction_candidates;
+const rule_reasoning = core.rule_reasoning;
+const shards = core.shards;
+
+const REPORT_JSON_REL_PATH = "zig-out/bench/compute_dominance.json";
+const REPORT_MD_REL_PATH = "zig-out/bench/compute_dominance.md";
+
+const OperationKind = enum {
+    @"corpus.ask",
+    @"rule.evaluate",
+    @"correction.propose",
+    @"corpus.lifecycle",
+};
+
+const ScenarioResult = struct {
+    name: []const u8,
+    operation_kind: OperationKind,
+    success: bool,
+    duration_ns: u64,
+    input_bytes: usize = 0,
+    corpus_entries_considered: ?usize = null,
+    evidence_count: usize = 0,
+    similar_candidate_count: usize = 0,
+    unknown_count: usize = 0,
+    capacity_warning_count: usize = 0,
+    correction_candidate_count: usize = 0,
+    learning_candidate_count: usize = 0,
+    commands_executed: u32 = 0,
+    verifiers_executed: u32 = 0,
+    corpus_mutation: bool = false,
+    pack_mutation: bool = false,
+    negative_knowledge_mutation: bool = false,
+    answer_draft_present: bool = false,
+    non_authorizing: bool = true,
+    required_review: ?bool = null,
+    local_only: bool = true,
+    deterministic_rank_stability: ?bool = null,
+    setup_corpus_mutation: bool = false,
+};
+
+const SuiteResult = struct {
+    allocator: std.mem.Allocator,
+    scenarios: []ScenarioResult,
+    total_duration_ns: u64,
+
+    fn deinit(self: *SuiteResult) void {
+        self.allocator.free(self.scenarios);
+        self.* = undefined;
+    }
+};
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var suite = try runSuite(allocator);
+    defer suite.deinit();
+
+    const json = try renderJsonReport(allocator, suite);
+    defer allocator.free(json);
+    const md = try renderMarkdownReport(allocator, suite);
+    defer allocator.free(md);
+
+    const json_path = try config.getPath(allocator, REPORT_JSON_REL_PATH);
+    defer allocator.free(json_path);
+    const md_path = try config.getPath(allocator, REPORT_MD_REL_PATH);
+    defer allocator.free(md_path);
+
+    try writeAbsoluteFile(allocator, json_path, json);
+    try writeAbsoluteFile(allocator, md_path, md);
+
+    std.debug.print("{s}\n", .{md});
+    if (!allScenariosPassed(suite.scenarios)) return error.ComputeDominanceBenchmarkFailures;
+}
+
+pub fn runSuite(allocator: std.mem.Allocator) !SuiteResult {
+    const started = std.time.nanoTimestamp();
+    var results = std.ArrayList(ScenarioResult).init(allocator);
+    errdefer results.deinit();
+
+    try results.append(try runCorpusNoCorpus(allocator));
+    try results.append(try runCorpusExactPhrase(allocator));
+    try results.append(try runCorpusWeakUnrelated(allocator));
+    try results.append(try runCorpusConflicting(allocator));
+    try results.append(try runCorpusApproximateOnly(allocator));
+    try results.append(try runCorpusCapacityLimited(allocator));
+    try results.append(try runCorpusLargerBounded(allocator));
+    try results.append(try runRuleSimpleFires(allocator));
+    try results.append(try runRuleNonMatching(allocator));
+    try results.append(try runRuleMultipleDeterministic(allocator));
+    try results.append(try runRuleMaxFiredRulesCap(allocator));
+    try results.append(try runRuleMaxOutputCap(allocator));
+    try results.append(try runRuleInvalidOutputRejection(allocator));
+    try results.append(runCorrectionWrongAnswer());
+    try results.append(runCorrectionMissingEvidence());
+    try results.append(runCorrectionRepeatedFailedPattern());
+    try results.append(runCorrectionUnderspecified());
+    try results.append(try runLifecycleScenario(allocator));
+
+    return .{
+        .allocator = allocator,
+        .scenarios = try results.toOwnedSlice(),
+        .total_duration_ns = elapsedNs(started),
+    };
+}
+
+fn runCorpusNoCorpus(allocator: std.mem.Allocator) !ScenarioResult {
+    const shard_id = "bench-compute-dominance-no-corpus";
+    try cleanProjectShard(allocator, shard_id);
+    defer cleanProjectShard(allocator, shard_id) catch {};
+
+    const question = "what is the retention policy";
+    const started = std.time.nanoTimestamp();
+    var result = try corpus_ask.ask(allocator, .{ .question = question, .project_shard = shard_id });
+    defer result.deinit();
+
+    var out = scenarioFromAsk("corpus.ask/no_corpus", question.len, elapsedNs(started), &result);
+    out.success = result.status == .unknown and result.unknowns.len > 0 and result.unknowns[0].kind == .no_corpus_available and result.answer_draft == null;
+    return out;
+}
+
+fn runCorpusExactPhrase(allocator: std.mem.Allocator) !ScenarioResult {
+    const shard_id = "bench-compute-dominance-exact";
+    try withCorpus(allocator, shard_id, &.{
+        .{ .path = "runtime.md", .body = "Retention policy is enabled for event audit logs.\nOperators cite exact local evidence before drafting.\n" },
+    });
+    defer cleanProjectShard(allocator, shard_id) catch {};
+
+    const question = "is retention policy enabled";
+    const started = std.time.nanoTimestamp();
+    var result = try corpus_ask.ask(allocator, .{ .question = question, .project_shard = shard_id, .max_snippet_bytes = 96 });
+    defer result.deinit();
+
+    var out = scenarioFromAsk("corpus.ask/exact_phrase_match", question.len, elapsedNs(started), &result);
+    out.success = result.status == .answered and result.answer_draft != null and result.evidence_used.len == 1 and result.evidence_used[0].matched_phrase != null;
+    out.setup_corpus_mutation = true;
+    return out;
+}
+
+fn runCorpusWeakUnrelated(allocator: std.mem.Allocator) !ScenarioResult {
+    const shard_id = "bench-compute-dominance-weak";
+    try withCorpus(allocator, shard_id, &.{
+        .{ .path = "runtime.md", .body = "Retention policy is enabled for event audit logs.\n" },
+    });
+    defer cleanProjectShard(allocator, shard_id) catch {};
+
+    const question = "database backup window";
+    const started = std.time.nanoTimestamp();
+    var result = try corpus_ask.ask(allocator, .{ .question = question, .project_shard = shard_id });
+    defer result.deinit();
+
+    var out = scenarioFromAsk("corpus.ask/weak_unrelated_evidence", question.len, elapsedNs(started), &result);
+    out.success = result.status == .unknown and result.evidence_used.len == 0 and result.answer_draft == null;
+    out.setup_corpus_mutation = true;
+    return out;
+}
+
+fn runCorpusConflicting(allocator: std.mem.Allocator) !ScenarioResult {
+    const shard_id = "bench-compute-dominance-conflict";
+    try withCorpus(allocator, shard_id, &.{
+        .{ .path = "enabled.md", .body = "Retention policy is enabled for event audit logs.\n" },
+        .{ .path = "disabled.md", .body = "Retention policy is disabled for event audit logs.\n" },
+    });
+    defer cleanProjectShard(allocator, shard_id) catch {};
+
+    const question = "is retention policy enabled";
+    const started = std.time.nanoTimestamp();
+    var result = try corpus_ask.ask(allocator, .{ .question = question, .project_shard = shard_id, .max_results = 2 });
+    defer result.deinit();
+
+    var out = scenarioFromAsk("corpus.ask/conflicting_evidence", question.len, elapsedNs(started), &result);
+    out.success = result.status == .unknown and result.unknowns.len > 0 and result.unknowns[0].kind == .conflicting_evidence and result.answer_draft == null and result.learning_candidates.len == 1;
+    out.setup_corpus_mutation = true;
+    return out;
+}
+
+fn runCorpusApproximateOnly(allocator: std.mem.Allocator) !ScenarioResult {
+    const shard_id = "bench-compute-dominance-approx";
+    try withCorpus(allocator, shard_id, &.{
+        .{ .path = "a.md", .body = "Frobulator quiescence window requires bounded local recurrence detection for duplicate corpus chunks.\n" },
+        .{ .path = "b.md", .body = "Frobulator quiescence window requires bounded local recurrence detection for duplicate corpus chunk review.\n" },
+        .{ .path = "c.md", .body = "Shader compilation diagnostics belong to graphics startup logs and runtime driver setup.\n" },
+    });
+    defer cleanProjectShard(allocator, shard_id) catch {};
+
+    const question = "frobulatr quiescense windos requir boundid lokel recurence detecton duplikate korpus chonks";
+    const started = std.time.nanoTimestamp();
+    var result = try corpus_ask.ask(allocator, .{ .question = question, .project_shard = shard_id, .max_results = 3 });
+    defer result.deinit();
+
+    var out = scenarioFromAsk("corpus.ask/approximate_only_similarity_hint", question.len, elapsedNs(started), &result);
+    out.success = result.status == .unknown and result.evidence_used.len == 0 and result.similar_candidates.len >= 2 and result.answer_draft == null and result.similar_candidates[0].non_authorizing;
+    out.setup_corpus_mutation = true;
+    return out;
+}
+
+fn runCorpusCapacityLimited(allocator: std.mem.Allocator) !ScenarioResult {
+    const shard_id = "bench-compute-dominance-capacity";
+    try withCorpus(allocator, shard_id, &.{
+        .{ .path = "a.md", .body = "Alpha recall policy enabled with exact local evidence and bounded snippets for answer drafting.\n" },
+        .{ .path = "b.md", .body = "Beta recall policy enabled with exact local evidence and bounded snippets for answer drafting.\n" },
+        .{ .path = "c.md", .body = "Gamma recall policy enabled with exact local evidence and bounded snippets for answer drafting.\n" },
+    });
+    defer cleanProjectShard(allocator, shard_id) catch {};
+
+    const question = "recall policy enabled";
+    const started = std.time.nanoTimestamp();
+    var result = try corpus_ask.ask(allocator, .{ .question = question, .project_shard = shard_id, .max_results = 2, .max_snippet_bytes = 32 });
+    defer result.deinit();
+
+    var out = scenarioFromAsk("corpus.ask/capacity_limited_max_results_and_snippets", question.len, elapsedNs(started), &result);
+    out.success = result.status == .answered and result.evidence_used.len == 2 and result.capacity_telemetry.max_results_hit and result.capacity_telemetry.truncated_snippets == 2 and result.unknowns.len > 0;
+    out.setup_corpus_mutation = true;
+    return out;
+}
+
+fn runCorpusLargerBounded(allocator: std.mem.Allocator) !ScenarioResult {
+    const shard_id = "bench-compute-dominance-larger";
+    try withCorpus(allocator, shard_id, &.{
+        .{ .path = "a.md", .body = "Alpha recall policy enabled with exact local evidence and bounded snippets.\n" },
+        .{ .path = "b.md", .body = "Beta recall policy enabled with exact local evidence and bounded snippets.\n" },
+        .{ .path = "c.md", .body = "Gamma recall policy enabled with exact local evidence and bounded snippets.\n" },
+        .{ .path = "d.md", .body = "Delta recall policy enabled with exact local evidence and bounded snippets.\n" },
+        .{ .path = "noise.md", .body = "Unrelated shader startup diagnostics are local but not recall policy evidence.\n" },
+    });
+    defer cleanProjectShard(allocator, shard_id) catch {};
+
+    const question = "recall policy enabled";
+    const started = std.time.nanoTimestamp();
+    var first = try corpus_ask.ask(allocator, .{ .question = question, .project_shard = shard_id, .max_results = 3, .max_snippet_bytes = 72 });
+    defer first.deinit();
+    var second = try corpus_ask.ask(allocator, .{ .question = question, .project_shard = shard_id, .max_results = 3, .max_snippet_bytes = 72 });
+    defer second.deinit();
+
+    var out = scenarioFromAsk("corpus.ask/larger_bounded_corpus_deterministic_ranking", question.len, elapsedNs(started), &first);
+    const stable = sameEvidenceRanking(&first, &second);
+    out.success = first.status == .answered and first.evidence_used.len == 3 and first.corpus_entries_considered >= 5 and stable;
+    out.deterministic_rank_stability = stable;
+    out.setup_corpus_mutation = true;
+    return out;
+}
+
+fn runRuleSimpleFires(allocator: std.mem.Allocator) !ScenarioResult {
+    const facts = [_]rule_reasoning.Fact{.{ .subject = "build", .predicate = "has", .object = "test" }};
+    const outputs = [_]rule_reasoning.RuleOutput{.{ .kind = .check_candidate, .id = "check:test", .summary = "run explicit test verifier" }};
+    const rules = [_]rule_reasoning.Rule{.{ .id = "rule:test", .name = "test rule", .all = &.{.{ .subject = "build", .predicate = "has", .object = "test" }}, .outputs = &outputs }};
+    return runRuleScenario(allocator, "rule.evaluate/simple_rule_fires", &facts, &rules, .{}, true, 1, 1);
+}
+
+fn runRuleNonMatching(allocator: std.mem.Allocator) !ScenarioResult {
+    const facts = [_]rule_reasoning.Fact{.{ .subject = "build", .predicate = "has", .object = "lint" }};
+    const outputs = [_]rule_reasoning.RuleOutput{.{ .kind = .check_candidate, .id = "check:test", .summary = "run explicit test verifier" }};
+    const rules = [_]rule_reasoning.Rule{.{ .id = "rule:test", .name = "test rule", .all = &.{.{ .subject = "build", .predicate = "has", .object = "test" }}, .outputs = &outputs }};
+    return runRuleScenario(allocator, "rule.evaluate/non_matching_rule", &facts, &rules, .{}, true, 0, 0);
+}
+
+fn runRuleMultipleDeterministic(allocator: std.mem.Allocator) !ScenarioResult {
+    const facts = [_]rule_reasoning.Fact{
+        .{ .subject = "build", .predicate = "has", .object = "test" },
+        .{ .subject = "runtime", .predicate = "has", .object = "oracle" },
+    };
+    const out_a = [_]rule_reasoning.RuleOutput{.{ .kind = .check_candidate, .id = "check:test", .summary = "run explicit test verifier" }};
+    const out_b = [_]rule_reasoning.RuleOutput{.{ .kind = .evidence_expectation, .id = "evidence:oracle", .summary = "cite runtime oracle output" }};
+    const rules = [_]rule_reasoning.Rule{
+        .{ .id = "rule:a", .name = "test rule", .all = &.{.{ .subject = "build", .predicate = "has", .object = "test" }}, .outputs = &out_a },
+        .{ .id = "rule:b", .name = "oracle rule", .all = &.{.{ .subject = "runtime", .predicate = "has", .object = "oracle" }}, .outputs = &out_b },
+    };
+    return runRuleScenario(allocator, "rule.evaluate/multiple_deterministic_rules", &facts, &rules, .{}, true, 2, 2);
+}
+
+fn runRuleMaxFiredRulesCap(allocator: std.mem.Allocator) !ScenarioResult {
+    const facts = [_]rule_reasoning.Fact{.{ .subject = "build", .predicate = "has", .object = "test" }};
+    const out_a = [_]rule_reasoning.RuleOutput{.{ .kind = .check_candidate, .id = "check:a", .summary = "candidate a" }};
+    const out_b = [_]rule_reasoning.RuleOutput{.{ .kind = .check_candidate, .id = "check:b", .summary = "candidate b" }};
+    const rules = [_]rule_reasoning.Rule{
+        .{ .id = "rule:a", .name = "rule a", .all = &.{.{ .subject = "build", .predicate = "has", .object = "test" }}, .outputs = &out_a },
+        .{ .id = "rule:b", .name = "rule b", .all = &.{.{ .subject = "build", .predicate = "has", .object = "test" }}, .outputs = &out_b },
+    };
+    return runRuleScenario(allocator, "rule.evaluate/max_fired_rules_cap", &facts, &rules, .{ .max_fired_rules = 1 }, true, 1, 1);
+}
+
+fn runRuleMaxOutputCap(allocator: std.mem.Allocator) !ScenarioResult {
+    const facts = [_]rule_reasoning.Fact{.{ .subject = "build", .predicate = "has", .object = "test" }};
+    const outputs = [_]rule_reasoning.RuleOutput{
+        .{ .kind = .check_candidate, .id = "check:a", .summary = "candidate a" },
+        .{ .kind = .unknown, .id = "unknown:a", .summary = "bounded unknown" },
+    };
+    const rules = [_]rule_reasoning.Rule{.{ .id = "rule:a", .name = "rule a", .all = &.{.{ .subject = "build", .predicate = "has", .object = "test" }}, .outputs = &outputs }};
+    return runRuleScenario(allocator, "rule.evaluate/max_output_cap", &facts, &rules, .{ .max_outputs = 1 }, true, 1, 1);
+}
+
+fn runRuleInvalidOutputRejection(allocator: std.mem.Allocator) !ScenarioResult {
+    const facts = [_]rule_reasoning.Fact{.{ .subject = "build", .predicate = "has", .object = "test" }};
+    const outputs = [_]rule_reasoning.RuleOutput{.{ .kind = .fact, .id = "fact:recursive", .summary = "recursive fact output" }};
+    const rules = [_]rule_reasoning.Rule{.{ .id = "rule:recursive", .name = "recursive rule", .all = &.{.{ .subject = "build", .predicate = "has", .object = "test" }}, .outputs = &outputs }};
+    const input_bytes = estimateRuleInputBytes(&facts, &rules);
+    const started = std.time.nanoTimestamp();
+    const rejected = if (rule_reasoning.evaluate(allocator, .{ .facts = &facts, .rules = &rules })) |result_value| blk: {
+        var result = result_value;
+        result.deinit();
+        break :blk false;
+    } else |err| err == error.InvalidRule;
+    return .{
+        .name = "rule.evaluate/recursive_invalid_output_rejection",
+        .operation_kind = .@"rule.evaluate",
+        .success = rejected,
+        .duration_ns = elapsedNs(started),
+        .input_bytes = input_bytes,
+        .unknown_count = if (rejected) 1 else 0,
+        .non_authorizing = true,
+    };
+}
+
+fn runRuleScenario(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    facts: []const rule_reasoning.Fact,
+    rules: []const rule_reasoning.Rule,
+    limits: rule_reasoning.Limits,
+    expect_success: bool,
+    expected_fired: usize,
+    expected_outputs: usize,
+) !ScenarioResult {
+    const started = std.time.nanoTimestamp();
+    var result = try rule_reasoning.evaluate(allocator, .{ .facts = facts, .rules = rules, .limits = limits });
+    defer result.deinit();
+
+    var out = scenarioFromRule(name, estimateRuleInputBytes(facts, rules), elapsedNs(started), &result);
+    out.success = expect_success and result.fired_rules.len == expected_fired and result.outputs_emitted == expected_outputs;
+    if (std.mem.indexOf(u8, name, "cap") != null) out.success = out.success and result.budget_exhausted;
+    return out;
+}
+
+fn runCorrectionWrongAnswer() ScenarioResult {
+    return runCorrectionScenario("correction.propose/wrong_answer", .{
+        .operation_kind = "corpus.ask",
+        .disputed_output_kind = .answerDraft,
+        .disputed_output_ref = "answer:1",
+        .user_correction = "the answer is wrong",
+        .correction_type = .wrong_answer,
+    }, 3);
+}
+
+fn runCorrectionMissingEvidence() ScenarioResult {
+    return runCorrectionScenario("correction.propose/missing_evidence", .{
+        .operation_kind = "corpus.ask",
+        .disputed_output_kind = .unknown,
+        .user_correction = "the answer needs a citation",
+        .correction_type = .missing_evidence,
+    }, 1);
+}
+
+fn runCorrectionRepeatedFailedPattern() ScenarioResult {
+    return runCorrectionScenario("correction.propose/repeated_failed_pattern", .{
+        .operation_kind = "context.autopsy",
+        .disputed_output_kind = .unknown,
+        .user_correction = "this same missing-context pattern keeps failing",
+        .correction_type = .repeated_failed_pattern,
+    }, 1);
+}
+
+fn runCorrectionUnderspecified() ScenarioResult {
+    return runCorrectionScenario("correction.propose/underspecified_correction", .{
+        .operation_kind = "rule.evaluate",
+        .correction_type = .missing_evidence,
+    }, 1);
+}
+
+fn runCorrectionScenario(name: []const u8, request: correction_candidates.Request, expected_learning: usize) ScenarioResult {
+    const input_bytes = estimateCorrectionInputBytes(request);
+    const started = std.time.nanoTimestamp();
+    const proposal = correction_candidates.propose(request, 0xfeed_cafe);
+    var out = scenarioFromCorrection(name, input_bytes, elapsedNs(started), proposal);
+    out.success = proposal.required_review and proposal.non_authorizing and !proposal.treated_as_proof and proposal.learning_outputs.len == expected_learning and
+        !proposal.mutation_flags.corpus_mutation and !proposal.mutation_flags.pack_mutation and !proposal.mutation_flags.negative_knowledge_mutation and
+        !proposal.mutation_flags.commands_executed and !proposal.mutation_flags.verifiers_executed;
+    if (std.mem.indexOf(u8, name, "underspecified") != null) {
+        out.success = out.success and std.mem.eql(u8, proposal.status, "request_more_detail") and proposal.candidate_id_hash == null and proposal.unknown_reason != null;
+    } else {
+        out.success = out.success and std.mem.eql(u8, proposal.status, "proposed") and proposal.candidate_id_hash != null;
+        out.correction_candidate_count = 1;
+    }
+    return out;
+}
+
+fn runLifecycleScenario(allocator: std.mem.Allocator) !ScenarioResult {
+    const shard_id = "bench-compute-dominance-lifecycle";
+    try cleanProjectShard(allocator, shard_id);
+    defer cleanProjectShard(allocator, shard_id) catch {};
+
+    const fixture_root = try prepareCorpusFixture(allocator, "lifecycle", &.{
+        .{ .path = "verifier-policy.md", .body = "Verifier execution must remain explicit and never run by default.\nCorpus answers draft from cited evidence only.\n" },
+    });
+    defer allocator.free(fixture_root);
+    defer deleteTreeIfExistsAbsolute(fixture_root) catch {};
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, shard_id);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+
+    const question = "what does the corpus say about verifier execution";
+    const input_bytes = question.len + fixture_root.len;
+    const started = std.time.nanoTimestamp();
+    var stage_result = try corpus_ingest.stage(allocator, .{
+        .corpus_path = fixture_root,
+        .project_shard = shard_id,
+        .trust_class = .project,
+        .source_label = "compute-dominance-lifecycle",
+    });
+    defer stage_result.deinit();
+    try corpus_ingest.applyStaged(allocator, &project_paths);
+
+    var ask_result = try corpus_ask.ask(allocator, .{
+        .question = question,
+        .project_shard = shard_id,
+        .max_results = 2,
+        .max_snippet_bytes = 96,
+    });
+    defer ask_result.deinit();
+
+    const proposal = correction_candidates.propose(.{
+        .operation_kind = "corpus.ask",
+        .disputed_output_kind = .answerDraft,
+        .disputed_output_ref = "answer:lifecycle",
+        .user_correction = "missing evidence should stay review-required",
+        .correction_type = .missing_evidence,
+    }, 0x51);
+
+    var out = scenarioFromAsk("end_to_end/lifecycle_ingest_apply_ask_correction_no_hidden_mutation", input_bytes, elapsedNs(started), &ask_result);
+    out.operation_kind = .@"corpus.lifecycle";
+    out.setup_corpus_mutation = true;
+    out.required_review = proposal.required_review;
+    out.correction_candidate_count = if (proposal.candidate_id_hash != null) 1 else 0;
+    out.learning_candidate_count += proposal.learning_outputs.len;
+    out.success = stage_result.staged_items == 1 and ask_result.status == .answered and ask_result.answer_draft != null and ask_result.evidence_used.len == 1 and
+        proposal.required_review and proposal.non_authorizing and
+        !ask_result.safety_flags.corpus_mutation and !ask_result.safety_flags.pack_mutation and !ask_result.safety_flags.negative_knowledge_mutation and
+        !proposal.mutation_flags.corpus_mutation and !proposal.mutation_flags.pack_mutation and !proposal.mutation_flags.negative_knowledge_mutation;
+    return out;
+}
+
+const CorpusFile = struct {
+    path: []const u8,
+    body: []const u8,
+};
+
+fn withCorpus(allocator: std.mem.Allocator, shard_id: []const u8, files: []const CorpusFile) !void {
+    try cleanProjectShard(allocator, shard_id);
+    const fixture_root = try prepareCorpusFixture(allocator, shard_id, files);
+    defer allocator.free(fixture_root);
+    defer deleteTreeIfExistsAbsolute(fixture_root) catch {};
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, shard_id);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+
+    var stage_result = try corpus_ingest.stage(allocator, .{
+        .corpus_path = fixture_root,
+        .project_shard = shard_id,
+        .trust_class = .project,
+        .source_label = "compute-dominance-corpus",
+    });
+    defer stage_result.deinit();
+    try corpus_ingest.applyStaged(allocator, &project_paths);
+}
+
+fn prepareCorpusFixture(allocator: std.mem.Allocator, name: []const u8, files: []const CorpusFile) ![]u8 {
+    const root = try std.fmt.allocPrint(allocator, "/tmp/ghost_compute_dominance/{s}", .{name});
+    errdefer allocator.free(root);
+    try deleteTreeIfExistsAbsolute(root);
+    try std.fs.cwd().makePath(root);
+    for (files) |file| {
+        const abs = try std.fs.path.join(allocator, &.{ root, file.path });
+        defer allocator.free(abs);
+        try ensureParentDirAbsolute(abs);
+        const handle = try std.fs.createFileAbsolute(abs, .{ .truncate = true });
+        defer handle.close();
+        try handle.writeAll(file.body);
+    }
+    return root;
+}
+
+fn cleanProjectShard(allocator: std.mem.Allocator, shard_id: []const u8) !void {
+    var project_metadata = try shards.resolveProjectMetadata(allocator, shard_id);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.root_abs_path);
+}
+
+fn scenarioFromAsk(name: []const u8, input_bytes: usize, duration_ns: u64, result: *const corpus_ask.Result) ScenarioResult {
+    return .{
+        .name = name,
+        .operation_kind = .@"corpus.ask",
+        .success = false,
+        .duration_ns = duration_ns,
+        .input_bytes = input_bytes,
+        .corpus_entries_considered = result.corpus_entries_considered,
+        .evidence_count = result.evidence_used.len,
+        .similar_candidate_count = result.similar_candidates.len,
+        .unknown_count = result.unknowns.len,
+        .capacity_warning_count = capacityWarningsFromAsk(result.capacity_telemetry),
+        .learning_candidate_count = result.learning_candidates.len,
+        .commands_executed = if (result.safety_flags.commands_executed) 1 else 0,
+        .verifiers_executed = if (result.safety_flags.verifiers_executed) 1 else 0,
+        .corpus_mutation = result.safety_flags.corpus_mutation,
+        .pack_mutation = result.safety_flags.pack_mutation,
+        .negative_knowledge_mutation = result.safety_flags.negative_knowledge_mutation,
+        .answer_draft_present = result.answer_draft != null,
+        .non_authorizing = true,
+    };
+}
+
+fn scenarioFromRule(name: []const u8, input_bytes: usize, duration_ns: u64, result: *const rule_reasoning.EvaluationResult) ScenarioResult {
+    return .{
+        .name = name,
+        .operation_kind = .@"rule.evaluate",
+        .success = false,
+        .duration_ns = duration_ns,
+        .input_bytes = input_bytes,
+        .evidence_count = result.emitted_obligations.len,
+        .unknown_count = result.emitted_unknowns.len,
+        .capacity_warning_count = capacityWarningsFromRule(result.capacity_telemetry),
+        .correction_candidate_count = result.emitted_candidates.len,
+        .commands_executed = if (result.safety_flags.commands_executed) 1 else 0,
+        .verifiers_executed = if (result.safety_flags.verifiers_executed) 1 else 0,
+        .corpus_mutation = result.safety_flags.corpus_mutation,
+        .pack_mutation = result.safety_flags.pack_mutation,
+        .negative_knowledge_mutation = result.safety_flags.negative_knowledge_mutation,
+        .non_authorizing = result.non_authorizing,
+    };
+}
+
+fn scenarioFromCorrection(name: []const u8, input_bytes: usize, duration_ns: u64, proposal: correction_candidates.Proposal) ScenarioResult {
+    return .{
+        .name = name,
+        .operation_kind = .@"correction.propose",
+        .success = false,
+        .duration_ns = duration_ns,
+        .input_bytes = input_bytes,
+        .unknown_count = if (proposal.unknown_reason != null) 1 else 0,
+        .learning_candidate_count = proposal.learning_outputs.len,
+        .commands_executed = if (proposal.mutation_flags.commands_executed) 1 else 0,
+        .verifiers_executed = if (proposal.mutation_flags.verifiers_executed) 1 else 0,
+        .corpus_mutation = proposal.mutation_flags.corpus_mutation,
+        .pack_mutation = proposal.mutation_flags.pack_mutation,
+        .negative_knowledge_mutation = proposal.mutation_flags.negative_knowledge_mutation,
+        .non_authorizing = proposal.non_authorizing,
+        .required_review = proposal.required_review,
+    };
+}
+
+fn capacityWarningsFromAsk(telemetry: corpus_ask.CapacityTelemetry) usize {
+    var count: usize = 0;
+    if (telemetry.hasPressure()) count += 1;
+    if (telemetry.max_results_hit) count += 1;
+    if (telemetry.truncated_snippets != 0) count += telemetry.truncated_snippets;
+    if (telemetry.truncated_inputs != 0) count += telemetry.truncated_inputs;
+    return count;
+}
+
+fn capacityWarningsFromRule(telemetry: rule_reasoning.CapacityTelemetry) usize {
+    var count: usize = 0;
+    if (telemetry.hasPressure()) count += 1;
+    if (telemetry.max_outputs_hit) count += 1;
+    if (telemetry.max_fired_rules_hit) count += 1;
+    if (telemetry.rejected_outputs != 0) count += telemetry.rejected_outputs;
+    return count;
+}
+
+fn sameEvidenceRanking(lhs: *const corpus_ask.Result, rhs: *const corpus_ask.Result) bool {
+    if (lhs.evidence_used.len != rhs.evidence_used.len) return false;
+    for (lhs.evidence_used, 0..) |item, idx| {
+        if (item.rank != rhs.evidence_used[idx].rank) return false;
+        if (!std.mem.eql(u8, item.source_path, rhs.evidence_used[idx].source_path)) return false;
+    }
+    return true;
+}
+
+fn estimateRuleInputBytes(facts: []const rule_reasoning.Fact, rules: []const rule_reasoning.Rule) usize {
+    var total: usize = 0;
+    for (facts) |fact| total += fact.subject.len + fact.predicate.len + fact.object.len + fact.source.len;
+    for (rules) |rule| {
+        total += rule.id.len + rule.name.len;
+        for (rule.all) |condition| total += condition.subject.len + condition.predicate.len + if (condition.object) |object| object.len else 0;
+        for (rule.any) |condition| total += condition.subject.len + condition.predicate.len + if (condition.object) |object| object.len else 0;
+        for (rule.outputs) |output| total += output.id.len + output.summary.len + output.detail.len + output.risk_level.len;
+    }
+    return total;
+}
+
+fn estimateCorrectionInputBytes(request: correction_candidates.Request) usize {
+    var total: usize = 0;
+    if (request.operation_kind) |value| total += value.len;
+    if (request.original_request_id) |value| total += value.len;
+    if (request.original_request_summary) |value| total += value.len;
+    if (request.disputed_output_ref) |value| total += value.len;
+    if (request.disputed_output_summary) |value| total += value.len;
+    if (request.user_correction) |value| total += value.len;
+    if (request.project_shard) |value| total += value.len;
+    for (request.evidence_refs) |value| total += value.len;
+    return total;
+}
+
+pub fn renderJsonReport(allocator: std.mem.Allocator, suite: SuiteResult) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const writer = out.writer();
+
+    try writer.writeAll("{");
+    try writeJsonFieldString(writer, "suite", "ghost_compute_dominance", true);
+    try writeJsonFieldString(writer, "os", @tagName(builtin.os.tag), false);
+    try writer.print(",\"localOnly\":true,\"networkUsed\":false,\"cloudUsed\":false,\"transformersUsed\":false,\"embeddingsUsed\":false,\"fabricatedBaselines\":false,\"totalScenarios\":{d},\"passedScenarios\":{d},\"failedScenarios\":{d},\"totalDurationNs\":{d}", .{
+        suite.scenarios.len,
+        passedCount(suite.scenarios),
+        suite.scenarios.len - passedCount(suite.scenarios),
+        suite.total_duration_ns,
+    });
+    try writer.writeAll(",\"scenarios\":[");
+    for (suite.scenarios, 0..) |scenario, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try writer.writeByte('{');
+        try writeJsonFieldString(writer, "scenarioName", scenario.name, true);
+        try writeJsonFieldString(writer, "operationKind", @tagName(scenario.operation_kind), false);
+        try writer.print(",\"success\":{s},\"durationNs\":{d},\"inputBytes\":{d}", .{ boolText(scenario.success), scenario.duration_ns, scenario.input_bytes });
+        if (scenario.corpus_entries_considered) |value| {
+            try writer.print(",\"corpusEntriesConsidered\":{d}", .{value});
+        } else {
+            try writer.writeAll(",\"corpusEntriesConsidered\":null");
+        }
+        try writer.print(",\"evidenceCount\":{d},\"similarCandidateCount\":{d},\"unknownCount\":{d},\"capacityWarningCount\":{d},\"correctionCandidateCount\":{d},\"learningCandidateCount\":{d}", .{
+            scenario.evidence_count,
+            scenario.similar_candidate_count,
+            scenario.unknown_count,
+            scenario.capacity_warning_count,
+            scenario.correction_candidate_count,
+            scenario.learning_candidate_count,
+        });
+        try writer.print(",\"commandsExecuted\":{d},\"verifiersExecuted\":{d}", .{ scenario.commands_executed, scenario.verifiers_executed });
+        try writer.print(",\"corpusMutation\":{s},\"packMutation\":{s},\"negativeKnowledgeMutation\":{s},\"answerDraftPresent\":{s},\"nonAuthorizing\":{s}", .{
+            boolText(scenario.corpus_mutation),
+            boolText(scenario.pack_mutation),
+            boolText(scenario.negative_knowledge_mutation),
+            boolText(scenario.answer_draft_present),
+            boolText(scenario.non_authorizing),
+        });
+        if (scenario.required_review) |value| {
+            try writer.print(",\"requiredReview\":{s}", .{boolText(value)});
+        } else {
+            try writer.writeAll(",\"requiredReview\":null");
+        }
+        try writer.print(",\"localOnly\":{s},\"setupCorpusMutation\":{s}", .{ boolText(scenario.local_only), boolText(scenario.setup_corpus_mutation) });
+        if (scenario.deterministic_rank_stability) |value| {
+            try writer.print(",\"deterministicRankStability\":{s}", .{boolText(value)});
+        }
+        try writer.writeByte('}');
+    }
+    try writer.writeAll("]}");
+    return out.toOwnedSlice();
+}
+
+pub fn renderMarkdownReport(allocator: std.mem.Allocator, suite: SuiteResult) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const writer = out.writer();
+
+    try writer.writeAll("# Ghost Compute Dominance Benchmark\n\n");
+    try writer.print("- scenarios: {d}\n- passed: {d}\n- failed: {d}\n- total duration ns: {d}\n- local only: true\n- cloud/Transformer/embedding baselines: none\n\n", .{
+        suite.scenarios.len,
+        passedCount(suite.scenarios),
+        suite.scenarios.len - passedCount(suite.scenarios),
+        suite.total_duration_ns,
+    });
+    try writer.writeAll("| scenario | kind | ok | duration ns | evidence | similar | unknown | capacity | corrections | learning |\n");
+    try writer.writeAll("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    for (suite.scenarios) |scenario| {
+        try writer.print("| {s} | {s} | {s} | {d} | {d} | {d} | {d} | {d} | {d} | {d} |\n", .{
+            scenario.name,
+            @tagName(scenario.operation_kind),
+            if (scenario.success) "yes" else "no",
+            scenario.duration_ns,
+            scenario.evidence_count,
+            scenario.similar_candidate_count,
+            scenario.unknown_count,
+            scenario.capacity_warning_count,
+            scenario.correction_candidate_count,
+            scenario.learning_candidate_count,
+        });
+    }
+    return out.toOwnedSlice();
+}
+
+fn allScenariosPassed(scenarios: []const ScenarioResult) bool {
+    for (scenarios) |scenario| if (!scenario.success) return false;
+    return true;
+}
+
+fn passedCount(scenarios: []const ScenarioResult) usize {
+    var count: usize = 0;
+    for (scenarios) |scenario| {
+        if (scenario.success) count += 1;
+    }
+    return count;
+}
+
+fn elapsedNs(started: i128) u64 {
+    const now = std.time.nanoTimestamp();
+    return @intCast(@max(now - started, 0));
+}
+
+fn boolText(value: bool) []const u8 {
+    return if (value) "true" else "false";
+}
+
+fn writeAbsoluteFile(allocator: std.mem.Allocator, path: []const u8, body: []const u8) !void {
+    try ensureParentDirAbsolute(path);
+    const file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(body);
+    _ = allocator;
+}
+
+fn ensureParentDirAbsolute(path: []const u8) !void {
+    const dir = std.fs.path.dirname(path) orelse return;
+    try std.fs.cwd().makePath(dir);
+}
+
+fn deleteTreeIfExistsAbsolute(path: []const u8) !void {
+    std.fs.deleteTreeAbsolute(path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+fn writeJsonFieldString(writer: anytype, key: []const u8, value: []const u8, first: bool) !void {
+    if (!first) try writer.writeByte(',');
+    try writeJsonString(writer, key);
+    try writer.writeByte(':');
+    try writeJsonString(writer, value);
+}
+
+fn writeJsonString(writer: anytype, value: []const u8) !void {
+    try writer.writeByte('"');
+    for (value) |c| {
+        switch (c) {
+            '\\' => try writer.writeAll("\\\\"),
+            '"' => try writer.writeAll("\\\""),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => {
+                if (c < 0x20) {
+                    try writer.print("\\u{X:0>4}", .{@as(u8, c)});
+                } else {
+                    try writer.writeByte(c);
+                }
+            },
+        }
+    }
+    try writer.writeByte('"');
+}
+
+test "compute dominance report is generated with required scenarios and safety fields" {
+    const allocator = std.testing.allocator;
+    var suite = try runSuite(allocator);
+    defer suite.deinit();
+
+    try std.testing.expectEqual(@as(usize, 18), suite.scenarios.len);
+    try std.testing.expect(allScenariosPassed(suite.scenarios));
+
+    const json = try renderJsonReport(allocator, suite);
+    defer allocator.free(json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"suite\":\"ghost_compute_dominance\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"corpus.ask/no_corpus\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"corpus.ask/larger_bounded_corpus_deterministic_ranking\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"rule.evaluate/recursive_invalid_output_rejection\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"correction.propose/repeated_failed_pattern\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"end_to_end/lifecycle_ingest_apply_ask_correction_no_hidden_mutation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"cloudUsed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"transformersUsed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"embeddingsUsed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"fabricatedBaselines\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"packMutation\":true") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"negativeKnowledgeMutation\":true") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"commandsExecuted\":1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verifiersExecuted\":1") == null);
+}

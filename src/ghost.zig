@@ -42,6 +42,7 @@ pub const conversation_session = @import("conversation_session.zig");
 pub const verifier_adapter = @import("verifier_adapter.zig");
 pub const verifier_execution = @import("verifier_execution.zig");
 pub const correction_hooks = @import("correction_hooks.zig");
+pub const correction_candidates = @import("correction_candidates.zig");
 pub const negative_knowledge = @import("negative_knowledge.zig");
 pub const repo_hygiene = @import("repo_hygiene.zig");
 pub const project_autopsy = @import("project_autopsy.zig");

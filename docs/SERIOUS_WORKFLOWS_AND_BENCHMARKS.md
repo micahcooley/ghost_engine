@@ -11,6 +11,7 @@ Current measured surfaces:
 - code-impact correctness
 - contradiction detection correctness
 - unresolved-versus-unsupported honesty behavior
+- local compute dominance workflow metrics for corpus ask, rule evaluation, correction proposals, and explicit corpus lifecycle
 - minimal-safe-refactor selection
 - execution-loop handling
 - provenance/support completeness
@@ -47,8 +48,42 @@ Outputs:
 
 - `benchmarks/ghost_serious_workflows/results/latest-linux.json`
 - `benchmarks/ghost_serious_workflows/results/latest-linux.md`
+- `zig-out/bench/compute_dominance.json`
+- `zig-out/bench/compute_dominance.md`
 
-The runner is implemented in `src/bench_serious_workflows.zig`.
+The serious-workflow runner is implemented in `src/bench_serious_workflows.zig`. The compute-dominance runner is implemented in `src/bench_compute_dominance.zig` and can also be run directly:
+
+```bash
+zig build bench-compute-dominance
+```
+
+## Compute Dominance Benchmarks
+
+The compute-dominance report measures whether shipped local Ghost surfaces are doing useful bounded work per unit of local compute. It is not a model leaderboard and it does not compare Ghost to cloud LLMs, Transformers, embedding search, or any fabricated baseline.
+
+Measured operation groups:
+
+- `corpus.ask`: no corpus, exact phrase match, weak unrelated evidence, conflicting evidence, approximate-only SimHash hints, capacity-limited retrieval, and larger bounded deterministic ranking
+- `rule.evaluate`: simple match, non-match, multiple deterministic rules, fired-rule cap, output cap, and invalid recursive fact-output rejection
+- `correction.propose`: `wrong_answer`, `missing_evidence`, `repeated_failed_pattern`, and underspecified correction requests
+- `corpus.lifecycle`: isolated fixture corpus creation, ingest/stage, explicit apply-live, exact ask, and review-required correction proposal
+
+Machine-readable scenario metrics include:
+
+- scenario name and operation kind
+- success/failure and duration in nanoseconds
+- input bytes
+- corpus entries considered when available
+- evidence, similar-candidate, unknown, capacity-warning, correction-candidate, and learning-candidate counts
+- command and verifier execution counts
+- corpus, pack, and negative-knowledge mutation flags from the measured outputs
+- answer-draft presence
+- non-authorizing and required-review flags
+- deterministic rank-stability where the scenario checks it
+
+The lifecycle case performs explicit temporary corpus setup for the benchmark and reports that setup separately as `setupCorpusMutation`. The benchmark does not mutate packs or negative knowledge, does not execute commands or verifiers, does not use network calls, and does not add Transformers, embeddings, LLM adapters, or cloud calls. Timing numbers are local observed workflow timings only; they are not universal intelligence claims.
+
+RSS or memory counters are not emitted because there is no existing benchmark stats utility in this repo that exposes them for these surfaces.
 
 ## Current Linux Report
 
@@ -74,8 +109,8 @@ Latest report from this workspace:
 - patch compile-pass rate: 84% (16/19)
 - test-pass rate: 87% (14/16)
 - runtime-pass rate: 83% (5/6)
-- latency per verified result: 7509 ms
-- cold start / warm start: 276 ms / 360 ms
+- latency per verified result: 7485 ms
+- cold start / warm start: 267 ms / 335 ms
 - cold cache changed files / warm cache changed files: 15 / 0
 - workflow cases: 7
 - task-state distribution: `blocked=2`, `unresolved=1`, `verified_complete=4`
@@ -90,7 +125,7 @@ Latest report from this workspace:
 - pack budget cap hits / local-truth wins: 4 / 1
 - response mode distribution: draft=1, fast=1, deep=1
 - measured response mode selection / draft path / fast path / deep path: 0 / 2 / 1 / 1 ms
-- measured artifact schema pipeline / verifier adapter dispatch: 3 / 15 ms
+- measured artifact schema pipeline / verifier adapter dispatch: 8 / 10 ms
 - verifier domains: code=36, non_code=2
 
 ## Interpreting The Rates

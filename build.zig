@@ -185,9 +185,27 @@ pub fn build(b: *std.Build) void {
         vulkan_sdk,
         addVulkanIncludes,
     );
+    const compute_bench_exe = addGhostExecutable(
+        b,
+        "ghost_bench_compute_dominance",
+        "src/bench_compute_dominance.zig",
+        target,
+        optimize,
+        ghost_core,
+        core_options,
+        target.result.os,
+        vulkan_sdk,
+        addVulkanIncludes,
+    );
+    const run_compute_bench = b.addRunArtifact(compute_bench_exe);
+    run_compute_bench.step.dependOn(b.getInstallStep());
+    const compute_bench_step = b.step("bench-compute-dominance", "Run local compute dominance benchmark scenarios");
+    compute_bench_step.dependOn(&run_compute_bench.step);
+
     const run_bench = b.addRunArtifact(bench_exe);
     run_bench.step.dependOn(b.getInstallStep());
     const bench_step = b.step("bench-serious-workflows", "Run the serious workflow benchmark suite");
+    bench_step.dependOn(&run_compute_bench.step);
     bench_step.dependOn(&run_bench.step);
 
     const hygiene_cmd = b.addSystemCommand(&.{
@@ -296,6 +314,23 @@ pub fn build(b: *std.Build) void {
     addVulkanIncludes(project_autopsy_cli_tests.root_module, target.result.os, vulkan_sdk, b);
     const run_project_autopsy_cli_tests = b.addRunArtifact(project_autopsy_cli_tests);
     test_step.dependOn(&run_project_autopsy_cli_tests.step);
+
+    const compute_dominance_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_compute_dominance.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    compute_dominance_tests.root_module.addImport("ghost_core", ghost_core_test);
+    compute_dominance_tests.root_module.addOptions("build_options", test_core_options);
+    compute_dominance_tests.root_module.linkSystemLibrary("c", .{});
+    if (target.result.os.tag == .linux) {
+        compute_dominance_tests.root_module.linkSystemLibrary("dl", .{});
+    }
+    addVulkanIncludes(compute_dominance_tests.root_module, target.result.os, vulkan_sdk, b);
+    const run_compute_dominance_tests = b.addRunArtifact(compute_dominance_tests);
+    test_step.dependOn(&run_compute_dominance_tests.step);
 
     // ── 10. Parity Test ──
     const parity_test = b.addTest(.{
