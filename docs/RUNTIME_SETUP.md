@@ -195,12 +195,18 @@ Run the ingestion CLI explicitly when you want to import a bounded external subs
   --source-label=<label>
 ```
 
+Apply that staged corpus explicitly before expecting live-corpus readers such as `corpus.ask` to see it:
+
+```bash
+./zig-out/bin/ghost_corpus_ingest --apply-staged --project-shard=<id>
+```
+
 Important behavior:
 
 - ingestion is Linux-first and manual only
 - there are no watchers and no auto-ingest
 - staged corpus data is cleared by `discard`
-- manual `ghost_corpus_ingest` output stays staged until a later `commit`
+- manual `ghost_corpus_ingest` output stays staged until an explicit `--apply-staged` or a later `commit`
 - operator-driven external evidence is different: the task-support recovery path applies the staged set into shard-local live corpus immediately before rerunning support
 - live corpus data participates in shard-local `code_intel` and symbolic grounding
 - `snapshot` and `revert` cover live corpus state along with the rest of the shard

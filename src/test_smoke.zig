@@ -5674,6 +5674,88 @@ test "corpus ask returns draft answer with bounded evidence and weak matches sta
     try std.testing.expect(weak.answer_draft == null);
 }
 
+test "gip corpus ask sees ingested corpus only after explicit staged apply" {
+    const allocator = std.testing.allocator;
+    const project_shard = "corpus-ask-e2e-apply-test";
+    var corpus_fixture = std.testing.tmpDir(.{});
+    defer corpus_fixture.cleanup();
+    const corpus_root = try corpus_fixture.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+    try writeFixtureFile(corpus_fixture.dir, "verifier-policy.md",
+        \\# Verifier Execution Policy
+        \\Ghost corpus smoke fact: verifier execution must remain explicit and never run by default.
+        \\Corpus answers may draft from evidence, but they do not execute verifiers.
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path) catch {};
+
+    var before = try gip.dispatch.dispatch(
+        allocator,
+        "corpus.ask",
+        gip.core.PROTOCOL_VERSION,
+        null,
+        null,
+        "{\"question\":\"What does the corpus say about verifier execution?\",\"projectShard\":\"corpus-ask-e2e-apply-test\",\"maxResults\":2,\"maxSnippetBytes\":96}",
+    );
+    defer before.deinit(allocator);
+    try std.testing.expectEqual(gip.core.ProtocolStatus.unresolved, before.status);
+    try std.testing.expect(before.result_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, before.result_json.?, "\"no_corpus_available\"") != null);
+
+    var stage_result = try corpus_ingest.stage(allocator, .{
+        .corpus_path = corpus_root,
+        .project_shard = project_shard,
+        .trust_class = .project,
+        .source_label = "verifier-policy-corpus",
+    });
+    defer stage_result.deinit();
+
+    var staged_only = try gip.dispatch.dispatch(
+        allocator,
+        "corpus.ask",
+        gip.core.PROTOCOL_VERSION,
+        null,
+        null,
+        "{\"question\":\"What does the corpus say about verifier execution?\",\"projectShard\":\"corpus-ask-e2e-apply-test\",\"maxResults\":2,\"maxSnippetBytes\":96}",
+    );
+    defer staged_only.deinit(allocator);
+    try std.testing.expectEqual(gip.core.ProtocolStatus.unresolved, staged_only.status);
+    try std.testing.expect(staged_only.result_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, staged_only.result_json.?, "\"no_corpus_available\"") != null);
+
+    try corpus_ingest.applyStaged(allocator, &project_paths);
+
+    var answered = try gip.dispatch.dispatch(
+        allocator,
+        "corpus.ask",
+        gip.core.PROTOCOL_VERSION,
+        null,
+        null,
+        "{\"question\":\"What does the corpus say about verifier execution?\",\"projectShard\":\"corpus-ask-e2e-apply-test\",\"maxResults\":2,\"maxSnippetBytes\":96}",
+    );
+    defer answered.deinit(allocator);
+    try std.testing.expectEqual(gip.core.ProtocolStatus.ok, answered.status);
+    try std.testing.expect(answered.result_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "\"status\":\"answered\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "\"state\":\"draft\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "\"permission\":\"none\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "\"nonAuthorizing\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "\"answerDraft\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "\"sourcePath\":\"verifier-policy.md\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "verifier execution must remain explicit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "\"corpusMutation\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "\"packMutation\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "\"negativeKnowledgeMutation\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "\"commandsExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "\"verifiersExecuted\":false") != null);
+}
+
 test "corpus ask conflicting evidence stays unresolved and learning is candidate-only" {
     const allocator = std.testing.allocator;
     const project_shard = "corpus-ask-conflict-test";

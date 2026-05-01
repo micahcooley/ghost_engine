@@ -42,7 +42,7 @@ Current ingestion contract:
 - classifies each file into `code`, `docs`, `specs`, `configs`, or `symbolic`
 - rejects unsupported or weakly structured inputs instead of falling back to loose interpretation
 - stages all accepted items under the selected shard first
-- manual `ghost_corpus_ingest` runs stop at the staged manifest; operator-driven external evidence can apply the staged set into shard-local live corpus immediately for support recovery
+- manual `ghost_corpus_ingest` runs stop at the staged manifest until `ghost_corpus_ingest --apply-staged --project-shard=<id>` or a later Sigil `commit`; operator-driven external evidence can apply the staged set into shard-local live corpus immediately for support recovery
 
 Current classification rules are explicit:
 
@@ -67,6 +67,14 @@ Every live corpus item carries:
 That metadata is attached to `code_intel` subjects, evidence, abstraction traces, and grounding traces when the result depends on ingested corpus surfaces.
 
 `corpus.ask` is the first GIP runtime slice that answers directly from this live corpus state. It does not ingest data, read staged corpus as active knowledge, run verifiers, or write learning state. When evidence is present it returns a draft/non-authorizing `answerDraft` with `evidenceUsed`; when evidence is missing, weak, or conflicting it returns explicit unknowns and candidate followups. Any learning output is a candidate object only and is not persisted automatically.
+
+Minimal binary-only ingest/apply/ask loop:
+
+```bash
+./zig-out/bin/ghost_corpus_ingest /tmp/ghost-corpus-smoke --project-shard=smoke --trust-class=project --source-label=smoke
+./zig-out/bin/ghost_corpus_ingest --apply-staged --project-shard=smoke
+echo '{"gipVersion":"gip.v0.1","kind":"corpus.ask","projectShard":"smoke","question":"What does the corpus say about verifier execution?"}' | ./zig-out/bin/ghost_gip --stdin
+```
 
 Bounded external evidence now reuses the same path instead of a separate web-memory system:
 
