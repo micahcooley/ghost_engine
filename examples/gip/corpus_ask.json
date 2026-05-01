@@ -1,0 +1,10 @@
+{
+  "gipVersion": "gip.v0.1",
+  "kind": "corpus.ask",
+  "requestId": "example-corpus-ask-001",
+  "projectShard": "my-project",
+  "question": "what does the corpus say about retention?",
+  "maxResults": 3,
+  "maxSnippetBytes": 320,
+  "requireCitations": true
+}

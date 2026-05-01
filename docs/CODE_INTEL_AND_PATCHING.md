@@ -66,6 +66,8 @@ Every live corpus item carries:
 
 That metadata is attached to `code_intel` subjects, evidence, abstraction traces, and grounding traces when the result depends on ingested corpus surfaces.
 
+`corpus.ask` is the first GIP runtime slice that answers directly from this live corpus state. It does not ingest data, read staged corpus as active knowledge, run verifiers, or write learning state. When evidence is present it returns a draft/non-authorizing `answerDraft` with `evidenceUsed`; when evidence is missing, weak, or conflicting it returns explicit unknowns and candidate followups. Any learning output is a candidate object only and is not persisted automatically.
+
 Bounded external evidence now reuses the same path instead of a separate web-memory system:
 
 - the operator accepts explicit URLs and/or bounded search queries

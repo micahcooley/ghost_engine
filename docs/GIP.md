@@ -99,6 +99,7 @@ results when GIP has no active session or workspace metadata:
 |-----------|------------------------|----------|
 | `hypothesis.list` | Returns empty hypotheses + zero counts | `stateless` |
 | `hypothesis.triage` | Returns empty triage summary with scoring policy version | `stateless` |
+| `corpus.ask` | Reads existing live shard corpus; returns explicit unknown when no corpus/evidence is visible | `read_only_live_corpus_grounded_draft` |
 | `verifier.candidate.execution.list` | Reads existing task/result support-graph state; returns empty when no state is visible | `read_only_state_inspection` |
 | `verifier.candidate.execution.get` | Reads one existing execution job/result projection; missing IDs return `path_not_found` | `read_only_state_inspection` |
 | `correction.list` | Reads existing correction-event state; returns empty when no state is visible | `read_only_state_inspection` |
@@ -193,6 +194,17 @@ promotion, or pack mutation.
     - **Verified**: Fully actionable output.
   - *Note*: This is the future path for `ghost_cli` migration.
 - `conversation.replay` — Replay a session for determinism testing **(Not implemented yet)**
+
+### Corpus-Grounded Ask
+- `corpus.ask` — Answer from explicitly ingested live shard corpus evidence **(Implemented)**
+  - **Request**: `{"question": string}` or `{"message": string}`, plus optional `projectShard` / `project_shard`, `maxResults` / `max_results`, `maxSnippetBytes` / `max_snippet_bytes`, and `requireCitations` / `require_citations`.
+  - **Response**: `{"corpusAsk":{"status":"answered"|"unknown","state":"draft"|"unresolved","permission":"none"|"unresolved","answerDraft": string optional,"evidenceUsed":[...],"unknowns":[...],"candidateFollowups":[...],"learningCandidates":[...],"trace":{...}}}`.
+  - Uses only existing live corpus state created through explicit corpus ingestion/lifecycle paths. Staged corpus is not read as active knowledge.
+  - Matching is bounded and deterministic over live corpus file excerpts. It is a first runtime slice, not a full semantic retrieval system.
+  - `evidenceUsed` reports corpus lineage id/path/source path/class, bounded snippet, selection reason, provenance, and score.
+  - Unknowns include `no_corpus_available`, `insufficient_evidence`, and `conflicting_evidence`.
+  - `learningCandidates` are candidate-only and non-authorizing. They are not persisted and do not mutate Knowledge Packs, corpus state, or negative knowledge.
+  - Trace flags always report `corpusMutation:false`, `packMutation:false`, `negativeKnowledgeMutation:false`, `commandsExecuted:false`, and `verifiersExecuted:false`.
 
 ### Artifacts
 - `artifact.read` — Read file content (workspace-bounded) **(Implemented)**
@@ -356,6 +368,7 @@ promote global authority.
 | `artifact.patch.apply` | requires_approval | no (mutation) |
 | `artifact.write.propose` | allowed | yes |
 | `artifact.write.apply` | requires_approval | no (mutation) |
+| `corpus.ask` | allowed | yes |
 | `hypothesis.list` | allowed | yes |
 | `hypothesis.triage` | allowed | yes |
 | `verifier.list` | allowed | yes |
@@ -414,6 +427,7 @@ Maximum timeout: 30 seconds. Maximum output: 256KB.
 10. **Negative knowledge remains non-authorizing** — records and influence projections never support output
 11. **No automatic negative-knowledge mutation** — GIP does not mutate packs, apply trust decay, or promote global authority
 12. **Large input stays bounded** — `context.autopsy` uses artifact references, filters, chunked reads, budgets, coverage, and explicit unknowns rather than unbounded stdin JSON
+13. **Corpus ask is not proof** — `corpus.ask` can draft from cited corpus evidence, but corpus text alone does not verify or authorize supported output
 
 ## CLI Usage
 
@@ -440,6 +454,7 @@ echo '{"gipVersion":"gip.v0.1","kind":"negative_knowledge.candidate.list"}' | gh
 echo '{"gipVersion":"gip.v0.1","kind":"pack.inspect","packId":"my-pack"}' | ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"feedback.summary"}' | ghost_gip --stdin --workspace /path/to/project
 echo '{"gipVersion":"gip.v0.1","kind":"session.get","sessionId":"my-session"}' | ghost_gip --stdin
+echo '{"gipVersion":"gip.v0.1","kind":"corpus.ask","projectShard":"my-project","question":"what does the corpus say about retention?","maxResults":3}' | ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"project.autopsy"}' | ghost_gip --stdin --workspace /path/to/project
 echo '{"gipVersion":"gip.v0.1","kind":"context.autopsy","context":{"summary":"inspect source context"},"artifactRefs":[{"kind":"directory","path":".","include":["src/**/*.zig"],"exclude":[".git/**","zig-out/**",".zig-cache/**","node_modules/**"],"maxChunkBytes":32768,"maxFiles":64}]}' | ghost_gip --stdin --workspace /path/to/project
 ```
@@ -456,6 +471,7 @@ See `examples/gip/` for sample request JSON files:
 - `negative_knowledge_candidate_list.json` — negative_knowledge.candidate.list request
 - `pack_list.json` — pack.list request
 - `pack_inspect.json` — pack.inspect request
+- `corpus_ask.json` — corpus.ask request over live shard corpus
 - `context_autopsy_artifact_refs.json` — context.autopsy request using bounded artifact references
 
 ## Module Structure

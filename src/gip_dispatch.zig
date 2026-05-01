@@ -21,6 +21,7 @@ const context_autopsy = @import("context_autopsy.zig");
 const context_autopsy_engine = @import("context_autopsy_engine.zig");
 const context_artifacts = @import("context_artifacts.zig");
 const context_inputs = @import("context_inputs.zig");
+const corpus_ask = @import("corpus_ask.zig");
 
 pub const DispatchResult = struct {
     status: core.ProtocolStatus,
@@ -96,6 +97,7 @@ pub fn dispatch(
         .@"capabilities.describe" => dispatchCapabilitiesDescribe(allocator),
         .@"engine.status" => dispatchEngineStatus(allocator),
         .@"conversation.turn" => dispatchConversationTurn(allocator, workspace_root, request_body),
+        .@"corpus.ask" => dispatchCorpusAsk(allocator, request_body),
         .@"artifact.read" => dispatchArtifactRead(allocator, workspace_root, request_path),
         .@"artifact.list" => dispatchArtifactList(allocator, workspace_root, request_path),
         .@"artifact.patch.propose" => dispatchArtifactPatchPropose(allocator, workspace_root, request_body),
@@ -142,8 +144,8 @@ fn dispatchProtocolDescribe(allocator: std.mem.Allocator) !DispatchResult {
     try w.writeAll("{\"protocol\":{");
     try w.writeAll("\"version\":\"");
     try w.writeAll(core.PROTOCOL_VERSION);
-    try w.writeAll("\",\"implemented\":[\"protocol.describe\",\"capabilities.describe\",\"engine.status\",\"conversation.turn\",\"artifact.read\",\"artifact.list\",\"artifact.patch.propose\",\"hypothesis.list\",\"hypothesis.triage\",\"verifier.list\",\"verifier.candidate.execution.list\",\"verifier.candidate.execution.get\",\"correction.list\",\"correction.get\",\"negative_knowledge.candidate.list\",\"negative_knowledge.candidate.get\",\"negative_knowledge.record.list\",\"negative_knowledge.record.get\",\"negative_knowledge.influence.list\",\"trust_decay.candidate.list\",\"negative_knowledge.candidate.review\",\"negative_knowledge.record.expire\",\"negative_knowledge.record.supersede\",\"pack.list\",\"pack.inspect\",\"feedback.summary\",\"session.get\",\"project.autopsy\",\"context.autopsy\"]");
-    try w.writeAll(",\"maturity\":{\"hypothesis.list\":\"stateless\",\"hypothesis.triage\":\"stateless\",\"verifier.candidate.execution.list\":\"read_only_state_inspection\",\"verifier.candidate.execution.get\":\"read_only_state_inspection\",\"correction.list\":\"read_only_state_inspection\",\"correction.get\":\"read_only_state_inspection\",\"negative_knowledge.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.get\":\"read_only_state_inspection\",\"negative_knowledge.record.list\":\"read_only_state_inspection\",\"negative_knowledge.record.get\":\"read_only_state_inspection\",\"negative_knowledge.influence.list\":\"read_only_state_inspection\",\"trust_decay.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.review\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.expire\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.supersede\":\"structured_unsupported_without_persistence\",\"feedback.summary\":\"requires_workspace_metadata\",\"session.get\":\"requires_existing_session\",\"project.autopsy\":\"read_only_workspace_inspection\",\"context.autopsy\":\"read_only_artifact_and_input_refs_runtime_and_persistent_pack_guidance\"}");
+    try w.writeAll("\",\"implemented\":[\"protocol.describe\",\"capabilities.describe\",\"engine.status\",\"conversation.turn\",\"corpus.ask\",\"artifact.read\",\"artifact.list\",\"artifact.patch.propose\",\"hypothesis.list\",\"hypothesis.triage\",\"verifier.list\",\"verifier.candidate.execution.list\",\"verifier.candidate.execution.get\",\"correction.list\",\"correction.get\",\"negative_knowledge.candidate.list\",\"negative_knowledge.candidate.get\",\"negative_knowledge.record.list\",\"negative_knowledge.record.get\",\"negative_knowledge.influence.list\",\"trust_decay.candidate.list\",\"negative_knowledge.candidate.review\",\"negative_knowledge.record.expire\",\"negative_knowledge.record.supersede\",\"pack.list\",\"pack.inspect\",\"feedback.summary\",\"session.get\",\"project.autopsy\",\"context.autopsy\"]");
+    try w.writeAll(",\"maturity\":{\"corpus.ask\":\"read_only_live_corpus_grounded_draft\",\"hypothesis.list\":\"stateless\",\"hypothesis.triage\":\"stateless\",\"verifier.candidate.execution.list\":\"read_only_state_inspection\",\"verifier.candidate.execution.get\":\"read_only_state_inspection\",\"correction.list\":\"read_only_state_inspection\",\"correction.get\":\"read_only_state_inspection\",\"negative_knowledge.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.get\":\"read_only_state_inspection\",\"negative_knowledge.record.list\":\"read_only_state_inspection\",\"negative_knowledge.record.get\":\"read_only_state_inspection\",\"negative_knowledge.influence.list\":\"read_only_state_inspection\",\"trust_decay.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.review\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.expire\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.supersede\":\"structured_unsupported_without_persistence\",\"feedback.summary\":\"requires_workspace_metadata\",\"session.get\":\"requires_existing_session\",\"project.autopsy\":\"read_only_workspace_inspection\",\"context.autopsy\":\"read_only_artifact_and_input_refs_runtime_and_persistent_pack_guidance\"}");
     try w.writeAll(",\"unsupported\":[\"artifact.patch.apply\",\"artifact.write.propose\",\"artifact.write.apply\",\"artifact.search\",\"conversation.replay\",\"intent.ground\",\"response.evaluate\",\"verifier.run\",\"verifier.candidate.execute\",\"hypothesis.generate\",\"hypothesis.verifier.schedule\",\"correction.apply\",\"negative_knowledge.promote\",\"pack.update_from_negative_knowledge\",\"trust_decay.apply\",\"pack.mount\",\"pack.unmount\",\"pack.import\",\"pack.export\",\"pack.distill.list\",\"pack.distill.show\",\"pack.distill.export\",\"feedback.record\",\"feedback.replay\",\"session.create\",\"session.update\",\"session.close\",\"command.run\"]");
     try w.writeAll("}}");
 
@@ -167,6 +169,7 @@ fn dispatchCapabilitiesDescribe(allocator: std.mem.Allocator) !DispatchResult {
     try w.writeAll("{\"capability\":\"artifact.list\",\"policy\":\"allowed\"},");
     try w.writeAll("{\"capability\":\"artifact.patch.propose\",\"policy\":\"allowed\"},");
     try w.writeAll("{\"capability\":\"conversation.turn\",\"policy\":\"allowed\"},");
+    try w.writeAll("{\"capability\":\"corpus.ask\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"note\":\"bounded live-corpus retrieval with explicit evidence, unknowns, and candidate-only learning; no commands, verifiers, pack mutation, corpus mutation, or negative-knowledge mutation\"},");
     try w.writeAll("{\"capability\":\"hypothesis.list\",\"policy\":\"allowed\",\"read_only\":true},");
     try w.writeAll("{\"capability\":\"hypothesis.triage\",\"policy\":\"allowed\",\"read_only\":true},");
     try w.writeAll("{\"capability\":\"verifier.list\",\"policy\":\"allowed\",\"read_only\":true},");
@@ -315,6 +318,70 @@ fn renderConversationTurnResult(w: anytype, res: conversation_session.TurnResult
         try w.writeAll("null");
     }
     try w.writeAll("}");
+}
+
+fn dispatchCorpusAsk(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
+    const body = request_body orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "request body is required for corpus.ask" },
+    };
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } };
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) {
+        return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "corpus.ask request must be a JSON object" } };
+    }
+
+    const obj = parsed.value.object;
+    const question = getStr(obj, "question", "question") orelse getStr(obj, "message", "message") orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "question or message is required for corpus.ask" },
+    };
+    if (std.mem.trim(u8, question, " \r\n\t").len == 0) {
+        return .{
+            .status = .rejected,
+            .err = .{ .code = .invalid_request, .message = "question must be non-empty" },
+        };
+    }
+
+    const max_results_raw = getInt(obj, "max_results", "maxResults") orelse corpus_ask.DEFAULT_MAX_RESULTS;
+    const max_results = if (max_results_raw <= 0)
+        corpus_ask.DEFAULT_MAX_RESULTS
+    else
+        @min(@as(usize, @intCast(max_results_raw)), corpus_ask.MAX_RESULTS);
+    const max_snippet_raw = getInt(obj, "max_snippet_bytes", "maxSnippetBytes") orelse corpus_ask.DEFAULT_MAX_SNIPPET_BYTES;
+    const max_snippet_bytes = if (max_snippet_raw <= 0)
+        corpus_ask.DEFAULT_MAX_SNIPPET_BYTES
+    else
+        @min(@as(usize, @intCast(max_snippet_raw)), corpus_ask.MAX_SNIPPET_BYTES);
+
+    var result = try corpus_ask.ask(allocator, .{
+        .question = question,
+        .project_shard = getStr(obj, "project_shard", "projectShard"),
+        .max_results = max_results,
+        .max_snippet_bytes = max_snippet_bytes,
+        .require_citations = getBool(obj, "require_citations", "requireCitations") orelse true,
+    });
+    defer result.deinit();
+
+    const rendered = try corpus_ask.renderJson(allocator, &result);
+    errdefer allocator.free(rendered);
+
+    var gip_state = if (result.status == .answered)
+        schema.draftResultState()
+    else
+        schema.unresolvedResultState(if (result.unknowns.len > 0) @tagName(result.unknowns[0].kind) else "unknown");
+    gip_state.non_authorization_notice = "corpus.ask output is draft/non-authorizing; cited corpus evidence is not proof and no verifier was executed";
+
+    return .{
+        .status = if (result.status == .answered) .ok else .unresolved,
+        .result_state = gip_state,
+        .result_json = rendered,
+        .allocated_result = true,
+    };
 }
 
 fn dispatchArtifactRead(allocator: std.mem.Allocator, workspace_root: ?[]const u8, request_path: ?[]const u8) !DispatchResult {

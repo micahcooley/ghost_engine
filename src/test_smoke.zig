@@ -13,6 +13,7 @@ const scratchpad = @import("scratchpad.zig");
 const panic_dump = @import("panic_dump.zig");
 const code_intel = @import("code_intel.zig");
 const corpus_ingest = @import("corpus_ingest.zig");
+const corpus_ask = @import("corpus_ask.zig");
 const external_evidence = @import("external_evidence.zig");
 const execution = @import("execution.zig");
 const abstractions = @import("abstractions.zig");
@@ -5587,6 +5588,201 @@ test "corpus ingestion integrates with code intel and grounding traces" {
     try std.testing.expect(std.mem.indexOf(u8, docs_rendered, "\"targetKind\":\"file\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, docs_rendered, "\"ownerId\":\"corpus-ingest-code-intel-test\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, docs_rendered, "\"trust\":\"project\"") != null);
+}
+
+test "corpus ask no corpus returns explicit unknown without mutation" {
+    const allocator = std.testing.allocator;
+    const project_shard = "corpus-ask-no-corpus-test";
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path) catch {};
+
+    var result = try corpus_ask.ask(allocator, .{
+        .question = "what is the retention policy",
+        .project_shard = project_shard,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(corpus_ask.AskStatus.unknown, result.status);
+    try std.testing.expectEqual(@as(usize, 1), result.unknowns.len);
+    try std.testing.expectEqual(corpus_ask.UnknownKind.no_corpus_available, result.unknowns[0].kind);
+    try std.testing.expect(result.answer_draft == null);
+    try std.testing.expect(!result.safety_flags.corpus_mutation);
+    try std.testing.expect(!result.safety_flags.pack_mutation);
+    try std.testing.expect(!result.safety_flags.negative_knowledge_mutation);
+    try std.testing.expect(!result.safety_flags.commands_executed);
+    try std.testing.expect(!result.safety_flags.verifiers_executed);
+}
+
+test "corpus ask returns draft answer with bounded evidence and weak matches stay unknown" {
+    const allocator = std.testing.allocator;
+    const project_shard = "corpus-ask-evidence-test";
+    var corpus_fixture = std.testing.tmpDir(.{});
+    defer corpus_fixture.cleanup();
+    const corpus_root = try corpus_fixture.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+    try writeFixtureFile(corpus_fixture.dir, "runtime.md",
+        \\# Runtime Retention
+        \\Retention policy is enabled for event audit logs.
+        \\Operators should cite this corpus item before drafting an answer.
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path) catch {};
+
+    var stage_result = try corpus_ingest.stage(allocator, .{
+        .corpus_path = corpus_root,
+        .project_shard = project_shard,
+        .trust_class = .project,
+        .source_label = "ask-corpus",
+    });
+    defer stage_result.deinit();
+    try corpus_ingest.applyStaged(allocator, &project_paths);
+
+    var answered = try corpus_ask.ask(allocator, .{
+        .question = "is retention policy enabled",
+        .project_shard = project_shard,
+        .max_snippet_bytes = 80,
+    });
+    defer answered.deinit();
+
+    try std.testing.expectEqual(corpus_ask.AskStatus.answered, answered.status);
+    try std.testing.expect(answered.answer_draft != null);
+    try std.testing.expectEqual(@as(usize, 1), answered.evidence_used.len);
+    try std.testing.expect(answered.evidence_used[0].snippet.len <= 80);
+    try std.testing.expect(std.mem.indexOf(u8, answered.evidence_used[0].path, "@corpus/docs/runtime.md") != null);
+    try std.testing.expect(!answered.safety_flags.corpus_mutation);
+    try std.testing.expect(!answered.safety_flags.commands_executed);
+    try std.testing.expect(!answered.safety_flags.verifiers_executed);
+
+    var weak = try corpus_ask.ask(allocator, .{
+        .question = "database backup window",
+        .project_shard = project_shard,
+    });
+    defer weak.deinit();
+    try std.testing.expectEqual(corpus_ask.AskStatus.unknown, weak.status);
+    try std.testing.expectEqual(corpus_ask.UnknownKind.insufficient_evidence, weak.unknowns[0].kind);
+    try std.testing.expect(weak.answer_draft == null);
+}
+
+test "corpus ask conflicting evidence stays unresolved and learning is candidate-only" {
+    const allocator = std.testing.allocator;
+    const project_shard = "corpus-ask-conflict-test";
+    var corpus_fixture = std.testing.tmpDir(.{});
+    defer corpus_fixture.cleanup();
+    const corpus_root = try corpus_fixture.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+    try writeFixtureFile(corpus_fixture.dir, "enabled.md",
+        \\# Retention Enabled
+        \\Retention policy is enabled for event audit logs.
+        \\
+    );
+    try writeFixtureFile(corpus_fixture.dir, "disabled.md",
+        \\# Retention Disabled
+        \\Retention policy is disabled for event audit logs.
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path) catch {};
+
+    var stage_result = try corpus_ingest.stage(allocator, .{
+        .corpus_path = corpus_root,
+        .project_shard = project_shard,
+        .trust_class = .project,
+        .source_label = "conflict-corpus",
+    });
+    defer stage_result.deinit();
+    try corpus_ingest.applyStaged(allocator, &project_paths);
+
+    var result = try corpus_ask.ask(allocator, .{
+        .question = "is retention policy enabled",
+        .project_shard = project_shard,
+        .max_results = 2,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(corpus_ask.AskStatus.unknown, result.status);
+    try std.testing.expectEqual(corpus_ask.UnknownKind.conflicting_evidence, result.unknowns[0].kind);
+    try std.testing.expect(result.answer_draft == null);
+    try std.testing.expect(result.evidence_used.len >= 2);
+    try std.testing.expectEqual(@as(usize, 1), result.learning_candidates.len);
+    try std.testing.expect(result.learning_candidates[0].candidate_only);
+    try std.testing.expect(result.learning_candidates[0].non_authorizing);
+    try std.testing.expect(!result.learning_candidates[0].persisted);
+    try std.testing.expect(!result.safety_flags.corpus_mutation);
+    try std.testing.expect(!result.safety_flags.pack_mutation);
+    try std.testing.expect(!result.safety_flags.negative_knowledge_mutation);
+}
+
+test "gip corpus ask exposes protocol capability and malformed requests are structured" {
+    const allocator = std.testing.allocator;
+
+    var protocol = try gip.dispatch.dispatch(
+        allocator,
+        "protocol.describe",
+        gip.core.PROTOCOL_VERSION,
+        null,
+        null,
+        null,
+    );
+    defer protocol.deinit(allocator);
+    try std.testing.expectEqual(gip.core.ProtocolStatus.ok, protocol.status);
+    try std.testing.expect(protocol.result_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, protocol.result_json.?, "\"corpus.ask\"") != null);
+
+    var caps = try gip.dispatch.dispatch(
+        allocator,
+        "capabilities.describe",
+        gip.core.PROTOCOL_VERSION,
+        null,
+        null,
+        null,
+    );
+    defer caps.deinit(allocator);
+    try std.testing.expectEqual(gip.core.ProtocolStatus.ok, caps.status);
+    try std.testing.expect(caps.result_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, caps.result_json.?, "\"capability\":\"corpus.ask\"") != null);
+
+    var bounded = try gip.dispatch.dispatch(
+        allocator,
+        "corpus.ask",
+        gip.core.PROTOCOL_VERSION,
+        null,
+        null,
+        "{\"question\":\"what is the retention policy\",\"projectShard\":\"corpus-ask-gip-bounds-test\",\"maxResults\":2,\"maxSnippetBytes\":77}",
+    );
+    defer bounded.deinit(allocator);
+    try std.testing.expectEqual(gip.core.ProtocolStatus.unresolved, bounded.status);
+    try std.testing.expect(bounded.result_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, bounded.result_json.?, "\"maxResults\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bounded.result_json.?, "\"maxSnippetBytes\":77") != null);
+
+    var malformed = try gip.dispatch.dispatch(
+        allocator,
+        "corpus.ask",
+        gip.core.PROTOCOL_VERSION,
+        null,
+        null,
+        "{\"message\":\"\"}",
+    );
+    defer malformed.deinit(allocator);
+    try std.testing.expectEqual(gip.core.ProtocolStatus.rejected, malformed.status);
+    try std.testing.expect(malformed.err != null);
+    try std.testing.expectEqual(gip.core.ErrorCode.invalid_request, malformed.err.?.code);
 }
 
 test "corpus reverse grounding leaves tied symbolic surfaces unresolved" {
