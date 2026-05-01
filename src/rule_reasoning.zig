@@ -488,6 +488,8 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const EvaluationResult)
     try writeOutputs(w, result.emitted_obligations, true);
     try w.writeAll(",\"emittedUnknowns\":");
     try writeOutputs(w, result.emitted_unknowns, false);
+    try w.writeAll(",\"correctionReviewCandidates\":");
+    try writeCorrectionReviewCandidates(w, result);
     try w.writeAll(",\"capacityTelemetry\":");
     try writeCapacityTelemetry(w, result.capacity_telemetry);
     try w.writeAll(",\"explanationTrace\":[");
@@ -519,6 +521,40 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const EvaluationResult)
     });
     try w.writeAll("}}}");
     return try out.toOwnedSlice();
+}
+
+fn writeCorrectionReviewCandidates(w: anytype, result: *const EvaluationResult) !void {
+    try w.writeByte('[');
+    var wrote = false;
+    for (result.emitted_candidates) |candidate| {
+        const reason = switch (candidate.kind) {
+            .risk_candidate => "review bad or unsafe rule output through correction.propose with correctionType=unsafe_candidate",
+            .check_candidate, .follow_up_candidate => "review missing or misleading rule output through correction.propose before future influence",
+            else => "review rule output through correction.propose before future influence",
+        };
+        try writeCorrectionReviewCandidate(w, &wrote, candidate.id, candidate.rule_id, @tagName(candidate.kind), reason);
+    }
+    for (result.emitted_obligations) |obligation| {
+        try writeCorrectionReviewCandidate(w, &wrote, obligation.id, obligation.rule_id, @tagName(obligation.kind), "misleading obligation can be disputed through correction.propose with correctionType=misleading_rule");
+    }
+    if (result.capacity_telemetry.hasPressure()) {
+        try writeCorrectionReviewCandidate(w, &wrote, "capacity:rule.evaluate", "capacity", "capacity_warning", "capacity-limited evaluation requires stronger review and cannot authorize candidates");
+    }
+    try w.writeByte(']');
+}
+
+fn writeCorrectionReviewCandidate(w: anytype, wrote: *bool, output_id: []const u8, rule_id: []const u8, disputed_kind: []const u8, reason: []const u8) !void {
+    if (wrote.*) try w.writeByte(',');
+    wrote.* = true;
+    try w.writeAll("{\"operationKind\":\"rule.evaluate\",\"outputId\":\"");
+    try writeEscaped(w, output_id);
+    try w.writeAll("\",\"ruleId\":\"");
+    try writeEscaped(w, rule_id);
+    try w.writeAll("\",\"disputedOutput\":\"");
+    try writeEscaped(w, disputed_kind);
+    try w.writeAll("\",\"proposedOperation\":\"correction.propose\",\"requiredReview\":true,\"candidateOnly\":true,\"nonAuthorizing\":true,\"treatedAsProof\":false,\"persisted\":false,\"reason\":\"");
+    try writeEscaped(w, reason);
+    try w.writeAll("\"}");
 }
 
 fn writeCapacityTelemetry(w: anytype, telemetry: CapacityTelemetry) !void {

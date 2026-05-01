@@ -111,6 +111,7 @@ pub const LearningCandidate = struct {
     reason: []u8,
     candidate_only: bool = true,
     non_authorizing: bool = true,
+    treated_as_proof: bool = false,
     persisted: bool = false,
 
     fn deinit(self: *LearningCandidate, allocator: std.mem.Allocator) void {
@@ -1131,6 +1132,7 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
         try writeField(w, "reason", candidate.reason, false);
         try w.print(",\"candidateOnly\":{s}", .{if (candidate.candidate_only) "true" else "false"});
         try w.print(",\"nonAuthorizing\":{s}", .{if (candidate.non_authorizing) "true" else "false"});
+        try w.print(",\"treatedAsProof\":{s}", .{if (candidate.treated_as_proof) "true" else "false"});
         try w.print(",\"persisted\":{s}", .{if (candidate.persisted) "true" else "false"});
         try w.writeAll("}");
     }

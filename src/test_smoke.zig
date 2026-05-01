@@ -34,6 +34,7 @@ const response_engine = @import("response_engine.zig");
 const verifier_adapter = @import("verifier_adapter.zig");
 const verifier_execution = @import("verifier_execution.zig");
 const correction_hooks = @import("correction_hooks.zig");
+const correction_candidates = @import("correction_candidates.zig");
 const negative_knowledge = @import("negative_knowledge.zig");
 const support_routing = @import("support_routing.zig");
 const repo_hygiene = @import("repo_hygiene.zig");
@@ -56,8 +57,27 @@ comptime {
     _ = gip;
     _ = verifier_execution;
     _ = correction_hooks;
+    _ = correction_candidates;
     _ = negative_knowledge;
     _ = support_routing;
+}
+
+test "smoke: correction proposal remains candidate-only and non-mutating" {
+    const proposal = correction_candidates.propose(.{
+        .operation_kind = "rule.evaluate",
+        .disputed_output_kind = .rule_candidate,
+        .user_correction = "the emitted rule candidate is misleading",
+        .correction_type = .misleading_rule,
+    }, 0xabc);
+    try std.testing.expectEqualStrings("proposed", proposal.status);
+    try std.testing.expect(proposal.required_review);
+    try std.testing.expect(proposal.non_authorizing);
+    try std.testing.expect(!proposal.treated_as_proof);
+    try std.testing.expect(!proposal.mutation_flags.corpus_mutation);
+    try std.testing.expect(!proposal.mutation_flags.pack_mutation);
+    try std.testing.expect(!proposal.mutation_flags.negative_knowledge_mutation);
+    try std.testing.expect(!proposal.mutation_flags.commands_executed);
+    try std.testing.expect(!proposal.mutation_flags.verifiers_executed);
 }
 
 const TraceCapture = struct {

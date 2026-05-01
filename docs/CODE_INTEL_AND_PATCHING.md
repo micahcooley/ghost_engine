@@ -77,12 +77,15 @@ Phase 3 adds a small deterministic rule/graph substrate exposed as `rule.evaluat
 
 Phase 4 makes capacity pressure explicit across corpus retrieval, sketch routing, rule evaluation, and trainer/VSA diagnostics. Dropped runes, collision stalls, saturated slots, skipped files/inputs, truncated snippets/inputs, max-result caps, max-output caps, max-rule caps, and budget hits must be surfaced as telemetry, warnings, or unknowns. Unknown is not false, dropped data is not learned data, and skipped evidence is not negative evidence.
 
+Phase 5 adds correction-native learning candidates through GIP `correction.propose`. A disputed `corpus.ask`, `rule.evaluate`, `context.autopsy`, answer draft, evidence item, unknown, rule candidate, similarity hint, or capacity warning can be turned into a proposed correction candidate with `requiredReview:true`, `nonAuthorizing:true`, and `treatedAsProof:false`. The proposal can emit candidate-only negative-knowledge, corpus update, pack guidance, verifier/check, or follow-up evidence requests. It does not persist learning, mutate corpus, mutate packs, mutate negative knowledge, run commands, run verifiers, or promote future influence. User correction is signal, not proof; accepted learning requires an explicit review lifecycle.
+
 Minimal binary-only ingest/apply/ask loop:
 
 ```bash
 ./zig-out/bin/ghost_corpus_ingest /tmp/ghost-corpus-smoke --project-shard=smoke --trust-class=project --source-label=smoke
 ./zig-out/bin/ghost_corpus_ingest --apply-staged --project-shard=smoke
 echo '{"gipVersion":"gip.v0.1","kind":"corpus.ask","projectShard":"smoke","question":"What does the corpus say about verifier execution?"}' | ./zig-out/bin/ghost_gip --stdin
+echo '{"gipVersion":"gip.v0.1","kind":"correction.propose","operationKind":"corpus.ask","disputedOutput":{"kind":"answerDraft","ref":"answer:1"},"userCorrection":"the answer used the wrong evidence","correctionType":"wrong_answer","evidenceRefs":["corpus:item:1"]}' | ./zig-out/bin/ghost_gip --stdin
 ```
 
 Bounded external evidence now reuses the same path instead of a separate web-memory system:

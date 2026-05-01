@@ -46,6 +46,7 @@ pub const RequestKind = enum {
     @"hypothesis.verifier.schedule",
 
     // Correction / negative knowledge inspection
+    @"correction.propose",
     @"correction.list",
     @"correction.get",
     @"correction.apply",
@@ -225,6 +226,7 @@ pub const CapabilityName = enum {
     @"hypothesis.list",
     @"hypothesis.triage",
     @"verifier.list",
+    @"correction.propose",
     @"correction.list",
     @"correction.get",
     @"correction.apply",
@@ -278,7 +280,7 @@ pub const CapabilityEntry = struct {
     policy: CapabilityPolicy,
 };
 
-pub fn defaultCapabilities() [46]CapabilityEntry {
+pub fn defaultCapabilities() [47]CapabilityEntry {
     return .{
         .{ .capability = .@"artifact.read", .policy = .allowed },
         .{ .capability = .@"artifact.list", .policy = .allowed },
@@ -296,6 +298,7 @@ pub fn defaultCapabilities() [46]CapabilityEntry {
         .{ .capability = .@"hypothesis.list", .policy = .allowed },
         .{ .capability = .@"hypothesis.triage", .policy = .allowed },
         .{ .capability = .@"verifier.list", .policy = .allowed },
+        .{ .capability = .@"correction.propose", .policy = .allowed },
         .{ .capability = .@"correction.list", .policy = .allowed },
         .{ .capability = .@"correction.get", .policy = .allowed },
         .{ .capability = .@"correction.apply", .policy = .denied },
@@ -477,6 +480,7 @@ pub const IMPLEMENTED_KINDS = [_]RequestKind{
     .@"verifier.list",
     .@"verifier.candidate.execution.list",
     .@"verifier.candidate.execution.get",
+    .@"correction.propose",
     .@"correction.list",
     .@"correction.get",
     .@"negative_knowledge.candidate.list",
@@ -533,15 +537,24 @@ test "default capabilities have safe defaults" {
     // command.run should be allowlisted
     try std.testing.expectEqual(CapabilityPolicy.allowlist, caps[7].policy);
     // network.access should be denied
-    try std.testing.expectEqual(CapabilityPolicy.denied, caps[41].policy);
+    try std.testing.expectEqual(CapabilityPolicy.denied, capabilityPolicy(&caps, .@"network.access").?);
     // corpus.ask should be allowed (read-only/non-authorizing)
-    try std.testing.expectEqual(CapabilityPolicy.allowed, caps[42].policy);
+    try std.testing.expectEqual(CapabilityPolicy.allowed, capabilityPolicy(&caps, .@"corpus.ask").?);
     // rule.evaluate should be allowed (read-only/non-authorizing)
-    try std.testing.expectEqual(CapabilityPolicy.allowed, caps[43].policy);
+    try std.testing.expectEqual(CapabilityPolicy.allowed, capabilityPolicy(&caps, .@"rule.evaluate").?);
+    // correction.propose should be allowed (candidate-only/non-authorizing)
+    try std.testing.expectEqual(CapabilityPolicy.allowed, capabilityPolicy(&caps, .@"correction.propose").?);
     // project.autopsy should be allowed (read-only)
-    try std.testing.expectEqual(CapabilityPolicy.allowed, caps[44].policy);
+    try std.testing.expectEqual(CapabilityPolicy.allowed, capabilityPolicy(&caps, .@"project.autopsy").?);
     // context.autopsy should be allowed (read-only/non-authorizing)
-    try std.testing.expectEqual(CapabilityPolicy.allowed, caps[45].policy);
+    try std.testing.expectEqual(CapabilityPolicy.allowed, capabilityPolicy(&caps, .@"context.autopsy").?);
+}
+
+fn capabilityPolicy(caps: []const CapabilityEntry, capability: CapabilityName) ?CapabilityPolicy {
+    for (caps) |cap| {
+        if (cap.capability == capability) return cap.policy;
+    }
+    return null;
 }
 
 test "command allowlist rejects arbitrary commands" {

@@ -101,6 +101,7 @@ results when GIP has no active session or workspace metadata:
 | `hypothesis.triage` | Returns empty triage summary with scoring policy version | `stateless` |
 | `corpus.ask` | Reads existing live shard corpus; returns explicit unknown when no corpus/evidence is visible; may include non-authorizing local sketch candidates and capacity telemetry | `read_only_live_corpus_grounded_draft` |
 | `rule.evaluate` | Evaluates bounded deterministic rules over request facts and emits candidate-only outputs with explanation traces and capacity telemetry | `bounded_deterministic_non_authorizing_candidates` |
+| `correction.propose` | Converts a user-disputed output into a review-required correction candidate plus non-authorizing learning candidates; performs no mutation or execution | `candidate_only_review_required_no_mutation` |
 | `verifier.candidate.execution.list` | Reads existing task/result support-graph state; returns empty when no state is visible | `read_only_state_inspection` |
 | `verifier.candidate.execution.get` | Reads one existing execution job/result projection; missing IDs return `path_not_found` | `read_only_state_inspection` |
 | `correction.list` | Reads existing correction-event state; returns empty when no state is visible | `read_only_state_inspection` |
@@ -187,6 +188,7 @@ promotion, or pack mutation.
 - Similarity candidates are not proof, are not semantic search, do not populate `evidenceUsed`, and cannot authorize an answer. No Transformers, embeddings, model adapters, or network calls are used.
 - Capacity pressure is explicit. Skipped files, truncated live-corpus reads, truncated snippets, exact/sketch candidate caps, and max-result caps appear in `capacityTelemetry` and create `capacity_limited` unknowns or warnings. Dropped or skipped evidence is not learned data and cannot become negative evidence.
 - Capacity warnings are diagnostic, not proof. They may recommend explicit expansion or spillover, but they never discharge support gates.
+- `learningCandidates` are proposed review inputs only. A later `correction.propose` request can tie a user correction to `evidenceUsed.itemId`, similarity hints, unknowns, or capacity warnings, but `corpus.ask` itself never mutates corpus, packs, or negative knowledge.
 
 ### Rule Evaluation
 - `rule.evaluate` evaluates request-local structured facts against request-local rules. It is deterministic, bounded, and read-only.
@@ -197,6 +199,7 @@ promotion, or pack mutation.
 - Rule firing cannot execute commands or verifiers, cannot mutate corpus, Knowledge Packs, or negative knowledge, and cannot discharge proof/support gates.
 - The substrate is structural rule matching only. It does not use Transformers, embeddings, model adapters, network calls, or semantic black-box search.
 - Fired-rule/output caps and rejected outputs appear in `capacityTelemetry`. Capacity warnings do not make any emitted candidate more authoritative.
+- `correctionReviewCandidates` point at `correction.propose` for bad rule output, missing rules, unsafe candidates, misleading obligations, or capacity-limited evaluation. These review candidates are non-authorizing and not persisted.
   - Guidance matching is bounded and deterministic: structured tags/kinds/required fields are matched case-insensitively, keywords prefer structured context and artifact/input ref metadata before bounded JSON string/key inspection, and applied pack influences include non-authorizing `matchTrace` metadata.
   - Does not execute commands, run verifiers, mutate packs, or mutate negative knowledge.
   - Persisted Knowledge Pack autopsy guidance can be preflighted through the read-only `ghost_knowledge_pack validate-autopsy-guidance` operator tool; this is outside the GIP request surface and does not change `context.autopsy` response authority.
@@ -223,16 +226,25 @@ promotion, or pack mutation.
   - `evidenceUsed` reports corpus lineage id/path/source path/source label/class/trust class, content hash, byte and line spans, bounded snippet with truncation flag, matched terms/phrase, match reason, provenance, score, and rank.
   - `capacityTelemetry` reports bounded retrieval pressure such as `truncatedInputs`, `truncatedSnippets`, `skippedFiles`, `budgetHits`, `maxResultsHit`, exact/sketch candidate caps, `capacityWarnings`, `unknownsCreated`, and expansion/spillover recommendations.
   - Unknowns include `no_corpus_available`, `insufficient_evidence`, `conflicting_evidence`, and `capacity_limited`. Weak, approximate-only, skipped, dropped, or truncated signals do not produce `answerDraft`; exact evidence may still produce a draft, but the partial coverage is disclosed.
-  - `learningCandidates` are candidate-only and non-authorizing. They are not persisted and do not mutate Knowledge Packs, corpus state, or negative knowledge.
+  - `learningCandidates` are candidate-only, non-authorizing, and `treatedAsProof:false`. They are not persisted and do not mutate Knowledge Packs, corpus state, or negative knowledge.
   - Trace flags always report `corpusMutation:false`, `packMutation:false`, `negativeKnowledgeMutation:false`, `commandsExecuted:false`, and `verifiersExecuted:false`.
 
 ### Deterministic Rule Evaluation
 - `rule.evaluate` — Evaluate bounded request facts/rules and return non-authorizing candidates, obligations, unknowns, and traces **(Implemented)**
   - **Request**: `{"facts":[{"subject": string,"predicate": string,"object": string,"source": string optional}],"rules":[{"id": string,"name": string,"when":{"all":[...],"any":[...]},"emit":[{"kind":"check_candidate"|"risk_candidate"|"evidence_expectation"|"unknown"|"follow_up_candidate","id": string,"summary": string,"detail": string optional}]}],"limits":{"maxFacts": int,"maxRules": int,"maxFiredRules": int,"maxOutputs": int}}`.
-  - **Response**: `{"ruleEvaluation":{"nonAuthorizing":true,"candidateOnly":true,"proofDischarged":false,"supportGranted":false,"firedRules":[...],"emittedCandidates":[...],"emittedObligations":[...],"emittedUnknowns":[...],"capacityTelemetry":{...},"explanationTrace":[...],"safetyFlags":{...}}}`.
+  - **Response**: `{"ruleEvaluation":{"nonAuthorizing":true,"candidateOnly":true,"proofDischarged":false,"supportGranted":false,"firedRules":[...],"emittedCandidates":[...],"emittedObligations":[...],"emittedUnknowns":[...],"correctionReviewCandidates":[...],"capacityTelemetry":{...},"explanationTrace":[...],"safetyFlags":{...}}}`.
   - Rule order and fact order are stable. Bounds are enforced before and during evaluation.
   - `capacityTelemetry` reports fired-rule and output caps as `maxFiredRulesHit`, `maxOutputsHit`, `maxRulesHit`, `rejectedOutputs`, `budgetHits`, `capacityWarnings`, and expansion recommendations. Capacity warnings are not proof and do not grant support.
   - Invalid rules and unsupported recursive fact outputs are rejected cleanly with `invalid_request`.
+
+### Correction Proposal
+- `correction.propose` — Propose a review-required correction candidate for a disputed output **(Implemented)**
+  - **Request**: `{"operationKind": string, "originalRequestId": string optional, "originalRequestSummary": string optional, "disputedOutput": "answerDraft" | "evidenceUsed" | "unknown" | "rule_candidate" | "similarity_hint" | "capacity_warning" or {"kind": "...", "ref": string optional, "summary": string optional}, "userCorrection": string, "correctionType": "wrong_answer" | "missing_evidence" | "bad_evidence" | "outdated_corpus" | "misleading_rule" | "repeated_failed_pattern" | "unsafe_candidate", "evidenceRefs": string[] optional, "projectShard": string optional}`.
+  - **Response**: `{"correctionProposal":{"status":"proposed"|"request_more_detail","requiredReview":true,"correctionCandidate":...,"learningCandidates":[...],"unknowns":[...],"mutationFlags":...,"authority":...}}`.
+  - User correction is signal, not proof. Every correction candidate has `nonAuthorizing:true`, `treatedAsProof:false`, `state:"proposed"`, and `requiredReview:true`.
+  - Learning candidates can propose negative-knowledge candidates, corpus update candidates, pack guidance candidates, verifier/check candidates, or follow-up evidence requests. They are not persisted and are not globally promoted.
+  - Mutation flags remain false: `corpusMutation:false`, `packMutation:false`, `negativeKnowledgeMutation:false`, `commandsExecuted:false`, and `verifiersExecuted:false`.
+  - Underspecified correction requests return `request_more_detail` with an explicit unknown instead of inventing a candidate. Malformed requests are rejected with structured `invalid_request` or JSON errors.
 
 ### Artifacts
 - `artifact.read` — Read file content (workspace-bounded) **(Implemented)**
@@ -398,6 +410,7 @@ promote global authority.
 | `artifact.write.apply` | requires_approval | no (mutation) |
 | `corpus.ask` | allowed | yes |
 | `rule.evaluate` | allowed | yes |
+| `correction.propose` | allowed | yes |
 | `hypothesis.list` | allowed | yes |
 | `hypothesis.triage` | allowed | yes |
 | `verifier.list` | allowed | yes |

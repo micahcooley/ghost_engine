@@ -230,8 +230,12 @@ pub const ContextAutopsyResult = struct {
   - Refactor `project_autopsy.zig` to output the new `ContextAutopsyResult` schema internally, mapping legacy types to the new universal types.
 - **Phase 4: pack-aware context autopsy prototype using existing packs**
   - Implement engine routing to query mounted packs for signals, risks, and checks, fusing them with the intake context.
-- **Phase 5: correction/negative-knowledge feedback loop**
-  - Feed results of checks (both soft and hard) back into the knowledge packs to improve signal detection and refine negative knowledge.
+- **Phase 5: correction-native learning candidates**
+  - `context.autopsy` results can be disputed through the explicit GIP `correction.propose` operation.
+  - The correction proposal is signal, not proof. It creates review-required correction candidates and proposed learning outputs only.
+  - Proposed outputs can include negative-knowledge candidates, pack guidance candidates, corpus update candidates, verifier/check candidates, or follow-up evidence requests.
+  - No Context Autopsy correction silently mutates packs, corpus, negative knowledge, command state, verifier state, or future behavior.
+  - Accepted learning requires a separate explicit review lifecycle. In current GIP, negative-knowledge review validation is present, but append-only persistence remains structured unsupported until a safe persistence target exists.
 
 ## 7. Explicit Non-Goals
 - **No domain-specific hardcoded adapters:** Ghost core will not contain logic for baking, marketing, relationship advice, etc.
@@ -248,3 +252,4 @@ pub const ContextAutopsyResult = struct {
 - **Unknown is not false:** Missing evidence is represented as an unknown, not as negative evidence.
 - **No evidence is not negative evidence:** The absence of a signal does not imply the absence of the underlying concept.
 - **Capacity warnings are not proof:** Skipped, truncated, capped, dropped, or saturated data creates explicit coverage/unknown pressure and never authorizes a claim.
+- **No hidden learning:** User corrections against Context Autopsy output are routed through `correction.propose`; they remain non-authorizing, `treatedAsProof:false`, and review-required until an explicit lifecycle accepts them.
