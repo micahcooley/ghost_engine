@@ -147,6 +147,12 @@ budget hits, and explicit unknowns for unread or truncated regions. These
 unknowns remain missing evidence, not negative evidence, and the result remains
 draft/non-authorizing.
 
+Coverage and capacity pressure are explicit by contract. Skipped, filtered,
+unsupported, unread, truncated, capped, dropped, or saturated data must surface
+as coverage, telemetry, warnings, or unknowns rather than silent success.
+Capacity warnings are diagnostic only; they are not proof, do not teach dropped
+data, and do not authorize support.
+
 ## 5. Minimal Proposed Schema
 
 ```zig
@@ -241,3 +247,4 @@ pub const ContextAutopsyResult = struct {
 - **Soft real-world checks must be labeled weaker than hard verifiers:** A subjective user check is distinct from a deterministic compiler exit code.
 - **Unknown is not false:** Missing evidence is represented as an unknown, not as negative evidence.
 - **No evidence is not negative evidence:** The absence of a signal does not imply the absence of the underlying concept.
+- **Capacity warnings are not proof:** Skipped, truncated, capped, dropped, or saturated data creates explicit coverage/unknown pressure and never authorizes a claim.

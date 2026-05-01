@@ -23,6 +23,24 @@ pub const CorpusWeight = struct {
     weight: u32,
 };
 
+pub const CapacityTelemetry = struct {
+    dropped_runes: u32 = 0,
+    collision_stalls: u32 = 0,
+    saturated_slots: u32 = 0,
+    truncated_inputs: u32 = 0,
+    truncated_snippets: u32 = 0,
+    skipped_inputs: u32 = 0,
+    skipped_files: u32 = 0,
+    budget_hits: u32 = 0,
+    max_results_hit: bool = false,
+    max_outputs_hit: bool = false,
+    max_rules_hit: bool = false,
+    unknowns_created: u32 = 0,
+    capacity_warnings: u32 = 0,
+    expansion_recommended: bool = false,
+    spillover_recommended: bool = false,
+};
+
 pub const TrainerOptions = struct {
     tier: u32 = @intFromEnum(vsa_vulkan.OperationalTier.standard),
     batch_size_override: u32 = 0,
@@ -769,6 +787,25 @@ pub const OhlTrainer = struct {
         return stalls;
     }
 
+    pub fn getCapacityTelemetry(self: *const OhlTrainer) CapacityTelemetry {
+        const dropped = self.getDroppedRunes();
+        const stalls = self.getCollisionStalls();
+        const slot_usage = self.getSlotUsageBp();
+        const saturated = slot_usage >= 9000 or self.getStopReason() == .slot_usage;
+        const warnings: u32 = (if (dropped != 0) @as(u32, 1) else 0) +
+            (if (stalls != 0) @as(u32, 1) else 0) +
+            (if (saturated) @as(u32, 1) else 0);
+        return .{
+            .dropped_runes = dropped,
+            .collision_stalls = stalls,
+            .saturated_slots = if (saturated) self.countUsedSlots() else 0,
+            .budget_hits = if (self.getStopReason() == .slot_usage or self.getStopReason() == .max_runes) 1 else 0,
+            .capacity_warnings = warnings,
+            .expansion_recommended = dropped != 0 or saturated,
+            .spillover_recommended = stalls != 0 or saturated,
+        };
+    }
+
     pub fn getBatchFillPct(self: *const OhlTrainer) f64 {
         const requested = self.batcher.last_requested_batch.load(.monotonic);
         if (requested == 0) return 0;
@@ -1245,4 +1282,22 @@ pub fn main() void {
         sys.print("\n[FATAL ERROR] {any}\n", .{err});
         std.process.exit(1);
     };
+}
+
+test "trainer capacity telemetry exposes dropped runes and collision stalls" {
+    const allocator = std.testing.allocator;
+    var batcher = try GreedyBatcher.init(allocator, &.{});
+    var trainer = try OhlTrainer.init(allocator, null, &batcher, .{});
+    defer trainer.deinit();
+
+    trainer.cpu_dropped_runes.store(3, .monotonic);
+    trainer.cpu_collision_stalls.store(5, .monotonic);
+    trainer.stop_reason.store(@intFromEnum(StopReason.max_runes), .monotonic);
+
+    const telemetry = trainer.getCapacityTelemetry();
+    try std.testing.expectEqual(@as(u32, 3), telemetry.dropped_runes);
+    try std.testing.expectEqual(@as(u32, 5), telemetry.collision_stalls);
+    try std.testing.expectEqual(@as(u32, 1), telemetry.budget_hits);
+    try std.testing.expectEqual(true, telemetry.expansion_recommended);
+    try std.testing.expectEqual(true, telemetry.spillover_recommended);
 }

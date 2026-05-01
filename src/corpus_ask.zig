@@ -23,6 +23,7 @@ pub const UnknownKind = enum {
     no_corpus_available,
     insufficient_evidence,
     conflicting_evidence,
+    capacity_limited,
     malformed_request,
 };
 
@@ -145,6 +146,41 @@ pub const SimilarCandidate = struct {
     }
 };
 
+pub const CapacityTelemetry = struct {
+    dropped_runes: usize = 0,
+    collision_stalls: usize = 0,
+    saturated_slots: usize = 0,
+    truncated_inputs: usize = 0,
+    truncated_snippets: usize = 0,
+    skipped_inputs: usize = 0,
+    skipped_files: usize = 0,
+    budget_hits: usize = 0,
+    max_results_hit: bool = false,
+    max_outputs_hit: bool = false,
+    max_rules_hit: bool = false,
+    exact_candidate_cap_hit: bool = false,
+    sketch_candidate_cap_hit: bool = false,
+    unknowns_created: usize = 0,
+    expansion_recommended: bool = false,
+    spillover_recommended: bool = false,
+
+    pub fn hasPressure(self: CapacityTelemetry) bool {
+        return self.dropped_runes != 0 or
+            self.collision_stalls != 0 or
+            self.saturated_slots != 0 or
+            self.truncated_inputs != 0 or
+            self.truncated_snippets != 0 or
+            self.skipped_inputs != 0 or
+            self.skipped_files != 0 or
+            self.budget_hits != 0 or
+            self.max_results_hit or
+            self.max_outputs_hit or
+            self.max_rules_hit or
+            self.exact_candidate_cap_hit or
+            self.sketch_candidate_cap_hit;
+    }
+};
+
 pub const Result = struct {
     allocator: std.mem.Allocator,
     status: AskStatus,
@@ -164,6 +200,7 @@ pub const Result = struct {
     max_results: usize = DEFAULT_MAX_RESULTS,
     max_snippet_bytes: usize = DEFAULT_MAX_SNIPPET_BYTES,
     require_citations: bool = true,
+    capacity_telemetry: CapacityTelemetry = .{},
 
     pub fn deinit(self: *Result) void {
         self.allocator.free(self.state);
@@ -271,6 +308,11 @@ const Snippet = struct {
     truncated: bool,
 };
 
+const ReadEntryResult = struct {
+    text: []u8,
+    truncated: bool,
+};
+
 const Polarity = enum {
     none,
     affirmative,
@@ -317,10 +359,21 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     var sketch_candidates = std.ArrayList(SketchCandidate).init(allocator);
     defer sketch_candidates.deinit();
     const query_sketch = try corpus_sketch.simHash64(allocator, options.question);
+    var telemetry = CapacityTelemetry{};
 
     for (entries, 0..) |entry, idx| {
-        const file_text = readEntryText(allocator, entry.abs_path) catch continue;
+        const read_result = readEntryText(allocator, entry.abs_path) catch {
+            telemetry.skipped_files += 1;
+            telemetry.skipped_inputs += 1;
+            telemetry.budget_hits += 1;
+            continue;
+        };
+        const file_text = read_result.text;
         errdefer allocator.free(file_text);
+        if (read_result.truncated) {
+            telemetry.truncated_inputs += 1;
+            telemetry.budget_hits += 1;
+        }
         if (query_sketch.valid()) {
             const entry_sketch = try corpus_sketch.simHash64(allocator, file_text);
             if (entry_sketch.valid()) {
@@ -366,20 +419,39 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         var result = try unknownResult(allocator, options, &paths, .insufficient_evidence, "no live corpus item matched the question terms", entries.len, max_results, max_snippet);
         errdefer result.deinit();
         result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
+        telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
+        telemetry.max_results_hit = telemetry.sketch_candidate_cap_hit;
+        if (telemetry.sketch_candidate_cap_hit) telemetry.budget_hits += 1;
+        telemetry.expansion_recommended = telemetry.hasPressure();
+        result.capacity_telemetry = telemetry;
+        try applyCapacityDisclosure(allocator, &result);
         return result;
     }
 
     std.mem.sort(Candidate, candidates.items, {}, candidateLessThan);
     const top_count = @min(max_results, candidates.items.len);
+    telemetry.exact_candidate_cap_hit = candidates.items.len > top_count;
+    telemetry.max_results_hit = telemetry.exact_candidate_cap_hit;
+    if (telemetry.exact_candidate_cap_hit) telemetry.budget_hits += 1;
     const conflict = hasConflict(candidates.items[0..top_count]);
     if (conflict) {
         var result = try buildBaseResult(allocator, options, &paths, .unknown, "unresolved", "unresolved", entries.len, max_results, max_snippet);
         errdefer result.deinit();
         result.evidence_used = try buildEvidence(allocator, candidates.items[0..top_count], entries, max_snippet, "selected because it matched question terms but conflicts with another selected corpus item");
         result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
+        telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
+        if (telemetry.truncated_snippets != 0) telemetry.budget_hits += 1;
+        telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
+        if (telemetry.sketch_candidate_cap_hit) {
+            telemetry.max_results_hit = true;
+            telemetry.budget_hits += 1;
+        }
+        telemetry.expansion_recommended = telemetry.hasPressure();
+        result.capacity_telemetry = telemetry;
         result.unknowns = try singleUnknown(allocator, .conflicting_evidence, "selected corpus evidence contains conflicting affirmative and negative signals");
         result.candidate_followups = try singleFollowup(allocator, "evidence_to_collect", "provide or ingest an authoritative corpus item that resolves the conflict");
         result.learning_candidates = try singleLearningCandidate(allocator, "correction_candidate", "review the conflicting corpus items and propose a correction or corpus update through an explicit lifecycle", "conflicting evidence cannot authorize an answer");
+        try applyCapacityDisclosure(allocator, &result);
         return result;
     }
 
@@ -388,6 +460,14 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         var result = try unknownResult(allocator, options, &paths, .insufficient_evidence, "matched corpus evidence was too weak to support an answer draft", entries.len, max_results, max_snippet);
         errdefer result.deinit();
         result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
+        telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
+        if (telemetry.sketch_candidate_cap_hit) {
+            telemetry.max_results_hit = true;
+            telemetry.budget_hits += 1;
+        }
+        telemetry.expansion_recommended = telemetry.hasPressure();
+        result.capacity_telemetry = telemetry;
+        try applyCapacityDisclosure(allocator, &result);
         return result;
     }
 
@@ -395,12 +475,22 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     errdefer result.deinit();
     result.evidence_used = try buildEvidence(allocator, candidates.items[0..top_count], entries, max_snippet, "selected because it matched bounded question terms");
     result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
+    telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
+    if (telemetry.truncated_snippets != 0) telemetry.budget_hits += 1;
+    telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
+    if (telemetry.sketch_candidate_cap_hit) {
+        telemetry.max_results_hit = true;
+        telemetry.budget_hits += 1;
+    }
+    telemetry.expansion_recommended = telemetry.hasPressure();
+    result.capacity_telemetry = telemetry;
     result.answer_draft = try std.fmt.allocPrint(
         allocator,
         "Draft answer from corpus evidence: {s}",
         .{result.evidence_used[0].snippet},
     );
     result.candidate_followups = try singleFollowup(allocator, "verifier_check_candidate", "review the cited corpus evidence before treating this answer as supported");
+    try applyCapacityDisclosure(allocator, &result);
     return result;
 }
 
@@ -435,6 +525,7 @@ fn unknownResult(
         .no_corpus_available => try singleFollowup(allocator, "evidence_to_collect", "ingest and explicitly commit a corpus for the target shard before asking again"),
         .insufficient_evidence => try singleFollowup(allocator, "evidence_to_collect", "provide a more specific question or ingest corpus evidence that addresses it"),
         .conflicting_evidence => try singleFollowup(allocator, "evidence_to_collect", "provide authoritative evidence to resolve the conflict"),
+        .capacity_limited => try singleFollowup(allocator, "capacity_review_candidate", "raise explicit retrieval bounds or inspect skipped/truncated corpus coverage before relying on missing evidence"),
         .malformed_request => try singleFollowup(allocator, "question_to_ask_user", "provide a valid ask request"),
     };
     result.learning_candidates = try singleLearningCandidate(
@@ -479,6 +570,32 @@ fn singleUnknown(allocator: std.mem.Allocator, kind: UnknownKind, reason: []cons
         .reason = try allocator.dupe(u8, reason),
     };
     return items;
+}
+
+fn appendUnknown(allocator: std.mem.Allocator, existing: []Unknown, kind: UnknownKind, reason: []const u8) ![]Unknown {
+    const out = try allocator.alloc(Unknown, existing.len + 1);
+    @memcpy(out[0..existing.len], existing);
+    out[existing.len] = .{
+        .kind = kind,
+        .reason = try allocator.dupe(u8, reason),
+    };
+    allocator.free(existing);
+    return out;
+}
+
+fn applyCapacityDisclosure(allocator: std.mem.Allocator, result: *Result) !void {
+    if (result.capacity_telemetry.hasPressure()) {
+        result.unknowns = try appendUnknown(
+            allocator,
+            result.unknowns,
+            .capacity_limited,
+            "bounded corpus retrieval had skipped, truncated, or capped coverage; missing evidence remains unknown and cannot be treated as negative evidence",
+        );
+        if (result.candidate_followups.len == 0) {
+            result.candidate_followups = try singleFollowup(allocator, "capacity_review_candidate", "raise explicit retrieval bounds or inspect skipped/truncated corpus coverage before relying on missing evidence");
+        }
+    }
+    result.capacity_telemetry.unknowns_created = result.unknowns.len;
 }
 
 fn singleFollowup(allocator: std.mem.Allocator, kind: []const u8, detail: []const u8) ![]CandidateFollowup {
@@ -581,16 +698,40 @@ fn buildSimilarCandidates(
     return out;
 }
 
+fn sketchCandidatesCapHit(candidate_count: usize, max_results: usize) bool {
+    const cap = @min(max_results, MAX_SKETCH_CANDIDATES);
+    return candidate_count > cap;
+}
+
+fn countTruncatedSnippets(evidence: []const EvidenceUsed) usize {
+    var count: usize = 0;
+    for (evidence) |item| {
+        if (item.snippet_truncated) count += 1;
+    }
+    return count;
+}
+
 fn sketchCandidateLessThan(_: void, lhs: SketchCandidate, rhs: SketchCandidate) bool {
     if (lhs.hamming_distance != rhs.hamming_distance) return lhs.hamming_distance < rhs.hamming_distance;
     if (lhs.similarity_score != rhs.similarity_score) return lhs.similarity_score > rhs.similarity_score;
     return lhs.entry_index < rhs.entry_index;
 }
 
-fn readEntryText(allocator: std.mem.Allocator, abs_path: []const u8) ![]u8 {
+fn readEntryText(allocator: std.mem.Allocator, abs_path: []const u8) !ReadEntryResult {
     const file = try std.fs.openFileAbsolute(abs_path, .{});
     defer file.close();
-    return file.readToEndAlloc(allocator, MAX_FILE_READ_BYTES);
+    const file_size = try file.getEndPos();
+    const read_len: usize = @intCast(@min(file_size, MAX_FILE_READ_BYTES));
+    var buffer = try allocator.alloc(u8, read_len);
+    errdefer allocator.free(buffer);
+    const actual = try file.readAll(buffer);
+    if (actual != read_len) {
+        buffer = try allocator.realloc(buffer, actual);
+    }
+    return .{
+        .text = buffer,
+        .truncated = file_size > MAX_FILE_READ_BYTES,
+    };
 }
 
 fn tokenizeQuery(allocator: std.mem.Allocator, question: []const u8) !QueryTokens {
@@ -993,7 +1134,9 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
         try w.print(",\"persisted\":{s}", .{if (candidate.persisted) "true" else "false"});
         try w.writeAll("}");
     }
-    try w.writeAll("],\"trace\":{");
+    try w.writeAll("],\"capacityTelemetry\":");
+    try writeCapacityTelemetry(w, result.capacity_telemetry);
+    try w.writeAll(",\"trace\":{");
     try w.print("\"corpusEntriesConsidered\":{d}", .{result.corpus_entries_considered});
     try w.print(",\"maxResults\":{d}", .{result.max_results});
     try w.print(",\"maxSnippetBytes\":{d}", .{result.max_snippet_bytes});
@@ -1005,6 +1148,45 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
     try w.print(",\"verifiersExecuted\":{s}", .{if (result.safety_flags.verifiers_executed) "true" else "false"});
     try w.writeAll("}}}");
     return out.toOwnedSlice();
+}
+
+fn writeCapacityTelemetry(w: anytype, telemetry: CapacityTelemetry) !void {
+    try w.writeAll("{");
+    try w.print("\"droppedRunes\":{d},\"collisionStalls\":{d},\"saturatedSlots\":{d}", .{ telemetry.dropped_runes, telemetry.collision_stalls, telemetry.saturated_slots });
+    try w.print(",\"truncatedInputs\":{d},\"truncatedSnippets\":{d},\"skippedInputs\":{d},\"skippedFiles\":{d}", .{ telemetry.truncated_inputs, telemetry.truncated_snippets, telemetry.skipped_inputs, telemetry.skipped_files });
+    try w.print(",\"budgetHits\":{d},\"maxResultsHit\":{s},\"maxOutputsHit\":{s},\"maxRulesHit\":{s}", .{
+        telemetry.budget_hits,
+        if (telemetry.max_results_hit) "true" else "false",
+        if (telemetry.max_outputs_hit) "true" else "false",
+        if (telemetry.max_rules_hit) "true" else "false",
+    });
+    try w.print(",\"exactCandidateCapHit\":{s},\"sketchCandidateCapHit\":{s},\"unknownsCreated\":{d}", .{
+        if (telemetry.exact_candidate_cap_hit) "true" else "false",
+        if (telemetry.sketch_candidate_cap_hit) "true" else "false",
+        telemetry.unknowns_created,
+    });
+    try w.writeAll(",\"capacityWarnings\":[");
+    var wrote = false;
+    try writeWarningIf(w, &wrote, telemetry.max_results_hit, "max_results_hit");
+    try writeWarningIf(w, &wrote, telemetry.exact_candidate_cap_hit, "exact_candidate_cap_hit");
+    try writeWarningIf(w, &wrote, telemetry.sketch_candidate_cap_hit, "sketch_candidate_cap_hit");
+    try writeWarningIf(w, &wrote, telemetry.truncated_inputs != 0, "truncated_inputs");
+    try writeWarningIf(w, &wrote, telemetry.truncated_snippets != 0, "truncated_snippets");
+    try writeWarningIf(w, &wrote, telemetry.skipped_files != 0, "skipped_files");
+    try w.print("],\"expansionRecommended\":{s},\"spilloverRecommended\":{s}", .{
+        if (telemetry.expansion_recommended) "true" else "false",
+        if (telemetry.spillover_recommended) "true" else "false",
+    });
+    try w.writeAll("}");
+}
+
+fn writeWarningIf(w: anytype, wrote: *bool, condition: bool, warning: []const u8) !void {
+    if (!condition) return;
+    if (wrote.*) try w.writeByte(',');
+    try w.writeByte('"');
+    try writeEscaped(w, warning);
+    try w.writeByte('"');
+    wrote.* = true;
 }
 
 fn writeField(w: anytype, key: []const u8, value: []const u8, first: bool) !void {

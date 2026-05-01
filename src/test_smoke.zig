@@ -5759,6 +5759,21 @@ test "corpus ask reports deterministic non-authorizing sketch candidates without
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"nonAuthorizing\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"answerDraft\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"evidenceUsed\":[]") != null);
+
+    var capped = try corpus_ask.ask(allocator, .{
+        .question = "frobulatr quiescense windos requir boundid lokel recurence detecton duplikate korpus chonks",
+        .project_shard = project_shard,
+        .max_results = 1,
+    });
+    defer capped.deinit();
+
+    try std.testing.expectEqual(corpus_ask.AskStatus.unknown, capped.status);
+    try std.testing.expect(capped.answer_draft == null);
+    try std.testing.expect(capped.capacity_telemetry.sketch_candidate_cap_hit);
+    try std.testing.expect(capped.capacity_telemetry.max_results_hit);
+    try std.testing.expectEqual(corpus_ask.UnknownKind.capacity_limited, capped.unknowns[1].kind);
+    try std.testing.expectEqual(@as(usize, 1), capped.similar_candidates.len);
+    try std.testing.expect(capped.similar_candidates[0].non_authorizing);
 }
 
 test "corpus ask respects max results and snippet bounds in exact evidence" {
@@ -5810,6 +5825,11 @@ test "corpus ask respects max results and snippet bounds in exact evidence" {
 
     try std.testing.expectEqual(corpus_ask.AskStatus.answered, result.status);
     try std.testing.expectEqual(@as(usize, 2), result.evidence_used.len);
+    try std.testing.expectEqual(true, result.capacity_telemetry.max_results_hit);
+    try std.testing.expectEqual(true, result.capacity_telemetry.exact_candidate_cap_hit);
+    try std.testing.expectEqual(@as(usize, 2), result.capacity_telemetry.truncated_snippets);
+    try std.testing.expect(result.capacity_telemetry.budget_hits >= 2);
+    try std.testing.expectEqual(corpus_ask.UnknownKind.capacity_limited, result.unknowns[0].kind);
     for (result.evidence_used, 0..) |evidence, idx| {
         try std.testing.expect(evidence.snippet.len <= 32);
         try std.testing.expect(evidence.snippet_truncated);
@@ -5818,6 +5838,62 @@ test "corpus ask respects max results and snippet bounds in exact evidence" {
         try std.testing.expect(std.mem.startsWith(u8, evidence.content_hash, "fnv1a64:"));
         try std.testing.expect(evidence.byte_end > evidence.byte_start);
     }
+
+    const rendered = try corpus_ask.renderJson(allocator, &result);
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"capacityTelemetry\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"maxResultsHit\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"truncatedSnippets\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"capacityWarnings\"") != null);
+}
+
+test "corpus ask skipped oversized evidence cannot support answer draft" {
+    const allocator = std.testing.allocator;
+    const project_shard = "corpus-ask-skipped-capacity-test";
+    var corpus_fixture = std.testing.tmpDir(.{});
+    defer corpus_fixture.cleanup();
+    const corpus_root = try corpus_fixture.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+
+    const prefix = try allocator.alloc(u8, 70 * 1024);
+    defer allocator.free(prefix);
+    @memset(prefix, 'x');
+    var large = std.ArrayList(u8).init(allocator);
+    defer large.deinit();
+    try large.appendSlice(prefix);
+    try large.appendSlice("\nLate policy says retention policy enabled after the bounded ask read window.\n");
+    try corpus_fixture.dir.writeFile(.{ .sub_path = "large.md", .data = large.items });
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path) catch {};
+
+    var stage_result = try corpus_ingest.stage(allocator, .{
+        .corpus_path = corpus_root,
+        .project_shard = project_shard,
+        .trust_class = .project,
+        .source_label = "large-corpus",
+    });
+    defer stage_result.deinit();
+    try corpus_ingest.applyStaged(allocator, &project_paths);
+
+    var result = try corpus_ask.ask(allocator, .{
+        .question = "retention policy enabled",
+        .project_shard = project_shard,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(corpus_ask.AskStatus.unknown, result.status);
+    try std.testing.expect(result.answer_draft == null);
+    try std.testing.expectEqual(@as(usize, 0), result.evidence_used.len);
+    try std.testing.expectEqual(@as(usize, 1), result.capacity_telemetry.truncated_inputs);
+    try std.testing.expectEqual(corpus_ask.UnknownKind.capacity_limited, result.unknowns[1].kind);
+    try std.testing.expect(!result.safety_flags.corpus_mutation);
+    try std.testing.expect(!result.safety_flags.pack_mutation);
+    try std.testing.expect(!result.safety_flags.negative_knowledge_mutation);
 }
 
 test "gip corpus ask sees ingested corpus only after explicit staged apply" {
@@ -6069,6 +6145,27 @@ test "gip rule evaluate emits bounded non-authorizing candidates obligations unk
     try std.testing.expect(std.mem.indexOf(u8, result.result_json.?, "\"corpusMutation\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.result_json.?, "\"packMutation\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.result_json.?, "\"negativeKnowledgeMutation\":false") != null);
+
+    var capped = try gip.dispatch.dispatch(allocator, "rule.evaluate", gip.core.PROTOCOL_VERSION, null, null,
+        \\{"facts":[{"subject":"change","predicate":"touches","object":"runtime"}],"rules":[{"id":"rule.a","name":"A","when":{"all":[{"subject":"change","predicate":"touches","object":"runtime"}]},"emit":[{"kind":"check_candidate","id":"check.a1","summary":"first"},{"kind":"check_candidate","id":"check.a2","summary":"second"}]},{"id":"rule.b","name":"B","when":{"all":[{"subject":"change","predicate":"touches","object":"runtime"}]},"emit":[{"kind":"follow_up_candidate","id":"follow.b","summary":"later"}]}],"limits":{"maxFacts":8,"maxRules":4,"maxFiredRules":1,"maxOutputs":1}}
+    );
+    defer capped.deinit(allocator);
+    try std.testing.expectEqual(gip.core.ProtocolStatus.ok, capped.status);
+    try std.testing.expect(capped.result_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, capped.result_json.?, "\"budgetExhausted\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capped.result_json.?, "\"capacityTelemetry\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capped.result_json.?, "\"maxOutputsHit\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capped.result_json.?, "\"capacityWarnings\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capped.result_json.?, "\"supportGranted\":false") != null);
+
+    var fired_capped = try gip.dispatch.dispatch(allocator, "rule.evaluate", gip.core.PROTOCOL_VERSION, null, null,
+        \\{"facts":[{"subject":"change","predicate":"touches","object":"runtime"}],"rules":[{"id":"rule.a","name":"A","when":{"all":[{"subject":"change","predicate":"touches","object":"runtime"}]},"emit":[{"kind":"check_candidate","id":"check.a","summary":"first"}]},{"id":"rule.b","name":"B","when":{"all":[{"subject":"change","predicate":"touches","object":"runtime"}]},"emit":[{"kind":"follow_up_candidate","id":"follow.b","summary":"later"}]}],"limits":{"maxFacts":8,"maxRules":4,"maxFiredRules":1,"maxOutputs":8}}
+    );
+    defer fired_capped.deinit(allocator);
+    try std.testing.expectEqual(gip.core.ProtocolStatus.ok, fired_capped.status);
+    try std.testing.expect(fired_capped.result_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, fired_capped.result_json.?, "\"maxFiredRulesHit\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fired_capped.result_json.?, "\"maxRulesHit\":true") != null);
 }
 
 test "gip rule evaluate rejects recursive fact output" {

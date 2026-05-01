@@ -99,8 +99,8 @@ results when GIP has no active session or workspace metadata:
 |-----------|------------------------|----------|
 | `hypothesis.list` | Returns empty hypotheses + zero counts | `stateless` |
 | `hypothesis.triage` | Returns empty triage summary with scoring policy version | `stateless` |
-| `corpus.ask` | Reads existing live shard corpus; returns explicit unknown when no corpus/evidence is visible; may include non-authorizing local sketch candidates | `read_only_live_corpus_grounded_draft` |
-| `rule.evaluate` | Evaluates bounded deterministic rules over request facts and emits candidate-only outputs with explanation traces | `bounded_deterministic_non_authorizing_candidates` |
+| `corpus.ask` | Reads existing live shard corpus; returns explicit unknown when no corpus/evidence is visible; may include non-authorizing local sketch candidates and capacity telemetry | `read_only_live_corpus_grounded_draft` |
+| `rule.evaluate` | Evaluates bounded deterministic rules over request facts and emits candidate-only outputs with explanation traces and capacity telemetry | `bounded_deterministic_non_authorizing_candidates` |
 | `verifier.candidate.execution.list` | Reads existing task/result support-graph state; returns empty when no state is visible | `read_only_state_inspection` |
 | `verifier.candidate.execution.get` | Reads one existing execution job/result projection; missing IDs return `path_not_found` | `read_only_state_inspection` |
 | `correction.list` | Reads existing correction-event state; returns empty when no state is visible | `read_only_state_inspection` |
@@ -185,6 +185,8 @@ promotion, or pack mutation.
 - `answerDraft` remains gated by exact local recall only: case-insensitive exact token overlap and adjacent exact phrase evidence. Drafts cite `evidenceUsed`; approximate-only matches return `unresolved`.
 - `similarCandidates` are approximate SimHash routing hints. They include Hamming distance, similarity score, reason, rank, and `nonAuthorizing: true`.
 - Similarity candidates are not proof, are not semantic search, do not populate `evidenceUsed`, and cannot authorize an answer. No Transformers, embeddings, model adapters, or network calls are used.
+- Capacity pressure is explicit. Skipped files, truncated live-corpus reads, truncated snippets, exact/sketch candidate caps, and max-result caps appear in `capacityTelemetry` and create `capacity_limited` unknowns or warnings. Dropped or skipped evidence is not learned data and cannot become negative evidence.
+- Capacity warnings are diagnostic, not proof. They may recommend explicit expansion or spillover, but they never discharge support gates.
 
 ### Rule Evaluation
 - `rule.evaluate` evaluates request-local structured facts against request-local rules. It is deterministic, bounded, and read-only.
@@ -194,6 +196,7 @@ promotion, or pack mutation.
 - Outputs are candidate-only and non-authorizing. Check candidates always have `executesByDefault:false`; evidence expectations become pending obligations with `status:"pending"`, `executed:false`, and `treatedAsProof:false`.
 - Rule firing cannot execute commands or verifiers, cannot mutate corpus, Knowledge Packs, or negative knowledge, and cannot discharge proof/support gates.
 - The substrate is structural rule matching only. It does not use Transformers, embeddings, model adapters, network calls, or semantic black-box search.
+- Fired-rule/output caps and rejected outputs appear in `capacityTelemetry`. Capacity warnings do not make any emitted candidate more authoritative.
   - Guidance matching is bounded and deterministic: structured tags/kinds/required fields are matched case-insensitively, keywords prefer structured context and artifact/input ref metadata before bounded JSON string/key inspection, and applied pack influences include non-authorizing `matchTrace` metadata.
   - Does not execute commands, run verifiers, mutate packs, or mutate negative knowledge.
   - Persisted Knowledge Pack autopsy guidance can be preflighted through the read-only `ghost_knowledge_pack validate-autopsy-guidance` operator tool; this is outside the GIP request surface and does not change `context.autopsy` response authority.
@@ -218,15 +221,17 @@ promotion, or pack mutation.
   - Uses only existing live corpus state created through explicit corpus ingestion/lifecycle paths. Staged corpus is not read as active knowledge.
   - Matching is bounded, deterministic, local exact recall over live corpus file excerpts. It uses case-insensitive exact token overlap plus adjacent exact phrase hits; it is not semantic search and does not use embeddings, Transformers, model adapters, or network calls.
   - `evidenceUsed` reports corpus lineage id/path/source path/source label/class/trust class, content hash, byte and line spans, bounded snippet with truncation flag, matched terms/phrase, match reason, provenance, score, and rank.
-  - Unknowns include `no_corpus_available`, `insufficient_evidence`, and `conflicting_evidence`. Weak or approximate-only signals do not produce `answerDraft`.
+  - `capacityTelemetry` reports bounded retrieval pressure such as `truncatedInputs`, `truncatedSnippets`, `skippedFiles`, `budgetHits`, `maxResultsHit`, exact/sketch candidate caps, `capacityWarnings`, `unknownsCreated`, and expansion/spillover recommendations.
+  - Unknowns include `no_corpus_available`, `insufficient_evidence`, `conflicting_evidence`, and `capacity_limited`. Weak, approximate-only, skipped, dropped, or truncated signals do not produce `answerDraft`; exact evidence may still produce a draft, but the partial coverage is disclosed.
   - `learningCandidates` are candidate-only and non-authorizing. They are not persisted and do not mutate Knowledge Packs, corpus state, or negative knowledge.
   - Trace flags always report `corpusMutation:false`, `packMutation:false`, `negativeKnowledgeMutation:false`, `commandsExecuted:false`, and `verifiersExecuted:false`.
 
 ### Deterministic Rule Evaluation
 - `rule.evaluate` — Evaluate bounded request facts/rules and return non-authorizing candidates, obligations, unknowns, and traces **(Implemented)**
   - **Request**: `{"facts":[{"subject": string,"predicate": string,"object": string,"source": string optional}],"rules":[{"id": string,"name": string,"when":{"all":[...],"any":[...]},"emit":[{"kind":"check_candidate"|"risk_candidate"|"evidence_expectation"|"unknown"|"follow_up_candidate","id": string,"summary": string,"detail": string optional}]}],"limits":{"maxFacts": int,"maxRules": int,"maxFiredRules": int,"maxOutputs": int}}`.
-  - **Response**: `{"ruleEvaluation":{"nonAuthorizing":true,"candidateOnly":true,"proofDischarged":false,"supportGranted":false,"firedRules":[...],"emittedCandidates":[...],"emittedObligations":[...],"emittedUnknowns":[...],"explanationTrace":[...],"safetyFlags":{...}}}`.
+  - **Response**: `{"ruleEvaluation":{"nonAuthorizing":true,"candidateOnly":true,"proofDischarged":false,"supportGranted":false,"firedRules":[...],"emittedCandidates":[...],"emittedObligations":[...],"emittedUnknowns":[...],"capacityTelemetry":{...},"explanationTrace":[...],"safetyFlags":{...}}}`.
   - Rule order and fact order are stable. Bounds are enforced before and during evaluation.
+  - `capacityTelemetry` reports fired-rule and output caps as `maxFiredRulesHit`, `maxOutputsHit`, `maxRulesHit`, `rejectedOutputs`, `budgetHits`, `capacityWarnings`, and expansion recommendations. Capacity warnings are not proof and do not grant support.
   - Invalid rules and unsupported recursive fact outputs are rejected cleanly with `invalid_request`.
 
 ### Artifacts

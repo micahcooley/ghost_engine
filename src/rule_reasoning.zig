@@ -78,6 +78,35 @@ pub const SafetyFlags = struct {
     support_granted: bool = false,
 };
 
+pub const CapacityTelemetry = struct {
+    dropped_runes: usize = 0,
+    collision_stalls: usize = 0,
+    saturated_slots: usize = 0,
+    truncated_inputs: usize = 0,
+    truncated_snippets: usize = 0,
+    skipped_inputs: usize = 0,
+    skipped_files: usize = 0,
+    budget_hits: usize = 0,
+    max_results_hit: bool = false,
+    max_outputs_hit: bool = false,
+    max_rules_hit: bool = false,
+    max_fired_rules_hit: bool = false,
+    max_facts_hit: bool = false,
+    rejected_outputs: usize = 0,
+    unknowns_created: usize = 0,
+    expansion_recommended: bool = false,
+    spillover_recommended: bool = false,
+
+    pub fn hasPressure(self: CapacityTelemetry) bool {
+        return self.budget_hits != 0 or
+            self.max_outputs_hit or
+            self.max_rules_hit or
+            self.max_fired_rules_hit or
+            self.max_facts_hit or
+            self.rejected_outputs != 0;
+    }
+};
+
 pub const FiredRule = struct {
     id: []const u8,
     name: []const u8,
@@ -125,6 +154,7 @@ pub const EvaluationResult = struct {
     budget_exhausted: bool = false,
     non_authorizing: bool = true,
     safety_flags: SafetyFlags = .{},
+    capacity_telemetry: CapacityTelemetry = .{},
 
     pub fn deinit(self: *EvaluationResult) void {
         self.allocator.free(self.fired_rules);
@@ -184,6 +214,7 @@ pub fn evaluate(allocator: std.mem.Allocator, request: Request) !EvaluationResul
 
     var total_outputs: usize = 0;
     var budget_exhausted = false;
+    var telemetry = CapacityTelemetry{};
 
     for (request.rules) |rule| {
         const all_count = countMatchingConditions(request.facts, rule.all);
@@ -206,6 +237,10 @@ pub fn evaluate(allocator: std.mem.Allocator, request: Request) !EvaluationResul
         if (!did_fire) continue;
         if (fired.items.len >= limits.max_fired_rules) {
             budget_exhausted = true;
+            telemetry.max_fired_rules_hit = true;
+            telemetry.max_rules_hit = true;
+            telemetry.rejected_outputs += rule.outputs.len;
+            telemetry.budget_hits += 1;
             break;
         }
         try fired.append(.{
@@ -215,9 +250,12 @@ pub fn evaluate(allocator: std.mem.Allocator, request: Request) !EvaluationResul
             .matched_any = any_match,
         });
 
-        for (rule.outputs) |output| {
+        for (rule.outputs, 0..) |output, output_idx| {
             if (total_outputs >= limits.max_outputs) {
                 budget_exhausted = true;
+                telemetry.max_outputs_hit = true;
+                telemetry.rejected_outputs += rule.outputs.len - output_idx;
+                telemetry.budget_hits += 1;
                 break;
             }
             const emitted = emittedFromOutput(rule.id, output);
@@ -231,6 +269,8 @@ pub fn evaluate(allocator: std.mem.Allocator, request: Request) !EvaluationResul
         }
         if (budget_exhausted) break;
     }
+    telemetry.unknowns_created = unknowns.items.len;
+    telemetry.expansion_recommended = telemetry.hasPressure();
 
     return .{
         .allocator = allocator,
@@ -244,6 +284,7 @@ pub fn evaluate(allocator: std.mem.Allocator, request: Request) !EvaluationResul
         .rules_considered = request.rules.len,
         .outputs_emitted = total_outputs,
         .budget_exhausted = budget_exhausted,
+        .capacity_telemetry = telemetry,
     };
 }
 
@@ -447,6 +488,8 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const EvaluationResult)
     try writeOutputs(w, result.emitted_obligations, true);
     try w.writeAll(",\"emittedUnknowns\":");
     try writeOutputs(w, result.emitted_unknowns, false);
+    try w.writeAll(",\"capacityTelemetry\":");
+    try writeCapacityTelemetry(w, result.capacity_telemetry);
     try w.writeAll(",\"explanationTrace\":[");
     for (result.explanation_trace, 0..) |trace, idx| {
         if (idx != 0) try w.writeByte(',');
@@ -476,6 +519,45 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const EvaluationResult)
     });
     try w.writeAll("}}}");
     return try out.toOwnedSlice();
+}
+
+fn writeCapacityTelemetry(w: anytype, telemetry: CapacityTelemetry) !void {
+    try w.writeAll("{");
+    try w.print("\"droppedRunes\":{d},\"collisionStalls\":{d},\"saturatedSlots\":{d}", .{ telemetry.dropped_runes, telemetry.collision_stalls, telemetry.saturated_slots });
+    try w.print(",\"truncatedInputs\":{d},\"truncatedSnippets\":{d},\"skippedInputs\":{d},\"skippedFiles\":{d}", .{ telemetry.truncated_inputs, telemetry.truncated_snippets, telemetry.skipped_inputs, telemetry.skipped_files });
+    try w.print(",\"budgetHits\":{d},\"maxResultsHit\":{s},\"maxOutputsHit\":{s},\"maxRulesHit\":{s}", .{
+        telemetry.budget_hits,
+        if (telemetry.max_results_hit) "true" else "false",
+        if (telemetry.max_outputs_hit) "true" else "false",
+        if (telemetry.max_rules_hit) "true" else "false",
+    });
+    try w.print(",\"maxFiredRulesHit\":{s},\"maxFactsHit\":{s},\"rejectedOutputs\":{d},\"unknownsCreated\":{d}", .{
+        if (telemetry.max_fired_rules_hit) "true" else "false",
+        if (telemetry.max_facts_hit) "true" else "false",
+        telemetry.rejected_outputs,
+        telemetry.unknowns_created,
+    });
+    try w.writeAll(",\"capacityWarnings\":[");
+    var wrote = false;
+    try writeWarningIf(w, &wrote, telemetry.max_outputs_hit, "max_outputs_hit");
+    try writeWarningIf(w, &wrote, telemetry.max_fired_rules_hit, "max_fired_rules_hit");
+    try writeWarningIf(w, &wrote, telemetry.max_rules_hit, "max_rules_hit");
+    try writeWarningIf(w, &wrote, telemetry.max_facts_hit, "max_facts_hit");
+    try writeWarningIf(w, &wrote, telemetry.rejected_outputs != 0, "outputs_rejected_by_capacity");
+    try w.print("],\"expansionRecommended\":{s},\"spilloverRecommended\":{s}", .{
+        if (telemetry.expansion_recommended) "true" else "false",
+        if (telemetry.spillover_recommended) "true" else "false",
+    });
+    try w.writeAll("}");
+}
+
+fn writeWarningIf(w: anytype, wrote: *bool, condition: bool, warning: []const u8) !void {
+    if (!condition) return;
+    if (wrote.*) try w.writeByte(',');
+    try w.writeByte('"');
+    try writeEscaped(w, warning);
+    try w.writeByte('"');
+    wrote.* = true;
 }
 
 fn writeOutputs(w: anytype, outputs: []const EmittedOutput, obligations: bool) !void {
@@ -597,6 +679,9 @@ test "bounded max fired rules and outputs enforced" {
     try std.testing.expectEqual(@as(usize, 1), result.fired_rules.len);
     try std.testing.expectEqual(@as(usize, 1), result.outputs_emitted);
     try std.testing.expectEqual(true, result.budget_exhausted);
+    try std.testing.expectEqual(true, result.capacity_telemetry.max_outputs_hit);
+    try std.testing.expectEqual(@as(usize, 1), result.capacity_telemetry.budget_hits);
+    try std.testing.expectEqual(true, result.capacity_telemetry.expansion_recommended);
 }
 
 test "cyclic recursive fact output pattern is rejected" {
