@@ -19,6 +19,7 @@ pub const code_intel = @import("code_intel.zig");
 pub const corpus_ingest = @import("corpus_ingest.zig");
 pub const corpus_ask = @import("corpus_ask.zig");
 pub const corpus_sketch = @import("corpus_sketch.zig");
+pub const rule_reasoning = @import("rule_reasoning.zig");
 pub const external_evidence = @import("external_evidence.zig");
 pub const execution = @import("execution.zig");
 pub const feedback = @import("feedback.zig");

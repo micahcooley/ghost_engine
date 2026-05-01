@@ -24,7 +24,7 @@ Instead of Ghost hardcoding what to look for, Knowledge Packs provide declarativ
 - **Checks and Verifiers:** Hard verifiers (e.g., compiler exit codes) vs. soft real-world checks (e.g., "Taste the dough", "Ask your partner how they feel"). Soft checks are explicitly labeled as weaker.
 - **Negative Knowledge & Anti-patterns:** Packs provide known traps (e.g., "Do not mix baking soda without acid" or "Do not assume CI checks out PRs locally").
 
-Ghost evaluates the user's situation against these pack rules. The engine remains ignorant of baking or marketing, only understanding how to unify signals, risks, checks, and candidates into a unified `ContextAutopsyResult`.
+Ghost evaluates the user's situation against these pack rules. The engine remains ignorant of baking or marketing, only understanding how to unify signals, risks, checks, and candidates into a unified `ContextAutopsyResult`. Generic rule evaluation in Ghost remains non-authorizing: deterministic rules may suggest risks, checks, evidence expectations, unknowns, or follow-ups, but rule firing is never proof and never executes a verifier.
 
 ## 4. Runtime Status
 

@@ -24,6 +24,7 @@ pub const RequestKind = enum {
     @"conversation.turn",
     @"conversation.replay",
     @"corpus.ask",
+    @"rule.evaluate",
     @"intent.ground",
     @"response.evaluate",
 
@@ -251,6 +252,7 @@ pub const CapabilityName = enum {
     @"session.write",
     @"network.access",
     @"corpus.ask",
+    @"rule.evaluate",
     @"project.autopsy",
     @"context.autopsy",
 
@@ -276,7 +278,7 @@ pub const CapabilityEntry = struct {
     policy: CapabilityPolicy,
 };
 
-pub fn defaultCapabilities() [45]CapabilityEntry {
+pub fn defaultCapabilities() [46]CapabilityEntry {
     return .{
         .{ .capability = .@"artifact.read", .policy = .allowed },
         .{ .capability = .@"artifact.list", .policy = .allowed },
@@ -321,6 +323,7 @@ pub fn defaultCapabilities() [45]CapabilityEntry {
         .{ .capability = .@"session.write", .policy = .allowed },
         .{ .capability = .@"network.access", .policy = .denied },
         .{ .capability = .@"corpus.ask", .policy = .allowed },
+        .{ .capability = .@"rule.evaluate", .policy = .allowed },
         .{ .capability = .@"project.autopsy", .policy = .allowed },
         .{ .capability = .@"context.autopsy", .policy = .allowed },
     };
@@ -465,6 +468,7 @@ pub const IMPLEMENTED_KINDS = [_]RequestKind{
     .@"engine.status",
     .@"conversation.turn",
     .@"corpus.ask",
+    .@"rule.evaluate",
     .@"artifact.read",
     .@"artifact.list",
     .@"artifact.patch.propose",
@@ -532,10 +536,12 @@ test "default capabilities have safe defaults" {
     try std.testing.expectEqual(CapabilityPolicy.denied, caps[41].policy);
     // corpus.ask should be allowed (read-only/non-authorizing)
     try std.testing.expectEqual(CapabilityPolicy.allowed, caps[42].policy);
-    // project.autopsy should be allowed (read-only)
+    // rule.evaluate should be allowed (read-only/non-authorizing)
     try std.testing.expectEqual(CapabilityPolicy.allowed, caps[43].policy);
-    // context.autopsy should be allowed (read-only/non-authorizing)
+    // project.autopsy should be allowed (read-only)
     try std.testing.expectEqual(CapabilityPolicy.allowed, caps[44].policy);
+    // context.autopsy should be allowed (read-only/non-authorizing)
+    try std.testing.expectEqual(CapabilityPolicy.allowed, caps[45].policy);
 }
 
 test "command allowlist rejects arbitrary commands" {

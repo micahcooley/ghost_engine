@@ -15,6 +15,7 @@ const code_intel = @import("code_intel.zig");
 const corpus_ingest = @import("corpus_ingest.zig");
 const corpus_ask = @import("corpus_ask.zig");
 const corpus_sketch = @import("corpus_sketch.zig");
+const rule_reasoning = @import("rule_reasoning.zig");
 const external_evidence = @import("external_evidence.zig");
 const execution = @import("execution.zig");
 const abstractions = @import("abstractions.zig");
@@ -48,6 +49,7 @@ comptime {
     _ = context_autopsy_engine;
     _ = context_inputs;
     _ = project_autopsy;
+    _ = rule_reasoning;
     _ = corpus_sketch;
     _ = repo_hygiene;
     _ = hypothesis_core;
@@ -6018,6 +6020,67 @@ test "gip corpus ask exposes protocol capability and malformed requests are stru
     try std.testing.expectEqual(gip.core.ProtocolStatus.rejected, malformed.status);
     try std.testing.expect(malformed.err != null);
     try std.testing.expectEqual(gip.core.ErrorCode.invalid_request, malformed.err.?.code);
+}
+
+test "gip rule evaluate emits bounded non-authorizing candidates obligations unknowns" {
+    const allocator = std.testing.allocator;
+
+    var protocol = try gip.dispatch.dispatch(
+        allocator,
+        "protocol.describe",
+        gip.core.PROTOCOL_VERSION,
+        null,
+        null,
+        null,
+    );
+    defer protocol.deinit(allocator);
+    try std.testing.expect(protocol.result_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, protocol.result_json.?, "\"rule.evaluate\"") != null);
+
+    var caps = try gip.dispatch.dispatch(
+        allocator,
+        "capabilities.describe",
+        gip.core.PROTOCOL_VERSION,
+        null,
+        null,
+        null,
+    );
+    defer caps.deinit(allocator);
+    try std.testing.expect(caps.result_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, caps.result_json.?, "\"capability\":\"rule.evaluate\"") != null);
+
+    var result = try gip.dispatch.dispatch(allocator, "rule.evaluate", gip.core.PROTOCOL_VERSION, null, null,
+        \\{"facts":[{"subject":"change","predicate":"touches","object":"runtime","source":"smoke"}],"rules":[{"id":"rule.runtime","name":"Runtime checks","when":{"all":[{"subject":"change","predicate":"touches","object":"runtime"}]},"emit":[{"kind":"check_candidate","id":"check.runtime","summary":"review runtime checks","riskLevel":"medium"},{"kind":"evidence_expectation","id":"obligation.runtime","summary":"collect deterministic runtime evidence"},{"kind":"unknown","id":"unknown.runtime","summary":"runtime impact remains unknown until checked"}]}],"limits":{"maxFacts":8,"maxRules":4,"maxFiredRules":2,"maxOutputs":8}}
+    );
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(gip.core.ProtocolStatus.ok, result.status);
+    try std.testing.expect(result.result_state != null);
+    try std.testing.expectEqual(gip.core.Permission.none, result.result_state.?.permission);
+    try std.testing.expect(result.result_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.result_json.?, "\"nonAuthorizing\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.result_json.?, "\"executesByDefault\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.result_json.?, "\"status\":\"pending\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.result_json.?, "\"executed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.result_json.?, "\"treatedAsProof\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.result_json.?, "\"proofDischarged\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.result_json.?, "\"supportGranted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.result_json.?, "\"commandsExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.result_json.?, "\"verifiersExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.result_json.?, "\"corpusMutation\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.result_json.?, "\"packMutation\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.result_json.?, "\"negativeKnowledgeMutation\":false") != null);
+}
+
+test "gip rule evaluate rejects recursive fact output" {
+    const allocator = std.testing.allocator;
+    var result = try gip.dispatch.dispatch(allocator, "rule.evaluate", gip.core.PROTOCOL_VERSION, null, null,
+        \\{"facts":[{"subject":"a","predicate":"b","object":"c"}],"rules":[{"id":"recursive","name":"recursive","when":{"all":[{"subject":"a","predicate":"b","object":"c"}]},"emit":[{"kind":"fact","id":"derived","summary":"derive another fact"}]}]}
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(gip.core.ProtocolStatus.rejected, result.status);
+    try std.testing.expect(result.err != null);
+    try std.testing.expectEqual(gip.core.ErrorCode.invalid_request, result.err.?.code);
 }
 
 test "corpus reverse grounding leaves tied symbolic surfaces unresolved" {

@@ -73,6 +73,8 @@ That metadata is attached to `code_intel` subjects, evidence, abstraction traces
 
 Phase 2 adds local sketch routing as a hint channel for corpus candidates. `corpus.ask` computes bounded 64-bit SimHash sketches over normalized local text features during the same live-corpus scan and may return `similarCandidates` with Hamming distance, similarity score, and `nonAuthorizing: true`. These candidates are approximate routing signals for near-duplicate, clustering, or recurrence work. They are not proof, are not exact memory, do not populate `evidenceUsed`, and never authorize `answerDraft`.
 
+Phase 3 adds a small deterministic rule/graph substrate exposed as `rule.evaluate`. It evaluates request-local structured facts against bounded request-local rules, in stable order, and emits only non-authorizing candidates, pending obligations, unknowns, and explanation traces. Rules cannot execute commands or verifiers, cannot infer recursive facts, cannot mutate corpus, Knowledge Packs, or negative knowledge, and cannot discharge support/proof gates. The substrate is structural matching only; it does not use embeddings, Transformers, model adapters, cloud calls, or semantic black-box search.
+
 Minimal binary-only ingest/apply/ask loop:
 
 ```bash

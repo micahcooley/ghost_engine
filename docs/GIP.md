@@ -100,6 +100,7 @@ results when GIP has no active session or workspace metadata:
 | `hypothesis.list` | Returns empty hypotheses + zero counts | `stateless` |
 | `hypothesis.triage` | Returns empty triage summary with scoring policy version | `stateless` |
 | `corpus.ask` | Reads existing live shard corpus; returns explicit unknown when no corpus/evidence is visible; may include non-authorizing local sketch candidates | `read_only_live_corpus_grounded_draft` |
+| `rule.evaluate` | Evaluates bounded deterministic rules over request facts and emits candidate-only outputs with explanation traces | `bounded_deterministic_non_authorizing_candidates` |
 | `verifier.candidate.execution.list` | Reads existing task/result support-graph state; returns empty when no state is visible | `read_only_state_inspection` |
 | `verifier.candidate.execution.get` | Reads one existing execution job/result projection; missing IDs return `path_not_found` | `read_only_state_inspection` |
 | `correction.list` | Reads existing correction-event state; returns empty when no state is visible | `read_only_state_inspection` |
@@ -184,6 +185,15 @@ promotion, or pack mutation.
 - `answerDraft` remains gated by exact local recall only: case-insensitive exact token overlap and adjacent exact phrase evidence. Drafts cite `evidenceUsed`; approximate-only matches return `unresolved`.
 - `similarCandidates` are approximate SimHash routing hints. They include Hamming distance, similarity score, reason, rank, and `nonAuthorizing: true`.
 - Similarity candidates are not proof, are not semantic search, do not populate `evidenceUsed`, and cannot authorize an answer. No Transformers, embeddings, model adapters, or network calls are used.
+
+### Rule Evaluation
+- `rule.evaluate` evaluates request-local structured facts against request-local rules. It is deterministic, bounded, and read-only.
+- Facts are simple subject/predicate/object/source records. Rules contain `all` conditions, optional `any` conditions, and `emit` outputs.
+- Supported output kinds are `risk_candidate`, `check_candidate`, `evidence_expectation`, `unknown`, and `follow_up_candidate`.
+- Rules do not infer or append new facts. Recursive/cyclic fact output is unsupported and rejected as an invalid request.
+- Outputs are candidate-only and non-authorizing. Check candidates always have `executesByDefault:false`; evidence expectations become pending obligations with `status:"pending"`, `executed:false`, and `treatedAsProof:false`.
+- Rule firing cannot execute commands or verifiers, cannot mutate corpus, Knowledge Packs, or negative knowledge, and cannot discharge proof/support gates.
+- The substrate is structural rule matching only. It does not use Transformers, embeddings, model adapters, network calls, or semantic black-box search.
   - Guidance matching is bounded and deterministic: structured tags/kinds/required fields are matched case-insensitively, keywords prefer structured context and artifact/input ref metadata before bounded JSON string/key inspection, and applied pack influences include non-authorizing `matchTrace` metadata.
   - Does not execute commands, run verifiers, mutate packs, or mutate negative knowledge.
   - Persisted Knowledge Pack autopsy guidance can be preflighted through the read-only `ghost_knowledge_pack validate-autopsy-guidance` operator tool; this is outside the GIP request surface and does not change `context.autopsy` response authority.
@@ -211,6 +221,13 @@ promotion, or pack mutation.
   - Unknowns include `no_corpus_available`, `insufficient_evidence`, and `conflicting_evidence`. Weak or approximate-only signals do not produce `answerDraft`.
   - `learningCandidates` are candidate-only and non-authorizing. They are not persisted and do not mutate Knowledge Packs, corpus state, or negative knowledge.
   - Trace flags always report `corpusMutation:false`, `packMutation:false`, `negativeKnowledgeMutation:false`, `commandsExecuted:false`, and `verifiersExecuted:false`.
+
+### Deterministic Rule Evaluation
+- `rule.evaluate` — Evaluate bounded request facts/rules and return non-authorizing candidates, obligations, unknowns, and traces **(Implemented)**
+  - **Request**: `{"facts":[{"subject": string,"predicate": string,"object": string,"source": string optional}],"rules":[{"id": string,"name": string,"when":{"all":[...],"any":[...]},"emit":[{"kind":"check_candidate"|"risk_candidate"|"evidence_expectation"|"unknown"|"follow_up_candidate","id": string,"summary": string,"detail": string optional}]}],"limits":{"maxFacts": int,"maxRules": int,"maxFiredRules": int,"maxOutputs": int}}`.
+  - **Response**: `{"ruleEvaluation":{"nonAuthorizing":true,"candidateOnly":true,"proofDischarged":false,"supportGranted":false,"firedRules":[...],"emittedCandidates":[...],"emittedObligations":[...],"emittedUnknowns":[...],"explanationTrace":[...],"safetyFlags":{...}}}`.
+  - Rule order and fact order are stable. Bounds are enforced before and during evaluation.
+  - Invalid rules and unsupported recursive fact outputs are rejected cleanly with `invalid_request`.
 
 ### Artifacts
 - `artifact.read` — Read file content (workspace-bounded) **(Implemented)**
@@ -375,6 +392,7 @@ promote global authority.
 | `artifact.write.propose` | allowed | yes |
 | `artifact.write.apply` | requires_approval | no (mutation) |
 | `corpus.ask` | allowed | yes |
+| `rule.evaluate` | allowed | yes |
 | `hypothesis.list` | allowed | yes |
 | `hypothesis.triage` | allowed | yes |
 | `verifier.list` | allowed | yes |
@@ -434,6 +452,7 @@ Maximum timeout: 30 seconds. Maximum output: 256KB.
 11. **No automatic negative-knowledge mutation** — GIP does not mutate packs, apply trust decay, or promote global authority
 12. **Large input stays bounded** — `context.autopsy` uses artifact references, filters, chunked reads, budgets, coverage, and explicit unknowns rather than unbounded stdin JSON
 13. **Corpus ask is not proof** — `corpus.ask` can draft from cited corpus evidence, but corpus text alone does not verify or authorize supported output
+14. **Rules are not proof** — `rule.evaluate` emits candidate checks, obligations, risks, unknowns, and follow-ups only; rule firing cannot authorize supported output
 
 ## CLI Usage
 
@@ -461,6 +480,7 @@ echo '{"gipVersion":"gip.v0.1","kind":"pack.inspect","packId":"my-pack"}' | ghos
 echo '{"gipVersion":"gip.v0.1","kind":"feedback.summary"}' | ghost_gip --stdin --workspace /path/to/project
 echo '{"gipVersion":"gip.v0.1","kind":"session.get","sessionId":"my-session"}' | ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"corpus.ask","projectShard":"my-project","question":"what does the corpus say about retention?","maxResults":3}' | ghost_gip --stdin
+echo '{"gipVersion":"gip.v0.1","kind":"rule.evaluate","facts":[{"subject":"change","predicate":"touches","object":"runtime"}],"rules":[{"id":"runtime-check","name":"Runtime check expectation","when":{"all":[{"subject":"change","predicate":"touches","object":"runtime"}]},"emit":[{"kind":"check_candidate","id":"check-runtime","summary":"Review runtime behavior before support."}]}]}' | ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"project.autopsy"}' | ghost_gip --stdin --workspace /path/to/project
 echo '{"gipVersion":"gip.v0.1","kind":"context.autopsy","context":{"summary":"inspect source context"},"artifactRefs":[{"kind":"directory","path":".","include":["src/**/*.zig"],"exclude":[".git/**","zig-out/**",".zig-cache/**","node_modules/**"],"maxChunkBytes":32768,"maxFiles":64}]}' | ghost_gip --stdin --workspace /path/to/project
 ```
