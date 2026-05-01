@@ -63,10 +63,13 @@ Every live corpus item carries:
 - shard-local provenance
 - trust class
 - lineage id and lineage version
+- source path and source label
+
+`corpus.ask` computes byte/line evidence spans and a cheap FNV-1a content hash during bounded retrieval from the live file bytes. Those span fields are retrieval metadata, not a separate persisted corpus-store index.
 
 That metadata is attached to `code_intel` subjects, evidence, abstraction traces, and grounding traces when the result depends on ingested corpus surfaces.
 
-`corpus.ask` is the first GIP runtime slice that answers directly from this live corpus state. It does not ingest data, read staged corpus as active knowledge, run verifiers, or write learning state. When evidence is present it returns a draft/non-authorizing `answerDraft` with `evidenceUsed`; when evidence is missing, weak, or conflicting it returns explicit unknowns and candidate followups. Any learning output is a candidate object only and is not persisted automatically.
+`corpus.ask` is the first GIP runtime slice that answers directly from this live corpus state. It does not ingest data, read staged corpus as active knowledge, run verifiers, or write learning state. Retrieval is deterministic local exact recall: case-insensitive exact token matching, adjacent exact phrase hits, simple bounded overlap/frequency scoring, and stable tie-breaking. It is not semantic search, does not use embeddings, and does not call out to a model or network service. When exact evidence is present it may return a draft/non-authorizing `answerDraft` with `evidenceUsed`; when evidence is missing, weak, approximate-only, or conflicting it returns explicit unknowns and candidate followups. Any learning output is a candidate object only and is not persisted automatically.
 
 Minimal binary-only ingest/apply/ask loop:
 

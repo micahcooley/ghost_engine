@@ -200,9 +200,9 @@ promotion, or pack mutation.
   - **Request**: `{"question": string}` or `{"message": string}`, plus optional `projectShard` / `project_shard`, `maxResults` / `max_results`, `maxSnippetBytes` / `max_snippet_bytes`, and `requireCitations` / `require_citations`.
   - **Response**: `{"corpusAsk":{"status":"answered"|"unknown","state":"draft"|"unresolved","permission":"none"|"unresolved","answerDraft": string optional,"evidenceUsed":[...],"unknowns":[...],"candidateFollowups":[...],"learningCandidates":[...],"trace":{...}}}`.
   - Uses only existing live corpus state created through explicit corpus ingestion/lifecycle paths. Staged corpus is not read as active knowledge.
-  - Matching is bounded and deterministic over live corpus file excerpts. It is a first runtime slice, not a full semantic retrieval system.
-  - `evidenceUsed` reports corpus lineage id/path/source path/class, bounded snippet, selection reason, provenance, and score.
-  - Unknowns include `no_corpus_available`, `insufficient_evidence`, and `conflicting_evidence`.
+  - Matching is bounded, deterministic, local exact recall over live corpus file excerpts. It uses case-insensitive exact token overlap plus adjacent exact phrase hits; it is not semantic search and does not use embeddings, Transformers, model adapters, or network calls.
+  - `evidenceUsed` reports corpus lineage id/path/source path/source label/class/trust class, content hash, byte and line spans, bounded snippet with truncation flag, matched terms/phrase, match reason, provenance, score, and rank.
+  - Unknowns include `no_corpus_available`, `insufficient_evidence`, and `conflicting_evidence`. Weak or approximate-only signals do not produce `answerDraft`.
   - `learningCandidates` are candidate-only and non-authorizing. They are not persisted and do not mutate Knowledge Packs, corpus state, or negative knowledge.
   - Trace flags always report `corpusMutation:false`, `packMutation:false`, `negativeKnowledgeMutation:false`, `commandsExecuted:false`, and `verifiersExecuted:false`.
 

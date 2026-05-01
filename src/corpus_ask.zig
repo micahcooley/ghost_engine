@@ -1,4 +1,5 @@
 const std = @import("std");
+const abstractions = @import("abstractions.zig");
 const corpus_ingest = @import("corpus_ingest.zig");
 const shards = @import("shards.zig");
 
@@ -42,19 +43,38 @@ pub const EvidenceUsed = struct {
     item_id: []u8,
     path: []u8,
     source_path: []u8,
+    source_label: []u8,
     class_name: []u8,
+    trust_class: []u8,
+    content_hash: []u8,
+    byte_start: usize,
+    byte_end: usize,
+    line_start: usize,
+    line_end: usize,
     snippet: []u8,
+    snippet_truncated: bool,
+    matched_terms: [][]u8,
+    matched_phrase: ?[]u8 = null,
     reason: []u8,
+    match_reason: []u8,
     provenance: []u8,
     score: u32,
+    rank: usize,
 
     fn deinit(self: *EvidenceUsed, allocator: std.mem.Allocator) void {
         allocator.free(self.item_id);
         allocator.free(self.path);
         allocator.free(self.source_path);
+        allocator.free(self.source_label);
         allocator.free(self.class_name);
+        allocator.free(self.trust_class);
+        allocator.free(self.content_hash);
         allocator.free(self.snippet);
+        for (self.matched_terms) |term| allocator.free(term);
+        allocator.free(self.matched_terms);
+        if (self.matched_phrase) |phrase| allocator.free(phrase);
         allocator.free(self.reason);
+        allocator.free(self.match_reason);
         allocator.free(self.provenance);
         self.* = undefined;
     }
@@ -149,13 +169,68 @@ const Candidate = struct {
     entry_index: usize,
     score: u32,
     first_match: usize,
+    byte_start: usize,
+    byte_end: usize,
+    line_start: usize,
+    line_end: usize,
+    matched_terms: [][]u8,
+    matched_phrase: ?[]u8,
+    content_hash: u64,
     polarity: Polarity,
     text: []u8,
 
     fn deinit(self: *Candidate, allocator: std.mem.Allocator) void {
         allocator.free(self.text);
+        for (self.matched_terms) |term| allocator.free(term);
+        allocator.free(self.matched_terms);
+        if (self.matched_phrase) |phrase| allocator.free(phrase);
         self.* = undefined;
     }
+};
+
+const TextToken = struct {
+    lower: []u8,
+    start: usize,
+    end: usize,
+    line_start: usize,
+    line_end: usize,
+
+    fn deinit(self: *TextToken, allocator: std.mem.Allocator) void {
+        allocator.free(self.lower);
+        self.* = undefined;
+    }
+};
+
+const MatchSummary = struct {
+    score: u32,
+    first_match: usize,
+    byte_start: usize,
+    byte_end: usize,
+    line_start: usize,
+    line_end: usize,
+    matched_terms: [][]u8,
+    matched_phrase: ?[]u8,
+
+    fn deinit(self: *MatchSummary, allocator: std.mem.Allocator) void {
+        for (self.matched_terms) |term| allocator.free(term);
+        allocator.free(self.matched_terms);
+        if (self.matched_phrase) |phrase| allocator.free(phrase);
+        self.* = undefined;
+    }
+};
+
+const PhraseHit = struct {
+    text: []u8,
+    token_count: usize,
+    byte_start: usize,
+    byte_end: usize,
+    line_start: usize,
+    line_end: usize,
+};
+
+const Snippet = struct {
+    text: []u8,
+    truncated: bool,
 };
 
 const Polarity = enum {
@@ -205,18 +280,31 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     for (entries, 0..) |entry, idx| {
         const file_text = readEntryText(allocator, entry.abs_path) catch continue;
         errdefer allocator.free(file_text);
-        const scored = try scoreText(allocator, file_text, tokens.tokens);
+        const text_tokens = try tokenizeText(allocator, file_text);
+        defer freeTextTokens(allocator, text_tokens);
+        var scored = try scoreText(allocator, text_tokens, tokens.tokens);
         if (scored.score == 0) {
+            scored.deinit(allocator);
             allocator.free(file_text);
             continue;
         }
-        try candidates.append(.{
+        candidates.append(.{
             .entry_index = idx,
             .score = scored.score,
             .first_match = scored.first_match,
+            .byte_start = scored.byte_start,
+            .byte_end = scored.byte_end,
+            .line_start = scored.line_start,
+            .line_end = scored.line_end,
+            .matched_terms = scored.matched_terms,
+            .matched_phrase = scored.matched_phrase,
+            .content_hash = std.hash.Fnv1a_64.hash(file_text),
             .polarity = detectPolarity(file_text),
             .text = file_text,
-        });
+        }) catch |err| {
+            scored.deinit(allocator);
+            return err;
+        };
     }
 
     if (candidates.items.len == 0) {
@@ -237,7 +325,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     }
 
     const top = candidates.items[0];
-    if (top.score < requiredScore(tokens.tokens.len)) {
+    if (top.score < requiredScore(tokens.tokens.len) and top.matched_phrase == null) {
         return unknownResult(allocator, options, &paths, .insufficient_evidence, "matched corpus evidence was too weak to support an answer draft", entries.len, max_results, max_snippet);
     }
 
@@ -369,15 +457,28 @@ fn buildEvidence(
 
     for (candidates, 0..) |candidate, idx| {
         const entry = entries[candidate.entry_index];
+        const snippet = try makeSnippet(allocator, candidate.text, candidate.first_match, max_snippet_bytes);
         out[idx] = .{
             .item_id = try allocator.dupe(u8, entry.corpus_meta.lineage_id),
             .path = try allocator.dupe(u8, entry.rel_path),
             .source_path = try allocator.dupe(u8, entry.corpus_meta.source_rel_path),
+            .source_label = try allocator.dupe(u8, entry.corpus_meta.source_label),
             .class_name = try allocator.dupe(u8, corpus_ingest.className(entry.corpus_meta.class)),
-            .snippet = try makeSnippet(allocator, candidate.text, candidate.first_match, max_snippet_bytes),
+            .trust_class = try allocator.dupe(u8, abstractions.trustClassName(entry.corpus_meta.trust_class)),
+            .content_hash = try std.fmt.allocPrint(allocator, "fnv1a64:{x:0>16}", .{candidate.content_hash}),
+            .byte_start = candidate.byte_start,
+            .byte_end = candidate.byte_end,
+            .line_start = candidate.line_start,
+            .line_end = candidate.line_end,
+            .snippet = snippet.text,
+            .snippet_truncated = snippet.truncated,
+            .matched_terms = try cloneStringSlice(allocator, candidate.matched_terms),
+            .matched_phrase = if (candidate.matched_phrase) |phrase| try allocator.dupe(u8, phrase) else null,
             .reason = try allocator.dupe(u8, reason),
+            .match_reason = try allocator.dupe(u8, if (candidate.matched_phrase != null) "exact_phrase_and_token_overlap" else "case_insensitive_exact_token_overlap"),
             .provenance = try allocator.dupe(u8, entry.corpus_meta.provenance),
             .score = candidate.score,
+            .rank = idx + 1,
         };
     }
     return out;
@@ -441,31 +542,70 @@ fn isStopWord(token: []const u8) bool {
     return false;
 }
 
-const Score = struct {
-    score: u32,
-    first_match: usize,
-};
-
-fn scoreText(allocator: std.mem.Allocator, text: []const u8, tokens: []const []const u8) !Score {
-    const lower = try allocator.alloc(u8, text.len);
-    defer allocator.free(lower);
-    for (text, 0..) |c, idx| lower[idx] = std.ascii.toLower(c);
-
+fn scoreText(allocator: std.mem.Allocator, text_tokens: []const TextToken, tokens: []const []const u8) !MatchSummary {
     var score: u32 = 0;
     var first_match: usize = 0;
+    var byte_start: usize = 0;
+    var byte_end: usize = 0;
+    var line_start: usize = 0;
+    var line_end: usize = 0;
     var found_any = false;
+    var matched_terms = std.ArrayList([]u8).init(allocator);
+    errdefer {
+        for (matched_terms.items) |term| allocator.free(term);
+        matched_terms.deinit();
+    }
+
     for (tokens) |token| {
-        if (std.mem.indexOf(u8, lower, token)) |idx| {
+        var token_count: u32 = 0;
+        var first_token: ?TextToken = null;
+        for (text_tokens) |text_token| {
+            if (!std.mem.eql(u8, text_token.lower, token)) continue;
+            token_count += 1;
+            if (first_token == null) first_token = text_token;
+        }
+        if (first_token) |first| {
             score += 1;
-            if (!found_any or idx < first_match) first_match = idx;
+            score += @min(token_count, 3) - 1;
+            try matched_terms.append(try allocator.dupe(u8, token));
+            if (!found_any or first.start < first_match) {
+                first_match = first.start;
+                byte_start = first.start;
+                byte_end = first.end;
+                line_start = first.line_start;
+                line_end = first.line_end;
+            }
             found_any = true;
         }
     }
-    return .{ .score = score, .first_match = first_match };
+
+    const phrase = try findBestPhrase(allocator, text_tokens, tokens);
+    if (phrase) |hit| {
+        score += 20 + @as(u32, @intCast(hit.token_count * 5));
+        if (!found_any or hit.byte_start < first_match) first_match = hit.byte_start;
+        byte_start = hit.byte_start;
+        byte_end = hit.byte_end;
+        line_start = hit.line_start;
+        line_end = hit.line_end;
+        found_any = true;
+    }
+
+    return .{
+        .score = if (found_any) score else 0,
+        .first_match = if (found_any) first_match else 0,
+        .byte_start = if (found_any) byte_start else 0,
+        .byte_end = if (found_any) byte_end else 0,
+        .line_start = if (found_any) line_start else 0,
+        .line_end = if (found_any) line_end else 0,
+        .matched_terms = try matched_terms.toOwnedSlice(),
+        .matched_phrase = if (phrase) |hit| hit.text else null,
+    };
 }
 
 fn candidateLessThan(_: void, lhs: Candidate, rhs: Candidate) bool {
     if (lhs.score != rhs.score) return lhs.score > rhs.score;
+    if ((lhs.matched_phrase != null) != (rhs.matched_phrase != null)) return lhs.matched_phrase != null;
+    if (lhs.first_match != rhs.first_match) return lhs.first_match < rhs.first_match;
     return lhs.entry_index < rhs.entry_index;
 }
 
@@ -520,12 +660,122 @@ fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
     return null;
 }
 
-fn makeSnippet(allocator: std.mem.Allocator, text: []const u8, first_match: usize, max_bytes: usize) ![]u8 {
-    if (text.len <= max_bytes) return cleanSnippet(allocator, text);
+fn tokenizeText(allocator: std.mem.Allocator, text: []const u8) ![]TextToken {
+    var out = std.ArrayList(TextToken).init(allocator);
+    errdefer {
+        for (out.items) |*token| token.deinit(allocator);
+        out.deinit();
+    }
+
+    var start: ?usize = null;
+    var line: usize = 1;
+    var token_line: usize = 1;
+    for (text, 0..) |c, idx| {
+        if (std.ascii.isAlphanumeric(c) or c == '_' or c == '-') {
+            if (start == null) {
+                start = idx;
+                token_line = line;
+            }
+        } else {
+            if (start) |s| {
+                try appendTextToken(allocator, &out, text[s..idx], s, idx, token_line, line);
+                start = null;
+            }
+            if (c == '\n') line += 1;
+        }
+    }
+    if (start) |s| try appendTextToken(allocator, &out, text[s..], s, text.len, token_line, line);
+    return out.toOwnedSlice();
+}
+
+fn appendTextToken(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(TextToken),
+    raw: []const u8,
+    start: usize,
+    end: usize,
+    line_start: usize,
+    line_end: usize,
+) !void {
+    const lower = try allocator.alloc(u8, raw.len);
+    errdefer allocator.free(lower);
+    for (raw, 0..) |c, idx| lower[idx] = std.ascii.toLower(c);
+    try out.append(.{
+        .lower = lower,
+        .start = start,
+        .end = end,
+        .line_start = line_start,
+        .line_end = line_end,
+    });
+}
+
+fn freeTextTokens(allocator: std.mem.Allocator, tokens: []TextToken) void {
+    for (tokens) |*token| token.deinit(allocator);
+    allocator.free(tokens);
+}
+
+fn findBestPhrase(allocator: std.mem.Allocator, text_tokens: []const TextToken, query_tokens: []const []const u8) !?PhraseHit {
+    if (query_tokens.len < 2 or text_tokens.len < 2) return null;
+    var phrase_len = @min(query_tokens.len, @as(usize, 5));
+    while (phrase_len >= 2) : (phrase_len -= 1) {
+        var query_start: usize = 0;
+        while (query_start + phrase_len <= query_tokens.len) : (query_start += 1) {
+            const phrase_tokens = query_tokens[query_start .. query_start + phrase_len];
+            var text_start: usize = 0;
+            while (text_start + phrase_len <= text_tokens.len) : (text_start += 1) {
+                var matches = true;
+                for (phrase_tokens, 0..) |phrase_token, offset| {
+                    if (!std.mem.eql(u8, phrase_token, text_tokens[text_start + offset].lower)) {
+                        matches = false;
+                        break;
+                    }
+                }
+                if (!matches) continue;
+                return .{
+                    .text = try joinPhrase(allocator, phrase_tokens),
+                    .token_count = phrase_len,
+                    .byte_start = text_tokens[text_start].start,
+                    .byte_end = text_tokens[text_start + phrase_len - 1].end,
+                    .line_start = text_tokens[text_start].line_start,
+                    .line_end = text_tokens[text_start + phrase_len - 1].line_end,
+                };
+            }
+        }
+        if (phrase_len == 2) break;
+    }
+    return null;
+}
+
+fn joinPhrase(allocator: std.mem.Allocator, tokens: []const []const u8) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    for (tokens, 0..) |token, idx| {
+        if (idx != 0) try out.append(' ');
+        try out.appendSlice(token);
+    }
+    return out.toOwnedSlice();
+}
+
+fn cloneStringSlice(allocator: std.mem.Allocator, values: []const []const u8) ![][]u8 {
+    const out = try allocator.alloc([]u8, values.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |value| allocator.free(value);
+        allocator.free(out);
+    }
+    for (values, 0..) |value, idx| {
+        out[idx] = try allocator.dupe(u8, value);
+        built += 1;
+    }
+    return out;
+}
+
+fn makeSnippet(allocator: std.mem.Allocator, text: []const u8, first_match: usize, max_bytes: usize) !Snippet {
+    if (text.len <= max_bytes) return .{ .text = try cleanSnippet(allocator, text), .truncated = false };
     const half = max_bytes / 2;
     const start = if (first_match > half) first_match - half else 0;
     const end = @min(text.len, start + max_bytes);
-    return cleanSnippet(allocator, text[start..end]);
+    return .{ .text = try cleanSnippet(allocator, text[start..end]), .truncated = true };
 }
 
 fn cleanSnippet(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
@@ -571,11 +821,28 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
         try writeField(w, "itemId", evidence.item_id, true);
         try writeField(w, "path", evidence.path, false);
         try writeField(w, "sourcePath", evidence.source_path, false);
+        try writeField(w, "sourceLabel", evidence.source_label, false);
         try writeField(w, "class", evidence.class_name, false);
+        try writeField(w, "trustClass", evidence.trust_class, false);
+        try writeField(w, "contentHash", evidence.content_hash, false);
+        try w.print(",\"byteSpan\":{{\"start\":{d},\"end\":{d}}}", .{ evidence.byte_start, evidence.byte_end });
+        try w.print(",\"lineSpan\":{{\"start\":{d},\"end\":{d}}}", .{ evidence.line_start, evidence.line_end });
         try writeField(w, "snippet", evidence.snippet, false);
+        try w.print(",\"snippetTruncated\":{s}", .{if (evidence.snippet_truncated) "true" else "false"});
+        try w.writeAll(",\"matchedTerms\":[");
+        for (evidence.matched_terms, 0..) |term, term_idx| {
+            if (term_idx != 0) try w.writeByte(',');
+            try w.writeByte('"');
+            try writeEscaped(w, term);
+            try w.writeByte('"');
+        }
+        try w.writeAll("]");
+        if (evidence.matched_phrase) |phrase| try writeField(w, "matchedPhrase", phrase, false);
         try writeField(w, "reason", evidence.reason, false);
+        try writeField(w, "matchReason", evidence.match_reason, false);
         try writeField(w, "provenance", evidence.provenance, false);
         try w.print(",\"score\":{d}", .{evidence.score});
+        try w.print(",\"rank\":{d}", .{evidence.rank});
         try w.writeAll("}");
     }
     try w.writeAll("],\"unknowns\":[");

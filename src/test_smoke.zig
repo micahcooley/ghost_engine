@@ -5649,7 +5649,7 @@ test "corpus ask returns draft answer with bounded evidence and weak matches sta
     try corpus_ingest.applyStaged(allocator, &project_paths);
 
     var answered = try corpus_ask.ask(allocator, .{
-        .question = "is retention policy enabled",
+        .question = "is RETENTION POLICY enabled",
         .project_shard = project_shard,
         .max_snippet_bytes = 80,
     });
@@ -5659,8 +5659,21 @@ test "corpus ask returns draft answer with bounded evidence and weak matches sta
     try std.testing.expect(answered.answer_draft != null);
     try std.testing.expectEqual(@as(usize, 1), answered.evidence_used.len);
     try std.testing.expect(answered.evidence_used[0].snippet.len <= 80);
+    try std.testing.expect(answered.evidence_used[0].byte_end > answered.evidence_used[0].byte_start);
+    try std.testing.expect(answered.evidence_used[0].line_start >= 1);
+    try std.testing.expect(answered.evidence_used[0].line_end >= answered.evidence_used[0].line_start);
     try std.testing.expect(std.mem.indexOf(u8, answered.evidence_used[0].path, "@corpus/docs/runtime.md") != null);
+    try std.testing.expect(std.mem.eql(u8, answered.evidence_used[0].source_path, "runtime.md"));
+    try std.testing.expect(std.mem.eql(u8, answered.evidence_used[0].source_label, "ask-corpus"));
+    try std.testing.expect(std.mem.eql(u8, answered.evidence_used[0].trust_class, "project"));
+    try std.testing.expect(std.mem.startsWith(u8, answered.evidence_used[0].content_hash, "fnv1a64:"));
+    try std.testing.expect(answered.evidence_used[0].matched_terms.len >= 2);
+    try std.testing.expect(answered.evidence_used[0].matched_phrase != null);
+    try std.testing.expect(std.mem.eql(u8, answered.evidence_used[0].matched_phrase.?, "retention policy"));
+    try std.testing.expect(std.mem.eql(u8, answered.evidence_used[0].match_reason, "exact_phrase_and_token_overlap"));
     try std.testing.expect(!answered.safety_flags.corpus_mutation);
+    try std.testing.expect(!answered.safety_flags.pack_mutation);
+    try std.testing.expect(!answered.safety_flags.negative_knowledge_mutation);
     try std.testing.expect(!answered.safety_flags.commands_executed);
     try std.testing.expect(!answered.safety_flags.verifiers_executed);
 
@@ -5672,6 +5685,65 @@ test "corpus ask returns draft answer with bounded evidence and weak matches sta
     try std.testing.expectEqual(corpus_ask.AskStatus.unknown, weak.status);
     try std.testing.expectEqual(corpus_ask.UnknownKind.insufficient_evidence, weak.unknowns[0].kind);
     try std.testing.expect(weak.answer_draft == null);
+}
+
+test "corpus ask respects max results and snippet bounds in exact evidence" {
+    const allocator = std.testing.allocator;
+    const project_shard = "corpus-ask-bounds-test";
+    var corpus_fixture = std.testing.tmpDir(.{});
+    defer corpus_fixture.cleanup();
+    const corpus_root = try corpus_fixture.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+    try writeFixtureFile(corpus_fixture.dir, "a.md",
+        \\# Recall A
+        \\Recall policy enabled with exact local evidence and bounded snippets for answer drafting.
+        \\
+    );
+    try writeFixtureFile(corpus_fixture.dir, "b.md",
+        \\# Recall B
+        \\Recall policy enabled with exact local evidence and bounded snippets for answer drafting.
+        \\
+    );
+    try writeFixtureFile(corpus_fixture.dir, "c.md",
+        \\# Recall C
+        \\Recall policy enabled with exact local evidence and bounded snippets for answer drafting.
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path) catch {};
+
+    var stage_result = try corpus_ingest.stage(allocator, .{
+        .corpus_path = corpus_root,
+        .project_shard = project_shard,
+        .trust_class = .project,
+        .source_label = "bounds-corpus",
+    });
+    defer stage_result.deinit();
+    try corpus_ingest.applyStaged(allocator, &project_paths);
+
+    var result = try corpus_ask.ask(allocator, .{
+        .question = "recall policy enabled",
+        .project_shard = project_shard,
+        .max_results = 2,
+        .max_snippet_bytes = 32,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(corpus_ask.AskStatus.answered, result.status);
+    try std.testing.expectEqual(@as(usize, 2), result.evidence_used.len);
+    for (result.evidence_used, 0..) |evidence, idx| {
+        try std.testing.expect(evidence.snippet.len <= 32);
+        try std.testing.expect(evidence.snippet_truncated);
+        try std.testing.expectEqual(idx + 1, evidence.rank);
+        try std.testing.expect(std.mem.eql(u8, evidence.source_label, "bounds-corpus"));
+        try std.testing.expect(std.mem.startsWith(u8, evidence.content_hash, "fnv1a64:"));
+        try std.testing.expect(evidence.byte_end > evidence.byte_start);
+    }
 }
 
 test "gip corpus ask sees ingested corpus only after explicit staged apply" {
@@ -5748,6 +5820,15 @@ test "gip corpus ask sees ingested corpus only after explicit staged apply" {
     try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "\"nonAuthorizing\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "\"answerDraft\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "\"sourcePath\":\"verifier-policy.md\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "\"sourceLabel\":\"verifier-policy-corpus\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "\"trustClass\":\"project\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "\"contentHash\":\"fnv1a64:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "\"byteSpan\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "\"lineSpan\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "\"matchedTerms\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "\"matchedPhrase\":\"verifier execution\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "\"matchReason\":\"exact_phrase_and_token_overlap\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "\"rank\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "verifier execution must remain explicit") != null);
     try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "\"corpusMutation\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "\"packMutation\":false") != null);
