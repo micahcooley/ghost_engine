@@ -7,6 +7,7 @@ const corpus_ask = core.corpus_ask;
 const corpus_ingest = core.corpus_ingest;
 const correction_candidates = core.correction_candidates;
 const correction_review = core.correction_review;
+const negative_knowledge_review = core.negative_knowledge_review;
 const rule_reasoning = core.rule_reasoning;
 const shards = core.shards;
 
@@ -18,6 +19,7 @@ const OperationKind = enum {
     @"rule.evaluate",
     @"correction.propose",
     @"correction.reviewed",
+    @"negative_knowledge.reviewed",
     @"corpus.lifecycle",
 };
 
@@ -113,6 +115,9 @@ pub fn runSuite(allocator: std.mem.Allocator) !SuiteResult {
     try results.append(try runCorrectionReviewedGet(allocator));
     try results.append(try runCorrectionInfluenceStatusNoFile(allocator));
     try results.append(try runCorrectionInfluenceStatusPopulated(allocator));
+    try results.append(try runNegativeKnowledgeReviewAccepted(allocator));
+    try results.append(try runNegativeKnowledgeReviewRejected(allocator));
+    try results.append(try runNegativeKnowledgeReviewedListGet(allocator));
     try results.append(try runLifecycleScenario(allocator));
 
     return .{
@@ -678,6 +683,134 @@ fn runCorrectionInfluenceStatusPopulated(allocator: std.mem.Allocator) !Scenario
     };
 }
 
+fn runNegativeKnowledgeReviewAccepted(allocator: std.mem.Allocator) !ScenarioResult {
+    const shard_id = "bench-compute-dominance-nk-review-accepted";
+    try cleanProjectShard(allocator, shard_id);
+    defer cleanProjectShard(allocator, shard_id) catch {};
+
+    const started = std.time.nanoTimestamp();
+    var reviewed = try negative_knowledge_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .accepted,
+        .reviewer_note = "benchmark accepted reviewed negative knowledge",
+        .rejected_reason = null,
+        .source_candidate_id = "nk:candidate:bench-accepted",
+        .source_correction_review_id = "reviewed-correction:bench",
+        .negative_knowledge_candidate_json =
+        \\{"id":"nk:candidate:bench-accepted","kind":"failed_hypothesis","condition":"exact repeated bad draft","nonAuthorizing":true}
+        ,
+    });
+    defer reviewed.deinit();
+
+    return .{
+        .name = "negative_knowledge.review/accepted_append_only",
+        .operation_kind = .@"negative_knowledge.reviewed",
+        .success = std.mem.indexOf(u8, reviewed.record_json, "\"reviewDecision\":\"accepted\"") != null and
+            std.mem.indexOf(u8, reviewed.record_json, "\"nonAuthorizing\":true") != null and
+            std.mem.indexOf(u8, reviewed.record_json, "\"treatedAsProof\":false") != null and
+            std.mem.indexOf(u8, reviewed.record_json, "\"usedAsEvidence\":false") != null and
+            std.mem.indexOf(u8, reviewed.record_json, "\"globalPromotion\":false") != null,
+        .duration_ns = elapsedNs(started),
+        .input_bytes = reviewed.record_json.len,
+        .future_behavior_candidate_count = 1,
+        .commands_executed = 0,
+        .verifiers_executed = 0,
+        .corpus_mutation = false,
+        .pack_mutation = false,
+        .negative_knowledge_mutation = true,
+        .non_authorizing = true,
+        .required_review = false,
+    };
+}
+
+fn runNegativeKnowledgeReviewRejected(allocator: std.mem.Allocator) !ScenarioResult {
+    const shard_id = "bench-compute-dominance-nk-review-rejected";
+    try cleanProjectShard(allocator, shard_id);
+    defer cleanProjectShard(allocator, shard_id) catch {};
+
+    const started = std.time.nanoTimestamp();
+    var reviewed = try negative_knowledge_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .rejected,
+        .reviewer_note = "benchmark rejected reviewed negative knowledge",
+        .rejected_reason = "candidate was too broad",
+        .source_candidate_id = "nk:candidate:bench-rejected",
+        .negative_knowledge_candidate_json =
+        \\{"id":"nk:candidate:bench-rejected","kind":"overbroad_rule","condition":"too broad","nonAuthorizing":true}
+        ,
+    });
+    defer reviewed.deinit();
+
+    return .{
+        .name = "negative_knowledge.review/rejected_append_only",
+        .operation_kind = .@"negative_knowledge.reviewed",
+        .success = std.mem.indexOf(u8, reviewed.record_json, "\"reviewDecision\":\"rejected\"") != null and
+            std.mem.indexOf(u8, reviewed.record_json, "\"rejectedReason\":\"candidate was too broad\"") != null and
+            std.mem.indexOf(u8, reviewed.record_json, "\"futureInfluenceCandidate\":null") != null,
+        .duration_ns = elapsedNs(started),
+        .input_bytes = reviewed.record_json.len,
+        .commands_executed = 0,
+        .verifiers_executed = 0,
+        .corpus_mutation = false,
+        .pack_mutation = false,
+        .negative_knowledge_mutation = true,
+        .non_authorizing = true,
+        .required_review = false,
+    };
+}
+
+fn runNegativeKnowledgeReviewedListGet(allocator: std.mem.Allocator) !ScenarioResult {
+    const shard_id = "bench-compute-dominance-nk-reviewed-list-get";
+    try cleanProjectShard(allocator, shard_id);
+    defer cleanProjectShard(allocator, shard_id) catch {};
+
+    var accepted = try negative_knowledge_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .accepted,
+        .reviewer_note = "benchmark list accepted",
+        .rejected_reason = null,
+        .source_candidate_id = "nk:candidate:list-accepted",
+        .negative_knowledge_candidate_json = "{\"id\":\"nk:candidate:list-accepted\"}",
+    });
+    defer accepted.deinit();
+    var rejected = try negative_knowledge_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .rejected,
+        .reviewer_note = "benchmark list rejected",
+        .rejected_reason = "not accepted",
+        .source_candidate_id = "nk:candidate:list-rejected",
+        .negative_knowledge_candidate_json = "{\"id\":\"nk:candidate:list-rejected\"}",
+    });
+    defer rejected.deinit();
+
+    const id = try reviewedNegativeKnowledgeId(allocator, accepted.record_json);
+    defer allocator.free(id);
+
+    const started = std.time.nanoTimestamp();
+    var listed = try negative_knowledge_review.listReviewedNegativeKnowledge(allocator, shard_id, .all, 8, 0, negative_knowledge_review.MAX_REVIEWED_NEGATIVE_KNOWLEDGE_READ);
+    defer listed.deinit();
+    var accepted_only = try negative_knowledge_review.listReviewedNegativeKnowledge(allocator, shard_id, .accepted, 8, 0, negative_knowledge_review.MAX_REVIEWED_NEGATIVE_KNOWLEDGE_READ);
+    defer accepted_only.deinit();
+    var got = try negative_knowledge_review.getReviewedNegativeKnowledge(allocator, shard_id, id, negative_knowledge_review.MAX_REVIEWED_NEGATIVE_KNOWLEDGE_READ);
+    defer got.deinit();
+
+    return .{
+        .name = "negative_knowledge.reviewed.list_get/read_only_append_order",
+        .operation_kind = .@"negative_knowledge.reviewed",
+        .success = listed.returned_count == 2 and accepted_only.returned_count == 1 and got.record != null and
+            !listed.missing_file and listed.malformed_lines == 0,
+        .duration_ns = elapsedNs(started),
+        .input_bytes = accepted.record_json.len + rejected.record_json.len,
+        .commands_executed = 0,
+        .verifiers_executed = 0,
+        .corpus_mutation = false,
+        .pack_mutation = false,
+        .negative_knowledge_mutation = false,
+        .non_authorizing = true,
+        .required_review = false,
+    };
+}
+
 const CorpusFile = struct {
     path: []const u8,
     body: []const u8,
@@ -758,6 +891,10 @@ fn reviewedRecordId(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
     const id_value = obj.get("id") orelse return error.InvalidJson;
     if (id_value != .string) return error.InvalidJson;
     return allocator.dupe(u8, id_value.string);
+}
+
+fn reviewedNegativeKnowledgeId(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
+    return reviewedRecordId(allocator, json);
 }
 
 fn scenarioFromAsk(name: []const u8, input_bytes: usize, duration_ns: u64, result: *const corpus_ask.Result) ScenarioResult {
@@ -1045,7 +1182,7 @@ test "compute dominance report is generated with required scenarios and safety f
     var suite = try runSuite(allocator);
     defer suite.deinit();
 
-    try std.testing.expectEqual(@as(usize, 24), suite.scenarios.len);
+    try std.testing.expectEqual(@as(usize, 27), suite.scenarios.len);
     try std.testing.expect(allScenariosPassed(suite.scenarios));
 
     const json = try renderJsonReport(allocator, suite);
@@ -1066,13 +1203,16 @@ test "compute dominance report is generated with required scenarios and safety f
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"correction.reviewed.get/read_only_existing_with_malformed_warning\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"correction.influence.status/no_file_zero_summary\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"correction.influence.status/accepted_rejected_summary\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"negative_knowledge.review/accepted_append_only\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"negative_knowledge.review/rejected_append_only\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"negative_knowledge.reviewed.list_get/read_only_append_order\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"end_to_end/lifecycle_ingest_apply_ask_correction_no_hidden_mutation\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"cloudUsed\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"transformersUsed\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"embeddingsUsed\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"fabricatedBaselines\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"packMutation\":true") == null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"negativeKnowledgeMutation\":true") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"negativeKnowledgeMutation\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"commandsExecuted\":1") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"verifiersExecuted\":1") == null);
 }

@@ -89,6 +89,8 @@ Phase 9A adds read-only inspection of reviewed correction records through GIP `c
 
 Phase 10A adds read-only correction influence status through GIP `correction.influence.status`. The status operation summarizes the same shard-local reviewed correction JSONL without rewriting it: total/accepted/rejected records, operation-kind counts, correction-type counts, conservative influence-kind counts, candidate counts for suppression, stronger evidence, verifier/checks, negative knowledge, corpus update, pack guidance, rule update, and future behavior, plus malformed-line warnings and capacity telemetry. `includeRecords` can echo bounded records for inspection, but the default omits records. The summary is operator diagnostics only: it is not proof, not evidence, not support, not a review decision, not a corpus or pack update, not negative knowledge, not global promotion, and it never executes commands or verifiers.
 
+Phase 11A adds explicit reviewed negative-knowledge persistence through GIP `negative_knowledge.review`, plus read-only inspection through `negative_knowledge.reviewed.list` and `negative_knowledge.reviewed.get`. Negative-knowledge candidates remain signal until explicitly reviewed. Accepted and rejected reviewed NK records are appended under the same project shard at `negative_knowledge/reviewed_negative_knowledge.jsonl`, with no rewrite, deletion, compaction, hidden promotion, corpus mutation, pack mutation, command execution, or verifier execution. Accepted reviewed NK remains `nonAuthorizing:true`, `treatedAsProof:false`, `usedAsEvidence:false`, and `globalPromotion:false`; Phase 11A persists and inspects reviewed NK only and does not add broad future influence.
+
 Minimal binary-only ingest/apply/ask loop:
 
 ```bash
@@ -97,6 +99,7 @@ Minimal binary-only ingest/apply/ask loop:
 echo '{"gipVersion":"gip.v0.1","kind":"corpus.ask","projectShard":"smoke","question":"What does the corpus say about verifier execution?"}' | ./zig-out/bin/ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"correction.propose","operationKind":"corpus.ask","disputedOutput":{"kind":"answerDraft","ref":"answer:1"},"userCorrection":"the answer used the wrong evidence","correctionType":"wrong_answer","evidenceRefs":["corpus:item:1"]}' | ./zig-out/bin/ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"correction.review","projectShard":"smoke","correctionCandidateId":"correction:candidate:example","decision":"rejected","reviewerNote":"reviewed by operator","rejectedReason":"candidate did not match the cited evidence"}' | ./zig-out/bin/ghost_gip --stdin
+echo '{"gipVersion":"gip.v0.1","kind":"negative_knowledge.review","projectShard":"smoke","negativeKnowledgeCandidateId":"nk:candidate:example","decision":"rejected","reviewerNote":"reviewed by operator","rejectedReason":"candidate was too broad"}' | ./zig-out/bin/ghost_gip --stdin
 ```
 
 Bounded external evidence now reuses the same path instead of a separate web-memory system:

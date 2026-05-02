@@ -59,6 +59,9 @@ pub const RequestKind = enum {
     @"negative_knowledge.record.list",
     @"negative_knowledge.record.get",
     @"negative_knowledge.influence.list",
+    @"negative_knowledge.review",
+    @"negative_knowledge.reviewed.list",
+    @"negative_knowledge.reviewed.get",
     @"negative_knowledge.candidate.review",
     @"negative_knowledge.record.expire",
     @"negative_knowledge.record.supersede",
@@ -243,6 +246,9 @@ pub const CapabilityName = enum {
     @"negative_knowledge.record.list",
     @"negative_knowledge.record.get",
     @"negative_knowledge.influence.list",
+    @"negative_knowledge.review",
+    @"negative_knowledge.reviewed.list",
+    @"negative_knowledge.reviewed.get",
     @"negative_knowledge.candidate.review",
     @"negative_knowledge.record.expire",
     @"negative_knowledge.record.supersede",
@@ -288,7 +294,7 @@ pub const CapabilityEntry = struct {
     policy: CapabilityPolicy,
 };
 
-pub fn defaultCapabilities() [51]CapabilityEntry {
+pub fn defaultCapabilities() [54]CapabilityEntry {
     return .{
         .{ .capability = .@"artifact.read", .policy = .allowed },
         .{ .capability = .@"artifact.list", .policy = .allowed },
@@ -319,6 +325,9 @@ pub fn defaultCapabilities() [51]CapabilityEntry {
         .{ .capability = .@"negative_knowledge.record.list", .policy = .allowed },
         .{ .capability = .@"negative_knowledge.record.get", .policy = .allowed },
         .{ .capability = .@"negative_knowledge.influence.list", .policy = .allowed },
+        .{ .capability = .@"negative_knowledge.review", .policy = .allowed },
+        .{ .capability = .@"negative_knowledge.reviewed.list", .policy = .allowed },
+        .{ .capability = .@"negative_knowledge.reviewed.get", .policy = .allowed },
         .{ .capability = .@"negative_knowledge.candidate.review", .policy = .allowed },
         .{ .capability = .@"negative_knowledge.record.expire", .policy = .allowed },
         .{ .capability = .@"negative_knowledge.record.supersede", .policy = .allowed },
@@ -504,6 +513,9 @@ pub const IMPLEMENTED_KINDS = [_]RequestKind{
     .@"negative_knowledge.record.list",
     .@"negative_knowledge.record.get",
     .@"negative_knowledge.influence.list",
+    .@"negative_knowledge.review",
+    .@"negative_knowledge.reviewed.list",
+    .@"negative_knowledge.reviewed.get",
     .@"trust_decay.candidate.list",
     .@"negative_knowledge.candidate.review",
     .@"negative_knowledge.record.expire",
@@ -566,6 +578,10 @@ test "default capabilities have safe defaults" {
     try std.testing.expectEqual(CapabilityPolicy.allowed, capabilityPolicy(&caps, .@"correction.reviewed.list").?);
     try std.testing.expectEqual(CapabilityPolicy.allowed, capabilityPolicy(&caps, .@"correction.reviewed.get").?);
     try std.testing.expectEqual(CapabilityPolicy.allowed, capabilityPolicy(&caps, .@"correction.influence.status").?);
+    // reviewed negative knowledge lifecycle should be explicit and allowed.
+    try std.testing.expectEqual(CapabilityPolicy.allowed, capabilityPolicy(&caps, .@"negative_knowledge.review").?);
+    try std.testing.expectEqual(CapabilityPolicy.allowed, capabilityPolicy(&caps, .@"negative_knowledge.reviewed.list").?);
+    try std.testing.expectEqual(CapabilityPolicy.allowed, capabilityPolicy(&caps, .@"negative_knowledge.reviewed.get").?);
     // project.autopsy should be allowed (read-only)
     try std.testing.expectEqual(CapabilityPolicy.allowed, capabilityPolicy(&caps, .@"project.autopsy").?);
     // context.autopsy should be allowed (read-only/non-authorizing)

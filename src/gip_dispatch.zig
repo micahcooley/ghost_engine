@@ -25,6 +25,7 @@ const corpus_ask = @import("corpus_ask.zig");
 const rule_reasoning = @import("rule_reasoning.zig");
 const correction_candidates = @import("correction_candidates.zig");
 const correction_review = @import("correction_review.zig");
+const negative_knowledge_review = @import("negative_knowledge_review.zig");
 
 pub const DispatchResult = struct {
     status: core.ProtocolStatus,
@@ -122,6 +123,9 @@ pub fn dispatch(
         .@"negative_knowledge.record.list" => dispatchNegativeKnowledgeRecordList(allocator, workspace_root, request_body),
         .@"negative_knowledge.record.get" => dispatchNegativeKnowledgeRecordGet(allocator, workspace_root, request_body),
         .@"negative_knowledge.influence.list" => dispatchNegativeKnowledgeInfluenceList(allocator, workspace_root, request_body),
+        .@"negative_knowledge.review" => dispatchNegativeKnowledgeReview(allocator, request_body),
+        .@"negative_knowledge.reviewed.list" => dispatchNegativeKnowledgeReviewedList(allocator, request_body),
+        .@"negative_knowledge.reviewed.get" => dispatchNegativeKnowledgeReviewedGet(allocator, request_body),
         .@"trust_decay.candidate.list" => dispatchTrustDecayCandidateList(allocator, workspace_root, request_body),
         .@"negative_knowledge.candidate.review" => dispatchNegativeKnowledgeCandidateReview(allocator, request_body),
         .@"negative_knowledge.record.expire" => dispatchNegativeKnowledgeRecordExpire(allocator, request_body),
@@ -153,8 +157,8 @@ fn dispatchProtocolDescribe(allocator: std.mem.Allocator) !DispatchResult {
     try w.writeAll("{\"protocol\":{");
     try w.writeAll("\"version\":\"");
     try w.writeAll(core.PROTOCOL_VERSION);
-    try w.writeAll("\",\"implemented\":[\"protocol.describe\",\"capabilities.describe\",\"engine.status\",\"conversation.turn\",\"corpus.ask\",\"rule.evaluate\",\"correction.propose\",\"correction.review\",\"correction.reviewed.list\",\"correction.reviewed.get\",\"correction.influence.status\",\"artifact.read\",\"artifact.list\",\"artifact.patch.propose\",\"hypothesis.list\",\"hypothesis.triage\",\"verifier.list\",\"verifier.candidate.execution.list\",\"verifier.candidate.execution.get\",\"correction.list\",\"correction.get\",\"negative_knowledge.candidate.list\",\"negative_knowledge.candidate.get\",\"negative_knowledge.record.list\",\"negative_knowledge.record.get\",\"negative_knowledge.influence.list\",\"trust_decay.candidate.list\",\"negative_knowledge.candidate.review\",\"negative_knowledge.record.expire\",\"negative_knowledge.record.supersede\",\"pack.list\",\"pack.inspect\",\"feedback.summary\",\"session.get\",\"project.autopsy\",\"context.autopsy\"]");
-    try w.writeAll(",\"maturity\":{\"corpus.ask\":\"read_only_live_corpus_grounded_draft\",\"rule.evaluate\":\"bounded_deterministic_non_authorizing_candidates\",\"correction.propose\":\"candidate_only_review_required_no_mutation\",\"correction.review\":\"append_only_reviewed_record_no_hidden_mutation\",\"correction.reviewed.list\":\"read_only_reviewed_correction_inspection_non_authorizing\",\"correction.reviewed.get\":\"read_only_reviewed_correction_inspection_non_authorizing\",\"correction.influence.status\":\"read_only_reviewed_correction_influence_summary_non_authorizing\",\"hypothesis.list\":\"stateless\",\"hypothesis.triage\":\"stateless\",\"verifier.candidate.execution.list\":\"read_only_state_inspection\",\"verifier.candidate.execution.get\":\"read_only_state_inspection\",\"correction.list\":\"read_only_state_inspection\",\"correction.get\":\"read_only_state_inspection\",\"negative_knowledge.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.get\":\"read_only_state_inspection\",\"negative_knowledge.record.list\":\"read_only_state_inspection\",\"negative_knowledge.record.get\":\"read_only_state_inspection\",\"negative_knowledge.influence.list\":\"read_only_state_inspection\",\"trust_decay.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.review\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.expire\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.supersede\":\"structured_unsupported_without_persistence\",\"feedback.summary\":\"requires_workspace_metadata\",\"session.get\":\"requires_existing_session\",\"project.autopsy\":\"read_only_workspace_inspection\",\"context.autopsy\":\"read_only_artifact_and_input_refs_runtime_and_persistent_pack_guidance\"}");
+    try w.writeAll("\",\"implemented\":[\"protocol.describe\",\"capabilities.describe\",\"engine.status\",\"conversation.turn\",\"corpus.ask\",\"rule.evaluate\",\"correction.propose\",\"correction.review\",\"correction.reviewed.list\",\"correction.reviewed.get\",\"correction.influence.status\",\"artifact.read\",\"artifact.list\",\"artifact.patch.propose\",\"hypothesis.list\",\"hypothesis.triage\",\"verifier.list\",\"verifier.candidate.execution.list\",\"verifier.candidate.execution.get\",\"correction.list\",\"correction.get\",\"negative_knowledge.candidate.list\",\"negative_knowledge.candidate.get\",\"negative_knowledge.record.list\",\"negative_knowledge.record.get\",\"negative_knowledge.influence.list\",\"negative_knowledge.review\",\"negative_knowledge.reviewed.list\",\"negative_knowledge.reviewed.get\",\"trust_decay.candidate.list\",\"negative_knowledge.candidate.review\",\"negative_knowledge.record.expire\",\"negative_knowledge.record.supersede\",\"pack.list\",\"pack.inspect\",\"feedback.summary\",\"session.get\",\"project.autopsy\",\"context.autopsy\"]");
+    try w.writeAll(",\"maturity\":{\"corpus.ask\":\"read_only_live_corpus_grounded_draft\",\"rule.evaluate\":\"bounded_deterministic_non_authorizing_candidates\",\"correction.propose\":\"candidate_only_review_required_no_mutation\",\"correction.review\":\"append_only_reviewed_record_no_hidden_mutation\",\"correction.reviewed.list\":\"read_only_reviewed_correction_inspection_non_authorizing\",\"correction.reviewed.get\":\"read_only_reviewed_correction_inspection_non_authorizing\",\"correction.influence.status\":\"read_only_reviewed_correction_influence_summary_non_authorizing\",\"hypothesis.list\":\"stateless\",\"hypothesis.triage\":\"stateless\",\"verifier.candidate.execution.list\":\"read_only_state_inspection\",\"verifier.candidate.execution.get\":\"read_only_state_inspection\",\"correction.list\":\"read_only_state_inspection\",\"correction.get\":\"read_only_state_inspection\",\"negative_knowledge.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.get\":\"read_only_state_inspection\",\"negative_knowledge.record.list\":\"read_only_state_inspection\",\"negative_knowledge.record.get\":\"read_only_state_inspection\",\"negative_knowledge.influence.list\":\"read_only_state_inspection\",\"negative_knowledge.review\":\"append_only_reviewed_negative_knowledge_no_hidden_mutation\",\"negative_knowledge.reviewed.list\":\"read_only_reviewed_negative_knowledge_inspection_non_authorizing\",\"negative_knowledge.reviewed.get\":\"read_only_reviewed_negative_knowledge_inspection_non_authorizing\",\"trust_decay.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.review\":\"structured_unsupported_legacy_review_surface\",\"negative_knowledge.record.expire\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.supersede\":\"structured_unsupported_without_persistence\",\"feedback.summary\":\"requires_workspace_metadata\",\"session.get\":\"requires_existing_session\",\"project.autopsy\":\"read_only_workspace_inspection\",\"context.autopsy\":\"read_only_artifact_and_input_refs_runtime_and_persistent_pack_guidance\"}");
     try w.writeAll(",\"unsupported\":[\"artifact.patch.apply\",\"artifact.write.propose\",\"artifact.write.apply\",\"artifact.search\",\"conversation.replay\",\"intent.ground\",\"response.evaluate\",\"verifier.run\",\"verifier.candidate.execute\",\"hypothesis.generate\",\"hypothesis.verifier.schedule\",\"correction.apply\",\"negative_knowledge.promote\",\"pack.update_from_negative_knowledge\",\"trust_decay.apply\",\"pack.mount\",\"pack.unmount\",\"pack.import\",\"pack.export\",\"pack.distill.list\",\"pack.distill.show\",\"pack.distill.export\",\"feedback.record\",\"feedback.replay\",\"session.create\",\"session.update\",\"session.close\",\"command.run\"]");
     try w.writeAll("}}");
 
@@ -197,6 +201,9 @@ fn dispatchCapabilitiesDescribe(allocator: std.mem.Allocator) !DispatchResult {
     try w.writeAll("{\"capability\":\"negative_knowledge.record.list\",\"policy\":\"allowed\",\"read_only\":true},");
     try w.writeAll("{\"capability\":\"negative_knowledge.record.get\",\"policy\":\"allowed\",\"read_only\":true},");
     try w.writeAll("{\"capability\":\"negative_knowledge.influence.list\",\"policy\":\"allowed\",\"read_only\":true},");
+    try w.writeAll("{\"capability\":\"negative_knowledge.review\",\"policy\":\"allowed\",\"append_only\":true,\"non_authorizing\":true,\"treated_as_proof\":false,\"note\":\"accepts or rejects negative knowledge candidates into durable reviewed records only; no corpus, pack, command, verifier, or global promotion mutation\"},");
+    try w.writeAll("{\"capability\":\"negative_knowledge.reviewed.list\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"treated_as_proof\":false,\"note\":\"inspects append-only reviewed negative knowledge records without mutation, proof authority, command execution, or verifier execution\"},");
+    try w.writeAll("{\"capability\":\"negative_knowledge.reviewed.get\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"treated_as_proof\":false,\"note\":\"retrieves one reviewed negative knowledge record without mutation, proof authority, command execution, or verifier execution\"},");
     try w.writeAll("{\"capability\":\"trust_decay.candidate.list\",\"policy\":\"allowed\",\"read_only\":true},");
     try w.writeAll("{\"capability\":\"negative_knowledge.candidate.review\",\"policy\":\"requires_approval\",\"mutation\":true,\"note\":\"structured unsupported until safe append-only persistence is available\"},");
     try w.writeAll("{\"capability\":\"negative_knowledge.record.expire\",\"policy\":\"requires_approval\",\"mutation\":true,\"note\":\"structured unsupported until safe append-only persistence is available\"},");
@@ -930,6 +937,263 @@ fn dispatchCorrectionInfluenceStatus(allocator: std.mem.Allocator, request_body:
     };
 }
 
+fn dispatchNegativeKnowledgeReview(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
+    const body = request_body orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "request body is required for negative_knowledge.review" },
+    };
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } };
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) {
+        return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "negative_knowledge.review request must be a JSON object" } };
+    }
+
+    const obj = parsed.value.object;
+    const decision_text = getStr(obj, "decision", "decision") orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "decision is required" },
+    };
+    const decision = negative_knowledge_review.Decision.parse(decision_text) orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .invalid_request, .message = "decision must be accepted or rejected", .details = decision_text },
+    };
+    const reviewer_note = getStr(obj, "reviewer_note", "reviewerNote") orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "reviewerNote is required" },
+    };
+    if (std.mem.trim(u8, reviewer_note, " \r\n\t").len == 0) {
+        return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "reviewerNote must be non-empty" } };
+    }
+    const rejected_reason = getStr(obj, "rejected_reason", "rejectedReason");
+    if (decision == .rejected and (rejected_reason == null or std.mem.trim(u8, rejected_reason.?, " \r\n\t").len == 0)) {
+        return .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "rejectedReason is required when decision is rejected" } };
+    }
+
+    const candidate_value = obj.get("negativeKnowledgeCandidate") orelse obj.get("negative_knowledge_candidate");
+    const candidate_id = getStr(obj, "negative_knowledge_candidate_id", "negativeKnowledgeCandidateId") orelse blk: {
+        if (candidate_value) |value| {
+            const candidate_obj = valueObject(value) orelse return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "negativeKnowledgeCandidate must be an object when provided" } };
+            break :blk getStr(candidate_obj, "id", "id");
+        }
+        break :blk null;
+    } orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "negativeKnowledgeCandidate or negativeKnowledgeCandidateId is required" },
+    };
+
+    const candidate_json = if (candidate_value) |value|
+        try stringifyJsonValue(allocator, value)
+    else
+        try std.fmt.allocPrint(allocator, "{{\"id\":\"{}\"}}", .{std.zig.fmtEscapes(candidate_id)});
+    defer allocator.free(candidate_json);
+
+    var result = try negative_knowledge_review.reviewAndAppend(allocator, .{
+        .project_shard = getStr(obj, "project_shard", "projectShard") orelse shards.DEFAULT_PROJECT_ID,
+        .decision = decision,
+        .reviewer_note = reviewer_note,
+        .rejected_reason = rejected_reason,
+        .source_candidate_id = candidate_id,
+        .source_correction_review_id = getStr(obj, "source_correction_review_id", "sourceCorrectionReviewId"),
+        .negative_knowledge_candidate_json = candidate_json,
+    });
+    defer result.deinit();
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"negativeKnowledgeReview\":{\"status\":\"reviewed\",\"reviewedNegativeKnowledgeRecord\":");
+    try w.writeAll(result.record_json);
+    try w.writeAll(",\"requiredReview\":false,\"readOnly\":false,\"appendOnly\":true,\"futureInfluenceCandidate\":");
+    if (decision == .accepted) {
+        try w.writeAll("{\"status\":\"candidate\",\"kind\":\"reviewed_negative_knowledge_influence_candidate\",\"candidateOnly\":true,\"nonAuthorizing\":true,\"treatedAsProof\":false,\"usedAsEvidence\":false,\"globalPromotion\":false}");
+    } else {
+        try w.writeAll("null");
+    }
+    try w.writeAll(",\"storage\":{\"path\":\"");
+    try writeEscaped(w, result.storage_path);
+    try w.writeAll("\",\"appendOnly\":true,\"stableOrdering\":\"file_append_order\",\"inPlaceRewrite\":false,\"deletion\":false,\"compaction\":false}");
+    try w.writeAll(",\"mutationFlags\":{\"corpusMutation\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":true,\"commandsExecuted\":false,\"verifiersExecuted\":false}");
+    try w.writeAll(",\"authority\":{\"nonAuthorizing\":true,\"treatedAsProof\":false,\"usedAsEvidence\":false,\"requiredReview\":false,\"globalPromotion\":false,\"supportGranted\":false,\"proofDischarged\":false}}}");
+
+    var gip_state = schema.draftResultState();
+    gip_state.permission = .none;
+    gip_state.verification_state = .unverified;
+    gip_state.support_minimum_met = false;
+    gip_state.non_authorization_notice = "negative_knowledge.review persists append-only reviewed negative knowledge records only; accepted records are still not proof, evidence, corpus, packs, or global promotion";
+
+    return .{
+        .status = .ok,
+        .result_state = gip_state,
+        .result_json = try out.toOwnedSlice(),
+        .allocated_result = true,
+    };
+}
+
+fn dispatchNegativeKnowledgeReviewedList(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
+    const body = request_body orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "request body is required for negative_knowledge.reviewed.list" },
+    };
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } };
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "negative_knowledge.reviewed.list request must be a JSON object" } };
+    }
+
+    const obj = parsed.value.object;
+    const project_shard = getStr(obj, "project_shard", "projectShard") orelse shards.DEFAULT_PROJECT_ID;
+    const decision_text = getStr(obj, "decision", "decision") orelse "all";
+    const decision_filter = negative_knowledge_review.DecisionFilter.parse(decision_text) orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .invalid_request, .message = "decision filter must be accepted, rejected, or all", .details = decision_text },
+    };
+    const limit = boundedCount(obj, "limit", "limit", negative_knowledge_review.MAX_REVIEWED_NEGATIVE_KNOWLEDGE_READ, negative_knowledge_review.MAX_REVIEWED_NEGATIVE_KNOWLEDGE_READ);
+    const offset = boundedCount(obj, "offset", "cursor", 0, negative_knowledge_review.MAX_REVIEWED_NEGATIVE_KNOWLEDGE_READ);
+
+    var inspected = try negative_knowledge_review.listReviewedNegativeKnowledge(
+        allocator,
+        project_shard,
+        decision_filter,
+        limit,
+        offset,
+        negative_knowledge_review.MAX_REVIEWED_NEGATIVE_KNOWLEDGE_READ,
+    );
+    defer inspected.deinit();
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"reviewedNegativeKnowledge\":{\"status\":\"ok\",\"records\":[");
+    for (inspected.records, 0..) |record, i| {
+        if (i != 0) try w.writeByte(',');
+        try w.writeAll("{\"id\":\"");
+        try writeEscaped(w, record.id);
+        try w.writeAll("\",\"reviewDecision\":\"");
+        try writeEscaped(w, @tagName(record.decision));
+        try w.writeAll("\",\"lineNumber\":");
+        try w.print("{d}", .{record.line_number});
+        try w.writeAll(",\"reviewedNegativeKnowledgeRecord\":");
+        try w.writeAll(record.record_json);
+        try w.writeAll("}");
+    }
+    try w.writeAll("],\"totalRead\":");
+    try w.print("{d}", .{inspected.total_read});
+    try w.writeAll(",\"returnedCount\":");
+    try w.print("{d}", .{inspected.returned_count});
+    try w.writeAll(",\"malformedLines\":");
+    try w.print("{d}", .{inspected.malformed_lines});
+    try w.writeAll(",\"warnings\":");
+    try writeNegativeKnowledgeReadWarningsJson(w, inspected.warnings);
+    try w.writeAll(",\"capacityTelemetry\":{\"maxRecords\":");
+    try w.print("{d}", .{negative_knowledge_review.MAX_REVIEWED_NEGATIVE_KNOWLEDGE_READ});
+    try w.writeAll(",\"maxRecordsHit\":");
+    try w.print("{}", .{inspected.max_records_hit});
+    try w.writeAll(",\"limit\":");
+    try w.print("{d}", .{inspected.limit});
+    try w.writeAll(",\"offset\":");
+    try w.print("{d}", .{inspected.offset});
+    try w.writeAll(",\"limitHit\":");
+    try w.print("{}", .{inspected.limit_hit});
+    try w.writeAll(",\"maxBytes\":");
+    try w.print("{d}", .{negative_knowledge_review.MAX_REVIEWED_NEGATIVE_KNOWLEDGE_BYTES});
+    try w.writeAll(",\"truncated\":");
+    try w.print("{}", .{inspected.truncated});
+    try w.writeAll("},\"storage\":{\"appendOnly\":true,\"missingFile\":");
+    try w.print("{}", .{inspected.missing_file});
+    try w.writeAll(",\"sameShardOnly\":true,\"readOnly\":true,\"inPlaceRewrite\":false,\"deletion\":false,\"compaction\":false,\"stableOrdering\":\"file_append_order\"}");
+    try writeReviewedNegativeKnowledgeSafeguards(w);
+    try w.writeAll("}}");
+
+    var gip_state = schema.draftResultState();
+    gip_state.permission = .none;
+    gip_state.verification_state = .unverified;
+    gip_state.support_minimum_met = false;
+    gip_state.non_authorization_notice = "negative_knowledge.reviewed.list inspects reviewed negative knowledge records only; records are non-authorizing and not proof or evidence";
+
+    return .{
+        .status = .ok,
+        .result_state = gip_state,
+        .result_json = try out.toOwnedSlice(),
+        .allocated_result = true,
+    };
+}
+
+fn dispatchNegativeKnowledgeReviewedGet(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
+    const body = request_body orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "request body is required for negative_knowledge.reviewed.get" },
+    };
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } };
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "negative_knowledge.reviewed.get request must be a JSON object" } };
+    }
+
+    const obj = parsed.value.object;
+    const project_shard = getStr(obj, "project_shard", "projectShard") orelse shards.DEFAULT_PROJECT_ID;
+    const id = getStr(obj, "id", "id") orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "id is required" },
+    };
+
+    var inspected = try negative_knowledge_review.getReviewedNegativeKnowledge(allocator, project_shard, id, negative_knowledge_review.MAX_REVIEWED_NEGATIVE_KNOWLEDGE_READ);
+    defer inspected.deinit();
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"reviewedNegativeKnowledge\":{\"status\":\"");
+    try w.writeAll(if (inspected.record != null) "found" else "not_found");
+    try w.writeAll("\",\"reviewedNegativeKnowledgeRecord\":");
+    if (inspected.record) |record| {
+        try w.writeAll(record.record_json);
+    } else {
+        try w.writeAll("null,\"unknown\":{\"kind\":\"reviewed_negative_knowledge_not_found\",\"reason\":\"no same-shard reviewed negative knowledge record matched id\"}");
+    }
+    try w.writeAll(",\"totalRead\":");
+    try w.print("{d}", .{inspected.total_read});
+    try w.writeAll(",\"malformedLines\":");
+    try w.print("{d}", .{inspected.malformed_lines});
+    try w.writeAll(",\"warnings\":");
+    try writeNegativeKnowledgeReadWarningsJson(w, inspected.warnings);
+    try w.writeAll(",\"capacityTelemetry\":{\"maxRecords\":");
+    try w.print("{d}", .{negative_knowledge_review.MAX_REVIEWED_NEGATIVE_KNOWLEDGE_READ});
+    try w.writeAll(",\"maxRecordsHit\":");
+    try w.print("{}", .{inspected.max_records_hit});
+    try w.writeAll(",\"maxBytes\":");
+    try w.print("{d}", .{negative_knowledge_review.MAX_REVIEWED_NEGATIVE_KNOWLEDGE_BYTES});
+    try w.writeAll(",\"truncated\":");
+    try w.print("{}", .{inspected.truncated});
+    try w.writeAll("},\"storage\":{\"appendOnly\":true,\"missingFile\":");
+    try w.print("{}", .{inspected.missing_file});
+    try w.writeAll(",\"sameShardOnly\":true,\"readOnly\":true,\"inPlaceRewrite\":false,\"deletion\":false,\"compaction\":false,\"stableOrdering\":\"file_append_order\"}");
+    try writeReviewedNegativeKnowledgeSafeguards(w);
+    try w.writeAll("}}");
+
+    var gip_state = if (inspected.record != null) schema.draftResultState() else schema.unresolvedResultState("reviewed_negative_knowledge_not_found");
+    gip_state.permission = .none;
+    gip_state.verification_state = .unverified;
+    gip_state.support_minimum_met = false;
+    gip_state.non_authorization_notice = "negative_knowledge.reviewed.get inspects reviewed negative knowledge records only; records are non-authorizing and not proof or evidence";
+
+    return .{
+        .status = if (inspected.record != null) .ok else .failed,
+        .result_state = gip_state,
+        .result_json = try out.toOwnedSlice(),
+        .allocated_result = true,
+    };
+}
+
 fn boundedCount(obj: std.json.ObjectMap, snake: []const u8, camel: []const u8, default_value: usize, max_value: usize) usize {
     const requested = getInt(obj, snake, camel) orelse return default_value;
     if (requested <= 0) return 0;
@@ -986,6 +1250,25 @@ fn writeReviewedCorrectionSafeguards(w: anytype) !void {
     try w.writeAll(",\"readOnly\":true");
     try w.writeAll(",\"mutationFlags\":{\"corpusMutation\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false}");
     try w.writeAll(",\"authority\":{\"nonAuthorizing\":true,\"treatedAsProof\":false,\"supportGranted\":false,\"proofDischarged\":false,\"usedAsEvidence\":false}");
+}
+
+fn writeNegativeKnowledgeReadWarningsJson(w: anytype, warnings: []const negative_knowledge_review.ReadWarning) !void {
+    try w.writeByte('[');
+    for (warnings, 0..) |warning, i| {
+        if (i != 0) try w.writeByte(',');
+        try w.writeAll("{\"lineNumber\":");
+        try w.print("{d}", .{warning.line_number});
+        try w.writeAll(",\"reason\":\"");
+        try writeEscaped(w, warning.reason);
+        try w.writeAll("\"}");
+    }
+    try w.writeByte(']');
+}
+
+fn writeReviewedNegativeKnowledgeSafeguards(w: anytype) !void {
+    try w.writeAll(",\"readOnly\":true");
+    try w.writeAll(",\"mutationFlags\":{\"corpusMutation\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false}");
+    try w.writeAll(",\"authority\":{\"nonAuthorizing\":true,\"treatedAsProof\":false,\"supportGranted\":false,\"proofDischarged\":false,\"usedAsEvidence\":false,\"globalPromotion\":false}");
 }
 
 fn stringifyJsonValue(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
@@ -4437,6 +4720,120 @@ test "negative_knowledge.candidate.review validates approval and persistence hon
     try std.testing.expect(std.mem.indexOf(u8, accepted.result_json.?, "\"support_authority\":false") != null);
 }
 
+test "negative_knowledge.review appends accepted and rejected reviewed records" {
+    const allocator = std.testing.allocator;
+    const project_shard = "phase11a-gip-review";
+    try cleanProjectShardForTest(allocator, project_shard);
+    defer cleanProjectShardForTest(allocator, project_shard) catch {};
+
+    var accepted = try dispatch(allocator, "negative_knowledge.review", core.PROTOCOL_VERSION, null, null,
+        \\{"projectShard":"phase11a-gip-review","negativeKnowledgeCandidate":{"id":"nk:candidate:accepted","kind":"failed_hypothesis","condition":"bad repeated answer","nonAuthorizing":true},"decision":"accepted","reviewerNote":"accepted by test","sourceCorrectionReviewId":"reviewed-correction:test"}
+    );
+    defer accepted.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, accepted.status);
+    const accepted_json = accepted.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, accepted_json, "\"reviewedNegativeKnowledgeRecord\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, accepted_json, "\"reviewDecision\":\"accepted\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, accepted_json, "\"nonAuthorizing\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, accepted_json, "\"treatedAsProof\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, accepted_json, "\"usedAsEvidence\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, accepted_json, "\"globalPromotion\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, accepted_json, "\"corpusMutation\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, accepted_json, "\"packMutation\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, accepted_json, "\"negativeKnowledgeMutation\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, accepted_json, "\"commandsExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, accepted_json, "\"verifiersExecuted\":false") != null);
+
+    var rejected_missing_reason = try dispatch(allocator, "negative_knowledge.review", core.PROTOCOL_VERSION, null, null,
+        \\{"projectShard":"phase11a-gip-review","negativeKnowledgeCandidateId":"nk:candidate:missing-reason","decision":"rejected","reviewerNote":"rejected by test"}
+    );
+    defer rejected_missing_reason.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, rejected_missing_reason.status);
+    try std.testing.expectEqual(core.ErrorCode.missing_required_field, rejected_missing_reason.err.?.code);
+
+    var rejected = try dispatch(allocator, "negative_knowledge.review", core.PROTOCOL_VERSION, null, null,
+        \\{"projectShard":"phase11a-gip-review","negativeKnowledgeCandidateId":"nk:candidate:rejected","decision":"rejected","reviewerNote":"rejected by test","rejectedReason":"candidate not supported"}
+    );
+    defer rejected.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, rejected.status);
+    try std.testing.expect(std.mem.indexOf(u8, rejected.result_json.?, "\"reviewDecision\":\"rejected\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rejected.result_json.?, "\"rejectedReason\":\"candidate not supported\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rejected.result_json.?, "\"futureInfluenceCandidate\":null") != null);
+
+    var all = try dispatch(allocator, "negative_knowledge.reviewed.list", core.PROTOCOL_VERSION, null, null,
+        \\{"projectShard":"phase11a-gip-review","decision":"all","limit":8}
+    );
+    defer all.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, all.status);
+    try std.testing.expect(std.mem.indexOf(u8, all.result_json.?, "\"returnedCount\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all.result_json.?, "\"readOnly\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all.result_json.?, "\"negativeKnowledgeMutation\":false") != null);
+
+    var accepted_only = try dispatch(allocator, "negative_knowledge.reviewed.list", core.PROTOCOL_VERSION, null, null,
+        \\{"projectShard":"phase11a-gip-review","decision":"accepted","limit":8}
+    );
+    defer accepted_only.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, accepted_only.result_json.?, "\"returnedCount\":1") != null);
+
+    var rejected_only = try dispatch(allocator, "negative_knowledge.reviewed.list", core.PROTOCOL_VERSION, null, null,
+        \\{"projectShard":"phase11a-gip-review","decision":"rejected","limit":8}
+    );
+    defer rejected_only.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, rejected_only.result_json.?, "\"returnedCount\":1") != null);
+}
+
+test "negative_knowledge.reviewed list and get handle missing and malformed records" {
+    const allocator = std.testing.allocator;
+    try cleanProjectShardForTest(allocator, "phase11a-gip-no-file");
+    defer cleanProjectShardForTest(allocator, "phase11a-gip-no-file") catch {};
+
+    var no_file = try dispatch(allocator, "negative_knowledge.reviewed.list", core.PROTOCOL_VERSION, null, null,
+        \\{"projectShard":"phase11a-gip-no-file","decision":"all"}
+    );
+    defer no_file.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, no_file.status);
+    try std.testing.expect(std.mem.indexOf(u8, no_file.result_json.?, "\"missingFile\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, no_file.result_json.?, "\"returnedCount\":0") != null);
+
+    const project_shard = "phase11a-gip-malformed";
+    try cleanProjectShardForTest(allocator, project_shard);
+    defer cleanProjectShardForTest(allocator, project_shard) catch {};
+
+    var accepted = try negative_knowledge_review.reviewAndAppend(allocator, .{
+        .project_shard = project_shard,
+        .decision = .accepted,
+        .reviewer_note = "accepted",
+        .rejected_reason = null,
+        .source_candidate_id = "nk:candidate:malformed",
+        .negative_knowledge_candidate_json = "{\"id\":\"nk:candidate:malformed\"}",
+    });
+    defer accepted.deinit();
+
+    const reviewed_path = try negative_knowledge_review.reviewedNegativeKnowledgePath(allocator, project_shard);
+    defer allocator.free(reviewed_path);
+    var file = try std.fs.openFileAbsolute(reviewed_path, .{ .mode = .write_only });
+    defer file.close();
+    try file.seekFromEnd(0);
+    try file.writeAll("{malformed reviewed negative knowledge line}\n");
+
+    const id = try reviewedRecordIdForTest(allocator, accepted.record_json);
+    defer allocator.free(id);
+    const get_body = try std.fmt.allocPrint(allocator, "{{\"projectShard\":\"{s}\",\"id\":\"{s}\"}}", .{ project_shard, id });
+    defer allocator.free(get_body);
+    var existing = try dispatch(allocator, "negative_knowledge.reviewed.get", core.PROTOCOL_VERSION, null, null, get_body);
+    defer existing.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, existing.status);
+    try std.testing.expect(std.mem.indexOf(u8, existing.result_json.?, "\"reviewedNegativeKnowledgeRecord\":{\"id\":\"") != null);
+
+    var missing = try dispatch(allocator, "negative_knowledge.reviewed.get", core.PROTOCOL_VERSION, null, null,
+        \\{"projectShard":"phase11a-gip-malformed","id":"reviewed-negative-knowledge:missing"}
+    );
+    defer missing.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.failed, missing.status);
+    try std.testing.expect(std.mem.indexOf(u8, missing.result_json.?, "\"kind\":\"reviewed_negative_knowledge_not_found\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missing.result_json.?, "malformed reviewed negative knowledge JSONL line ignored") != null);
+}
+
 test "correction.propose creates review-required wrong answer candidate" {
     const allocator = std.testing.allocator;
     const body =
@@ -4861,6 +5258,9 @@ test "protocol.describe lists new implemented operations exactly" {
     try std.testing.expect(std.mem.indexOf(u8, json, "negative_knowledge.record.list") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "negative_knowledge.record.get") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "negative_knowledge.influence.list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "negative_knowledge.review") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "negative_knowledge.reviewed.list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "negative_knowledge.reviewed.get") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "trust_decay.candidate.list") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "negative_knowledge.candidate.review") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "pack.list") != null);
@@ -4885,6 +5285,9 @@ test "capabilities.describe reports read-only operations as allowed" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"correction.list\",\"policy\":\"allowed\",\"read_only\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"negative_knowledge.candidate.list\",\"policy\":\"allowed\",\"read_only\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"negative_knowledge.record.list\",\"policy\":\"allowed\",\"read_only\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"negative_knowledge.review\",\"policy\":\"allowed\",\"append_only\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"negative_knowledge.reviewed.list\",\"policy\":\"allowed\",\"read_only\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"negative_knowledge.reviewed.get\",\"policy\":\"allowed\",\"read_only\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"negative_knowledge.candidate.review\",\"policy\":\"requires_approval\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"trust_decay.candidate.list\",\"policy\":\"allowed\",\"read_only\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"pack.list\",\"policy\":\"allowed\"") != null);

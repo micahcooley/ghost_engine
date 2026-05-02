@@ -115,8 +115,11 @@ results when GIP has no active session or workspace metadata:
 | `negative_knowledge.record.list` | Reads reviewed negative-knowledge record projections; returns empty when no state is visible | `read_only_state_inspection` |
 | `negative_knowledge.record.get` | Reads one reviewed record projection; missing IDs return `path_not_found` | `read_only_state_inspection` |
 | `negative_knowledge.influence.list` | Reads recorded negative-knowledge influence projections; does not recompute or mutate triage/routing | `read_only_state_inspection` |
+| `negative_knowledge.review` | Accepts or rejects a negative-knowledge candidate into append-only reviewed negative-knowledge storage; does not mutate corpus, packs, commands, verifiers, or global state | `append_only_reviewed_negative_knowledge_no_hidden_mutation` |
+| `negative_knowledge.reviewed.list` | Lists same-shard reviewed negative-knowledge records from append-only storage with filters, warnings, and capacity telemetry; read-only and not proof/evidence | `read_only_reviewed_negative_knowledge_inspection_non_authorizing` |
+| `negative_knowledge.reviewed.get` | Retrieves one same-shard reviewed negative-knowledge record by id; read-only, tolerant of malformed lines, and not proof/evidence | `read_only_reviewed_negative_knowledge_inspection_non_authorizing` |
 | `trust_decay.candidate.list` | Reads proposed trust-decay candidate projections; does not apply trust changes | `read_only_state_inspection` |
-| `negative_knowledge.candidate.review` | Validates review requests but returns structured unsupported until safe append-only persistence is available | `structured_unsupported_without_persistence` |
+| `negative_knowledge.candidate.review` | Legacy review validation surface; retained for compatibility while `negative_knowledge.review` is the durable append-only reviewed-record operation | `structured_unsupported_legacy_review_surface` |
 | `negative_knowledge.record.expire` | Validates expiry requests but returns structured unsupported until safe append-only persistence is available | `structured_unsupported_without_persistence` |
 | `negative_knowledge.record.supersede` | Validates supersede requests but returns structured unsupported until safe append-only persistence is available | `structured_unsupported_without_persistence` |
 | `feedback.summary` | Returns event counts if workspace metadata resolves; otherwise `unsupported` flag | `requires_workspace_metadata` |
@@ -211,6 +214,19 @@ promotion, or pack mutation.
 - `rule.evaluate` can also read accepted reviewed corrections from the same project shard when `projectShard` / `project_shard` is supplied. The read is bounded and missing storage is no influence; malformed reviewed-correction lines become `acceptedCorrectionWarnings` and `influenceTelemetry`.
 - Accepted reviewed corrections can influence `rule.evaluate` only as non-authorizing warnings, exact repeated-output suppression, stronger-review/check candidates, follow-up evidence requests, or future negative-knowledge/pack-guidance/rule-update candidates. They are never rule proof, never evidence, never support final answers, never execute verifiers or commands, and never mutate corpus, packs, negative knowledge, correction records, or unrelated shards.
 
+### Reviewed Negative Knowledge
+
+- Negative-knowledge candidates are proposed signal only. They may come from existing support-graph state or from accepted correction future-behavior candidates, but no candidate affects future behavior until an explicit `negative_knowledge.review` request accepts it.
+- `negative_knowledge.review` accepts `projectShard` / `project_shard`, either a `negativeKnowledgeCandidate` snapshot or `negativeKnowledgeCandidateId`, `decision: "accepted" | "rejected"`, `reviewerNote`, optional `sourceCorrectionReviewId`, and `rejectedReason` when rejected.
+- The response returns `reviewedNegativeKnowledgeRecord`, `requiredReview:false`, `readOnly:false`, `appendOnly:true`, storage metadata, mutation flags, authority flags, and an accepted-only `futureInfluenceCandidate`.
+- Reviewed negative-knowledge records are stored as project-shard-local JSONL at `negative_knowledge/reviewed_negative_knowledge.jsonl` under the resolved project shard. The file is append-only: prior records are not rewritten, deleted, compacted, or reordered; ordering is file append order.
+- Reviewed records store the candidate snapshot, source candidate id, optional source correction review id, `reviewDecision`, `reviewerNote`, `rejectedReason`, deterministic append-order timestamps, `influenceScope.kind:"project_shard"`, `nonAuthorizing:true`, `treatedAsProof:false`, `usedAsEvidence:false`, `globalPromotion:false`, and mutation flags.
+- `negativeKnowledgeMutation:true` on `negative_knowledge.review` means only that a reviewed NK record was appended. It does not mean corpus mutation, pack mutation, global promotion, command execution, verifier execution, proof discharge, support grant, or application of influence.
+- Accepted reviewed NK records are not proof and are not evidence. Phase 11A persists and inspects reviewed NK only; broad future influence is not added here.
+- `negative_knowledge.reviewed.list` accepts `projectShard` / `project_shard`, optional `decision: "accepted" | "rejected" | "all"`, `limit`, and `offset` / `cursor`. It returns records in append order plus `totalRead`, `returnedCount`, `malformedLines`, warnings, capacity telemetry, `readOnly:true`, false read mutation flags, and non-authorizing authority flags.
+- `negative_knowledge.reviewed.get` accepts `projectShard` / `project_shard` and `id`. It returns a matching record or `status:"not_found"` with an unknown. Missing storage is tolerated; malformed JSONL lines become warnings/telemetry.
+- List/get never rewrite, compact, delete, accept, reject, promote, execute commands, execute verifiers, mutate corpus, mutate packs, mutate negative knowledge, treat NK as proof, use NK as evidence, or discharge support gates.
+
 ### Rule Evaluation
 - `rule.evaluate` evaluates request-local structured facts against request-local rules. It is deterministic, bounded, and read-only.
 - Facts are simple subject/predicate/object/source records. Rules contain `all` conditions, optional `any` conditions, and `emit` outputs.
@@ -286,6 +302,19 @@ promotion, or pack mutation.
 - `correction.influence.status` — Summarize reviewed correction influence diagnostics **(Implemented; read-only diagnostics only)**
   - **Request**: `{"projectShard": string optional, "operationKind": string optional, "includeRecords": bool optional, "limit": int optional}`.
   - **Response**: `{"correctionInfluenceStatus":{"status":"ok","projectShard":string,"readOnly":true,"summary":{...},"warnings":[...],"capacityTelemetry":{...},"storage":{...},"records":[...] optional,"mutationFlags":...,"authority":{"nonAuthorizing":true,"treatedAsProof":false,"globalPromotion":false,...}}}`.
+
+- `negative_knowledge.review` — Accept or reject a negative-knowledge candidate into append-only reviewed negative-knowledge records **(Implemented; append-only persistence only)**
+  - **Request**: `{"projectShard": string optional, "negativeKnowledgeCandidate": object optional, "negativeKnowledgeCandidateId": string optional, "decision": "accepted" | "rejected", "reviewerNote": string, "rejectedReason": string required when rejected, "sourceCorrectionReviewId": string optional}`.
+  - **Response**: `{"negativeKnowledgeReview":{"status":"reviewed","reviewedNegativeKnowledgeRecord":object,"requiredReview":false,"readOnly":false,"appendOnly":true,"futureInfluenceCandidate":object|null,"storage":{...},"mutationFlags":...,"authority":...}}`.
+  - Records are appended to `negative_knowledge/reviewed_negative_knowledge.jsonl` in the selected project shard. Accepted and rejected records remain non-authorizing and do not mutate corpus, packs, commands, verifiers, or global promotion state.
+
+- `negative_knowledge.reviewed.list` — Inspect append-only reviewed negative-knowledge records **(Implemented; read-only inspection only)**
+  - **Request**: `{"projectShard": string optional, "decision": "accepted" | "rejected" | "all" optional, "limit": int optional, "offset": int optional}`.
+  - **Response**: `{"reviewedNegativeKnowledge":{"status":"ok","records":[...],"totalRead":int,"returnedCount":int,"malformedLines":int,"warnings":[...],"capacityTelemetry":{...},"readOnly":true,"mutationFlags":...,"authority":{"nonAuthorizing":true,"treatedAsProof":false,"usedAsEvidence":false,...}}}`.
+
+- `negative_knowledge.reviewed.get` — Inspect one reviewed negative-knowledge record by id **(Implemented; read-only inspection only)**
+  - **Request**: `{"projectShard": string optional, "id": string}`.
+  - **Response**: `{"reviewedNegativeKnowledge":{"status":"found"|"not_found","reviewedNegativeKnowledgeRecord":object|null,"unknown": object optional,"totalRead":int,"malformedLines":int,"warnings":[...],"capacityTelemetry":{...},"readOnly":true,"mutationFlags":...,"authority":{"nonAuthorizing":true,"treatedAsProof":false,"usedAsEvidence":false,...}}}`.
 
 ### Artifacts
 - `artifact.read` — Read file content (workspace-bounded) **(Implemented)**
