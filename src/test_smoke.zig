@@ -35,6 +35,7 @@ const verifier_adapter = @import("verifier_adapter.zig");
 const verifier_execution = @import("verifier_execution.zig");
 const correction_hooks = @import("correction_hooks.zig");
 const correction_candidates = @import("correction_candidates.zig");
+const correction_review = @import("correction_review.zig");
 const negative_knowledge = @import("negative_knowledge.zig");
 const support_routing = @import("support_routing.zig");
 const repo_hygiene = @import("repo_hygiene.zig");
@@ -58,6 +59,7 @@ comptime {
     _ = verifier_execution;
     _ = correction_hooks;
     _ = correction_candidates;
+    _ = correction_review;
     _ = negative_knowledge;
     _ = support_routing;
 }

@@ -157,6 +157,7 @@ pub fn checkCapability(kind: core.RequestKind) struct { cap: ?core.CapabilityNam
         .@"hypothesis.list" => .@"hypothesis.list",
         .@"hypothesis.triage" => .@"hypothesis.triage",
         .@"correction.propose" => .@"correction.propose",
+        .@"correction.review" => .@"correction.review",
         .@"correction.list" => .@"correction.list",
         .@"correction.get" => .@"correction.get",
         .@"correction.apply" => .@"correction.apply",

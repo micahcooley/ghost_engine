@@ -102,6 +102,7 @@ results when GIP has no active session or workspace metadata:
 | `corpus.ask` | Reads existing live shard corpus; returns explicit unknown when no corpus/evidence is visible; may include non-authorizing local sketch candidates and capacity telemetry | `read_only_live_corpus_grounded_draft` |
 | `rule.evaluate` | Evaluates bounded deterministic rules over request facts and emits candidate-only outputs with explanation traces and capacity telemetry | `bounded_deterministic_non_authorizing_candidates` |
 | `correction.propose` | Converts a user-disputed output into a review-required correction candidate plus non-authorizing learning candidates; performs no mutation or execution | `candidate_only_review_required_no_mutation` |
+| `correction.review` | Accepts or rejects a correction candidate into an append-only reviewed correction record; performs no corpus, pack, negative-knowledge, command, verifier, or global promotion mutation | `append_only_reviewed_record_no_hidden_mutation` |
 | `verifier.candidate.execution.list` | Reads existing task/result support-graph state; returns empty when no state is visible | `read_only_state_inspection` |
 | `verifier.candidate.execution.get` | Reads one existing execution job/result projection; missing IDs return `path_not_found` | `read_only_state_inspection` |
 | `correction.list` | Reads existing correction-event state; returns empty when no state is visible | `read_only_state_inspection` |
@@ -190,6 +191,15 @@ promotion, or pack mutation.
 - Capacity warnings are diagnostic, not proof. They may recommend explicit expansion or spillover, but they never discharge support gates.
 - `learningCandidates` are proposed review inputs only. A later `correction.propose` request can tie a user correction to `evidenceUsed.itemId`, similarity hints, unknowns, or capacity warnings, but `corpus.ask` itself never mutates corpus, packs, or negative knowledge.
 
+### Correction Review
+
+- `correction.propose` remains candidate-only and review-required. It does not persist, accept, reject, or mutate knowledge.
+- `correction.review` is the explicit reviewed learning boundary. It accepts `projectShard` / `project_shard`, either a `correctionCandidate` snapshot or `correctionCandidateId`, `decision: "accepted" | "rejected"`, `reviewerNote`, optional `acceptedLearningOutputs`, and `rejectedReason` for rejected reviews.
+- The response returns `reviewedCorrectionRecord`, `requiredReview:false`, `mutationFlags`, `authority`, storage metadata, and an accepted-only `futureBehaviorCandidate`.
+- Reviewed correction records are stored as project-shard-local JSONL at `corrections/reviewed_corrections.jsonl` under the resolved project shard. The file is append-only: prior records are not rewritten, deleted, or silently compacted, and ordering is file append order.
+- Accepted reviewed corrections are still `nonAuthorizing:true`, `treatedAsProof:false`, and `globalPromotion:false`. They may produce a future-behavior candidate or warning for later explicit lifecycles, but they do not discharge support gates and do not mutate corpus, packs, or negative knowledge.
+- Rejected reviewed corrections persist the rejection and `rejectedReason`; they do not create future influence.
+
 ### Rule Evaluation
 - `rule.evaluate` evaluates request-local structured facts against request-local rules. It is deterministic, bounded, and read-only.
 - Facts are simple subject/predicate/object/source records. Rules contain `all` conditions, optional `any` conditions, and `emit` outputs.
@@ -239,6 +249,8 @@ promotion, or pack mutation.
 
 ### Correction Proposal
 - `correction.propose` — Propose a review-required correction candidate for a disputed output **(Implemented)**
+
+- `correction.review` — Accept or reject a correction candidate into append-only reviewed correction records **(Implemented; append-only persistence only)**
   - **Request**: `{"operationKind": string, "originalRequestId": string optional, "originalRequestSummary": string optional, "disputedOutput": "answerDraft" | "evidenceUsed" | "unknown" | "rule_candidate" | "similarity_hint" | "capacity_warning" or {"kind": "...", "ref": string optional, "summary": string optional}, "userCorrection": string, "correctionType": "wrong_answer" | "missing_evidence" | "bad_evidence" | "outdated_corpus" | "misleading_rule" | "repeated_failed_pattern" | "unsafe_candidate", "evidenceRefs": string[] optional, "projectShard": string optional}`.
   - **Response**: `{"correctionProposal":{"status":"proposed"|"request_more_detail","requiredReview":true,"correctionCandidate":...,"learningCandidates":[...],"unknowns":[...],"mutationFlags":...,"authority":...}}`.
   - User correction is signal, not proof. Every correction candidate has `nonAuthorizing:true`, `treatedAsProof:false`, `state:"proposed"`, and `requiredReview:true`.
@@ -411,6 +423,7 @@ promote global authority.
 | `corpus.ask` | allowed | yes |
 | `rule.evaluate` | allowed | yes |
 | `correction.propose` | allowed | yes |
+| `correction.review` | allowed | yes |
 | `hypothesis.list` | allowed | yes |
 | `hypothesis.triage` | allowed | yes |
 | `verifier.list` | allowed | yes |
@@ -471,6 +484,7 @@ Maximum timeout: 30 seconds. Maximum output: 256KB.
 12. **Large input stays bounded** — `context.autopsy` uses artifact references, filters, chunked reads, budgets, coverage, and explicit unknowns rather than unbounded stdin JSON
 13. **Corpus ask is not proof** — `corpus.ask` can draft from cited corpus evidence, but corpus text alone does not verify or authorize supported output
 14. **Rules are not proof** — `rule.evaluate` emits candidate checks, obligations, risks, unknowns, and follow-ups only; rule firing cannot authorize supported output
+15. **Reviewed corrections are not proof** — `correction.review` persists explicit accept/reject records, but accepted records remain non-authorizing unless a separate explicit lifecycle later applies a candidate
 
 ## CLI Usage
 
@@ -499,6 +513,7 @@ echo '{"gipVersion":"gip.v0.1","kind":"feedback.summary"}' | ghost_gip --stdin -
 echo '{"gipVersion":"gip.v0.1","kind":"session.get","sessionId":"my-session"}' | ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"corpus.ask","projectShard":"my-project","question":"what does the corpus say about retention?","maxResults":3}' | ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"rule.evaluate","facts":[{"subject":"change","predicate":"touches","object":"runtime"}],"rules":[{"id":"runtime-check","name":"Runtime check expectation","when":{"all":[{"subject":"change","predicate":"touches","object":"runtime"}]},"emit":[{"kind":"check_candidate","id":"check-runtime","summary":"Review runtime behavior before support."}]}]}' | ghost_gip --stdin
+echo '{"gipVersion":"gip.v0.1","kind":"correction.review","projectShard":"my-project","correctionCandidateId":"correction:candidate:example","decision":"accepted","reviewerNote":"reviewed by operator","acceptedLearningOutputs":[{"kind":"verifier_check_candidate","status":"candidate"}]}' | ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"project.autopsy"}' | ghost_gip --stdin --workspace /path/to/project
 echo '{"gipVersion":"gip.v0.1","kind":"context.autopsy","context":{"summary":"inspect source context"},"artifactRefs":[{"kind":"directory","path":".","include":["src/**/*.zig"],"exclude":[".git/**","zig-out/**",".zig-cache/**","node_modules/**"],"maxChunkBytes":32768,"maxFiles":64}]}' | ghost_gip --stdin --workspace /path/to/project
 ```

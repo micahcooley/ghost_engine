@@ -24,6 +24,7 @@ const context_inputs = @import("context_inputs.zig");
 const corpus_ask = @import("corpus_ask.zig");
 const rule_reasoning = @import("rule_reasoning.zig");
 const correction_candidates = @import("correction_candidates.zig");
+const correction_review = @import("correction_review.zig");
 
 pub const DispatchResult = struct {
     status: core.ProtocolStatus,
@@ -102,6 +103,7 @@ pub fn dispatch(
         .@"corpus.ask" => dispatchCorpusAsk(allocator, request_body),
         .@"rule.evaluate" => dispatchRuleEvaluate(allocator, request_body),
         .@"correction.propose" => dispatchCorrectionPropose(allocator, request_body),
+        .@"correction.review" => dispatchCorrectionReview(allocator, request_body),
         .@"artifact.read" => dispatchArtifactRead(allocator, workspace_root, request_path),
         .@"artifact.list" => dispatchArtifactList(allocator, workspace_root, request_path),
         .@"artifact.patch.propose" => dispatchArtifactPatchPropose(allocator, workspace_root, request_body),
@@ -148,8 +150,8 @@ fn dispatchProtocolDescribe(allocator: std.mem.Allocator) !DispatchResult {
     try w.writeAll("{\"protocol\":{");
     try w.writeAll("\"version\":\"");
     try w.writeAll(core.PROTOCOL_VERSION);
-    try w.writeAll("\",\"implemented\":[\"protocol.describe\",\"capabilities.describe\",\"engine.status\",\"conversation.turn\",\"corpus.ask\",\"rule.evaluate\",\"correction.propose\",\"artifact.read\",\"artifact.list\",\"artifact.patch.propose\",\"hypothesis.list\",\"hypothesis.triage\",\"verifier.list\",\"verifier.candidate.execution.list\",\"verifier.candidate.execution.get\",\"correction.list\",\"correction.get\",\"negative_knowledge.candidate.list\",\"negative_knowledge.candidate.get\",\"negative_knowledge.record.list\",\"negative_knowledge.record.get\",\"negative_knowledge.influence.list\",\"trust_decay.candidate.list\",\"negative_knowledge.candidate.review\",\"negative_knowledge.record.expire\",\"negative_knowledge.record.supersede\",\"pack.list\",\"pack.inspect\",\"feedback.summary\",\"session.get\",\"project.autopsy\",\"context.autopsy\"]");
-    try w.writeAll(",\"maturity\":{\"corpus.ask\":\"read_only_live_corpus_grounded_draft\",\"rule.evaluate\":\"bounded_deterministic_non_authorizing_candidates\",\"correction.propose\":\"candidate_only_review_required_no_mutation\",\"hypothesis.list\":\"stateless\",\"hypothesis.triage\":\"stateless\",\"verifier.candidate.execution.list\":\"read_only_state_inspection\",\"verifier.candidate.execution.get\":\"read_only_state_inspection\",\"correction.list\":\"read_only_state_inspection\",\"correction.get\":\"read_only_state_inspection\",\"negative_knowledge.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.get\":\"read_only_state_inspection\",\"negative_knowledge.record.list\":\"read_only_state_inspection\",\"negative_knowledge.record.get\":\"read_only_state_inspection\",\"negative_knowledge.influence.list\":\"read_only_state_inspection\",\"trust_decay.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.review\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.expire\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.supersede\":\"structured_unsupported_without_persistence\",\"feedback.summary\":\"requires_workspace_metadata\",\"session.get\":\"requires_existing_session\",\"project.autopsy\":\"read_only_workspace_inspection\",\"context.autopsy\":\"read_only_artifact_and_input_refs_runtime_and_persistent_pack_guidance\"}");
+    try w.writeAll("\",\"implemented\":[\"protocol.describe\",\"capabilities.describe\",\"engine.status\",\"conversation.turn\",\"corpus.ask\",\"rule.evaluate\",\"correction.propose\",\"correction.review\",\"artifact.read\",\"artifact.list\",\"artifact.patch.propose\",\"hypothesis.list\",\"hypothesis.triage\",\"verifier.list\",\"verifier.candidate.execution.list\",\"verifier.candidate.execution.get\",\"correction.list\",\"correction.get\",\"negative_knowledge.candidate.list\",\"negative_knowledge.candidate.get\",\"negative_knowledge.record.list\",\"negative_knowledge.record.get\",\"negative_knowledge.influence.list\",\"trust_decay.candidate.list\",\"negative_knowledge.candidate.review\",\"negative_knowledge.record.expire\",\"negative_knowledge.record.supersede\",\"pack.list\",\"pack.inspect\",\"feedback.summary\",\"session.get\",\"project.autopsy\",\"context.autopsy\"]");
+    try w.writeAll(",\"maturity\":{\"corpus.ask\":\"read_only_live_corpus_grounded_draft\",\"rule.evaluate\":\"bounded_deterministic_non_authorizing_candidates\",\"correction.propose\":\"candidate_only_review_required_no_mutation\",\"correction.review\":\"append_only_reviewed_record_no_hidden_mutation\",\"hypothesis.list\":\"stateless\",\"hypothesis.triage\":\"stateless\",\"verifier.candidate.execution.list\":\"read_only_state_inspection\",\"verifier.candidate.execution.get\":\"read_only_state_inspection\",\"correction.list\":\"read_only_state_inspection\",\"correction.get\":\"read_only_state_inspection\",\"negative_knowledge.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.get\":\"read_only_state_inspection\",\"negative_knowledge.record.list\":\"read_only_state_inspection\",\"negative_knowledge.record.get\":\"read_only_state_inspection\",\"negative_knowledge.influence.list\":\"read_only_state_inspection\",\"trust_decay.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.review\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.expire\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.supersede\":\"structured_unsupported_without_persistence\",\"feedback.summary\":\"requires_workspace_metadata\",\"session.get\":\"requires_existing_session\",\"project.autopsy\":\"read_only_workspace_inspection\",\"context.autopsy\":\"read_only_artifact_and_input_refs_runtime_and_persistent_pack_guidance\"}");
     try w.writeAll(",\"unsupported\":[\"artifact.patch.apply\",\"artifact.write.propose\",\"artifact.write.apply\",\"artifact.search\",\"conversation.replay\",\"intent.ground\",\"response.evaluate\",\"verifier.run\",\"verifier.candidate.execute\",\"hypothesis.generate\",\"hypothesis.verifier.schedule\",\"correction.apply\",\"negative_knowledge.promote\",\"pack.update_from_negative_knowledge\",\"trust_decay.apply\",\"pack.mount\",\"pack.unmount\",\"pack.import\",\"pack.export\",\"pack.distill.list\",\"pack.distill.show\",\"pack.distill.export\",\"feedback.record\",\"feedback.replay\",\"session.create\",\"session.update\",\"session.close\",\"command.run\"]");
     try w.writeAll("}}");
 
@@ -176,6 +178,7 @@ fn dispatchCapabilitiesDescribe(allocator: std.mem.Allocator) !DispatchResult {
     try w.writeAll("{\"capability\":\"corpus.ask\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"note\":\"bounded live-corpus retrieval with explicit evidence, unknowns, and candidate-only learning; no commands, verifiers, pack mutation, corpus mutation, or negative-knowledge mutation\"},");
     try w.writeAll("{\"capability\":\"rule.evaluate\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"note\":\"bounded deterministic rule evaluation over structured facts; emits candidates, pending obligations, unknowns, and explanation traces only; no commands, verifiers, corpus mutation, pack mutation, or negative-knowledge mutation\"},");
     try w.writeAll("{\"capability\":\"correction.propose\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"requiredReview\":true,\"note\":\"proposes correction-native learning candidates only; no corpus, pack, negative-knowledge, command, or verifier mutation\"},");
+    try w.writeAll("{\"capability\":\"correction.review\",\"policy\":\"allowed\",\"append_only\":true,\"non_authorizing\":true,\"note\":\"accepts or rejects correction candidates into durable reviewed records only; no corpus, pack, negative-knowledge, command, verifier, or global promotion mutation\"},");
     try w.writeAll("{\"capability\":\"hypothesis.list\",\"policy\":\"allowed\",\"read_only\":true},");
     try w.writeAll("{\"capability\":\"hypothesis.triage\",\"policy\":\"allowed\",\"read_only\":true},");
     try w.writeAll("{\"capability\":\"verifier.list\",\"policy\":\"allowed\",\"read_only\":true},");
@@ -525,6 +528,116 @@ fn dispatchCorrectionPropose(allocator: std.mem.Allocator, request_body: ?[]cons
         .result_json = try out.toOwnedSlice(),
         .allocated_result = true,
     };
+}
+
+fn dispatchCorrectionReview(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
+    const body = request_body orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "request body is required for correction.review" },
+    };
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } };
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) {
+        return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "correction.review request must be a JSON object" } };
+    }
+
+    const obj = parsed.value.object;
+    const decision_text = getStr(obj, "decision", "decision") orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "decision is required" },
+    };
+    const decision = correction_review.Decision.parse(decision_text) orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .invalid_request, .message = "decision must be accepted or rejected", .details = decision_text },
+    };
+    const reviewer_note = getStr(obj, "reviewer_note", "reviewerNote") orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "reviewerNote is required" },
+    };
+    if (std.mem.trim(u8, reviewer_note, " \r\n\t").len == 0) {
+        return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "reviewerNote must be non-empty" } };
+    }
+    const rejected_reason = getStr(obj, "rejected_reason", "rejectedReason");
+    if (decision == .rejected and (rejected_reason == null or std.mem.trim(u8, rejected_reason.?, " \r\n\t").len == 0)) {
+        return .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "rejectedReason is required when decision is rejected" } };
+    }
+
+    const candidate_value = obj.get("correctionCandidate") orelse obj.get("correction_candidate");
+    const candidate_id = getStr(obj, "correction_candidate_id", "correctionCandidateId") orelse blk: {
+        if (candidate_value) |value| {
+            const candidate_obj = valueObject(value) orelse return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "correctionCandidate must be an object when provided" } };
+            break :blk getStr(candidate_obj, "id", "id");
+        }
+        break :blk null;
+    } orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "correctionCandidate or correctionCandidateId is required" },
+    };
+
+    const candidate_json = if (candidate_value) |value|
+        try stringifyJsonValue(allocator, value)
+    else
+        try std.fmt.allocPrint(allocator, "{{\"id\":\"{}\"}}", .{std.zig.fmtEscapes(candidate_id)});
+    defer allocator.free(candidate_json);
+
+    const accepted_outputs_value = obj.get("acceptedLearningOutputs") orelse obj.get("accepted_learning_outputs");
+    const accepted_outputs_json = if (accepted_outputs_value) |value| blk: {
+        if (value != .array) return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "acceptedLearningOutputs must be an array" } };
+        break :blk try stringifyJsonValue(allocator, value);
+    } else try allocator.dupe(u8, "[]");
+    defer allocator.free(accepted_outputs_json);
+
+    var result = try correction_review.reviewAndAppend(allocator, .{
+        .project_shard = getStr(obj, "project_shard", "projectShard") orelse shards.DEFAULT_PROJECT_ID,
+        .decision = decision,
+        .reviewer_note = reviewer_note,
+        .rejected_reason = rejected_reason,
+        .source_candidate_id = candidate_id,
+        .correction_candidate_json = candidate_json,
+        .accepted_learning_outputs_json = accepted_outputs_json,
+    });
+    defer result.deinit();
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"correctionReview\":{\"status\":\"reviewed\",\"reviewedCorrectionRecord\":");
+    try w.writeAll(result.record_json);
+    try w.writeAll(",\"requiredReview\":false,\"futureBehaviorCandidate\":");
+    if (decision == .accepted) {
+        try w.writeAll("{\"status\":\"candidate\",\"nonAuthorizing\":true,\"treatedAsProof\":false,\"globalPromotion\":false}");
+    } else {
+        try w.writeAll("null");
+    }
+    try w.writeAll(",\"storage\":{\"path\":\"");
+    try writeEscaped(w, result.storage_path);
+    try w.writeAll("\",\"appendOnly\":true,\"stableOrdering\":\"file_append_order\",\"inPlaceRewrite\":false,\"deletion\":false,\"compaction\":false}");
+    try w.writeAll(",\"mutationFlags\":{\"corpusMutation\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false}");
+    try w.writeAll(",\"authority\":{\"nonAuthorizing\":true,\"treatedAsProof\":false,\"requiredReview\":false,\"globalPromotion\":false,\"supportGranted\":false,\"proofDischarged\":false}}}");
+
+    var gip_state = schema.draftResultState();
+    gip_state.permission = .none;
+    gip_state.verification_state = .unverified;
+    gip_state.support_minimum_met = false;
+    gip_state.non_authorization_notice = "correction.review persists append-only reviewed records only; accepted records are still not proof and do not mutate corpus, packs, or negative knowledge";
+
+    return .{
+        .status = .ok,
+        .result_state = gip_state,
+        .result_json = try out.toOwnedSlice(),
+        .allocated_result = true,
+    };
+}
+
+fn stringifyJsonValue(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try std.json.stringify(value, .{}, out.writer());
+    return out.toOwnedSlice();
 }
 
 fn dispatchArtifactRead(allocator: std.mem.Allocator, workspace_root: ?[]const u8, request_path: ?[]const u8) !DispatchResult {
@@ -4051,6 +4164,61 @@ test "correction.propose malformed request returns invalid_request" {
     try std.testing.expectEqual(core.ErrorCode.invalid_request, result.err.?.code);
 }
 
+test "correction.review accepts candidate into append-only reviewed record" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"projectShard":"phase7-gip-accept","correctionCandidate":{"id":"correction:candidate:accept","correctionType":"wrong_answer"},"decision":"accepted","reviewerNote":"reviewed by test","acceptedLearningOutputs":[{"kind":"verifier_check_candidate","status":"candidate"}]}
+    ;
+    var result = try dispatch(allocator, "correction.review", core.PROTOCOL_VERSION, null, null, body);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
+    const json = result.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"reviewDecision\":\"accepted\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"requiredReview\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"nonAuthorizing\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"treatedAsProof\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"globalPromotion\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"corpusMutation\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"packMutation\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"negativeKnowledgeMutation\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"commandsExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verifiersExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"futureBehaviorCandidate\":{\"status\":\"candidate\"") != null);
+}
+
+test "correction.review rejects candidate with rejectedReason" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"projectShard":"phase7-gip-reject","correctionCandidateId":"correction:candidate:reject","decision":"rejected","reviewerNote":"reviewed by test","rejectedReason":"correction did not match evidence"}
+    ;
+    var result = try dispatch(allocator, "correction.review", core.PROTOCOL_VERSION, null, null, body);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
+    const json = result.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"reviewDecision\":\"rejected\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"rejectedReason\":\"correction did not match evidence\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"futureBehaviorCandidate\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"negativeKnowledgeMutation\":false") != null);
+}
+
+test "correction.review malformed and missing decision are structured rejections" {
+    const allocator = std.testing.allocator;
+    var malformed = try dispatch(allocator, "correction.review", core.PROTOCOL_VERSION, null, null, "[]");
+    defer malformed.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, malformed.status);
+    try std.testing.expectEqual(core.ErrorCode.invalid_request, malformed.err.?.code);
+
+    var missing_decision = try dispatch(allocator, "correction.review", core.PROTOCOL_VERSION, null, null, "{\"correctionCandidateId\":\"cand\",\"reviewerNote\":\"note\"}");
+    defer missing_decision.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, missing_decision.status);
+    try std.testing.expectEqual(core.ErrorCode.missing_required_field, missing_decision.err.?.code);
+
+    var invalid_decision = try dispatch(allocator, "correction.review", core.PROTOCOL_VERSION, null, null, "{\"correctionCandidateId\":\"cand\",\"decision\":\"accept\",\"reviewerNote\":\"note\"}");
+    defer invalid_decision.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, invalid_decision.status);
+    try std.testing.expectEqual(core.ErrorCode.invalid_request, invalid_decision.err.?.code);
+}
+
 test "get missing execution returns structured error" {
     const allocator = std.testing.allocator;
     var result = try dispatch(allocator, "verifier.candidate.execution.get", core.PROTOCOL_VERSION, null, null, "{\"executionId\":\"missing-exec\"}");
@@ -4187,6 +4355,7 @@ test "protocol.describe lists new implemented operations exactly" {
     try std.testing.expect(std.mem.indexOf(u8, json, "verifier.candidate.execution.list") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "verifier.candidate.execution.get") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "correction.propose") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "correction.review") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "correction.list") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "correction.get") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "negative_knowledge.candidate.list") != null);
@@ -4212,6 +4381,7 @@ test "capabilities.describe reports read-only operations as allowed" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"verifier.list\",\"policy\":\"allowed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"verifier.candidate.execution.list\",\"policy\":\"allowed\",\"read_only\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"correction.propose\",\"policy\":\"allowed\",\"read_only\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"correction.review\",\"policy\":\"allowed\",\"append_only\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"correction.list\",\"policy\":\"allowed\",\"read_only\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"negative_knowledge.candidate.list\",\"policy\":\"allowed\",\"read_only\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"negative_knowledge.record.list\",\"policy\":\"allowed\",\"read_only\":true") != null);

@@ -79,6 +79,8 @@ Phase 4 makes capacity pressure explicit across corpus retrieval, sketch routing
 
 Phase 5 adds correction-native learning candidates through GIP `correction.propose`. A disputed `corpus.ask`, `rule.evaluate`, `context.autopsy`, answer draft, evidence item, unknown, rule candidate, similarity hint, or capacity warning can be turned into a proposed correction candidate with `requiredReview:true`, `nonAuthorizing:true`, and `treatedAsProof:false`. The proposal can emit candidate-only negative-knowledge, corpus update, pack guidance, verifier/check, or follow-up evidence requests. It does not persist learning, mutate corpus, mutate packs, mutate negative knowledge, run commands, run verifiers, or promote future influence. User correction is signal, not proof; accepted learning requires an explicit review lifecycle.
 
+Phase 7 adds that explicit review lifecycle through GIP `correction.review`. Review accepts or rejects a proposed correction into a project-shard-local append-only JSONL record at `corrections/reviewed_corrections.jsonl`. The reviewed record stores the source candidate reference or inline snapshot, `reviewDecision`, `reviewerNote`, accepted learning outputs or rejected reason, mutation flags, authority flags, and append-order metadata. Accepted records may emit a `futureBehaviorCandidate`, such as stronger-evidence requirements or a later negative-knowledge/pack-guidance candidate, but they do not mutate corpus, packs, negative knowledge, execute verifiers or commands, prove claims, or promote globally.
+
 Minimal binary-only ingest/apply/ask loop:
 
 ```bash
@@ -86,6 +88,7 @@ Minimal binary-only ingest/apply/ask loop:
 ./zig-out/bin/ghost_corpus_ingest --apply-staged --project-shard=smoke
 echo '{"gipVersion":"gip.v0.1","kind":"corpus.ask","projectShard":"smoke","question":"What does the corpus say about verifier execution?"}' | ./zig-out/bin/ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"correction.propose","operationKind":"corpus.ask","disputedOutput":{"kind":"answerDraft","ref":"answer:1"},"userCorrection":"the answer used the wrong evidence","correctionType":"wrong_answer","evidenceRefs":["corpus:item:1"]}' | ./zig-out/bin/ghost_gip --stdin
+echo '{"gipVersion":"gip.v0.1","kind":"correction.review","projectShard":"smoke","correctionCandidateId":"correction:candidate:example","decision":"rejected","reviewerNote":"reviewed by operator","rejectedReason":"candidate did not match the cited evidence"}' | ./zig-out/bin/ghost_gip --stdin
 ```
 
 Bounded external evidence now reuses the same path instead of a separate web-memory system:

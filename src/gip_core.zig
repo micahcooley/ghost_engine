@@ -47,6 +47,7 @@ pub const RequestKind = enum {
 
     // Correction / negative knowledge inspection
     @"correction.propose",
+    @"correction.review",
     @"correction.list",
     @"correction.get",
     @"correction.apply",
@@ -227,6 +228,7 @@ pub const CapabilityName = enum {
     @"hypothesis.triage",
     @"verifier.list",
     @"correction.propose",
+    @"correction.review",
     @"correction.list",
     @"correction.get",
     @"correction.apply",
@@ -280,7 +282,7 @@ pub const CapabilityEntry = struct {
     policy: CapabilityPolicy,
 };
 
-pub fn defaultCapabilities() [47]CapabilityEntry {
+pub fn defaultCapabilities() [48]CapabilityEntry {
     return .{
         .{ .capability = .@"artifact.read", .policy = .allowed },
         .{ .capability = .@"artifact.list", .policy = .allowed },
@@ -299,6 +301,7 @@ pub fn defaultCapabilities() [47]CapabilityEntry {
         .{ .capability = .@"hypothesis.triage", .policy = .allowed },
         .{ .capability = .@"verifier.list", .policy = .allowed },
         .{ .capability = .@"correction.propose", .policy = .allowed },
+        .{ .capability = .@"correction.review", .policy = .allowed },
         .{ .capability = .@"correction.list", .policy = .allowed },
         .{ .capability = .@"correction.get", .policy = .allowed },
         .{ .capability = .@"correction.apply", .policy = .denied },
@@ -481,6 +484,7 @@ pub const IMPLEMENTED_KINDS = [_]RequestKind{
     .@"verifier.candidate.execution.list",
     .@"verifier.candidate.execution.get",
     .@"correction.propose",
+    .@"correction.review",
     .@"correction.list",
     .@"correction.get",
     .@"negative_knowledge.candidate.list",
@@ -544,6 +548,8 @@ test "default capabilities have safe defaults" {
     try std.testing.expectEqual(CapabilityPolicy.allowed, capabilityPolicy(&caps, .@"rule.evaluate").?);
     // correction.propose should be allowed (candidate-only/non-authorizing)
     try std.testing.expectEqual(CapabilityPolicy.allowed, capabilityPolicy(&caps, .@"correction.propose").?);
+    // correction.review should be allowed as append-only reviewed record persistence.
+    try std.testing.expectEqual(CapabilityPolicy.allowed, capabilityPolicy(&caps, .@"correction.review").?);
     // project.autopsy should be allowed (read-only)
     try std.testing.expectEqual(CapabilityPolicy.allowed, capabilityPolicy(&caps, .@"project.autopsy").?);
     // context.autopsy should be allowed (read-only/non-authorizing)
