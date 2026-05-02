@@ -27,7 +27,7 @@ pub const MAX_REQUEST_LABEL_BYTES: usize = 160;
 pub const MAX_SOURCE_FILE_BYTES: usize = 512 * 1024;
 pub const MAX_VERIFICATION_RETRIES: u32 = 1;
 pub const MAX_VERIFICATION_OUTPUT_BYTES: usize = 64 * 1024;
-pub const MAX_VERIFICATION_TIMEOUT_MS: u32 = 12_000;
+pub const MAX_VERIFICATION_TIMEOUT_MS: u32 = 15_000;
 pub const MAX_RUNTIME_ORACLE_BYTES: usize = 8 * 1024;
 pub const MAX_RUNTIME_ORACLE_CHECKS: usize = 16;
 pub const RUNTIME_ORACLE_FILE_NAME = "ghost_runtime_oracle.cfg";
@@ -2484,7 +2484,7 @@ fn verifyCandidate(
             .phase = execution.Phase.build,
             .argv = &.{ "zig", "build" },
             .expectations = &.{.{ .success = {} }},
-            .timeout_ms = @min(MAX_VERIFICATION_TIMEOUT_MS, effective_budget.max_wall_time_ms),
+            .timeout_ms = boundedVerifierTimeout(effective_budget, MAX_VERIFICATION_TIMEOUT_MS),
         });
         result.profile.build_exec_ms += sys.getMilliTick() - build_started;
         defer build_capture.deinit(allocator);
@@ -2539,7 +2539,7 @@ fn verifyCandidate(
                 .phase = execution.Phase.@"test",
                 .argv = &.{ "zig", "build", "test" },
                 .expectations = &.{.{ .success = {} }},
-                .timeout_ms = @min(MAX_VERIFICATION_TIMEOUT_MS, effective_budget.max_wall_time_ms),
+                .timeout_ms = boundedVerifierTimeout(effective_budget, MAX_VERIFICATION_TIMEOUT_MS),
             });
             result.profile.test_exec_ms += sys.getMilliTick() - test_started;
             defer test_capture.deinit(allocator);
@@ -2650,7 +2650,7 @@ fn verifyCandidate(
                 .phase = oracle.phase,
                 .argv = oracle.argv,
                 .expectations = expectations,
-                .timeout_ms = @min(oracle.timeout_ms, effective_budget.max_wall_time_ms),
+                .timeout_ms = boundedVerifierTimeout(effective_budget, oracle.timeout_ms),
             });
             result.profile.runtime_exec_ms += sys.getMilliTick() - runtime_started;
             defer runtime_capture.deinit(allocator);
@@ -2717,7 +2717,7 @@ fn verifyCandidate(
                     .{ .success = {} },
                     .{ .stderr_not_contains = "panic" },
                 },
-                .timeout_ms = @min(MAX_VERIFICATION_TIMEOUT_MS, effective_budget.max_wall_time_ms),
+                .timeout_ms = boundedVerifierTimeout(effective_budget, MAX_VERIFICATION_TIMEOUT_MS),
             });
             result.profile.runtime_exec_ms += sys.getMilliTick() - runtime_started;
             defer runtime_capture.deinit(allocator);
@@ -2774,6 +2774,10 @@ fn verifyCandidate(
 
     candidate.validation_state = .build_failed;
     return false;
+}
+
+fn boundedVerifierTimeout(effective_budget: compute_budget.Effective, requested_timeout_ms: u32) u32 {
+    return @max(@as(u32, 1), @min(@min(requested_timeout_ms, MAX_VERIFICATION_TIMEOUT_MS), effective_budget.max_verifier_time_ms));
 }
 
 fn maybeQueueRepairPlan(

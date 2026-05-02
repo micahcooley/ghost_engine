@@ -384,7 +384,7 @@ fn preset(tier: Tier) Effective {
             .max_ambiguity_sets = 6,
             .max_runtime_checks = 16,
             .max_verifier_runs = 8,
-            .max_verifier_time_ms = 12_000,
+            .max_verifier_time_ms = 15_000,
             .max_external_verifier_runs = 3,
             .max_verifier_evidence_bytes = 64 * 1024,
             .max_hypotheses_generated = 8,
@@ -410,7 +410,7 @@ fn preset(tier: Tier) Effective {
             .max_negative_knowledge_influence_matches = 4,
             .max_negative_knowledge_trace_items = 4,
             .max_trust_decay_candidates = 2,
-            .max_wall_time_ms = 12_000,
+            .max_wall_time_ms = 15_000,
             .max_temp_work_bytes = 256 * 1024,
         },
         .low => .{
