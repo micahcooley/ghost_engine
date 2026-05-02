@@ -1,4 +1,5 @@
 const std = @import("std");
+const correction_review = @import("correction_review.zig");
 
 pub const DEFAULT_MAX_FACTS: usize = 128;
 pub const DEFAULT_MAX_RULES: usize = 64;
@@ -78,6 +79,85 @@ pub const SafetyFlags = struct {
     support_granted: bool = false,
 };
 
+pub const AcceptedCorrectionWarning = struct {
+    line_number: usize,
+    reason: []u8,
+
+    fn deinit(self: *AcceptedCorrectionWarning, allocator: std.mem.Allocator) void {
+        allocator.free(self.reason);
+        self.* = undefined;
+    }
+};
+
+pub const CorrectionMutationFlags = struct {
+    corpus_mutation: bool = false,
+    pack_mutation: bool = false,
+    negative_knowledge_mutation: bool = false,
+    commands_executed: bool = false,
+    verifiers_executed: bool = false,
+};
+
+pub const CorrectionInfluence = struct {
+    id: []u8,
+    source_reviewed_correction_id: []u8,
+    influence_kind: []u8,
+    applies_to: []u8,
+    matched_rule_id: ?[]u8 = null,
+    matched_output_id: ?[]u8 = null,
+    reason: []u8,
+    non_authorizing: bool = true,
+    treated_as_proof: bool = false,
+    global_promotion: bool = false,
+    mutation_flags: CorrectionMutationFlags = .{},
+
+    fn deinit(self: *CorrectionInfluence, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.source_reviewed_correction_id);
+        allocator.free(self.influence_kind);
+        allocator.free(self.applies_to);
+        if (self.matched_rule_id) |value| allocator.free(value);
+        if (self.matched_output_id) |value| allocator.free(value);
+        allocator.free(self.reason);
+        self.* = undefined;
+    }
+};
+
+pub const FutureBehaviorCandidate = struct {
+    kind: []u8,
+    status: []u8,
+    reason: []u8,
+    source_reviewed_correction_id: []u8,
+    candidate_only: bool = true,
+    non_authorizing: bool = true,
+    treated_as_proof: bool = false,
+    global_promotion: bool = false,
+    mutation_flags: CorrectionMutationFlags = .{},
+
+    fn deinit(self: *FutureBehaviorCandidate, allocator: std.mem.Allocator) void {
+        allocator.free(self.kind);
+        allocator.free(self.status);
+        allocator.free(self.reason);
+        allocator.free(self.source_reviewed_correction_id);
+        self.* = undefined;
+    }
+};
+
+pub const InfluenceTelemetry = struct {
+    records_read: usize = 0,
+    accepted_records: usize = 0,
+    rejected_records: usize = 0,
+    malformed_lines: usize = 0,
+    warnings: usize = 0,
+    influences_loaded: usize = 0,
+    influences_applied: usize = 0,
+    outputs_suppressed: usize = 0,
+    truncated: bool = false,
+    same_shard_only: bool = true,
+    mutation_performed: bool = false,
+    verifiers_executed: bool = false,
+    commands_executed: bool = false,
+};
+
 pub const CapacityTelemetry = struct {
     dropped_runes: usize = 0,
     collision_stalls: usize = 0,
@@ -155,6 +235,10 @@ pub const EvaluationResult = struct {
     non_authorizing: bool = true,
     safety_flags: SafetyFlags = .{},
     capacity_telemetry: CapacityTelemetry = .{},
+    accepted_correction_warnings: []AcceptedCorrectionWarning = &.{},
+    correction_influences: []CorrectionInfluence = &.{},
+    future_behavior_candidates: []FutureBehaviorCandidate = &.{},
+    influence_telemetry: InfluenceTelemetry = .{},
 
     pub fn deinit(self: *EvaluationResult) void {
         self.allocator.free(self.fired_rules);
@@ -162,6 +246,12 @@ pub const EvaluationResult = struct {
         self.allocator.free(self.emitted_obligations);
         self.allocator.free(self.emitted_unknowns);
         self.allocator.free(self.explanation_trace);
+        for (self.accepted_correction_warnings) |*item| item.deinit(self.allocator);
+        self.allocator.free(self.accepted_correction_warnings);
+        for (self.correction_influences) |*item| item.deinit(self.allocator);
+        self.allocator.free(self.correction_influences);
+        for (self.future_behavior_candidates) |*item| item.deinit(self.allocator);
+        self.allocator.free(self.future_behavior_candidates);
         self.* = undefined;
     }
 };
@@ -170,6 +260,7 @@ pub const Request = struct {
     facts: []const Fact,
     rules: []const Rule,
     limits: Limits = .{},
+    project_shard: ?[]const u8 = null,
 };
 
 pub const Error = error{
@@ -372,6 +463,7 @@ pub fn parseRequest(allocator: std.mem.Allocator, root: std.json.Value) !Request
         .facts = try facts.toOwnedSlice(),
         .rules = try rules.toOwnedSlice(),
         .limits = parseLimits(obj),
+        .project_shard = getStringAliases(obj, &.{ "projectShard", "project_shard" }),
     };
 }
 
@@ -450,6 +542,181 @@ fn getUsize(obj: std.json.ObjectMap, camel: []const u8, snake: []const u8) ?usiz
     return @intCast(value.integer);
 }
 
+pub fn applyAcceptedCorrectionInfluence(allocator: std.mem.Allocator, result: *EvaluationResult, reviewed: *const correction_review.ReadResult) !void {
+    result.accepted_correction_warnings = try cloneWarnings(allocator, reviewed.warnings);
+    result.influence_telemetry.records_read = reviewed.records_read;
+    result.influence_telemetry.accepted_records = reviewed.accepted_records;
+    result.influence_telemetry.rejected_records = reviewed.rejected_records;
+    result.influence_telemetry.malformed_lines = reviewed.malformed_lines;
+    result.influence_telemetry.warnings = reviewed.warnings.len;
+    result.influence_telemetry.influences_loaded = reviewed.influences.len;
+    result.influence_telemetry.truncated = reviewed.truncated;
+
+    for (reviewed.influences) |influence| {
+        if (!std.mem.eql(u8, influence.applies_to, "rule.evaluate")) continue;
+        if (matchInfluence(result, influence)) |matched| {
+            try appendCorrectionInfluence(allocator, result, influence, matched.rule_id, matched.output_id);
+            result.influence_telemetry.influences_applied += 1;
+            switch (influence.influence_kind) {
+                .suppress_exact_repeat => if (matched.output_id) |output_id| {
+                    const removed = try suppressOutputById(allocator, result, output_id);
+                    if (removed) {
+                        result.influence_telemetry.outputs_suppressed += 1;
+                        try appendFutureBehaviorCandidate(allocator, result, "verifier_check_candidate", "suppressed exact repeated bad rule output requires explicit verifier/check candidate before reintroduction", influence.source_reviewed_correction_id);
+                    }
+                },
+                .require_stronger_evidence => try appendFutureBehaviorCandidate(allocator, result, "follow_up_evidence_request", "accepted missing-evidence correction requires explicit evidence expectation before relying on this rule output", influence.source_reviewed_correction_id),
+                .require_verifier_candidate => try appendFutureBehaviorCandidate(allocator, result, "verifier_check_candidate", "accepted unsafe rule-output correction requires stronger review and a verifier/check candidate; no verifier was executed", influence.source_reviewed_correction_id),
+                .warning, .penalty => try appendFutureBehaviorCandidate(allocator, result, "rule_update_candidate", "accepted reviewed correction warns on a repeated misleading rule output and may rank it lower after explicit review", influence.source_reviewed_correction_id),
+                .propose_negative_knowledge => try appendFutureBehaviorCandidate(allocator, result, "negative_knowledge_candidate", "accepted reviewed correction proposes negative knowledge candidate only", influence.source_reviewed_correction_id),
+                .propose_pack_guidance => try appendFutureBehaviorCandidate(allocator, result, "pack_guidance_candidate", "accepted reviewed correction proposes pack guidance candidate only", influence.source_reviewed_correction_id),
+                .propose_corpus_update => try appendFutureBehaviorCandidate(allocator, result, "corpus_update_candidate", "accepted reviewed correction proposes corpus update candidate only", influence.source_reviewed_correction_id),
+            }
+        }
+    }
+}
+
+const InfluenceMatch = struct {
+    rule_id: ?[]const u8,
+    output_id: ?[]const u8,
+};
+
+fn matchInfluence(result: *const EvaluationResult, influence: correction_review.AcceptedCorrectionInfluence) ?InfluenceMatch {
+    for (result.emitted_candidates) |output| {
+        if (outputMatchesInfluence(output, influence)) return .{ .rule_id = output.rule_id, .output_id = output.id };
+    }
+    for (result.emitted_obligations) |output| {
+        if (outputMatchesInfluence(output, influence)) return .{ .rule_id = output.rule_id, .output_id = output.id };
+    }
+    for (result.emitted_unknowns) |output| {
+        if (outputMatchesInfluence(output, influence)) return .{ .rule_id = output.rule_id, .output_id = output.id };
+    }
+    for (result.explanation_trace) |trace| {
+        if (textMatchesInfluence(trace.rule_id, influence) or
+            textMatchesInfluence(trace.rule_name, influence) or
+            textMatchesInfluence(trace.reason, influence))
+        {
+            return .{ .rule_id = trace.rule_id, .output_id = null };
+        }
+    }
+    return null;
+}
+
+fn outputMatchesInfluence(output: EmittedOutput, influence: correction_review.AcceptedCorrectionInfluence) bool {
+    return textMatchesInfluence(output.id, influence) or
+        textMatchesInfluence(output.rule_id, influence) or
+        textMatchesInfluence(output.summary, influence) or
+        textMatchesInfluence(output.detail, influence) or
+        textMatchesInfluence(output.kind.text(), influence);
+}
+
+fn textMatchesInfluence(text: []const u8, influence: correction_review.AcceptedCorrectionInfluence) bool {
+    if (text.len == 0 or influence.matched_pattern.len == 0) return false;
+    if (std.mem.eql(u8, text, influence.matched_pattern)) return true;
+    if (std.mem.indexOf(u8, text, influence.matched_pattern) != null) return true;
+    if (std.mem.indexOf(u8, influence.matched_pattern, text) != null) return true;
+    return fingerprintMatches(text, influence.disputed_output_fingerprint);
+}
+
+fn fingerprintMatches(text: []const u8, fingerprint: []const u8) bool {
+    var buf: [32]u8 = undefined;
+    const own = std.fmt.bufPrint(&buf, "fnv1a64:{x:0>16}", .{std.hash.Fnv1a_64.hash(text)}) catch return false;
+    return std.mem.eql(u8, own, fingerprint);
+}
+
+fn suppressOutputById(allocator: std.mem.Allocator, result: *EvaluationResult, output_id: []const u8) !bool {
+    if (try suppressFromSlice(allocator, &result.emitted_candidates, output_id)) |removed| {
+        if (removed) result.outputs_emitted -= 1;
+        return removed;
+    }
+    if (try suppressFromSlice(allocator, &result.emitted_obligations, output_id)) |removed| {
+        if (removed) result.outputs_emitted -= 1;
+        return removed;
+    }
+    if (try suppressFromSlice(allocator, &result.emitted_unknowns, output_id)) |removed| {
+        if (removed) result.outputs_emitted -= 1;
+        result.capacity_telemetry.unknowns_created = result.emitted_unknowns.len;
+        return removed;
+    }
+    return false;
+}
+
+fn suppressFromSlice(allocator: std.mem.Allocator, outputs: *[]EmittedOutput, output_id: []const u8) !?bool {
+    var found: ?usize = null;
+    for (outputs.*, 0..) |output, idx| {
+        if (std.mem.eql(u8, output.id, output_id)) {
+            found = idx;
+            break;
+        }
+    }
+    const idx = found orelse return null;
+    const old = outputs.*;
+    const next = try allocator.alloc(EmittedOutput, old.len - 1);
+    var write_idx: usize = 0;
+    for (old, 0..) |output, read_idx| {
+        if (read_idx == idx) continue;
+        next[write_idx] = output;
+        write_idx += 1;
+    }
+    allocator.free(old);
+    outputs.* = next;
+    return true;
+}
+
+fn cloneWarnings(allocator: std.mem.Allocator, warnings: []const correction_review.ReadWarning) ![]AcceptedCorrectionWarning {
+    const out = try allocator.alloc(AcceptedCorrectionWarning, warnings.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |*item| item.deinit(allocator);
+        allocator.free(out);
+    }
+    for (warnings, 0..) |warning, idx| {
+        out[idx] = .{
+            .line_number = warning.line_number,
+            .reason = try allocator.dupe(u8, warning.reason),
+        };
+        built += 1;
+    }
+    return out;
+}
+
+fn appendCorrectionInfluence(
+    allocator: std.mem.Allocator,
+    result: *EvaluationResult,
+    source: correction_review.AcceptedCorrectionInfluence,
+    matched_rule_id: ?[]const u8,
+    matched_output_id: ?[]const u8,
+) !void {
+    const old = result.correction_influences;
+    var out = try allocator.alloc(CorrectionInfluence, old.len + 1);
+    @memcpy(out[0..old.len], old);
+    out[old.len] = .{
+        .id = try allocator.dupe(u8, source.id),
+        .source_reviewed_correction_id = try allocator.dupe(u8, source.source_reviewed_correction_id),
+        .influence_kind = try allocator.dupe(u8, @tagName(source.influence_kind)),
+        .applies_to = try allocator.dupe(u8, "rule.evaluate"),
+        .matched_rule_id = if (matched_rule_id) |value| try allocator.dupe(u8, value) else null,
+        .matched_output_id = if (matched_output_id) |value| try allocator.dupe(u8, value) else null,
+        .reason = try allocator.dupe(u8, source.reason),
+    };
+    allocator.free(old);
+    result.correction_influences = out;
+}
+
+fn appendFutureBehaviorCandidate(allocator: std.mem.Allocator, result: *EvaluationResult, kind: []const u8, reason: []const u8, source_id: []const u8) !void {
+    const old = result.future_behavior_candidates;
+    var out = try allocator.alloc(FutureBehaviorCandidate, old.len + 1);
+    @memcpy(out[0..old.len], old);
+    out[old.len] = .{
+        .kind = try allocator.dupe(u8, kind),
+        .status = try allocator.dupe(u8, "candidate"),
+        .reason = try allocator.dupe(u8, reason),
+        .source_reviewed_correction_id = try allocator.dupe(u8, source_id),
+    };
+    allocator.free(old);
+    result.future_behavior_candidates = out;
+}
+
 pub fn renderJson(allocator: std.mem.Allocator, result: *const EvaluationResult) ![]u8 {
     var out = std.ArrayList(u8).init(allocator);
     errdefer out.deinit();
@@ -490,6 +757,56 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const EvaluationResult)
     try writeOutputs(w, result.emitted_unknowns, false);
     try w.writeAll(",\"correctionReviewCandidates\":");
     try writeCorrectionReviewCandidates(w, result);
+    try w.writeAll(",\"acceptedCorrectionWarnings\":[");
+    for (result.accepted_correction_warnings, 0..) |warning, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{");
+        try w.print("\"lineNumber\":{d}", .{warning.line_number});
+        try w.writeAll(",\"reason\":\"");
+        try writeEscaped(w, warning.reason);
+        try w.writeAll("\"}");
+    }
+    try w.writeAll("],\"correctionInfluences\":[");
+    for (result.correction_influences, 0..) |influence, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{\"sourceReviewedCorrectionId\":\"");
+        try writeEscaped(w, influence.source_reviewed_correction_id);
+        try w.writeAll("\",\"influenceKind\":\"");
+        try writeEscaped(w, influence.influence_kind);
+        try w.writeAll("\",\"appliesTo\":\"rule.evaluate\"");
+        if (influence.matched_rule_id) |value| {
+            try w.writeAll(",\"matchedRuleId\":\"");
+            try writeEscaped(w, value);
+            try w.writeByte('"');
+        }
+        if (influence.matched_output_id) |value| {
+            try w.writeAll(",\"matchedOutputId\":\"");
+            try writeEscaped(w, value);
+            try w.writeByte('"');
+        }
+        try w.writeAll(",\"reason\":\"");
+        try writeEscaped(w, influence.reason);
+        try w.writeAll("\",\"nonAuthorizing\":true,\"treatedAsProof\":false,\"globalPromotion\":false,\"mutationFlags\":");
+        try writeCorrectionMutationFlags(w, influence.mutation_flags);
+        try w.writeAll("}");
+    }
+    try w.writeAll("],\"futureBehaviorCandidates\":[");
+    for (result.future_behavior_candidates, 0..) |candidate, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{\"kind\":\"");
+        try writeEscaped(w, candidate.kind);
+        try w.writeAll("\",\"status\":\"");
+        try writeEscaped(w, candidate.status);
+        try w.writeAll("\",\"reason\":\"");
+        try writeEscaped(w, candidate.reason);
+        try w.writeAll("\",\"sourceReviewedCorrectionId\":\"");
+        try writeEscaped(w, candidate.source_reviewed_correction_id);
+        try w.writeAll("\",\"candidateOnly\":true,\"nonAuthorizing\":true,\"treatedAsProof\":false,\"globalPromotion\":false,\"mutationFlags\":");
+        try writeCorrectionMutationFlags(w, candidate.mutation_flags);
+        try w.writeAll("}");
+    }
+    try w.writeAll("],\"influenceTelemetry\":");
+    try writeInfluenceTelemetry(w, result.influence_telemetry);
     try w.writeAll(",\"capacityTelemetry\":");
     try writeCapacityTelemetry(w, result.capacity_telemetry);
     try w.writeAll(",\"explanationTrace\":[");
@@ -555,6 +872,38 @@ fn writeCorrectionReviewCandidate(w: anytype, wrote: *bool, output_id: []const u
     try w.writeAll("\",\"proposedOperation\":\"correction.propose\",\"requiredReview\":true,\"candidateOnly\":true,\"nonAuthorizing\":true,\"treatedAsProof\":false,\"persisted\":false,\"reason\":\"");
     try writeEscaped(w, reason);
     try w.writeAll("\"}");
+}
+
+fn writeCorrectionMutationFlags(w: anytype, flags: CorrectionMutationFlags) !void {
+    try w.print("{{\"corpusMutation\":{s},\"packMutation\":{s},\"negativeKnowledgeMutation\":{s},\"commandsExecuted\":{s},\"verifiersExecuted\":{s}}}", .{
+        if (flags.corpus_mutation) "true" else "false",
+        if (flags.pack_mutation) "true" else "false",
+        if (flags.negative_knowledge_mutation) "true" else "false",
+        if (flags.commands_executed) "true" else "false",
+        if (flags.verifiers_executed) "true" else "false",
+    });
+}
+
+fn writeInfluenceTelemetry(w: anytype, telemetry: InfluenceTelemetry) !void {
+    try w.print("{{\"recordsRead\":{d},\"acceptedRecords\":{d},\"rejectedRecords\":{d},\"malformedLines\":{d},\"warnings\":{d}", .{
+        telemetry.records_read,
+        telemetry.accepted_records,
+        telemetry.rejected_records,
+        telemetry.malformed_lines,
+        telemetry.warnings,
+    });
+    try w.print(",\"influencesLoaded\":{d},\"influencesApplied\":{d},\"outputsSuppressed\":{d},\"truncated\":{s}", .{
+        telemetry.influences_loaded,
+        telemetry.influences_applied,
+        telemetry.outputs_suppressed,
+        if (telemetry.truncated) "true" else "false",
+    });
+    try w.print(",\"sameShardOnly\":{s},\"mutationPerformed\":{s},\"commandsExecuted\":{s},\"verifiersExecuted\":{s}}}", .{
+        if (telemetry.same_shard_only) "true" else "false",
+        if (telemetry.mutation_performed) "true" else "false",
+        if (telemetry.commands_executed) "true" else "false",
+        if (telemetry.verifiers_executed) "true" else "false",
+    });
 }
 
 fn writeCapacityTelemetry(w: anytype, telemetry: CapacityTelemetry) !void {

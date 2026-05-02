@@ -438,6 +438,12 @@ fn dispatchRuleEvaluate(allocator: std.mem.Allocator, request_body: ?[]const u8)
     };
     defer result.deinit();
 
+    if (request.project_shard) |project_shard| {
+        var reviewed = try correction_review.readAcceptedInfluences(allocator, project_shard);
+        defer reviewed.deinit();
+        try rule_reasoning.applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
+    }
+
     const rendered = try rule_reasoning.renderJson(allocator, &result);
     errdefer allocator.free(rendered);
 

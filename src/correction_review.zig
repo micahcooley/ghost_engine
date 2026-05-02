@@ -599,12 +599,13 @@ fn influenceFromRecord(allocator: std.mem.Allocator, obj: std.json.ObjectMap, li
     const candidate_value = obj.get("correctionCandidate") orelse return null;
     const candidate = valueObject(candidate_value) orelse return null;
     const operation_kind = getStr(candidate, "originalOperationKind") orelse getStr(candidate, "operationKind") orelse return null;
-    if (!std.mem.eql(u8, operation_kind, "corpus.ask")) return null;
+    if (!std.mem.eql(u8, operation_kind, "corpus.ask") and !std.mem.eql(u8, operation_kind, "rule.evaluate")) return null;
     const correction_type = getStr(candidate, "correctionType") orelse return null;
 
-    const kind = influenceKindForCorrection(correction_type) orelse return null;
     const disputed = candidate.get("disputedOutput");
     const disputed_obj = if (disputed) |value| valueObject(value) else null;
+    const disputed_kind = if (disputed_obj) |d| getStr(d, "kind") else null;
+    const kind = influenceKindForCorrection(operation_kind, correction_type, disputed_kind) orelse return null;
     const original_summary = getStr(candidate, "originalRequestSummary");
     const disputed_summary = if (disputed_obj) |d| getStr(d, "summary") else null;
     const disputed_ref = if (disputed_obj) |d| getStr(d, "ref") else null;
@@ -619,8 +620,8 @@ fn influenceFromRecord(allocator: std.mem.Allocator, obj: std.json.ObjectMap, li
         .id = id,
         .source_reviewed_correction_id = try allocator.dupe(u8, record_id),
         .influence_kind = kind,
-        .reason = try allocator.dupe(u8, influenceReason(kind, correction_type)),
-        .applies_to = try allocator.dupe(u8, "corpus.ask"),
+        .reason = try allocator.dupe(u8, influenceReason(kind, operation_kind, correction_type)),
+        .applies_to = try allocator.dupe(u8, operation_kind),
         .operation_kind = try allocator.dupe(u8, operation_kind),
         .correction_type = try allocator.dupe(u8, correction_type),
         .matched_pattern = try allocator.dupe(u8, pattern),
@@ -628,7 +629,20 @@ fn influenceFromRecord(allocator: std.mem.Allocator, obj: std.json.ObjectMap, li
     };
 }
 
-fn influenceKindForCorrection(correction_type: []const u8) ?InfluenceKind {
+fn influenceKindForCorrection(operation_kind: []const u8, correction_type: []const u8, disputed_kind: ?[]const u8) ?InfluenceKind {
+    if (std.mem.eql(u8, operation_kind, "rule.evaluate")) {
+        if (std.mem.eql(u8, correction_type, "misleading_rule")) return .warning;
+        if (std.mem.eql(u8, correction_type, "unsafe_candidate")) return .require_verifier_candidate;
+        if (std.mem.eql(u8, correction_type, "repeated_failed_pattern")) return .suppress_exact_repeat;
+        if (std.mem.eql(u8, correction_type, "missing_evidence")) return .require_stronger_evidence;
+        if (std.mem.eql(u8, correction_type, "wrong_answer")) {
+            if (disputed_kind) |kind| {
+                if (std.mem.eql(u8, kind, "rule_candidate")) return .suppress_exact_repeat;
+            }
+        }
+        return null;
+    }
+
     if (std.mem.eql(u8, correction_type, "wrong_answer")) return .suppress_exact_repeat;
     if (std.mem.eql(u8, correction_type, "bad_evidence")) return .require_stronger_evidence;
     if (std.mem.eql(u8, correction_type, "missing_evidence")) return .require_verifier_candidate;
@@ -639,8 +653,13 @@ fn influenceKindForCorrection(correction_type: []const u8) ?InfluenceKind {
     return null;
 }
 
-fn influenceReason(kind: InfluenceKind, correction_type: []const u8) []const u8 {
-    _ = correction_type;
+fn influenceReason(kind: InfluenceKind, operation_kind: []const u8, correction_type: []const u8) []const u8 {
+    if (std.mem.eql(u8, operation_kind, "rule.evaluate")) {
+        if (std.mem.eql(u8, correction_type, "misleading_rule")) return "accepted reviewed correction warns on a repeated misleading rule output pattern";
+        if (std.mem.eql(u8, correction_type, "unsafe_candidate")) return "accepted reviewed correction requires stronger review and verifier/check candidate for unsafe rule output";
+        if (std.mem.eql(u8, correction_type, "missing_evidence")) return "accepted reviewed correction requires explicit evidence expectation before relying on this rule output";
+        if (std.mem.eql(u8, correction_type, "repeated_failed_pattern")) return "accepted reviewed correction suppresses an exact repeated bad rule output pattern";
+    }
     return switch (kind) {
         .warning => "accepted reviewed correction warns on a repeated disputed output pattern",
         .penalty => "accepted reviewed correction ranks a repeated disputed pattern lower",
@@ -897,6 +916,67 @@ test "read accepted reviewed correction influences tolerates missing malformed a
     try std.testing.expect(!read.influences[0].mutation_flags.corpus_mutation);
 
     var other_shard = try readAcceptedInfluencesAtPath(allocator, path, "other-phase8", MAX_REVIEWED_CORRECTIONS_READ);
+    defer other_shard.deinit();
+    try std.testing.expectEqual(@as(usize, 0), other_shard.influences.len);
+}
+
+test "read accepted reviewed correction influences supports rule evaluate same shard only" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const path = try std.fs.path.join(allocator, &.{ root, "reviewed-rules.jsonl" });
+    defer allocator.free(path);
+
+    const accepted = try renderRecordJson(allocator, .{
+        .project_shard = "phase9b",
+        .decision = .accepted,
+        .reviewer_note = "accepted unsafe rule output",
+        .rejected_reason = null,
+        .source_candidate_id = "correction:candidate:rule-accepted",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:rule-accepted","originalOperationKind":"rule.evaluate","originalRequestSummary":"rule:deploy","disputedOutput":{"kind":"rule_candidate","ref":"check.deploy","summary":"deploy candidate skips review"},"userCorrection":"unsafe rule candidate needs verifier review","correctionType":"unsafe_candidate"}
+        ,
+        .accepted_learning_outputs_json = "[{\"kind\":\"verifier_check_candidate\"}]",
+    }, 0);
+    defer allocator.free(accepted);
+    const rejected = try renderRecordJson(allocator, .{
+        .project_shard = "phase9b",
+        .decision = .rejected,
+        .reviewer_note = "not applicable",
+        .rejected_reason = "not repeated",
+        .source_candidate_id = "correction:candidate:rule-rejected",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:rule-rejected","originalOperationKind":"rule.evaluate","disputedOutput":{"kind":"rule_candidate","ref":"check.deploy"},"userCorrection":"ignore","correctionType":"unsafe_candidate"}
+        ,
+        .accepted_learning_outputs_json = "[]",
+    }, accepted.len + 1);
+    defer allocator.free(rejected);
+
+    var file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll("{malformed json}\n");
+    try file.writeAll(rejected);
+    try file.writeAll("\n");
+    try file.writeAll(accepted);
+    try file.writeAll("\n");
+
+    var read = try readAcceptedInfluencesAtPath(allocator, path, "phase9b", MAX_REVIEWED_CORRECTIONS_READ);
+    defer read.deinit();
+    try std.testing.expectEqual(@as(usize, 1), read.influences.len);
+    try std.testing.expectEqual(@as(usize, 3), read.records_read);
+    try std.testing.expectEqual(@as(usize, 1), read.accepted_records);
+    try std.testing.expectEqual(@as(usize, 1), read.rejected_records);
+    try std.testing.expectEqual(@as(usize, 1), read.malformed_lines);
+    try std.testing.expectEqual(InfluenceKind.require_verifier_candidate, read.influences[0].influence_kind);
+    try std.testing.expectEqualStrings("rule.evaluate", read.influences[0].applies_to);
+    try std.testing.expect(read.influences[0].non_authorizing);
+    try std.testing.expect(!read.influences[0].treated_as_proof);
+    try std.testing.expect(!read.influences[0].global_promotion);
+    try std.testing.expect(!read.influences[0].mutation_flags.commands_executed);
+
+    var other_shard = try readAcceptedInfluencesAtPath(allocator, path, "other-phase9b", MAX_REVIEWED_CORRECTIONS_READ);
     defer other_shard.deinit();
     try std.testing.expectEqual(@as(usize, 0), other_shard.influences.len);
 }

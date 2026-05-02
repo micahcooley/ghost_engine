@@ -99,6 +99,7 @@ pub fn runSuite(allocator: std.mem.Allocator) !SuiteResult {
     try results.append(try runCorpusCapacityLimited(allocator));
     try results.append(try runCorpusLargerBounded(allocator));
     try results.append(try runRuleSimpleFires(allocator));
+    try results.append(try runRuleAcceptedCorrectionInfluence(allocator));
     try results.append(try runRuleNonMatching(allocator));
     try results.append(try runRuleMultipleDeterministic(allocator));
     try results.append(try runRuleMaxFiredRulesCap(allocator));
@@ -294,6 +295,43 @@ fn runRuleSimpleFires(allocator: std.mem.Allocator) !ScenarioResult {
     const outputs = [_]rule_reasoning.RuleOutput{.{ .kind = .check_candidate, .id = "check:test", .summary = "run explicit test verifier" }};
     const rules = [_]rule_reasoning.Rule{.{ .id = "rule:test", .name = "test rule", .all = &.{.{ .subject = "build", .predicate = "has", .object = "test" }}, .outputs = &outputs }};
     return runRuleScenario(allocator, "rule.evaluate/simple_rule_fires", &facts, &rules, .{}, true, 1, 1);
+}
+
+fn runRuleAcceptedCorrectionInfluence(allocator: std.mem.Allocator) !ScenarioResult {
+    const shard_id = "bench-compute-dominance-rule-correction-influence";
+    try cleanProjectShard(allocator, shard_id);
+    defer cleanProjectShard(allocator, shard_id) catch {};
+
+    var reviewed = try correction_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .accepted,
+        .reviewer_note = "benchmark accepted repeated bad rule output",
+        .rejected_reason = null,
+        .source_candidate_id = "correction:candidate:bench-rule-influence",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:bench-rule-influence","originalOperationKind":"rule.evaluate","originalRequestSummary":"rule:bench","disputedOutput":{"kind":"rule_candidate","ref":"check:bench","summary":"run explicit test verifier"},"userCorrection":"suppress this exact repeated bad rule output and require explicit review","correctionType":"repeated_failed_pattern"}
+        ,
+        .accepted_learning_outputs_json = "[{\"kind\":\"verifier_check_candidate\",\"status\":\"candidate\"}]",
+    });
+    defer reviewed.deinit();
+
+    const facts = [_]rule_reasoning.Fact{.{ .subject = "build", .predicate = "has", .object = "test" }};
+    const outputs = [_]rule_reasoning.RuleOutput{.{ .kind = .check_candidate, .id = "check:bench", .summary = "run explicit test verifier" }};
+    const rules = [_]rule_reasoning.Rule{.{ .id = "rule:bench", .name = "bench rule", .all = &.{.{ .subject = "build", .predicate = "has", .object = "test" }}, .outputs = &outputs }};
+
+    var read = try correction_review.readAcceptedInfluences(allocator, shard_id);
+    defer read.deinit();
+    const started = std.time.nanoTimestamp();
+    var result = try rule_reasoning.evaluate(allocator, .{ .facts = &facts, .rules = &rules, .project_shard = shard_id });
+    defer result.deinit();
+    try rule_reasoning.applyAcceptedCorrectionInfluence(allocator, &result, &read);
+
+    var out = scenarioFromRule("rule.evaluate/accepted_correction_exact_suppression", estimateRuleInputBytes(&facts, &rules), elapsedNs(started), &result);
+    out.success = result.fired_rules.len == 1 and result.outputs_emitted == 0 and result.correction_influences.len == 1 and
+        result.future_behavior_candidates.len >= 1 and result.influence_telemetry.outputs_suppressed == 1 and
+        !result.influence_telemetry.mutation_performed and !result.safety_flags.corpus_mutation and !result.safety_flags.pack_mutation and
+        !result.safety_flags.negative_knowledge_mutation and !result.safety_flags.commands_executed and !result.safety_flags.verifiers_executed;
+    return out;
 }
 
 fn runRuleNonMatching(allocator: std.mem.Allocator) !ScenarioResult {
@@ -684,6 +722,8 @@ fn scenarioFromRule(name: []const u8, input_bytes: usize, duration_ns: u64, resu
         .unknown_count = result.emitted_unknowns.len,
         .capacity_warning_count = capacityWarningsFromRule(result.capacity_telemetry),
         .correction_candidate_count = result.emitted_candidates.len,
+        .correction_influence_count = result.correction_influences.len,
+        .future_behavior_candidate_count = result.future_behavior_candidates.len,
         .commands_executed = if (result.safety_flags.commands_executed) 1 else 0,
         .verifiers_executed = if (result.safety_flags.verifiers_executed) 1 else 0,
         .corpus_mutation = result.safety_flags.corpus_mutation,
@@ -931,7 +971,7 @@ test "compute dominance report is generated with required scenarios and safety f
     var suite = try runSuite(allocator);
     defer suite.deinit();
 
-    try std.testing.expectEqual(@as(usize, 21), suite.scenarios.len);
+    try std.testing.expectEqual(@as(usize, 22), suite.scenarios.len);
     try std.testing.expect(allScenariosPassed(suite.scenarios));
 
     const json = try renderJsonReport(allocator, suite);
@@ -943,6 +983,7 @@ test "compute dominance report is generated with required scenarios and safety f
     try std.testing.expect(std.mem.indexOf(u8, json, "\"suite\":\"ghost_compute_dominance\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"corpus.ask/no_corpus\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"corpus.ask/accepted_correction_exact_suppression\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"rule.evaluate/accepted_correction_exact_suppression\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"corpus.ask/larger_bounded_corpus_deterministic_ranking\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"correctionInfluenceCount\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"rule.evaluate/recursive_invalid_output_rejection\"") != null);

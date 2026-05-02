@@ -6383,6 +6383,134 @@ test "gip rule evaluate rejects recursive fact output" {
     try std.testing.expectEqual(gip.core.ErrorCode.invalid_request, result.err.?.code);
 }
 
+test "gip rule evaluate applies accepted reviewed corrections as non-authorizing influence" {
+    const allocator = std.testing.allocator;
+    const shard_id = "phase9b-rule-influence-smoke";
+    const other_shard_id = "phase9b-other-rule-influence-smoke";
+    var metadata = try shards.resolveProjectMetadata(allocator, shard_id);
+    defer metadata.deinit();
+    var paths = try shards.resolvePaths(allocator, metadata.metadata);
+    defer paths.deinit();
+    var other_metadata = try shards.resolveProjectMetadata(allocator, other_shard_id);
+    defer other_metadata.deinit();
+    var other_paths = try shards.resolvePaths(allocator, other_metadata.metadata);
+    defer other_paths.deinit();
+    try deleteTreeIfExistsAbsolute(paths.root_abs_path);
+    try deleteTreeIfExistsAbsolute(other_paths.root_abs_path);
+    defer deleteTreeIfExistsAbsolute(paths.root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(other_paths.root_abs_path) catch {};
+
+    var misleading = try correction_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .accepted,
+        .reviewer_note = "accepted misleading rule output",
+        .rejected_reason = null,
+        .source_candidate_id = "correction:candidate:misleading-rule",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:misleading-rule","originalOperationKind":"rule.evaluate","originalRequestSummary":"rule.warn","disputedOutput":{"kind":"rule_candidate","ref":"check.warn","summary":"warn candidate needs review"},"userCorrection":"this rule warning is misleading without context","correctionType":"misleading_rule"}
+        ,
+        .accepted_learning_outputs_json = "[{\"kind\":\"pack_guidance_candidate\",\"status\":\"candidate\"}]",
+    });
+    defer misleading.deinit();
+    var unsafe = try correction_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .accepted,
+        .reviewer_note = "accepted unsafe candidate",
+        .rejected_reason = null,
+        .source_candidate_id = "correction:candidate:unsafe-rule",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:unsafe-rule","originalOperationKind":"rule.evaluate","originalRequestSummary":"rule.unsafe","disputedOutput":{"kind":"rule_candidate","ref":"check.unsafe","summary":"unsafe candidate needs explicit verifier"},"userCorrection":"unsafe candidate needs stronger review","correctionType":"unsafe_candidate"}
+        ,
+        .accepted_learning_outputs_json = "[{\"kind\":\"verifier_check_candidate\",\"status\":\"candidate\"}]",
+    });
+    defer unsafe.deinit();
+    var missing = try correction_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .accepted,
+        .reviewer_note = "accepted missing evidence",
+        .rejected_reason = null,
+        .source_candidate_id = "correction:candidate:missing-rule-evidence",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:missing-rule-evidence","originalOperationKind":"rule.evaluate","originalRequestSummary":"rule.evidence","disputedOutput":{"kind":"rule_candidate","ref":"evidence.need","summary":"needs evidence expectation"},"userCorrection":"missing evidence must become a follow-up expectation","correctionType":"missing_evidence"}
+        ,
+        .accepted_learning_outputs_json = "[{\"kind\":\"follow_up_evidence_request\",\"status\":\"candidate\"}]",
+    });
+    defer missing.deinit();
+    var repeated = try correction_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .accepted,
+        .reviewer_note = "accepted repeated bad output",
+        .rejected_reason = null,
+        .source_candidate_id = "correction:candidate:repeated-rule",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:repeated-rule","originalOperationKind":"rule.evaluate","originalRequestSummary":"rule.bad","disputedOutput":{"kind":"rule_candidate","ref":"check.bad","summary":"exact bad rule output"},"userCorrection":"suppress this exact repeated bad rule output","correctionType":"repeated_failed_pattern"}
+        ,
+        .accepted_learning_outputs_json = "[{\"kind\":\"negative_knowledge_candidate\",\"status\":\"candidate\"}]",
+    });
+    defer repeated.deinit();
+    var rejected = try correction_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .rejected,
+        .reviewer_note = "rejected correction must not influence",
+        .rejected_reason = "not valid",
+        .source_candidate_id = "correction:candidate:rejected-rule",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:rejected-rule","originalOperationKind":"rule.evaluate","originalRequestSummary":"rule.rejected","disputedOutput":{"kind":"rule_candidate","ref":"check.rejected","summary":"rejected candidate"},"userCorrection":"ignore this","correctionType":"unsafe_candidate"}
+        ,
+        .accepted_learning_outputs_json = "[]",
+    });
+    defer rejected.deinit();
+    var other = try correction_review.reviewAndAppend(allocator, .{
+        .project_shard = other_shard_id,
+        .decision = .accepted,
+        .reviewer_note = "other shard",
+        .rejected_reason = null,
+        .source_candidate_id = "correction:candidate:other-rule",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:other-rule","originalOperationKind":"rule.evaluate","disputedOutput":{"kind":"rule_candidate","ref":"check.other"},"userCorrection":"other shard must not influence","correctionType":"unsafe_candidate"}
+        ,
+        .accepted_learning_outputs_json = "[{\"kind\":\"verifier_check_candidate\",\"status\":\"candidate\"}]",
+    });
+    defer other.deinit();
+
+    const reviewed_path = try correction_review.reviewedCorrectionsPath(allocator, shard_id);
+    defer allocator.free(reviewed_path);
+    var file = try std.fs.openFileAbsolute(reviewed_path, .{ .mode = .write_only });
+    defer file.close();
+    try file.seekFromEnd(0);
+    try file.writeAll("{malformed reviewed correction line}\n");
+
+    var result = try gip.dispatch.dispatch(allocator, "rule.evaluate", gip.core.PROTOCOL_VERSION, null, null,
+        \\{"projectShard":"phase9b-rule-influence-smoke","facts":[{"subject":"change","predicate":"touches","object":"runtime"}],"rules":[{"id":"rule.warn","name":"Warn","when":{"all":[{"subject":"change","predicate":"touches","object":"runtime"}]},"emit":[{"kind":"check_candidate","id":"check.warn","summary":"warn candidate needs review"}]},{"id":"rule.unsafe","name":"Unsafe","when":{"all":[{"subject":"change","predicate":"touches","object":"runtime"}]},"emit":[{"kind":"check_candidate","id":"check.unsafe","summary":"unsafe candidate needs explicit verifier"}]},{"id":"rule.evidence","name":"Evidence","when":{"all":[{"subject":"change","predicate":"touches","object":"runtime"}]},"emit":[{"kind":"evidence_expectation","id":"evidence.need","summary":"needs evidence expectation"}]},{"id":"rule.bad","name":"Bad","when":{"all":[{"subject":"change","predicate":"touches","object":"runtime"}]},"emit":[{"kind":"check_candidate","id":"check.bad","summary":"exact bad rule output"}]},{"id":"rule.rejected","name":"Rejected","when":{"all":[{"subject":"change","predicate":"touches","object":"runtime"}]},"emit":[{"kind":"check_candidate","id":"check.rejected","summary":"rejected candidate remains emitted"}]}]}
+    );
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(gip.core.ProtocolStatus.ok, result.status);
+    const json = result.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"acceptedCorrectionWarnings\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "malformed reviewed correction JSONL line ignored") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"correctionInfluences\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"matchedOutputId\":\"check.warn\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"matchedOutputId\":\"check.unsafe\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"matchedOutputId\":\"evidence.need\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"matchedOutputId\":\"check.bad\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"id\":\"check.bad\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"id\":\"check.rejected\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "phase9b-other-rule-influence-smoke") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"futureBehaviorCandidates\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"verifier_check_candidate\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"follow_up_evidence_request\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"rule_update_candidate\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"outputsSuppressed\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"sameShardOnly\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"mutationPerformed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"commandsExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verifiersExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"treatedAsProof\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"proofDischarged\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"supportGranted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"evidenceUsed\"") == null);
+}
+
 test "corpus reverse grounding leaves tied symbolic surfaces unresolved" {
     const allocator = std.testing.allocator;
     var repo_fixture = try makeCodeIntelFixture(allocator);
