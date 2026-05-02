@@ -26,7 +26,7 @@ Instead of Ghost hardcoding what to look for, Knowledge Packs provide declarativ
 
 Ghost evaluates the user's situation against these pack rules. The engine remains ignorant of baking or marketing, only understanding how to unify signals, risks, checks, and candidates into a unified `ContextAutopsyResult`. Generic rule evaluation in Ghost remains non-authorizing: deterministic rules may suggest risks, checks, evidence expectations, unknowns, or follow-ups, but rule firing is never proof and never executes a verifier.
 
-Accepted reviewed corrections are not an autopsy proof source. They may influence `corpus.ask` and `rule.evaluate` in their own same-shard runtime surfaces as warnings, exact repeated-output suppression, or future behavior candidates, but those signals remain non-authorizing and do not mutate packs, negative knowledge, corpus, correction records, or autopsy state.
+Accepted reviewed corrections are not an autopsy proof source. They may influence `corpus.ask` and `rule.evaluate` in their own same-shard runtime surfaces as warnings, exact repeated-output suppression, or future behavior candidates, and `correction.influence.status` may summarize those reviewed-record diagnostics read-only, but those signals remain non-authorizing and do not mutate packs, negative knowledge, corpus, correction records, or autopsy state.
 
 ## 4. Runtime Status
 

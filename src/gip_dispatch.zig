@@ -106,6 +106,7 @@ pub fn dispatch(
         .@"correction.review" => dispatchCorrectionReview(allocator, request_body),
         .@"correction.reviewed.list" => dispatchCorrectionReviewedList(allocator, request_body),
         .@"correction.reviewed.get" => dispatchCorrectionReviewedGet(allocator, request_body),
+        .@"correction.influence.status" => dispatchCorrectionInfluenceStatus(allocator, request_body),
         .@"artifact.read" => dispatchArtifactRead(allocator, workspace_root, request_path),
         .@"artifact.list" => dispatchArtifactList(allocator, workspace_root, request_path),
         .@"artifact.patch.propose" => dispatchArtifactPatchPropose(allocator, workspace_root, request_body),
@@ -152,8 +153,8 @@ fn dispatchProtocolDescribe(allocator: std.mem.Allocator) !DispatchResult {
     try w.writeAll("{\"protocol\":{");
     try w.writeAll("\"version\":\"");
     try w.writeAll(core.PROTOCOL_VERSION);
-    try w.writeAll("\",\"implemented\":[\"protocol.describe\",\"capabilities.describe\",\"engine.status\",\"conversation.turn\",\"corpus.ask\",\"rule.evaluate\",\"correction.propose\",\"correction.review\",\"correction.reviewed.list\",\"correction.reviewed.get\",\"artifact.read\",\"artifact.list\",\"artifact.patch.propose\",\"hypothesis.list\",\"hypothesis.triage\",\"verifier.list\",\"verifier.candidate.execution.list\",\"verifier.candidate.execution.get\",\"correction.list\",\"correction.get\",\"negative_knowledge.candidate.list\",\"negative_knowledge.candidate.get\",\"negative_knowledge.record.list\",\"negative_knowledge.record.get\",\"negative_knowledge.influence.list\",\"trust_decay.candidate.list\",\"negative_knowledge.candidate.review\",\"negative_knowledge.record.expire\",\"negative_knowledge.record.supersede\",\"pack.list\",\"pack.inspect\",\"feedback.summary\",\"session.get\",\"project.autopsy\",\"context.autopsy\"]");
-    try w.writeAll(",\"maturity\":{\"corpus.ask\":\"read_only_live_corpus_grounded_draft\",\"rule.evaluate\":\"bounded_deterministic_non_authorizing_candidates\",\"correction.propose\":\"candidate_only_review_required_no_mutation\",\"correction.review\":\"append_only_reviewed_record_no_hidden_mutation\",\"correction.reviewed.list\":\"read_only_reviewed_correction_inspection_non_authorizing\",\"correction.reviewed.get\":\"read_only_reviewed_correction_inspection_non_authorizing\",\"hypothesis.list\":\"stateless\",\"hypothesis.triage\":\"stateless\",\"verifier.candidate.execution.list\":\"read_only_state_inspection\",\"verifier.candidate.execution.get\":\"read_only_state_inspection\",\"correction.list\":\"read_only_state_inspection\",\"correction.get\":\"read_only_state_inspection\",\"negative_knowledge.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.get\":\"read_only_state_inspection\",\"negative_knowledge.record.list\":\"read_only_state_inspection\",\"negative_knowledge.record.get\":\"read_only_state_inspection\",\"negative_knowledge.influence.list\":\"read_only_state_inspection\",\"trust_decay.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.review\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.expire\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.supersede\":\"structured_unsupported_without_persistence\",\"feedback.summary\":\"requires_workspace_metadata\",\"session.get\":\"requires_existing_session\",\"project.autopsy\":\"read_only_workspace_inspection\",\"context.autopsy\":\"read_only_artifact_and_input_refs_runtime_and_persistent_pack_guidance\"}");
+    try w.writeAll("\",\"implemented\":[\"protocol.describe\",\"capabilities.describe\",\"engine.status\",\"conversation.turn\",\"corpus.ask\",\"rule.evaluate\",\"correction.propose\",\"correction.review\",\"correction.reviewed.list\",\"correction.reviewed.get\",\"correction.influence.status\",\"artifact.read\",\"artifact.list\",\"artifact.patch.propose\",\"hypothesis.list\",\"hypothesis.triage\",\"verifier.list\",\"verifier.candidate.execution.list\",\"verifier.candidate.execution.get\",\"correction.list\",\"correction.get\",\"negative_knowledge.candidate.list\",\"negative_knowledge.candidate.get\",\"negative_knowledge.record.list\",\"negative_knowledge.record.get\",\"negative_knowledge.influence.list\",\"trust_decay.candidate.list\",\"negative_knowledge.candidate.review\",\"negative_knowledge.record.expire\",\"negative_knowledge.record.supersede\",\"pack.list\",\"pack.inspect\",\"feedback.summary\",\"session.get\",\"project.autopsy\",\"context.autopsy\"]");
+    try w.writeAll(",\"maturity\":{\"corpus.ask\":\"read_only_live_corpus_grounded_draft\",\"rule.evaluate\":\"bounded_deterministic_non_authorizing_candidates\",\"correction.propose\":\"candidate_only_review_required_no_mutation\",\"correction.review\":\"append_only_reviewed_record_no_hidden_mutation\",\"correction.reviewed.list\":\"read_only_reviewed_correction_inspection_non_authorizing\",\"correction.reviewed.get\":\"read_only_reviewed_correction_inspection_non_authorizing\",\"correction.influence.status\":\"read_only_reviewed_correction_influence_summary_non_authorizing\",\"hypothesis.list\":\"stateless\",\"hypothesis.triage\":\"stateless\",\"verifier.candidate.execution.list\":\"read_only_state_inspection\",\"verifier.candidate.execution.get\":\"read_only_state_inspection\",\"correction.list\":\"read_only_state_inspection\",\"correction.get\":\"read_only_state_inspection\",\"negative_knowledge.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.get\":\"read_only_state_inspection\",\"negative_knowledge.record.list\":\"read_only_state_inspection\",\"negative_knowledge.record.get\":\"read_only_state_inspection\",\"negative_knowledge.influence.list\":\"read_only_state_inspection\",\"trust_decay.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.review\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.expire\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.supersede\":\"structured_unsupported_without_persistence\",\"feedback.summary\":\"requires_workspace_metadata\",\"session.get\":\"requires_existing_session\",\"project.autopsy\":\"read_only_workspace_inspection\",\"context.autopsy\":\"read_only_artifact_and_input_refs_runtime_and_persistent_pack_guidance\"}");
     try w.writeAll(",\"unsupported\":[\"artifact.patch.apply\",\"artifact.write.propose\",\"artifact.write.apply\",\"artifact.search\",\"conversation.replay\",\"intent.ground\",\"response.evaluate\",\"verifier.run\",\"verifier.candidate.execute\",\"hypothesis.generate\",\"hypothesis.verifier.schedule\",\"correction.apply\",\"negative_knowledge.promote\",\"pack.update_from_negative_knowledge\",\"trust_decay.apply\",\"pack.mount\",\"pack.unmount\",\"pack.import\",\"pack.export\",\"pack.distill.list\",\"pack.distill.show\",\"pack.distill.export\",\"feedback.record\",\"feedback.replay\",\"session.create\",\"session.update\",\"session.close\",\"command.run\"]");
     try w.writeAll("}}");
 
@@ -183,6 +184,7 @@ fn dispatchCapabilitiesDescribe(allocator: std.mem.Allocator) !DispatchResult {
     try w.writeAll("{\"capability\":\"correction.review\",\"policy\":\"allowed\",\"append_only\":true,\"non_authorizing\":true,\"note\":\"accepts or rejects correction candidates into durable reviewed records only; no corpus, pack, negative-knowledge, command, verifier, or global promotion mutation\"},");
     try w.writeAll("{\"capability\":\"correction.reviewed.list\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"treated_as_proof\":false,\"note\":\"inspects append-only reviewed correction records without mutation, proof authority, command execution, or verifier execution\"},");
     try w.writeAll("{\"capability\":\"correction.reviewed.get\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"treated_as_proof\":false,\"note\":\"retrieves one reviewed correction record without mutation, proof authority, command execution, or verifier execution\"},");
+    try w.writeAll("{\"capability\":\"correction.influence.status\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"treated_as_proof\":false,\"note\":\"summarizes reviewed correction records and possible influence candidates without mutation, proof authority, command execution, or verifier execution\"},");
     try w.writeAll("{\"capability\":\"hypothesis.list\",\"policy\":\"allowed\",\"read_only\":true},");
     try w.writeAll("{\"capability\":\"hypothesis.triage\",\"policy\":\"allowed\",\"read_only\":true},");
     try w.writeAll("{\"capability\":\"verifier.list\",\"policy\":\"allowed\",\"read_only\":true},");
@@ -821,10 +823,150 @@ fn dispatchCorrectionReviewedGet(allocator: std.mem.Allocator, request_body: ?[]
     };
 }
 
+fn dispatchCorrectionInfluenceStatus(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
+    const body = request_body orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "request body is required for correction.influence.status" },
+    };
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } };
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "correction.influence.status request must be a JSON object" } };
+    }
+
+    const obj = parsed.value.object;
+    const project_shard = getStr(obj, "project_shard", "projectShard") orelse shards.DEFAULT_PROJECT_ID;
+    const operation_kind_filter = getStr(obj, "operation_kind", "operationKind");
+    const include_records = getBool(obj, "include_records", "includeRecords") orelse false;
+    const limit = if (include_records)
+        boundedCount(obj, "limit", "limit", correction_review.MAX_REVIEWED_CORRECTIONS_READ, correction_review.MAX_REVIEWED_CORRECTIONS_READ)
+    else
+        0;
+
+    var status = try correction_review.correctionInfluenceStatus(
+        allocator,
+        project_shard,
+        operation_kind_filter,
+        include_records,
+        limit,
+        correction_review.MAX_REVIEWED_CORRECTIONS_READ,
+    );
+    defer status.deinit();
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"correctionInfluenceStatus\":{\"status\":\"ok\",\"projectShard\":\"");
+    try writeEscaped(w, project_shard);
+    try w.writeAll("\",\"readOnly\":true,\"operationKindFilter\":");
+    if (operation_kind_filter) |filter| {
+        try w.writeByte('"');
+        try writeEscaped(w, filter);
+        try w.writeByte('"');
+    } else {
+        try w.writeAll("null");
+    }
+    try w.writeAll(",\"summary\":{");
+    try w.print("\"totalRecords\":{d},\"acceptedRecords\":{d},\"rejectedRecords\":{d},\"malformedLines\":{d}", .{
+        status.summary.total_records,
+        status.summary.accepted_records,
+        status.summary.rejected_records,
+        status.summary.malformed_lines,
+    });
+    try w.writeAll(",\"operationKindCounts\":");
+    try writeCountEntriesJson(w, status.summary.operation_kind_counts);
+    try w.writeAll(",\"correctionTypeCounts\":");
+    try writeCountEntriesJson(w, status.summary.correction_type_counts);
+    try w.writeAll(",\"influenceKindCounts\":");
+    try writeCountEntriesJson(w, status.summary.influence_kind_counts);
+    try w.print(",\"suppressionCandidateCount\":{d},\"strongerEvidenceCandidateCount\":{d},\"verifierCandidateCount\":{d},\"negativeKnowledgeCandidateCount\":{d},\"corpusUpdateCandidateCount\":{d},\"packGuidanceCandidateCount\":{d},\"ruleUpdateCandidateCount\":{d},\"futureBehaviorCandidateCount\":{d}", .{
+        status.summary.suppression_candidate_count,
+        status.summary.stronger_evidence_candidate_count,
+        status.summary.verifier_candidate_count,
+        status.summary.negative_knowledge_candidate_count,
+        status.summary.corpus_update_candidate_count,
+        status.summary.pack_guidance_candidate_count,
+        status.summary.rule_update_candidate_count,
+        status.summary.future_behavior_candidate_count,
+    });
+    try w.writeAll("},\"warnings\":");
+    try writeReadWarningsJson(w, status.warnings);
+    try w.writeAll(",\"capacityTelemetry\":{");
+    try w.print("\"recordsRead\":{d},\"maxRecordsRead\":{d},\"maxRecordsHit\":{},\"includeRecords\":{},\"limit\":{d},\"returnedCount\":{d},\"limitHit\":{},\"fileBytesLimit\":{d},\"fileBytesLimitHit\":{}", .{
+        status.records_read,
+        correction_review.MAX_REVIEWED_CORRECTIONS_READ,
+        status.max_records_hit,
+        status.include_records,
+        status.limit,
+        status.returned_count,
+        status.limit_hit,
+        correction_review.MAX_REVIEWED_CORRECTIONS_BYTES,
+        status.truncated,
+    });
+    try w.writeAll("},\"storage\":{\"appendOnly\":true,\"missingFile\":");
+    try w.print("{}", .{status.missing_file});
+    try w.writeAll(",\"sameShardOnly\":true,\"readOnly\":true,\"inPlaceRewrite\":false,\"deletion\":false,\"compaction\":false,\"stableOrdering\":\"file_append_order\"}");
+    if (include_records) {
+        try w.writeAll(",\"records\":");
+        try writeInfluenceStatusRecordsJson(w, status.records);
+    }
+    try w.writeAll(",\"mutationFlags\":{\"corpusMutation\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false}");
+    try w.writeAll(",\"authority\":{\"nonAuthorizing\":true,\"treatedAsProof\":false,\"globalPromotion\":false,\"supportGranted\":false,\"proofDischarged\":false,\"usedAsEvidence\":false}}}");
+
+    var gip_state = schema.draftResultState();
+    gip_state.permission = .none;
+    gip_state.verification_state = .unverified;
+    gip_state.support_minimum_met = false;
+    gip_state.non_authorization_notice = "correction.influence.status summarizes reviewed correction records only; summaries are non-authorizing diagnostics and not proof";
+
+    return .{
+        .status = .ok,
+        .result_state = gip_state,
+        .result_json = try out.toOwnedSlice(),
+        .allocated_result = true,
+    };
+}
+
 fn boundedCount(obj: std.json.ObjectMap, snake: []const u8, camel: []const u8, default_value: usize, max_value: usize) usize {
     const requested = getInt(obj, snake, camel) orelse return default_value;
     if (requested <= 0) return 0;
     return @min(@as(usize, @intCast(requested)), max_value);
+}
+
+fn writeCountEntriesJson(w: anytype, entries: []const correction_review.CountEntry) !void {
+    try w.writeByte('{');
+    for (entries, 0..) |entry, i| {
+        if (i != 0) try w.writeByte(',');
+        try w.writeByte('"');
+        try writeEscaped(w, entry.name);
+        try w.writeAll("\":");
+        try w.print("{d}", .{entry.count});
+    }
+    try w.writeByte('}');
+}
+
+fn writeInfluenceStatusRecordsJson(w: anytype, records: []const correction_review.InfluenceStatusRecord) !void {
+    try w.writeByte('[');
+    for (records, 0..) |record, i| {
+        if (i != 0) try w.writeByte(',');
+        try w.writeAll("{\"id\":\"");
+        try writeEscaped(w, record.id);
+        try w.writeAll("\",\"reviewDecision\":\"");
+        try writeEscaped(w, @tagName(record.decision));
+        try w.writeAll("\",\"operationKind\":\"");
+        try writeEscaped(w, record.operation_kind);
+        try w.writeAll("\",\"correctionType\":\"");
+        try writeEscaped(w, record.correction_type);
+        try w.writeAll("\",\"lineNumber\":");
+        try w.print("{d}", .{record.line_number});
+        try w.writeAll(",\"reviewedCorrectionRecord\":");
+        try w.writeAll(record.record_json);
+        try w.writeAll("}");
+    }
+    try w.writeByte(']');
 }
 
 fn writeReadWarningsJson(w: anytype, warnings: []const correction_review.ReadWarning) !void {

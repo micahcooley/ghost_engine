@@ -111,6 +111,8 @@ pub fn runSuite(allocator: std.mem.Allocator) !SuiteResult {
     try results.append(runCorrectionUnderspecified());
     try results.append(try runCorrectionReviewedList(allocator));
     try results.append(try runCorrectionReviewedGet(allocator));
+    try results.append(try runCorrectionInfluenceStatusNoFile(allocator));
+    try results.append(try runCorrectionInfluenceStatusPopulated(allocator));
     try results.append(try runLifecycleScenario(allocator));
 
     return .{
@@ -604,6 +606,78 @@ fn runCorrectionReviewedGet(allocator: std.mem.Allocator) !ScenarioResult {
     };
 }
 
+fn runCorrectionInfluenceStatusNoFile(allocator: std.mem.Allocator) !ScenarioResult {
+    const shard_id = "bench-compute-dominance-influence-status-empty";
+    try cleanProjectShard(allocator, shard_id);
+    defer cleanProjectShard(allocator, shard_id) catch {};
+
+    const started = std.time.nanoTimestamp();
+    var status = try correction_review.correctionInfluenceStatus(allocator, shard_id, null, false, 0, correction_review.MAX_REVIEWED_CORRECTIONS_READ);
+    defer status.deinit();
+
+    return .{
+        .name = "correction.influence.status/no_file_zero_summary",
+        .operation_kind = .@"correction.reviewed",
+        .success = status.missing_file and status.summary.total_records == 0 and status.summary.accepted_records == 0 and
+            status.summary.rejected_records == 0 and status.summary.malformed_lines == 0 and status.records.len == 0 and
+            !status.max_records_hit and !status.limit_hit,
+        .duration_ns = elapsedNs(started),
+        .correction_candidate_count = status.summary.total_records,
+        .capacity_warning_count = if (status.max_records_hit or status.truncated) 1 else 0,
+        .commands_executed = 0,
+        .verifiers_executed = 0,
+        .corpus_mutation = false,
+        .pack_mutation = false,
+        .negative_knowledge_mutation = false,
+        .non_authorizing = true,
+    };
+}
+
+fn runCorrectionInfluenceStatusPopulated(allocator: std.mem.Allocator) !ScenarioResult {
+    const shard_id = "bench-compute-dominance-influence-status-populated";
+    try cleanProjectShard(allocator, shard_id);
+    defer cleanProjectShard(allocator, shard_id) catch {};
+    const path = try correction_review.reviewedCorrectionsPath(allocator, shard_id);
+    defer allocator.free(path);
+    const accepted = try reviewedRecordJson(allocator, shard_id, "bench-status-accepted", .accepted, 0);
+    defer allocator.free(accepted);
+    const rejected = try reviewedRecordJson(allocator, shard_id, "bench-status-rejected", .rejected, accepted.len + 1);
+    defer allocator.free(rejected);
+    var file = try createReviewedFile(path);
+    defer file.close();
+    try file.writeAll(accepted);
+    try file.writeAll("\n");
+    try file.writeAll(rejected);
+    try file.writeAll("\n");
+
+    const started = std.time.nanoTimestamp();
+    var status = try correction_review.correctionInfluenceStatus(allocator, shard_id, null, true, 1, correction_review.MAX_REVIEWED_CORRECTIONS_READ);
+    defer status.deinit();
+
+    return .{
+        .name = "correction.influence.status/accepted_rejected_summary",
+        .operation_kind = .@"correction.reviewed",
+        .success = status.summary.total_records == 2 and status.summary.accepted_records == 1 and status.summary.rejected_records == 1 and
+            status.summary.suppression_candidate_count == 1 and status.summary.verifier_candidate_count == 1 and
+            status.summary.future_behavior_candidate_count == 1 and status.records.len == 1 and status.limit_hit and
+            !status.max_records_hit and status.summary.malformed_lines == 0,
+        .duration_ns = elapsedNs(started),
+        .input_bytes = accepted.len + rejected.len,
+        .correction_candidate_count = status.summary.total_records,
+        .correction_influence_count = status.summary.suppression_candidate_count + status.summary.stronger_evidence_candidate_count +
+            status.summary.verifier_candidate_count + status.summary.negative_knowledge_candidate_count + status.summary.corpus_update_candidate_count +
+            status.summary.pack_guidance_candidate_count + status.summary.rule_update_candidate_count,
+        .future_behavior_candidate_count = status.summary.future_behavior_candidate_count,
+        .capacity_warning_count = if (status.limit_hit or status.max_records_hit or status.truncated) 1 else 0,
+        .commands_executed = 0,
+        .verifiers_executed = 0,
+        .corpus_mutation = false,
+        .pack_mutation = false,
+        .negative_knowledge_mutation = false,
+        .non_authorizing = true,
+    };
+}
+
 const CorpusFile = struct {
     path: []const u8,
     body: []const u8,
@@ -971,7 +1045,7 @@ test "compute dominance report is generated with required scenarios and safety f
     var suite = try runSuite(allocator);
     defer suite.deinit();
 
-    try std.testing.expectEqual(@as(usize, 22), suite.scenarios.len);
+    try std.testing.expectEqual(@as(usize, 24), suite.scenarios.len);
     try std.testing.expect(allScenariosPassed(suite.scenarios));
 
     const json = try renderJsonReport(allocator, suite);
@@ -990,6 +1064,8 @@ test "compute dominance report is generated with required scenarios and safety f
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"correction.propose/repeated_failed_pattern\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"correction.reviewed.list/read_only_append_order\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"correction.reviewed.get/read_only_existing_with_malformed_warning\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"correction.influence.status/no_file_zero_summary\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"correction.influence.status/accepted_rejected_summary\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"end_to_end/lifecycle_ingest_apply_ask_correction_no_hidden_mutation\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"cloudUsed\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"transformersUsed\":false") != null);

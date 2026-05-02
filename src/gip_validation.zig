@@ -160,6 +160,7 @@ pub fn checkCapability(kind: core.RequestKind) struct { cap: ?core.CapabilityNam
         .@"correction.review" => .@"correction.review",
         .@"correction.reviewed.list" => .@"correction.reviewed.list",
         .@"correction.reviewed.get" => .@"correction.reviewed.get",
+        .@"correction.influence.status" => .@"correction.influence.status",
         .@"correction.list" => .@"correction.list",
         .@"correction.get" => .@"correction.get",
         .@"correction.apply" => .@"correction.apply",

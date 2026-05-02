@@ -105,6 +105,7 @@ results when GIP has no active session or workspace metadata:
 | `correction.review` | Accepts or rejects a correction candidate into an append-only reviewed correction record; performs no corpus, pack, negative-knowledge, command, verifier, or global promotion mutation | `append_only_reviewed_record_no_hidden_mutation` |
 | `correction.reviewed.list` | Lists same-shard reviewed correction records from append-only storage with filters, warnings, and capacity telemetry; read-only and not proof | `read_only_reviewed_correction_inspection_non_authorizing` |
 | `correction.reviewed.get` | Retrieves one same-shard reviewed correction record by id; read-only, tolerant of malformed lines, and not proof | `read_only_reviewed_correction_inspection_non_authorizing` |
+| `correction.influence.status` | Summarizes same-shard reviewed correction totals, target operations, possible influence candidates, warnings, and read-cap telemetry; read-only diagnostics and not proof | `read_only_reviewed_correction_influence_summary_non_authorizing` |
 | `verifier.candidate.execution.list` | Reads existing task/result support-graph state; returns empty when no state is visible | `read_only_state_inspection` |
 | `verifier.candidate.execution.get` | Reads one existing execution job/result projection; missing IDs return `path_not_found` | `read_only_state_inspection` |
 | `correction.list` | Reads existing correction-event state; returns empty when no state is visible | `read_only_state_inspection` |
@@ -203,6 +204,8 @@ promotion, or pack mutation.
 - Rejected reviewed corrections persist the rejection and `rejectedReason`; they do not create future influence.
 - `correction.reviewed.list` accepts `projectShard` / `project_shard`, optional `decision: "accepted" | "rejected" | "all"`, optional `operationKind` / `operation_kind`, `limit`, and `offset` / `cursor`. It returns `records`, `totalRead`, `returnedCount`, `malformedLines`, `warnings`, `capacityTelemetry`, `readOnly:true`, false mutation flags, and `authority.nonAuthorizing:true` / `treatedAsProof:false`.
 - `correction.reviewed.get` accepts `projectShard` / `project_shard` and `id`. It returns `reviewedCorrectionRecord` when found, or `status:"not_found"` with an unknown when missing. Missing storage is tolerated, malformed JSONL lines become warnings/telemetry, and neither operation rewrites, compacts, deletes, accepts, rejects, promotes, executes commands, executes verifiers, mutates corpus, mutates packs, or mutates negative knowledge.
+- `correction.influence.status` accepts `projectShard` / `project_shard`, optional `operationKind` / `operation_kind`, optional `includeRecords` / `include_records` defaulting to `false`, and optional `limit` when record echoing is enabled. It reads the same same-shard `corrections/reviewed_corrections.jsonl` under bounded record and byte caps, tolerates a missing file as a zero summary, and reports malformed JSONL lines as `warnings` plus `summary.malformedLines`.
+- `correction.influence.status` returns `summary.totalRecords`, accepted/rejected counts, `operationKindCounts`, `correctionTypeCounts`, `influenceKindCounts`, suppression/stronger-evidence/verifier/negative-knowledge/corpus-update/pack-guidance/rule-update/future-behavior candidate counts, `capacityTelemetry`, false mutation flags, and `authority.nonAuthorizing:true`, `treatedAsProof:false`, `globalPromotion:false`. These counts are operator diagnostics only; they are not proof, evidence, support, review decisions, corpus updates, pack updates, negative knowledge, or global promotion.
 - `corpus.ask` reads accepted reviewed corrections from the same project shard only, with a bounded read limit. Missing `reviewed_corrections.jsonl` is treated as no influence. Malformed JSONL lines are exposed as `acceptedCorrectionWarnings` / `influenceTelemetry` and do not crash the ask.
 - Accepted reviewed corrections can influence `corpus.ask` only as non-authorizing `correctionInfluences` and `futureBehaviorCandidates`: warnings, stronger-evidence requirements, verifier/check candidates, exact repeated bad-pattern suppression, or candidate-only negative-knowledge/corpus/pack guidance proposals. They are never copied into `evidenceUsed`, never become proof, never execute verifiers, and never mutate corpus, packs, or negative knowledge.
 - `rule.evaluate` can also read accepted reviewed corrections from the same project shard when `projectShard` / `project_shard` is supplied. The read is bounded and missing storage is no influence; malformed reviewed-correction lines become `acceptedCorrectionWarnings` and `influenceTelemetry`.
@@ -279,6 +282,10 @@ promotion, or pack mutation.
 - `correction.reviewed.get` — Inspect one reviewed correction record by id **(Implemented; read-only inspection only)**
   - **Request**: `{"projectShard": string optional, "id": string}`.
   - **Response**: `{"correctionReviewedGet":{"status":"ok"|"not_found","reviewedCorrectionRecord":object|null,"unknown": object optional,"totalRead":int,"malformedLines":int,"warnings":[...],"capacityTelemetry":{...},"readOnly":true,"mutationFlags":...,"authority":{"nonAuthorizing":true,"treatedAsProof":false,...}}}`.
+
+- `correction.influence.status` — Summarize reviewed correction influence diagnostics **(Implemented; read-only diagnostics only)**
+  - **Request**: `{"projectShard": string optional, "operationKind": string optional, "includeRecords": bool optional, "limit": int optional}`.
+  - **Response**: `{"correctionInfluenceStatus":{"status":"ok","projectShard":string,"readOnly":true,"summary":{...},"warnings":[...],"capacityTelemetry":{...},"storage":{...},"records":[...] optional,"mutationFlags":...,"authority":{"nonAuthorizing":true,"treatedAsProof":false,"globalPromotion":false,...}}}`.
 
 ### Artifacts
 - `artifact.read` — Read file content (workspace-bounded) **(Implemented)**
@@ -448,6 +455,7 @@ promote global authority.
 | `correction.review` | allowed | yes |
 | `correction.reviewed.list` | allowed | yes |
 | `correction.reviewed.get` | allowed | yes |
+| `correction.influence.status` | allowed | yes |
 | `hypothesis.list` | allowed | yes |
 | `hypothesis.triage` | allowed | yes |
 | `verifier.list` | allowed | yes |
@@ -508,7 +516,7 @@ Maximum timeout: 30 seconds. Maximum output: 256KB.
 12. **Large input stays bounded** — `context.autopsy` uses artifact references, filters, chunked reads, budgets, coverage, and explicit unknowns rather than unbounded stdin JSON
 13. **Corpus ask is not proof** — `corpus.ask` can draft from cited corpus evidence, but corpus text alone does not verify or authorize supported output
 14. **Rules are not proof** — `rule.evaluate` emits candidate checks, obligations, risks, unknowns, and follow-ups only; rule firing cannot authorize supported output
-15. **Reviewed corrections are not proof** — `correction.review` persists explicit accept/reject records, `correction.reviewed.list` / `correction.reviewed.get` inspect them read-only, and accepted records may influence future `corpus.ask` behavior as warnings, exact suppression, or candidate-only follow-ups, but they remain non-authorizing and cannot satisfy proof/support gates
+15. **Reviewed corrections are not proof** — `correction.review` persists explicit accept/reject records, `correction.reviewed.list` / `correction.reviewed.get` inspect them read-only, `correction.influence.status` summarizes potential influence diagnostics read-only, and accepted records may influence future `corpus.ask` / `rule.evaluate` behavior as warnings, exact suppression, or candidate-only follow-ups, but they remain non-authorizing and cannot satisfy proof/support gates
 16. **Reviewed correction influence is shard-scoped and non-mutating** — accepted correction influence reads only the same project shard and does not mutate corpus, packs, negative knowledge, commands, verifiers, or unrelated shards
 
 ## CLI Usage

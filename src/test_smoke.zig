@@ -6301,6 +6301,97 @@ test "gip corpus ask exposes protocol capability and malformed requests are stru
     try std.testing.expectEqual(gip.core.ErrorCode.invalid_request, malformed.err.?.code);
 }
 
+test "gip correction influence status summarizes reviewed corrections read-only" {
+    const allocator = std.testing.allocator;
+    const shard_id = "phase10a-influence-status-smoke";
+    var metadata = try shards.resolveProjectMetadata(allocator, shard_id);
+    defer metadata.deinit();
+    var paths = try shards.resolvePaths(allocator, metadata.metadata);
+    defer paths.deinit();
+    try deleteTreeIfExistsAbsolute(paths.root_abs_path);
+    defer deleteTreeIfExistsAbsolute(paths.root_abs_path) catch {};
+
+    var no_file = try gip.dispatch.dispatch(allocator, "correction.influence.status", gip.core.PROTOCOL_VERSION, null, null,
+        \\{"projectShard":"phase10a-influence-status-smoke"}
+    );
+    defer no_file.deinit(allocator);
+    try std.testing.expectEqual(gip.core.ProtocolStatus.ok, no_file.status);
+    try std.testing.expect(no_file.result_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, no_file.result_json.?, "\"totalRecords\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, no_file.result_json.?, "\"readOnly\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, no_file.result_json.?, "\"records\"") == null);
+
+    var accepted = try correction_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .accepted,
+        .reviewer_note = "accepted wrong answer",
+        .rejected_reason = null,
+        .source_candidate_id = "correction:candidate:status-accepted",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:status-accepted","originalOperationKind":"corpus.ask","originalRequestSummary":"retention enabled","disputedOutput":{"kind":"answerDraft","summary":"Retention policy is enabled"},"userCorrection":"suppress this repeated answer","correctionType":"wrong_answer"}
+        ,
+        .accepted_learning_outputs_json = "[{\"kind\":\"verifier_check_candidate\",\"status\":\"candidate\"},{\"kind\":\"negative_knowledge_candidate\",\"status\":\"candidate\"}]",
+    });
+    defer accepted.deinit();
+    var rejected = try correction_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .rejected,
+        .reviewer_note = "rejected rule correction",
+        .rejected_reason = "not valid",
+        .source_candidate_id = "correction:candidate:status-rejected",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:status-rejected","originalOperationKind":"rule.evaluate","disputedOutput":{"kind":"rule_candidate","summary":"rule output"},"userCorrection":"ignore","correctionType":"misleading_rule"}
+        ,
+        .accepted_learning_outputs_json = "[]",
+    });
+    defer rejected.deinit();
+    const reviewed_path = try correction_review.reviewedCorrectionsPath(allocator, shard_id);
+    defer allocator.free(reviewed_path);
+    var file = try std.fs.openFileAbsolute(reviewed_path, .{ .mode = .write_only });
+    defer file.close();
+    try file.seekFromEnd(0);
+    try file.writeAll("{malformed reviewed correction line}\n");
+
+    var populated = try gip.dispatch.dispatch(allocator, "correction.influence.status", gip.core.PROTOCOL_VERSION, null, null,
+        \\{"projectShard":"phase10a-influence-status-smoke","includeRecords":true,"limit":1}
+    );
+    defer populated.deinit(allocator);
+    try std.testing.expectEqual(gip.core.ProtocolStatus.ok, populated.status);
+    const json = populated.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"totalRecords\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"acceptedRecords\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"rejectedRecords\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"malformedLines\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"corpus.ask\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"rule.evaluate\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"wrong_answer\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"suppressionCandidateCount\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verifierCandidateCount\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"negativeKnowledgeCandidateCount\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"futureBehaviorCandidateCount\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"limitHit\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"records\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"corpusMutation\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"packMutation\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"negativeKnowledgeMutation\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"commandsExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verifiersExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"nonAuthorizing\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"treatedAsProof\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"globalPromotion\":false") != null);
+
+    var filtered = try gip.dispatch.dispatch(allocator, "correction.influence.status", gip.core.PROTOCOL_VERSION, null, null,
+        \\{"projectShard":"phase10a-influence-status-smoke","operationKind":"rule.evaluate"}
+    );
+    defer filtered.deinit(allocator);
+    try std.testing.expectEqual(gip.core.ProtocolStatus.ok, filtered.status);
+    try std.testing.expect(filtered.result_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, filtered.result_json.?, "\"totalRecords\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filtered.result_json.?, "\"acceptedRecords\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filtered.result_json.?, "\"rejectedRecords\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filtered.result_json.?, "\"records\"") == null);
+}
+
 test "gip rule evaluate emits bounded non-authorizing candidates obligations unknowns" {
     const allocator = std.testing.allocator;
 

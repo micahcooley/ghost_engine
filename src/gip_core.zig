@@ -50,6 +50,7 @@ pub const RequestKind = enum {
     @"correction.review",
     @"correction.reviewed.list",
     @"correction.reviewed.get",
+    @"correction.influence.status",
     @"correction.list",
     @"correction.get",
     @"correction.apply",
@@ -233,6 +234,7 @@ pub const CapabilityName = enum {
     @"correction.review",
     @"correction.reviewed.list",
     @"correction.reviewed.get",
+    @"correction.influence.status",
     @"correction.list",
     @"correction.get",
     @"correction.apply",
@@ -286,7 +288,7 @@ pub const CapabilityEntry = struct {
     policy: CapabilityPolicy,
 };
 
-pub fn defaultCapabilities() [50]CapabilityEntry {
+pub fn defaultCapabilities() [51]CapabilityEntry {
     return .{
         .{ .capability = .@"artifact.read", .policy = .allowed },
         .{ .capability = .@"artifact.list", .policy = .allowed },
@@ -308,6 +310,7 @@ pub fn defaultCapabilities() [50]CapabilityEntry {
         .{ .capability = .@"correction.review", .policy = .allowed },
         .{ .capability = .@"correction.reviewed.list", .policy = .allowed },
         .{ .capability = .@"correction.reviewed.get", .policy = .allowed },
+        .{ .capability = .@"correction.influence.status", .policy = .allowed },
         .{ .capability = .@"correction.list", .policy = .allowed },
         .{ .capability = .@"correction.get", .policy = .allowed },
         .{ .capability = .@"correction.apply", .policy = .denied },
@@ -493,6 +496,7 @@ pub const IMPLEMENTED_KINDS = [_]RequestKind{
     .@"correction.review",
     .@"correction.reviewed.list",
     .@"correction.reviewed.get",
+    .@"correction.influence.status",
     .@"correction.list",
     .@"correction.get",
     .@"negative_knowledge.candidate.list",
@@ -561,6 +565,7 @@ test "default capabilities have safe defaults" {
     // reviewed correction inspection should be read-only/allowed.
     try std.testing.expectEqual(CapabilityPolicy.allowed, capabilityPolicy(&caps, .@"correction.reviewed.list").?);
     try std.testing.expectEqual(CapabilityPolicy.allowed, capabilityPolicy(&caps, .@"correction.reviewed.get").?);
+    try std.testing.expectEqual(CapabilityPolicy.allowed, capabilityPolicy(&caps, .@"correction.influence.status").?);
     // project.autopsy should be allowed (read-only)
     try std.testing.expectEqual(CapabilityPolicy.allowed, capabilityPolicy(&caps, .@"project.autopsy").?);
     // context.autopsy should be allowed (read-only/non-authorizing)

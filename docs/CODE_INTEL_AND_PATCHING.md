@@ -87,6 +87,8 @@ Phase 9B extends that same accepted-reviewed-correction influence to `rule.evalu
 
 Phase 9A adds read-only inspection of reviewed correction records through GIP `correction.reviewed.list` and `correction.reviewed.get`. Both operations read only the same project shard's append-only `corrections/reviewed_corrections.jsonl`, preserve append order, tolerate a missing file as empty/not-found state, report malformed JSONL lines as warnings and telemetry, and never rewrite, compact, delete, accept, reject, promote, execute commands, execute verifiers, mutate corpus, mutate packs, or mutate negative knowledge. Inspection results are operator visibility only: `readOnly:true`, mutation flags are false, `nonAuthorizing:true`, and `treatedAsProof:false`.
 
+Phase 10A adds read-only correction influence status through GIP `correction.influence.status`. The status operation summarizes the same shard-local reviewed correction JSONL without rewriting it: total/accepted/rejected records, operation-kind counts, correction-type counts, conservative influence-kind counts, candidate counts for suppression, stronger evidence, verifier/checks, negative knowledge, corpus update, pack guidance, rule update, and future behavior, plus malformed-line warnings and capacity telemetry. `includeRecords` can echo bounded records for inspection, but the default omits records. The summary is operator diagnostics only: it is not proof, not evidence, not support, not a review decision, not a corpus or pack update, not negative knowledge, not global promotion, and it never executes commands or verifiers.
+
 Minimal binary-only ingest/apply/ask loop:
 
 ```bash

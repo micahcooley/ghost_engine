@@ -160,6 +160,85 @@ pub const ReviewedCorrectionRecord = struct {
     }
 };
 
+pub const CountEntry = struct {
+    name: []u8,
+    count: usize,
+
+    pub fn deinit(self: *CountEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        self.* = undefined;
+    }
+};
+
+pub const InfluenceStatusRecord = struct {
+    id: []u8,
+    decision: Decision,
+    operation_kind: []u8,
+    correction_type: []u8,
+    record_json: []u8,
+    line_number: usize,
+
+    pub fn deinit(self: *InfluenceStatusRecord, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.operation_kind);
+        allocator.free(self.correction_type);
+        allocator.free(self.record_json);
+        self.* = undefined;
+    }
+};
+
+pub const InfluenceStatusSummary = struct {
+    total_records: usize = 0,
+    accepted_records: usize = 0,
+    rejected_records: usize = 0,
+    malformed_lines: usize = 0,
+    operation_kind_counts: []CountEntry = &.{},
+    correction_type_counts: []CountEntry = &.{},
+    influence_kind_counts: []CountEntry = &.{},
+    suppression_candidate_count: usize = 0,
+    stronger_evidence_candidate_count: usize = 0,
+    verifier_candidate_count: usize = 0,
+    negative_knowledge_candidate_count: usize = 0,
+    corpus_update_candidate_count: usize = 0,
+    pack_guidance_candidate_count: usize = 0,
+    rule_update_candidate_count: usize = 0,
+    future_behavior_candidate_count: usize = 0,
+
+    pub fn deinit(self: *InfluenceStatusSummary, allocator: std.mem.Allocator) void {
+        for (self.operation_kind_counts) |*entry| entry.deinit(allocator);
+        allocator.free(self.operation_kind_counts);
+        for (self.correction_type_counts) |*entry| entry.deinit(allocator);
+        allocator.free(self.correction_type_counts);
+        for (self.influence_kind_counts) |*entry| entry.deinit(allocator);
+        allocator.free(self.influence_kind_counts);
+        self.* = undefined;
+    }
+};
+
+pub const InfluenceStatusResult = struct {
+    allocator: std.mem.Allocator,
+    summary: InfluenceStatusSummary,
+    warnings: []ReadWarning,
+    records: []InfluenceStatusRecord,
+    records_read: usize,
+    returned_count: usize,
+    truncated: bool,
+    max_records_hit: bool,
+    limit_hit: bool,
+    limit: usize,
+    include_records: bool,
+    missing_file: bool,
+
+    pub fn deinit(self: *InfluenceStatusResult) void {
+        self.summary.deinit(self.allocator);
+        for (self.warnings) |*warning| warning.deinit(self.allocator);
+        self.allocator.free(self.warnings);
+        for (self.records) |*record| record.deinit(self.allocator);
+        self.allocator.free(self.records);
+        self.* = undefined;
+    }
+};
+
 pub const InspectionResult = struct {
     allocator: std.mem.Allocator,
     records: []ReviewedCorrectionRecord,
@@ -239,6 +318,19 @@ pub fn getReviewedCorrection(allocator: std.mem.Allocator, project_shard: []cons
     const path = try reviewedCorrectionsPath(allocator, project_shard);
     defer allocator.free(path);
     return getReviewedCorrectionAtPath(allocator, path, project_shard, id, max_records);
+}
+
+pub fn correctionInfluenceStatus(
+    allocator: std.mem.Allocator,
+    project_shard: []const u8,
+    operation_kind_filter: ?[]const u8,
+    include_records: bool,
+    limit: usize,
+    max_records: usize,
+) !InfluenceStatusResult {
+    const path = try reviewedCorrectionsPath(allocator, project_shard);
+    defer allocator.free(path);
+    return correctionInfluenceStatusAtPath(allocator, path, project_shard, operation_kind_filter, include_records, limit, max_records);
 }
 
 pub fn listReviewedCorrectionsAtPath(
@@ -358,6 +450,148 @@ pub fn listReviewedCorrectionsAtPath(
         .limit_hit = limit_hit,
         .offset = offset,
         .limit = limit,
+        .missing_file = false,
+    };
+}
+
+pub fn correctionInfluenceStatusAtPath(
+    allocator: std.mem.Allocator,
+    abs_path: []const u8,
+    project_shard: []const u8,
+    operation_kind_filter: ?[]const u8,
+    include_records: bool,
+    limit: usize,
+    max_records: usize,
+) !InfluenceStatusResult {
+    var operation_counts = std.StringArrayHashMap(usize).init(allocator);
+    defer deinitCountMap(allocator, &operation_counts);
+    var correction_counts = std.StringArrayHashMap(usize).init(allocator);
+    defer deinitCountMap(allocator, &correction_counts);
+    var influence_counts = std.StringArrayHashMap(usize).init(allocator);
+    defer deinitCountMap(allocator, &influence_counts);
+    var records = std.ArrayList(InfluenceStatusRecord).init(allocator);
+    errdefer {
+        for (records.items) |*record| record.deinit(allocator);
+        records.deinit();
+    }
+    var warnings = std.ArrayList(ReadWarning).init(allocator);
+    errdefer {
+        for (warnings.items) |*warning| warning.deinit(allocator);
+        warnings.deinit();
+    }
+
+    const data = readReviewedFileBounded(allocator, abs_path, &warnings) catch |err| switch (err) {
+        error.FileNotFound => return .{
+            .allocator = allocator,
+            .summary = .{
+                .operation_kind_counts = try emptyCountEntries(allocator),
+                .correction_type_counts = try emptyCountEntries(allocator),
+                .influence_kind_counts = try emptyCountEntries(allocator),
+            },
+            .warnings = try warnings.toOwnedSlice(),
+            .records = try records.toOwnedSlice(),
+            .records_read = 0,
+            .returned_count = 0,
+            .truncated = false,
+            .max_records_hit = false,
+            .limit_hit = false,
+            .limit = limit,
+            .include_records = include_records,
+            .missing_file = true,
+        },
+        else => return err,
+    };
+    defer allocator.free(data.bytes);
+
+    var summary = InfluenceStatusSummary{};
+    var records_read: usize = 0;
+    var returned_count: usize = 0;
+    var max_records_hit = false;
+    var limit_hit = false;
+    var line_number: usize = 1;
+    var lines = std.mem.splitScalar(u8, data.bytes, '\n');
+    while (lines.next()) |raw_line| : (line_number += 1) {
+        const line = std.mem.trim(u8, raw_line, " \r\t");
+        if (line.len == 0) continue;
+        if (records_read >= max_records) {
+            max_records_hit = true;
+            try appendReadWarning(allocator, &warnings, line_number, "reviewed correction record read limit reached");
+            break;
+        }
+        records_read += 1;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch {
+            summary.malformed_lines += 1;
+            try appendReadWarning(allocator, &warnings, line_number, "malformed reviewed correction JSONL line ignored");
+            continue;
+        };
+        defer parsed.deinit();
+
+        const obj = valueObject(parsed.value) orelse {
+            summary.malformed_lines += 1;
+            try appendReadWarning(allocator, &warnings, line_number, "reviewed correction line was not an object");
+            continue;
+        };
+        const record_shard = getStr(obj, "projectShard") orelse {
+            summary.malformed_lines += 1;
+            try appendReadWarning(allocator, &warnings, line_number, "reviewed correction missing projectShard");
+            continue;
+        };
+        if (!std.mem.eql(u8, record_shard, project_shard)) continue;
+        const decision_text = getStr(obj, "reviewDecision") orelse {
+            summary.malformed_lines += 1;
+            try appendReadWarning(allocator, &warnings, line_number, "reviewed correction missing reviewDecision");
+            continue;
+        };
+        const decision = Decision.parse(decision_text) orelse {
+            summary.malformed_lines += 1;
+            try appendReadWarning(allocator, &warnings, line_number, "reviewed correction had invalid reviewDecision");
+            continue;
+        };
+        const operation_kind = recordOperationKind(obj) orelse "unknown";
+        if (operation_kind_filter) |filter| {
+            if (!std.mem.eql(u8, operation_kind, filter)) continue;
+        }
+        const correction_type = recordCorrectionType(obj) orelse "unknown";
+
+        summary.total_records += 1;
+        switch (decision) {
+            .accepted => summary.accepted_records += 1,
+            .rejected => summary.rejected_records += 1,
+        }
+        try incrementCount(allocator, &operation_counts, operation_kind);
+        try incrementCount(allocator, &correction_counts, correction_type);
+
+        if (decision == .accepted) {
+            try summarizeAcceptedInfluence(allocator, obj, operation_kind, correction_type, &summary, &influence_counts);
+        }
+
+        if (include_records) {
+            if (returned_count < limit) {
+                try records.append(try duplicateInfluenceStatusRecord(allocator, obj, line, decision, operation_kind, correction_type, line_number));
+                returned_count += 1;
+            } else {
+                limit_hit = true;
+            }
+        }
+    }
+
+    summary.operation_kind_counts = try countEntriesFromMap(allocator, &operation_counts);
+    summary.correction_type_counts = try countEntriesFromMap(allocator, &correction_counts);
+    summary.influence_kind_counts = try countEntriesFromMap(allocator, &influence_counts);
+
+    return .{
+        .allocator = allocator,
+        .summary = summary,
+        .warnings = try warnings.toOwnedSlice(),
+        .records = try records.toOwnedSlice(),
+        .records_read = records_read,
+        .returned_count = returned_count,
+        .truncated = data.truncated,
+        .max_records_hit = max_records_hit or data.truncated,
+        .limit_hit = limit_hit,
+        .limit = limit,
+        .include_records = include_records,
         .missing_file = false,
     };
 }
@@ -588,10 +822,128 @@ fn duplicateReviewedRecord(allocator: std.mem.Allocator, obj: std.json.ObjectMap
     };
 }
 
+fn duplicateInfluenceStatusRecord(allocator: std.mem.Allocator, obj: std.json.ObjectMap, line: []const u8, decision: Decision, operation_kind: []const u8, correction_type: []const u8, line_number: usize) !InfluenceStatusRecord {
+    const id = getStr(obj, "id") orelse return error.InvalidReviewedCorrectionRecord;
+    return .{
+        .id = try allocator.dupe(u8, id),
+        .decision = decision,
+        .operation_kind = try allocator.dupe(u8, operation_kind),
+        .correction_type = try allocator.dupe(u8, correction_type),
+        .record_json = try allocator.dupe(u8, line),
+        .line_number = line_number,
+    };
+}
+
 fn recordOperationKind(obj: std.json.ObjectMap) ?[]const u8 {
     const candidate_value = obj.get("correctionCandidate") orelse return null;
     const candidate = valueObject(candidate_value) orelse return null;
     return getStr(candidate, "originalOperationKind") orelse getStr(candidate, "operationKind");
+}
+
+fn recordCorrectionType(obj: std.json.ObjectMap) ?[]const u8 {
+    const candidate_value = obj.get("correctionCandidate") orelse return null;
+    const candidate = valueObject(candidate_value) orelse return null;
+    return getStr(candidate, "correctionType");
+}
+
+fn summarizeAcceptedInfluence(
+    allocator: std.mem.Allocator,
+    obj: std.json.ObjectMap,
+    operation_kind: []const u8,
+    correction_type: []const u8,
+    summary: *InfluenceStatusSummary,
+    influence_counts: *std.StringArrayHashMap(usize),
+) !void {
+    if (futureBehaviorCandidatePresent(obj)) summary.future_behavior_candidate_count += 1;
+
+    const accepted_outputs = obj.get("acceptedLearningOutputs");
+    var saw_learning_output = false;
+    if (accepted_outputs) |value| {
+        if (value == .array) {
+            for (value.array.items) |item| {
+                const output = valueObject(item) orelse continue;
+                const kind = getStr(output, "kind") orelse continue;
+                saw_learning_output = true;
+                try incrementCount(allocator, influence_counts, kind);
+                countLearningOutputKind(summary, kind);
+            }
+        }
+    }
+
+    const candidate_value = obj.get("correctionCandidate");
+    const candidate = if (candidate_value) |value| valueObject(value) else null;
+    const disputed = if (candidate) |c| c.get("disputedOutput") else null;
+    const disputed_obj = if (disputed) |value| valueObject(value) else null;
+    const disputed_kind = if (disputed_obj) |d| getStr(d, "kind") else null;
+
+    if (influenceKindForCorrection(operation_kind, correction_type, disputed_kind)) |kind| {
+        try incrementCount(allocator, influence_counts, @tagName(kind));
+        countInfluenceKind(summary, kind, operation_kind, correction_type);
+    } else if (!saw_learning_output) {
+        try incrementCount(allocator, influence_counts, "unknownInfluenceCandidate");
+    }
+}
+
+fn futureBehaviorCandidatePresent(obj: std.json.ObjectMap) bool {
+    const value = obj.get("futureBehaviorCandidate") orelse return false;
+    return value != .null;
+}
+
+fn countLearningOutputKind(summary: *InfluenceStatusSummary, kind: []const u8) void {
+    if (std.mem.eql(u8, kind, "negative_knowledge_candidate")) summary.negative_knowledge_candidate_count += 1;
+    if (std.mem.eql(u8, kind, "corpus_update_candidate")) summary.corpus_update_candidate_count += 1;
+    if (std.mem.eql(u8, kind, "pack_guidance_candidate")) summary.pack_guidance_candidate_count += 1;
+    if (std.mem.eql(u8, kind, "verifier_check_candidate")) summary.verifier_candidate_count += 1;
+    if (std.mem.eql(u8, kind, "follow_up_evidence_request")) summary.stronger_evidence_candidate_count += 1;
+    if (std.mem.eql(u8, kind, "rule_update_candidate")) summary.rule_update_candidate_count += 1;
+}
+
+fn countInfluenceKind(summary: *InfluenceStatusSummary, kind: InfluenceKind, operation_kind: []const u8, correction_type: []const u8) void {
+    switch (kind) {
+        .suppress_exact_repeat => summary.suppression_candidate_count += 1,
+        .require_stronger_evidence => summary.stronger_evidence_candidate_count += 1,
+        .require_verifier_candidate => summary.verifier_candidate_count += 1,
+        .propose_negative_knowledge => summary.negative_knowledge_candidate_count += 1,
+        .propose_corpus_update => summary.corpus_update_candidate_count += 1,
+        .propose_pack_guidance => summary.pack_guidance_candidate_count += 1,
+        .warning, .penalty => {},
+    }
+    if (std.mem.eql(u8, operation_kind, "rule.evaluate") and std.mem.eql(u8, correction_type, "misleading_rule")) {
+        summary.rule_update_candidate_count += 1;
+    }
+}
+
+fn incrementCount(allocator: std.mem.Allocator, map: *std.StringArrayHashMap(usize), name: []const u8) !void {
+    if (map.getEntry(name)) |entry| {
+        entry.value_ptr.* += 1;
+        return;
+    }
+    const owned = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned);
+    try map.put(owned, 1);
+}
+
+fn countEntriesFromMap(allocator: std.mem.Allocator, map: *std.StringArrayHashMap(usize)) ![]CountEntry {
+    var entries = try allocator.alloc(CountEntry, map.count());
+    errdefer allocator.free(entries);
+    var idx: usize = 0;
+    var it = map.iterator();
+    while (it.next()) |entry| : (idx += 1) {
+        entries[idx] = .{
+            .name = try allocator.dupe(u8, entry.key_ptr.*),
+            .count = entry.value_ptr.*,
+        };
+    }
+    return entries;
+}
+
+fn emptyCountEntries(allocator: std.mem.Allocator) ![]CountEntry {
+    return allocator.alloc(CountEntry, 0);
+}
+
+fn deinitCountMap(allocator: std.mem.Allocator, map: *std.StringArrayHashMap(usize)) void {
+    for (map.keys()) |key| allocator.free(key);
+    map.deinit();
 }
 
 fn influenceFromRecord(allocator: std.mem.Allocator, obj: std.json.ObjectMap, line_number: usize) !?AcceptedCorrectionInfluence {
@@ -979,4 +1331,165 @@ test "read accepted reviewed correction influences supports rule evaluate same s
     var other_shard = try readAcceptedInfluencesAtPath(allocator, path, "other-phase9b", MAX_REVIEWED_CORRECTIONS_READ);
     defer other_shard.deinit();
     try std.testing.expectEqual(@as(usize, 0), other_shard.influences.len);
+}
+
+test "correction influence status no file returns zero read-only summary" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const path = try std.fs.path.join(allocator, &.{ root, "missing.jsonl" });
+    defer allocator.free(path);
+
+    var status = try correctionInfluenceStatusAtPath(allocator, path, "phase10a", null, false, 0, MAX_REVIEWED_CORRECTIONS_READ);
+    defer status.deinit();
+    try std.testing.expect(status.missing_file);
+    try std.testing.expectEqual(@as(usize, 0), status.summary.total_records);
+    try std.testing.expectEqual(@as(usize, 0), status.summary.accepted_records);
+    try std.testing.expectEqual(@as(usize, 0), status.summary.rejected_records);
+    try std.testing.expectEqual(@as(usize, 0), status.summary.malformed_lines);
+    try std.testing.expectEqual(@as(usize, 0), status.records.len);
+    try std.testing.expect(!status.include_records);
+}
+
+test "correction influence status counts accepted rejected malformed and operation filter" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const path = try std.fs.path.join(allocator, &.{ root, "reviewed-status.jsonl" });
+    defer allocator.free(path);
+
+    const accepted_corpus = try renderRecordJson(allocator, .{
+        .project_shard = "phase10a",
+        .decision = .accepted,
+        .reviewer_note = "accepted wrong answer",
+        .rejected_reason = null,
+        .source_candidate_id = "correction:candidate:corpus",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:corpus","originalOperationKind":"corpus.ask","originalRequestSummary":"retention enabled","disputedOutput":{"kind":"answerDraft","summary":"Retention policy is enabled"},"userCorrection":"suppress this repeated answer","correctionType":"wrong_answer"}
+        ,
+        .accepted_learning_outputs_json = "[{\"kind\":\"verifier_check_candidate\"},{\"kind\":\"negative_knowledge_candidate\"}]",
+    }, 0);
+    defer allocator.free(accepted_corpus);
+    const rejected_rule = try renderRecordJson(allocator, .{
+        .project_shard = "phase10a",
+        .decision = .rejected,
+        .reviewer_note = "rejected rule issue",
+        .rejected_reason = "not repeated",
+        .source_candidate_id = "correction:candidate:rule-rejected",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:rule-rejected","originalOperationKind":"rule.evaluate","disputedOutput":{"kind":"rule_candidate","summary":"deploy candidate"},"userCorrection":"ignore","correctionType":"misleading_rule"}
+        ,
+        .accepted_learning_outputs_json = "[]",
+    }, accepted_corpus.len + 1);
+    defer allocator.free(rejected_rule);
+    const accepted_rule = try renderRecordJson(allocator, .{
+        .project_shard = "phase10a",
+        .decision = .accepted,
+        .reviewer_note = "accepted misleading rule",
+        .rejected_reason = null,
+        .source_candidate_id = "correction:candidate:rule",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:rule","originalOperationKind":"rule.evaluate","originalRequestSummary":"deploy rule","disputedOutput":{"kind":"rule_candidate","summary":"deploy candidate"},"userCorrection":"this rule candidate is misleading","correctionType":"misleading_rule"}
+        ,
+        .accepted_learning_outputs_json = "[{\"kind\":\"pack_guidance_candidate\"}]",
+    }, accepted_corpus.len + rejected_rule.len + 2);
+    defer allocator.free(accepted_rule);
+
+    var file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll("{malformed json}\n");
+    try file.writeAll(accepted_corpus);
+    try file.writeAll("\n");
+    try file.writeAll(rejected_rule);
+    try file.writeAll("\n");
+    try file.writeAll(accepted_rule);
+    try file.writeAll("\n");
+
+    var status = try correctionInfluenceStatusAtPath(allocator, path, "phase10a", null, true, 2, MAX_REVIEWED_CORRECTIONS_READ);
+    defer status.deinit();
+    try std.testing.expectEqual(@as(usize, 3), status.summary.total_records);
+    try std.testing.expectEqual(@as(usize, 2), status.summary.accepted_records);
+    try std.testing.expectEqual(@as(usize, 1), status.summary.rejected_records);
+    try std.testing.expectEqual(@as(usize, 1), status.summary.malformed_lines);
+    try std.testing.expectEqual(@as(usize, 2), status.records.len);
+    try std.testing.expect(status.limit_hit);
+    try std.testing.expectEqual(@as(usize, 1), countFor(status.summary.operation_kind_counts, "corpus.ask"));
+    try std.testing.expectEqual(@as(usize, 2), countFor(status.summary.operation_kind_counts, "rule.evaluate"));
+    try std.testing.expectEqual(@as(usize, 1), countFor(status.summary.correction_type_counts, "wrong_answer"));
+    try std.testing.expectEqual(@as(usize, 2), countFor(status.summary.correction_type_counts, "misleading_rule"));
+    try std.testing.expectEqual(@as(usize, 1), status.summary.suppression_candidate_count);
+    try std.testing.expectEqual(@as(usize, 1), status.summary.negative_knowledge_candidate_count);
+    try std.testing.expectEqual(@as(usize, 1), status.summary.verifier_candidate_count);
+    try std.testing.expectEqual(@as(usize, 1), status.summary.pack_guidance_candidate_count);
+    try std.testing.expectEqual(@as(usize, 1), status.summary.rule_update_candidate_count);
+    try std.testing.expectEqual(@as(usize, 2), status.summary.future_behavior_candidate_count);
+
+    var filtered = try correctionInfluenceStatusAtPath(allocator, path, "phase10a", "rule.evaluate", false, 0, MAX_REVIEWED_CORRECTIONS_READ);
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(usize, 2), filtered.summary.total_records);
+    try std.testing.expectEqual(@as(usize, 1), filtered.summary.accepted_records);
+    try std.testing.expectEqual(@as(usize, 1), filtered.summary.rejected_records);
+    try std.testing.expectEqual(@as(usize, 0), filtered.records.len);
+    try std.testing.expectEqual(@as(usize, 0), countFor(filtered.summary.operation_kind_counts, "corpus.ask"));
+}
+
+test "correction influence status reports max record cap" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const path = try std.fs.path.join(allocator, &.{ root, "reviewed-cap.jsonl" });
+    defer allocator.free(path);
+
+    const first = try renderRecordJson(allocator, .{
+        .project_shard = "phase10a-cap",
+        .decision = .accepted,
+        .reviewer_note = "accepted",
+        .rejected_reason = null,
+        .source_candidate_id = "correction:candidate:first",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:first","originalOperationKind":"corpus.ask","disputedOutput":{"kind":"answerDraft","summary":"first"},"userCorrection":"first","correctionType":"wrong_answer"}
+        ,
+        .accepted_learning_outputs_json = "[]",
+    }, 0);
+    defer allocator.free(first);
+    const second = try renderRecordJson(allocator, .{
+        .project_shard = "phase10a-cap",
+        .decision = .accepted,
+        .reviewer_note = "accepted",
+        .rejected_reason = null,
+        .source_candidate_id = "correction:candidate:second",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:second","originalOperationKind":"corpus.ask","disputedOutput":{"kind":"answerDraft","summary":"second"},"userCorrection":"second","correctionType":"wrong_answer"}
+        ,
+        .accepted_learning_outputs_json = "[]",
+    }, first.len + 1);
+    defer allocator.free(second);
+
+    var file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(first);
+    try file.writeAll("\n");
+    try file.writeAll(second);
+    try file.writeAll("\n");
+
+    var status = try correctionInfluenceStatusAtPath(allocator, path, "phase10a-cap", null, true, 8, 1);
+    defer status.deinit();
+    try std.testing.expect(status.max_records_hit);
+    try std.testing.expectEqual(@as(usize, 1), status.records_read);
+    try std.testing.expectEqual(@as(usize, 1), status.summary.total_records);
+    try std.testing.expectEqual(@as(usize, 1), status.records.len);
+    try std.testing.expect(status.warnings.len > 0);
+}
+
+fn countFor(entries: []const CountEntry, name: []const u8) usize {
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.name, name)) return entry.count;
+    }
+    return 0;
 }
