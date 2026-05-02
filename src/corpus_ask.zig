@@ -3,6 +3,7 @@ const abstractions = @import("abstractions.zig");
 const corpus_ingest = @import("corpus_ingest.zig");
 const corpus_sketch = @import("corpus_sketch.zig");
 const correction_review = @import("correction_review.zig");
+const negative_knowledge_review = @import("negative_knowledge_review.zig");
 const shards = @import("shards.zig");
 
 pub const DEFAULT_MAX_RESULTS: usize = 3;
@@ -166,6 +167,16 @@ pub const AcceptedCorrectionWarning = struct {
     }
 };
 
+pub const AcceptedNegativeKnowledgeWarning = struct {
+    line_number: usize,
+    reason: []u8,
+
+    fn deinit(self: *AcceptedNegativeKnowledgeWarning, allocator: std.mem.Allocator) void {
+        allocator.free(self.reason);
+        self.* = undefined;
+    }
+};
+
 pub const CorrectionInfluence = struct {
     id: []u8,
     source_reviewed_correction_id: []u8,
@@ -195,10 +206,12 @@ pub const FutureBehaviorCandidate = struct {
     kind: []u8,
     status: []u8,
     reason: []u8,
-    source_reviewed_correction_id: []u8,
+    source_reviewed_correction_id: ?[]u8 = null,
+    source_reviewed_negative_knowledge_id: ?[]u8 = null,
     candidate_only: bool = true,
     non_authorizing: bool = true,
     treated_as_proof: bool = false,
+    used_as_evidence: bool = false,
     global_promotion: bool = false,
     mutation_flags: CorrectionMutationFlags = .{},
 
@@ -206,7 +219,36 @@ pub const FutureBehaviorCandidate = struct {
         allocator.free(self.kind);
         allocator.free(self.status);
         allocator.free(self.reason);
-        allocator.free(self.source_reviewed_correction_id);
+        if (self.source_reviewed_correction_id) |value| allocator.free(value);
+        if (self.source_reviewed_negative_knowledge_id) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const NegativeKnowledgeInfluence = struct {
+    id: []u8,
+    source_reviewed_negative_knowledge_id: []u8,
+    influence_kind: []u8,
+    applies_to: []u8,
+    matched_pattern: []u8,
+    matched_output_id: ?[]u8 = null,
+    matched_rule_id: ?[]u8 = null,
+    reason: []u8,
+    non_authorizing: bool = true,
+    treated_as_proof: bool = false,
+    used_as_evidence: bool = false,
+    global_promotion: bool = false,
+    mutation_flags: CorrectionMutationFlags = .{},
+
+    fn deinit(self: *NegativeKnowledgeInfluence, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.source_reviewed_negative_knowledge_id);
+        allocator.free(self.influence_kind);
+        allocator.free(self.applies_to);
+        allocator.free(self.matched_pattern);
+        if (self.matched_output_id) |value| allocator.free(value);
+        if (self.matched_rule_id) |value| allocator.free(value);
+        allocator.free(self.reason);
         self.* = undefined;
     }
 };
@@ -220,6 +262,22 @@ pub const InfluenceTelemetry = struct {
     matched_influences: usize = 0,
     answer_suppressed: bool = false,
     bounded_read_truncated: bool = false,
+};
+
+pub const NegativeKnowledgeTelemetry = struct {
+    records_read: usize = 0,
+    accepted_records: usize = 0,
+    rejected_records: usize = 0,
+    malformed_lines: usize = 0,
+    warnings: usize = 0,
+    influences_loaded: usize = 0,
+    influences_applied: usize = 0,
+    answer_suppressed: bool = false,
+    truncated: bool = false,
+    same_shard_only: bool = true,
+    mutation_performed: bool = false,
+    commands_executed: bool = false,
+    verifiers_executed: bool = false,
 };
 
 pub const CapacityTelemetry = struct {
@@ -273,6 +331,8 @@ pub const Result = struct {
     similar_candidates: []SimilarCandidate = &.{},
     accepted_correction_warnings: []AcceptedCorrectionWarning = &.{},
     correction_influences: []CorrectionInfluence = &.{},
+    accepted_negative_knowledge_warnings: []AcceptedNegativeKnowledgeWarning = &.{},
+    negative_knowledge_influences: []NegativeKnowledgeInfluence = &.{},
     future_behavior_candidates: []FutureBehaviorCandidate = &.{},
     safety_flags: SafetyFlags = .{},
     corpus_entries_considered: usize = 0,
@@ -281,6 +341,7 @@ pub const Result = struct {
     require_citations: bool = true,
     capacity_telemetry: CapacityTelemetry = .{},
     influence_telemetry: InfluenceTelemetry = .{},
+    negative_knowledge_telemetry: NegativeKnowledgeTelemetry = .{},
 
     pub fn deinit(self: *Result) void {
         self.allocator.free(self.state);
@@ -303,6 +364,10 @@ pub const Result = struct {
         self.allocator.free(self.accepted_correction_warnings);
         for (self.correction_influences) |*item| item.deinit(self.allocator);
         self.allocator.free(self.correction_influences);
+        for (self.accepted_negative_knowledge_warnings) |*item| item.deinit(self.allocator);
+        self.allocator.free(self.accepted_negative_knowledge_warnings);
+        for (self.negative_knowledge_influences) |*item| item.deinit(self.allocator);
+        self.allocator.free(self.negative_knowledge_influences);
         for (self.future_behavior_candidates) |*item| item.deinit(self.allocator);
         self.allocator.free(self.future_behavior_candidates);
         self.* = undefined;
@@ -425,6 +490,8 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     defer paths.deinit();
     var reviewed = try correction_review.readAcceptedInfluences(allocator, paths.metadata.id);
     defer reviewed.deinit();
+    var reviewed_nk = try negative_knowledge_review.readAcceptedInfluences(allocator, paths.metadata.id);
+    defer reviewed_nk.deinit();
 
     const entries = try corpus_ingest.collectLiveScanEntries(allocator, &paths);
     defer corpus_ingest.deinitIndexedEntries(allocator, entries);
@@ -436,12 +503,14 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         var result = try unknownResult(allocator, options, &paths, .no_corpus_available, "no live shard corpus is available for this ask request", entries.len, max_results, max_snippet);
         errdefer result.deinit();
         try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
+        try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
         return result;
     }
     if (tokens.tokens.len == 0) {
         var result = try unknownResult(allocator, options, &paths, .insufficient_evidence, "question did not contain enough searchable terms", entries.len, max_results, max_snippet);
         errdefer result.deinit();
         try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
+        try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
         return result;
     }
 
@@ -520,6 +589,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         result.capacity_telemetry = telemetry;
         try applyCapacityDisclosure(allocator, &result);
         try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
+        try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
         return result;
     }
 
@@ -548,6 +618,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         result.learning_candidates = try singleLearningCandidate(allocator, "correction_candidate", "review the conflicting corpus items and propose a correction or corpus update through an explicit lifecycle", "conflicting evidence cannot authorize an answer");
         try applyCapacityDisclosure(allocator, &result);
         try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
+        try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
         return result;
     }
 
@@ -565,6 +636,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         result.capacity_telemetry = telemetry;
         try applyCapacityDisclosure(allocator, &result);
         try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
+        try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
         return result;
     }
 
@@ -589,6 +661,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     result.candidate_followups = try singleFollowup(allocator, "verifier_check_candidate", "review the cited corpus evidence before treating this answer as supported");
     try applyCapacityDisclosure(allocator, &result);
     try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
+    try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
     return result;
 }
 
@@ -621,6 +694,39 @@ fn applyAcceptedCorrectionInfluence(allocator: std.mem.Allocator, result: *Resul
     }
 }
 
+fn applyAcceptedNegativeKnowledgeInfluence(allocator: std.mem.Allocator, result: *Result, reviewed: *const negative_knowledge_review.ReadResult) !void {
+    result.negative_knowledge_telemetry.records_read = reviewed.records_read;
+    result.negative_knowledge_telemetry.accepted_records = reviewed.accepted_records;
+    result.negative_knowledge_telemetry.rejected_records = reviewed.rejected_records;
+    result.negative_knowledge_telemetry.malformed_lines = reviewed.malformed_lines;
+    result.negative_knowledge_telemetry.warnings = reviewed.warnings.len;
+    result.negative_knowledge_telemetry.influences_loaded = reviewed.influences.len;
+    result.negative_knowledge_telemetry.truncated = reviewed.truncated;
+    result.accepted_negative_knowledge_warnings = try cloneNegativeKnowledgeWarnings(allocator, reviewed.warnings);
+
+    for (reviewed.influences) |influence| {
+        if (!std.mem.eql(u8, influence.applies_to, "corpus.ask")) continue;
+        if (!negativeKnowledgeMatchesResult(result, influence)) continue;
+        try appendNegativeKnowledgeInfluence(allocator, result, influence);
+        result.negative_knowledge_telemetry.influences_applied += 1;
+        switch (influence.influence_kind) {
+            .suppress_exact_repeat => try suppressAnswerDraftForNegativeKnowledge(allocator, result, influence),
+            .require_stronger_evidence => {
+                try appendNegativeKnowledgeFutureBehaviorCandidate(allocator, result, "corpus_update_candidate", "accepted reviewed negative knowledge requires stronger exact evidence before this corpus pattern can be relied on", influence.source_reviewed_negative_knowledge_id);
+                try appendCandidateFollowup(allocator, result, "evidence_to_collect", "accepted reviewed negative knowledge says this pattern needs stronger exact evidence before support changes");
+            },
+            .require_verifier_candidate => {
+                try appendNegativeKnowledgeFutureBehaviorCandidate(allocator, result, "verifier_check_candidate", "accepted reviewed negative knowledge requires an explicit verifier/check candidate; no verifier was executed", influence.source_reviewed_negative_knowledge_id);
+                try appendCandidateFollowup(allocator, result, "verifier_check_candidate", "accepted reviewed negative knowledge requires explicit checking before this pattern can support an answer");
+            },
+            .propose_pack_guidance => try appendNegativeKnowledgeFutureBehaviorCandidate(allocator, result, "pack_guidance_candidate", "accepted reviewed negative knowledge proposes pack guidance candidate only", influence.source_reviewed_negative_knowledge_id),
+            .propose_corpus_update => try appendNegativeKnowledgeFutureBehaviorCandidate(allocator, result, "corpus_update_candidate", "accepted reviewed negative knowledge proposes corpus update candidate only", influence.source_reviewed_negative_knowledge_id),
+            .propose_rule_update => try appendNegativeKnowledgeFutureBehaviorCandidate(allocator, result, "rule_update_candidate", "accepted reviewed negative knowledge proposes rule update candidate only", influence.source_reviewed_negative_knowledge_id),
+            .warning, .penalty => {},
+        }
+    }
+}
+
 fn influenceMatchesResult(result: *const Result, influence: correction_review.AcceptedCorrectionInfluence) bool {
     if (!std.mem.eql(u8, influence.operation_kind, "corpus.ask")) return false;
     if (containsIgnoreCase(result.question, influence.matched_pattern)) return true;
@@ -633,6 +739,36 @@ fn influenceMatchesResult(result: *const Result, influence: correction_review.Ac
         if (containsIgnoreCase(evidence.path, influence.matched_pattern)) return true;
     }
     return false;
+}
+
+fn negativeKnowledgeMatchesResult(result: *const Result, influence: negative_knowledge_review.AcceptedNegativeKnowledgeInfluence) bool {
+    if (textMatchesNegativeKnowledge(result.question, influence)) return true;
+    if (result.answer_draft) |answer| {
+        if (textMatchesNegativeKnowledge(answer, influence)) return true;
+    }
+    for (result.evidence_used) |evidence| {
+        if (textMatchesNegativeKnowledge(evidence.snippet, influence)) return true;
+        if (textMatchesNegativeKnowledge(evidence.item_id, influence)) return true;
+        if (textMatchesNegativeKnowledge(evidence.path, influence)) return true;
+        if (textMatchesNegativeKnowledge(evidence.source_path, influence)) return true;
+        if (textMatchesNegativeKnowledge(evidence.source_label, influence)) return true;
+        if (textMatchesNegativeKnowledge(evidence.content_hash, influence)) return true;
+    }
+    return false;
+}
+
+fn textMatchesNegativeKnowledge(text: []const u8, influence: negative_knowledge_review.AcceptedNegativeKnowledgeInfluence) bool {
+    if (text.len == 0 or influence.matched_pattern.len == 0) return false;
+    if (std.mem.eql(u8, text, influence.matched_pattern)) return true;
+    if (containsIgnoreCase(text, influence.matched_pattern)) return true;
+    if (containsIgnoreCase(influence.matched_pattern, text)) return true;
+    return fingerprintMatches(text, influence.pattern_fingerprint);
+}
+
+fn fingerprintMatches(text: []const u8, fingerprint: []const u8) bool {
+    var buf: [32]u8 = undefined;
+    const own = std.fmt.bufPrint(&buf, "fnv1a64:{x:0>16}", .{std.hash.Fnv1a_64.hash(text)}) catch return false;
+    return std.mem.eql(u8, own, fingerprint);
 }
 
 fn suppressAnswerDraft(allocator: std.mem.Allocator, result: *Result, influence: correction_review.AcceptedCorrectionInfluence) !void {
@@ -651,8 +787,41 @@ fn suppressAnswerDraft(allocator: std.mem.Allocator, result: *Result, influence:
     try appendFutureBehaviorCandidate(allocator, result, "verifier_check_candidate", "suppressed exact repeated bad answer pattern requires explicit verifier/check candidate", influence.source_reviewed_correction_id);
 }
 
+fn suppressAnswerDraftForNegativeKnowledge(allocator: std.mem.Allocator, result: *Result, influence: negative_knowledge_review.AcceptedNegativeKnowledgeInfluence) !void {
+    if (result.answer_draft) |answer| {
+        allocator.free(answer);
+        result.answer_draft = null;
+    }
+    result.status = .unknown;
+    allocator.free(result.state);
+    result.state = try allocator.dupe(u8, "unresolved");
+    allocator.free(result.permission);
+    result.permission = try allocator.dupe(u8, "unresolved");
+    result.negative_knowledge_telemetry.answer_suppressed = true;
+    try appendUnknownToResult(allocator, result, .insufficient_evidence, "accepted reviewed negative knowledge suppressed an exact repeated known-bad answer pattern; stronger evidence or explicit verification is required");
+    try appendCandidateFollowup(allocator, result, "verifier_check_candidate", "accepted reviewed negative knowledge requires an explicit check candidate before this repeated pattern can support an answer");
+    try appendNegativeKnowledgeFutureBehaviorCandidate(allocator, result, "verifier_check_candidate", "suppressed exact repeated known-bad answer pattern requires explicit verifier/check candidate", influence.source_reviewed_negative_knowledge_id);
+}
+
 fn cloneWarnings(allocator: std.mem.Allocator, warnings: []const correction_review.ReadWarning) ![]AcceptedCorrectionWarning {
     var out = try allocator.alloc(AcceptedCorrectionWarning, warnings.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |*item| item.deinit(allocator);
+        allocator.free(out);
+    }
+    for (warnings, 0..) |warning, idx| {
+        out[idx] = .{
+            .line_number = warning.line_number,
+            .reason = try allocator.dupe(u8, warning.reason),
+        };
+        built += 1;
+    }
+    return out;
+}
+
+fn cloneNegativeKnowledgeWarnings(allocator: std.mem.Allocator, warnings: []const negative_knowledge_review.ReadWarning) ![]AcceptedNegativeKnowledgeWarning {
+    var out = try allocator.alloc(AcceptedNegativeKnowledgeWarning, warnings.len);
     var built: usize = 0;
     errdefer {
         for (out[0..built]) |*item| item.deinit(allocator);
@@ -685,6 +854,24 @@ fn appendCorrectionInfluence(allocator: std.mem.Allocator, result: *Result, infl
     result.correction_influences = out;
 }
 
+fn appendNegativeKnowledgeInfluence(allocator: std.mem.Allocator, result: *Result, influence: negative_knowledge_review.AcceptedNegativeKnowledgeInfluence) !void {
+    const old = result.negative_knowledge_influences;
+    var out = try allocator.alloc(NegativeKnowledgeInfluence, old.len + 1);
+    @memcpy(out[0..old.len], old);
+    out[old.len] = .{
+        .id = try allocator.dupe(u8, influence.id),
+        .source_reviewed_negative_knowledge_id = try allocator.dupe(u8, influence.source_reviewed_negative_knowledge_id),
+        .influence_kind = try allocator.dupe(u8, @tagName(influence.influence_kind)),
+        .applies_to = try allocator.dupe(u8, influence.applies_to),
+        .matched_pattern = try allocator.dupe(u8, influence.matched_pattern),
+        .matched_output_id = if (influence.matched_output_id) |value| try allocator.dupe(u8, value) else null,
+        .matched_rule_id = if (influence.matched_rule_id) |value| try allocator.dupe(u8, value) else null,
+        .reason = try allocator.dupe(u8, influence.reason),
+    };
+    allocator.free(old);
+    result.negative_knowledge_influences = out;
+}
+
 fn appendFutureBehaviorCandidate(allocator: std.mem.Allocator, result: *Result, kind: []const u8, reason: []const u8, source_id: []const u8) !void {
     const old = result.future_behavior_candidates;
     var out = try allocator.alloc(FutureBehaviorCandidate, old.len + 1);
@@ -694,6 +881,20 @@ fn appendFutureBehaviorCandidate(allocator: std.mem.Allocator, result: *Result, 
         .status = try allocator.dupe(u8, "candidate"),
         .reason = try allocator.dupe(u8, reason),
         .source_reviewed_correction_id = try allocator.dupe(u8, source_id),
+    };
+    allocator.free(old);
+    result.future_behavior_candidates = out;
+}
+
+fn appendNegativeKnowledgeFutureBehaviorCandidate(allocator: std.mem.Allocator, result: *Result, kind: []const u8, reason: []const u8, source_id: []const u8) !void {
+    const old = result.future_behavior_candidates;
+    var out = try allocator.alloc(FutureBehaviorCandidate, old.len + 1);
+    @memcpy(out[0..old.len], old);
+    out[old.len] = .{
+        .kind = try allocator.dupe(u8, kind),
+        .status = try allocator.dupe(u8, "candidate"),
+        .reason = try allocator.dupe(u8, reason),
+        .source_reviewed_negative_knowledge_id = try allocator.dupe(u8, source_id),
     };
     allocator.free(old);
     result.future_behavior_candidates = out;
@@ -1362,6 +1563,34 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
         try writeCorrectionMutationFlags(w, influence.mutation_flags);
         try w.writeAll("}");
     }
+    try w.writeAll("],\"acceptedNegativeKnowledgeWarnings\":[");
+    for (result.accepted_negative_knowledge_warnings, 0..) |warning, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{");
+        try w.print("\"lineNumber\":{d}", .{warning.line_number});
+        try writeField(w, "reason", warning.reason, false);
+        try w.writeAll("}");
+    }
+    try w.writeAll("],\"negativeKnowledgeInfluences\":[");
+    for (result.negative_knowledge_influences, 0..) |influence, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{");
+        try writeField(w, "id", influence.id, true);
+        try writeField(w, "sourceReviewedNegativeKnowledgeId", influence.source_reviewed_negative_knowledge_id, false);
+        try writeField(w, "influenceKind", influence.influence_kind, false);
+        try writeField(w, "appliesTo", influence.applies_to, false);
+        try writeField(w, "matchedPattern", influence.matched_pattern, false);
+        if (influence.matched_output_id) |value| try writeField(w, "matchedOutputId", value, false);
+        if (influence.matched_rule_id) |value| try writeField(w, "matchedRuleId", value, false);
+        try writeField(w, "reason", influence.reason, false);
+        try w.print(",\"nonAuthorizing\":{s}", .{if (influence.non_authorizing) "true" else "false"});
+        try w.print(",\"treatedAsProof\":{s}", .{if (influence.treated_as_proof) "true" else "false"});
+        try w.print(",\"usedAsEvidence\":{s}", .{if (influence.used_as_evidence) "true" else "false"});
+        try w.print(",\"globalPromotion\":{s}", .{if (influence.global_promotion) "true" else "false"});
+        try w.writeAll(",\"mutationFlags\":");
+        try writeCorrectionMutationFlags(w, influence.mutation_flags);
+        try w.writeAll("}");
+    }
     try w.writeAll("],\"futureBehaviorCandidates\":[");
     for (result.future_behavior_candidates, 0..) |candidate, idx| {
         if (idx != 0) try w.writeByte(',');
@@ -1369,10 +1598,12 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
         try writeField(w, "kind", candidate.kind, true);
         try writeField(w, "status", candidate.status, false);
         try writeField(w, "reason", candidate.reason, false);
-        try writeField(w, "sourceReviewedCorrectionId", candidate.source_reviewed_correction_id, false);
+        if (candidate.source_reviewed_correction_id) |value| try writeField(w, "sourceReviewedCorrectionId", value, false);
+        if (candidate.source_reviewed_negative_knowledge_id) |value| try writeField(w, "sourceReviewedNegativeKnowledgeId", value, false);
         try w.print(",\"candidateOnly\":{s}", .{if (candidate.candidate_only) "true" else "false"});
         try w.print(",\"nonAuthorizing\":{s}", .{if (candidate.non_authorizing) "true" else "false"});
         try w.print(",\"treatedAsProof\":{s}", .{if (candidate.treated_as_proof) "true" else "false"});
+        try w.print(",\"usedAsEvidence\":{s}", .{if (candidate.used_as_evidence) "true" else "false"});
         try w.print(",\"globalPromotion\":{s}", .{if (candidate.global_promotion) "true" else "false"});
         try w.writeAll(",\"mutationFlags\":");
         try writeCorrectionMutationFlags(w, candidate.mutation_flags);
@@ -1380,6 +1611,8 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
     }
     try w.writeAll("],\"influenceTelemetry\":");
     try writeInfluenceTelemetry(w, result.influence_telemetry);
+    try w.writeAll(",\"negativeKnowledgeTelemetry\":");
+    try writeNegativeKnowledgeTelemetry(w, result.negative_knowledge_telemetry);
     try w.writeAll(",\"unknowns\":[");
     for (result.unknowns, 0..) |unknown, idx| {
         if (idx != 0) try w.writeByte(',');
@@ -1470,6 +1703,32 @@ fn writeInfluenceTelemetry(w: anytype, telemetry: InfluenceTelemetry) !void {
     try w.print(",\"answerSuppressed\":{s},\"boundedReadTruncated\":{s}", .{
         if (telemetry.answer_suppressed) "true" else "false",
         if (telemetry.bounded_read_truncated) "true" else "false",
+    });
+    try w.writeAll("}");
+}
+
+fn writeNegativeKnowledgeTelemetry(w: anytype, telemetry: NegativeKnowledgeTelemetry) !void {
+    try w.writeAll("{");
+    try w.print("\"recordsRead\":{d},\"acceptedRecords\":{d},\"rejectedRecords\":{d}", .{
+        telemetry.records_read,
+        telemetry.accepted_records,
+        telemetry.rejected_records,
+    });
+    try w.print(",\"malformedLines\":{d},\"warnings\":{d},\"influencesLoaded\":{d},\"influencesApplied\":{d}", .{
+        telemetry.malformed_lines,
+        telemetry.warnings,
+        telemetry.influences_loaded,
+        telemetry.influences_applied,
+    });
+    try w.print(",\"answerSuppressed\":{s},\"truncated\":{s},\"sameShardOnly\":{s}", .{
+        if (telemetry.answer_suppressed) "true" else "false",
+        if (telemetry.truncated) "true" else "false",
+        if (telemetry.same_shard_only) "true" else "false",
+    });
+    try w.print(",\"mutationPerformed\":{s},\"commandsExecuted\":{s},\"verifiersExecuted\":{s}", .{
+        if (telemetry.mutation_performed) "true" else "false",
+        if (telemetry.commands_executed) "true" else "false",
+        if (telemetry.verifiers_executed) "true" else "false",
     });
     try w.writeAll("}");
 }

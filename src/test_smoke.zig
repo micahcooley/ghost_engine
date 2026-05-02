@@ -37,6 +37,7 @@ const correction_hooks = @import("correction_hooks.zig");
 const correction_candidates = @import("correction_candidates.zig");
 const correction_review = @import("correction_review.zig");
 const negative_knowledge = @import("negative_knowledge.zig");
+const negative_knowledge_review = @import("negative_knowledge_review.zig");
 const support_routing = @import("support_routing.zig");
 const repo_hygiene = @import("repo_hygiene.zig");
 const hypothesis_core = @import("hypothesis_core.zig");
@@ -5819,6 +5820,113 @@ test "corpus ask applies accepted reviewed correction influence without proof or
     try std.testing.expectEqual(@as(usize, 0), other.correction_influences.len);
 }
 
+test "corpus ask applies accepted reviewed negative knowledge influence without proof or mutation" {
+    const allocator = std.testing.allocator;
+    const project_shard = "corpus-ask-accepted-nk-test";
+    var corpus_fixture = std.testing.tmpDir(.{});
+    defer corpus_fixture.cleanup();
+    const corpus_root = try corpus_fixture.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+    try writeFixtureFile(corpus_fixture.dir, "runtime.md",
+        \\# Runtime Retention
+        \\Retention policy is enabled for event audit logs.
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.root_abs_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.root_abs_path) catch {};
+
+    var stage_result = try corpus_ingest.stage(allocator, .{
+        .corpus_path = corpus_root,
+        .project_shard = project_shard,
+        .trust_class = .project,
+        .source_label = "ask-nk-corpus",
+    });
+    defer stage_result.deinit();
+    try corpus_ingest.applyStaged(allocator, &project_paths);
+
+    var rejected = try negative_knowledge_review.reviewAndAppend(allocator, .{
+        .project_shard = project_shard,
+        .decision = .rejected,
+        .reviewer_note = "rejected by test",
+        .rejected_reason = "not enough detail",
+        .source_candidate_id = "nk:candidate:rejected",
+        .negative_knowledge_candidate_json =
+        \\{"id":"nk:candidate:rejected","operationKind":"corpus.ask","condition":"Retention policy is enabled","suppression_rule":"Retention policy is enabled","nonAuthorizing":true}
+        ,
+    });
+    defer rejected.deinit();
+    var accepted = try negative_knowledge_review.reviewAndAppend(allocator, .{
+        .project_shard = project_shard,
+        .decision = .accepted,
+        .reviewer_note = "accepted by test",
+        .rejected_reason = null,
+        .source_candidate_id = "nk:candidate:accepted",
+        .negative_knowledge_candidate_json =
+        \\{"id":"nk:candidate:accepted","operationKind":"corpus.ask","kind":"failed_hypothesis","condition":"Retention policy is enabled","suppression_rule":"Retention policy is enabled","nonAuthorizing":true}
+        ,
+    });
+    defer accepted.deinit();
+
+    const reviewed_path = try negative_knowledge_review.reviewedNegativeKnowledgePath(allocator, project_shard);
+    defer allocator.free(reviewed_path);
+    var file = try std.fs.openFileAbsolute(reviewed_path, .{ .mode = .write_only });
+    defer file.close();
+    try file.seekFromEnd(0);
+    try file.writeAll("{malformed reviewed negative knowledge line}\n");
+
+    var result = try corpus_ask.ask(allocator, .{
+        .question = "is retention policy enabled",
+        .project_shard = project_shard,
+        .max_snippet_bytes = 96,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(corpus_ask.AskStatus.unknown, result.status);
+    try std.testing.expect(result.answer_draft == null);
+    try std.testing.expectEqual(@as(usize, 1), result.negative_knowledge_influences.len);
+    try std.testing.expectEqualStrings("suppress_exact_repeat", result.negative_knowledge_influences[0].influence_kind);
+    try std.testing.expect(result.negative_knowledge_influences[0].non_authorizing);
+    try std.testing.expect(!result.negative_knowledge_influences[0].treated_as_proof);
+    try std.testing.expect(!result.negative_knowledge_influences[0].used_as_evidence);
+    try std.testing.expect(!result.negative_knowledge_influences[0].global_promotion);
+    try std.testing.expectEqual(@as(usize, 1), result.negative_knowledge_telemetry.influences_applied);
+    try std.testing.expectEqual(@as(usize, 1), result.negative_knowledge_telemetry.malformed_lines);
+    try std.testing.expect(result.negative_knowledge_telemetry.answer_suppressed);
+    try std.testing.expect(result.future_behavior_candidates.len >= 1);
+    try std.testing.expect(result.future_behavior_candidates[0].source_reviewed_negative_knowledge_id != null);
+    try std.testing.expect(!result.future_behavior_candidates[0].treated_as_proof);
+    try std.testing.expect(!result.future_behavior_candidates[0].used_as_evidence);
+    try std.testing.expectEqual(@as(usize, 1), result.evidence_used.len);
+    try std.testing.expect(std.mem.indexOf(u8, result.evidence_used[0].item_id, "reviewed-negative-knowledge:") == null);
+    try std.testing.expect(!result.safety_flags.corpus_mutation);
+    try std.testing.expect(!result.safety_flags.pack_mutation);
+    try std.testing.expect(!result.safety_flags.negative_knowledge_mutation);
+    try std.testing.expect(!result.safety_flags.commands_executed);
+    try std.testing.expect(!result.safety_flags.verifiers_executed);
+
+    const rendered = try corpus_ask.renderJson(allocator, &result);
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"acceptedNegativeKnowledgeWarnings\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"negativeKnowledgeInfluences\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"negativeKnowledgeTelemetry\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "malformed reviewed negative knowledge JSONL line ignored") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"usedAsEvidence\":true") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"treatedAsProof\":true") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"corpusMutation\":true") == null);
+
+    var other = try corpus_ask.ask(allocator, .{
+        .question = "is retention policy enabled",
+        .project_shard = "corpus-ask-accepted-nk-other-shard",
+    });
+    defer other.deinit();
+    try std.testing.expectEqual(@as(usize, 0), other.negative_knowledge_influences.len);
+}
+
 test "corpus ask correction influence emits warning candidates for missing evidence and repeated patterns" {
     const allocator = std.testing.allocator;
     const project_shard = "corpus-ask-correction-candidates-test";
@@ -6596,6 +6704,103 @@ test "gip rule evaluate applies accepted reviewed corrections as non-authorizing
     try std.testing.expect(std.mem.indexOf(u8, json, "\"mutationPerformed\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"commandsExecuted\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"verifiersExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"treatedAsProof\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"proofDischarged\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"supportGranted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"evidenceUsed\"") == null);
+}
+
+test "gip rule evaluate applies accepted reviewed negative knowledge as non-authorizing influence" {
+    const allocator = std.testing.allocator;
+    const shard_id = "phase11b-rule-nk-influence-smoke";
+    const other_shard_id = "phase11b-other-rule-nk-influence-smoke";
+    var metadata = try shards.resolveProjectMetadata(allocator, shard_id);
+    defer metadata.deinit();
+    var paths = try shards.resolvePaths(allocator, metadata.metadata);
+    defer paths.deinit();
+    var other_metadata = try shards.resolveProjectMetadata(allocator, other_shard_id);
+    defer other_metadata.deinit();
+    var other_paths = try shards.resolvePaths(allocator, other_metadata.metadata);
+    defer other_paths.deinit();
+    try deleteTreeIfExistsAbsolute(paths.root_abs_path);
+    try deleteTreeIfExistsAbsolute(other_paths.root_abs_path);
+    defer deleteTreeIfExistsAbsolute(paths.root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(other_paths.root_abs_path) catch {};
+
+    var suppress = try negative_knowledge_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .accepted,
+        .reviewer_note = "accepted suppress rule output",
+        .rejected_reason = null,
+        .source_candidate_id = "nk:candidate:suppress-rule",
+        .negative_knowledge_candidate_json =
+        \\{"id":"nk:candidate:suppress-rule","operationKind":"rule.evaluate","kind":"forbidden_project_pattern","condition":"exact bad rule output","matchedOutputId":"check.bad","suppression_rule":"exact bad rule output","nonAuthorizing":true}
+        ,
+    });
+    defer suppress.deinit();
+    var verifier = try negative_knowledge_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .accepted,
+        .reviewer_note = "accepted verifier requirement",
+        .rejected_reason = null,
+        .source_candidate_id = "nk:candidate:verifier-rule",
+        .negative_knowledge_candidate_json =
+        \\{"id":"nk:candidate:verifier-rule","operationKind":"rule.evaluate","kind":"unsafe_verifier_candidate","condition":"unsafe candidate needs explicit verifier","matchedOutputId":"check.unsafe","verifier_requirement":"explicit verifier candidate","nonAuthorizing":true}
+        ,
+    });
+    defer verifier.deinit();
+    var rejected = try negative_knowledge_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .rejected,
+        .reviewer_note = "rejected must not influence",
+        .rejected_reason = "not accepted",
+        .source_candidate_id = "nk:candidate:rejected-rule",
+        .negative_knowledge_candidate_json =
+        \\{"id":"nk:candidate:rejected-rule","operationKind":"rule.evaluate","condition":"rejected candidate","matchedOutputId":"check.rejected","verifier_requirement":"do not apply","nonAuthorizing":true}
+        ,
+    });
+    defer rejected.deinit();
+    var other = try negative_knowledge_review.reviewAndAppend(allocator, .{
+        .project_shard = other_shard_id,
+        .decision = .accepted,
+        .reviewer_note = "other shard",
+        .rejected_reason = null,
+        .source_candidate_id = "nk:candidate:other-rule",
+        .negative_knowledge_candidate_json =
+        \\{"id":"nk:candidate:other-rule","operationKind":"rule.evaluate","condition":"other shard candidate","matchedOutputId":"check.other","verifier_requirement":"do not apply","nonAuthorizing":true}
+        ,
+    });
+    defer other.deinit();
+
+    const reviewed_path = try negative_knowledge_review.reviewedNegativeKnowledgePath(allocator, shard_id);
+    defer allocator.free(reviewed_path);
+    var file = try std.fs.openFileAbsolute(reviewed_path, .{ .mode = .write_only });
+    defer file.close();
+    try file.seekFromEnd(0);
+    try file.writeAll("{malformed reviewed negative knowledge line}\n");
+
+    var result = try gip.dispatch.dispatch(allocator, "rule.evaluate", gip.core.PROTOCOL_VERSION, null, null,
+        \\{"projectShard":"phase11b-rule-nk-influence-smoke","facts":[{"subject":"change","predicate":"touches","object":"runtime"}],"rules":[{"id":"rule.bad","name":"Bad","when":{"all":[{"subject":"change","predicate":"touches","object":"runtime"}]},"emit":[{"kind":"check_candidate","id":"check.bad","summary":"exact bad rule output"}]},{"id":"rule.unsafe","name":"Unsafe","when":{"all":[{"subject":"change","predicate":"touches","object":"runtime"}]},"emit":[{"kind":"check_candidate","id":"check.unsafe","summary":"unsafe candidate needs explicit verifier"}]},{"id":"rule.rejected","name":"Rejected","when":{"all":[{"subject":"change","predicate":"touches","object":"runtime"}]},"emit":[{"kind":"check_candidate","id":"check.rejected","summary":"rejected candidate remains emitted"}]}]}
+    );
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(gip.core.ProtocolStatus.ok, result.status);
+    const json = result.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"acceptedNegativeKnowledgeWarnings\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "malformed reviewed negative knowledge JSONL line ignored") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"negativeKnowledgeInfluences\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"matchedOutputId\":\"check.bad\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"matchedOutputId\":\"check.unsafe\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"id\":\"check.bad\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"id\":\"check.rejected\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "phase11b-other-rule-nk-influence-smoke") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"sourceReviewedNegativeKnowledgeId\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"verifier_check_candidate\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"outputsSuppressed\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"sameShardOnly\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"mutationPerformed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"commandsExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verifiersExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"usedAsEvidence\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"treatedAsProof\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"proofDischarged\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"supportGranted\":false") != null);

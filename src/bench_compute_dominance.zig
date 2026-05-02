@@ -95,6 +95,7 @@ pub fn runSuite(allocator: std.mem.Allocator) !SuiteResult {
     try results.append(try runCorpusNoCorpus(allocator));
     try results.append(try runCorpusExactPhrase(allocator));
     try results.append(try runCorpusAcceptedCorrectionInfluence(allocator));
+    try results.append(try runCorpusAcceptedNegativeKnowledgeInfluence(allocator));
     try results.append(try runCorpusWeakUnrelated(allocator));
     try results.append(try runCorpusConflicting(allocator));
     try results.append(try runCorpusApproximateOnly(allocator));
@@ -102,6 +103,7 @@ pub fn runSuite(allocator: std.mem.Allocator) !SuiteResult {
     try results.append(try runCorpusLargerBounded(allocator));
     try results.append(try runRuleSimpleFires(allocator));
     try results.append(try runRuleAcceptedCorrectionInfluence(allocator));
+    try results.append(try runRuleAcceptedNegativeKnowledgeInfluence(allocator));
     try results.append(try runRuleNonMatching(allocator));
     try results.append(try runRuleMultipleDeterministic(allocator));
     try results.append(try runRuleMaxFiredRulesCap(allocator));
@@ -190,6 +192,42 @@ fn runCorpusAcceptedCorrectionInfluence(allocator: std.mem.Allocator) !ScenarioR
     out.success = result.status == .unknown and result.answer_draft == null and result.evidence_used.len == 1 and result.correction_influences.len == 1 and
         result.future_behavior_candidates.len >= 1 and result.influence_telemetry.answer_suppressed and !result.safety_flags.corpus_mutation and
         !result.safety_flags.pack_mutation and !result.safety_flags.negative_knowledge_mutation and !result.safety_flags.commands_executed and !result.safety_flags.verifiers_executed;
+    out.setup_corpus_mutation = true;
+    return out;
+}
+
+fn runCorpusAcceptedNegativeKnowledgeInfluence(allocator: std.mem.Allocator) !ScenarioResult {
+    const shard_id = "bench-compute-dominance-nk-corpus-influence";
+    try cleanProjectShard(allocator, shard_id);
+    defer cleanProjectShard(allocator, shard_id) catch {};
+    try withCorpus(allocator, shard_id, &.{
+        .{ .path = "runtime.md", .body = "Retention policy is enabled for event audit logs.\nOperators cite exact local evidence before drafting.\n" },
+    });
+
+    var reviewed = try negative_knowledge_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .accepted,
+        .reviewer_note = "benchmark accepted reviewed NK corpus pattern",
+        .rejected_reason = null,
+        .source_candidate_id = "nk:candidate:bench-corpus-influence",
+        .negative_knowledge_candidate_json =
+        \\{"id":"nk:candidate:bench-corpus-influence","operationKind":"corpus.ask","kind":"failed_hypothesis","condition":"Retention policy is enabled","suppression_rule":"Retention policy is enabled","nonAuthorizing":true}
+        ,
+    });
+    defer reviewed.deinit();
+
+    const question = "is retention policy enabled";
+    const started = std.time.nanoTimestamp();
+    var result = try corpus_ask.ask(allocator, .{ .question = question, .project_shard = shard_id, .max_snippet_bytes = 96 });
+    defer result.deinit();
+
+    var out = scenarioFromAsk("corpus.ask/accepted_negative_knowledge_exact_suppression", question.len, elapsedNs(started), &result);
+    out.success = result.status == .unknown and result.answer_draft == null and result.evidence_used.len == 1 and
+        result.negative_knowledge_influences.len == 1 and result.future_behavior_candidates.len >= 1 and
+        result.negative_knowledge_telemetry.answer_suppressed and result.negative_knowledge_telemetry.influences_applied == 1 and
+        !result.negative_knowledge_telemetry.mutation_performed and !result.safety_flags.corpus_mutation and !result.safety_flags.pack_mutation and
+        !result.safety_flags.negative_knowledge_mutation and !result.safety_flags.commands_executed and !result.safety_flags.verifiers_executed;
+    out.correction_influence_count = result.negative_knowledge_influences.len;
     out.setup_corpus_mutation = true;
     return out;
 }
@@ -338,6 +376,44 @@ fn runRuleAcceptedCorrectionInfluence(allocator: std.mem.Allocator) !ScenarioRes
         result.future_behavior_candidates.len >= 1 and result.influence_telemetry.outputs_suppressed == 1 and
         !result.influence_telemetry.mutation_performed and !result.safety_flags.corpus_mutation and !result.safety_flags.pack_mutation and
         !result.safety_flags.negative_knowledge_mutation and !result.safety_flags.commands_executed and !result.safety_flags.verifiers_executed;
+    return out;
+}
+
+fn runRuleAcceptedNegativeKnowledgeInfluence(allocator: std.mem.Allocator) !ScenarioResult {
+    const shard_id = "bench-compute-dominance-rule-nk-influence";
+    try cleanProjectShard(allocator, shard_id);
+    defer cleanProjectShard(allocator, shard_id) catch {};
+
+    var reviewed = try negative_knowledge_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .accepted,
+        .reviewer_note = "benchmark accepted reviewed NK rule output",
+        .rejected_reason = null,
+        .source_candidate_id = "nk:candidate:bench-rule-influence",
+        .negative_knowledge_candidate_json =
+        \\{"id":"nk:candidate:bench-rule-influence","operationKind":"rule.evaluate","kind":"overbroad_rule","condition":"run explicit test verifier","matchedOutputId":"check:nk-bench","ruleUpdateCandidate":"tighten the rule","nonAuthorizing":true}
+        ,
+    });
+    defer reviewed.deinit();
+
+    const facts = [_]rule_reasoning.Fact{.{ .subject = "build", .predicate = "has", .object = "test" }};
+    const outputs = [_]rule_reasoning.RuleOutput{.{ .kind = .check_candidate, .id = "check:nk-bench", .summary = "run explicit test verifier" }};
+    const rules = [_]rule_reasoning.Rule{.{ .id = "rule:nk-bench", .name = "bench nk rule", .all = &.{.{ .subject = "build", .predicate = "has", .object = "test" }}, .outputs = &outputs }};
+
+    var read = try negative_knowledge_review.readAcceptedInfluences(allocator, shard_id);
+    defer read.deinit();
+    const started = std.time.nanoTimestamp();
+    var result = try rule_reasoning.evaluate(allocator, .{ .facts = &facts, .rules = &rules, .project_shard = shard_id });
+    defer result.deinit();
+    try rule_reasoning.applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &read);
+
+    var out = scenarioFromRule("rule.evaluate/accepted_negative_knowledge_rule_update_candidate", estimateRuleInputBytes(&facts, &rules), elapsedNs(started), &result);
+    out.success = result.fired_rules.len == 1 and result.outputs_emitted == 1 and result.negative_knowledge_influences.len == 1 and
+        result.future_behavior_candidates.len >= 1 and result.negative_knowledge_telemetry.influences_applied == 1 and
+        result.negative_knowledge_telemetry.outputs_suppressed == 0 and !result.negative_knowledge_telemetry.mutation_performed and
+        !result.safety_flags.corpus_mutation and !result.safety_flags.pack_mutation and !result.safety_flags.negative_knowledge_mutation and
+        !result.safety_flags.commands_executed and !result.safety_flags.verifiers_executed;
+    out.correction_influence_count = result.negative_knowledge_influences.len;
     return out;
 }
 
@@ -910,7 +986,7 @@ fn scenarioFromAsk(name: []const u8, input_bytes: usize, duration_ns: u64, resul
         .unknown_count = result.unknowns.len,
         .capacity_warning_count = capacityWarningsFromAsk(result.capacity_telemetry),
         .learning_candidate_count = result.learning_candidates.len,
-        .correction_influence_count = result.correction_influences.len,
+        .correction_influence_count = result.correction_influences.len + result.negative_knowledge_influences.len,
         .future_behavior_candidate_count = result.future_behavior_candidates.len,
         .commands_executed = if (result.safety_flags.commands_executed) 1 else 0,
         .verifiers_executed = if (result.safety_flags.verifiers_executed) 1 else 0,
@@ -933,7 +1009,7 @@ fn scenarioFromRule(name: []const u8, input_bytes: usize, duration_ns: u64, resu
         .unknown_count = result.emitted_unknowns.len,
         .capacity_warning_count = capacityWarningsFromRule(result.capacity_telemetry),
         .correction_candidate_count = result.emitted_candidates.len,
-        .correction_influence_count = result.correction_influences.len,
+        .correction_influence_count = result.correction_influences.len + result.negative_knowledge_influences.len,
         .future_behavior_candidate_count = result.future_behavior_candidates.len,
         .commands_executed = if (result.safety_flags.commands_executed) 1 else 0,
         .verifiers_executed = if (result.safety_flags.verifiers_executed) 1 else 0,
@@ -1182,7 +1258,7 @@ test "compute dominance report is generated with required scenarios and safety f
     var suite = try runSuite(allocator);
     defer suite.deinit();
 
-    try std.testing.expectEqual(@as(usize, 27), suite.scenarios.len);
+    try std.testing.expectEqual(@as(usize, 29), suite.scenarios.len);
     try std.testing.expect(allScenariosPassed(suite.scenarios));
 
     const json = try renderJsonReport(allocator, suite);
@@ -1194,7 +1270,9 @@ test "compute dominance report is generated with required scenarios and safety f
     try std.testing.expect(std.mem.indexOf(u8, json, "\"suite\":\"ghost_compute_dominance\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"corpus.ask/no_corpus\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"corpus.ask/accepted_correction_exact_suppression\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"corpus.ask/accepted_negative_knowledge_exact_suppression\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"rule.evaluate/accepted_correction_exact_suppression\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"rule.evaluate/accepted_negative_knowledge_rule_update_candidate\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"corpus.ask/larger_bounded_corpus_deterministic_ranking\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"correctionInfluenceCount\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"rule.evaluate/recursive_invalid_output_rejection\"") != null);

@@ -451,6 +451,9 @@ fn dispatchRuleEvaluate(allocator: std.mem.Allocator, request_body: ?[]const u8)
         var reviewed = try correction_review.readAcceptedInfluences(allocator, project_shard);
         defer reviewed.deinit();
         try rule_reasoning.applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
+        var reviewed_nk = try negative_knowledge_review.readAcceptedInfluences(allocator, project_shard);
+        defer reviewed_nk.deinit();
+        try rule_reasoning.applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
     }
 
     const rendered = try rule_reasoning.renderJson(allocator, &result);
