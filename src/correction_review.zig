@@ -19,6 +19,27 @@ pub const Decision = enum {
     }
 };
 
+pub const DecisionFilter = enum {
+    accepted,
+    rejected,
+    all,
+
+    pub fn parse(text: []const u8) ?DecisionFilter {
+        if (std.mem.eql(u8, text, "accepted")) return .accepted;
+        if (std.mem.eql(u8, text, "rejected")) return .rejected;
+        if (std.mem.eql(u8, text, "all")) return .all;
+        return null;
+    }
+
+    pub fn matches(self: DecisionFilter, decision: Decision) bool {
+        return switch (self) {
+            .accepted => decision == .accepted,
+            .rejected => decision == .rejected,
+            .all => true,
+        };
+    }
+};
+
 pub const Request = struct {
     project_shard: []const u8,
     decision: Decision,
@@ -124,6 +145,62 @@ pub const ReadResult = struct {
     }
 };
 
+pub const ReviewedCorrectionRecord = struct {
+    id: []u8,
+    decision: Decision,
+    operation_kind: []u8,
+    record_json: []u8,
+    line_number: usize,
+
+    pub fn deinit(self: *ReviewedCorrectionRecord, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.operation_kind);
+        allocator.free(self.record_json);
+        self.* = undefined;
+    }
+};
+
+pub const InspectionResult = struct {
+    allocator: std.mem.Allocator,
+    records: []ReviewedCorrectionRecord,
+    warnings: []ReadWarning,
+    total_read: usize,
+    returned_count: usize,
+    malformed_lines: usize,
+    truncated: bool,
+    max_records_hit: bool,
+    limit_hit: bool,
+    offset: usize,
+    limit: usize,
+    missing_file: bool,
+
+    pub fn deinit(self: *InspectionResult) void {
+        for (self.records) |*record| record.deinit(self.allocator);
+        self.allocator.free(self.records);
+        for (self.warnings) |*warning| warning.deinit(self.allocator);
+        self.allocator.free(self.warnings);
+        self.* = undefined;
+    }
+};
+
+pub const GetResult = struct {
+    allocator: std.mem.Allocator,
+    record: ?ReviewedCorrectionRecord,
+    warnings: []ReadWarning,
+    total_read: usize,
+    malformed_lines: usize,
+    truncated: bool,
+    max_records_hit: bool,
+    missing_file: bool,
+
+    pub fn deinit(self: *GetResult) void {
+        if (self.record) |*record| record.deinit(self.allocator);
+        for (self.warnings) |*warning| warning.deinit(self.allocator);
+        self.allocator.free(self.warnings);
+        self.* = undefined;
+    }
+};
+
 pub fn reviewedCorrectionsPath(allocator: std.mem.Allocator, project_shard: []const u8) ![]u8 {
     var metadata = try shards.resolveProjectMetadata(allocator, project_shard);
     defer metadata.deinit();
@@ -142,6 +219,243 @@ pub fn readAcceptedInfluences(allocator: std.mem.Allocator, project_shard: []con
     const path = try reviewedCorrectionsPath(allocator, project_shard);
     defer allocator.free(path);
     return readAcceptedInfluencesAtPath(allocator, path, project_shard, MAX_REVIEWED_CORRECTIONS_READ);
+}
+
+pub fn listReviewedCorrections(
+    allocator: std.mem.Allocator,
+    project_shard: []const u8,
+    decision_filter: DecisionFilter,
+    operation_kind_filter: ?[]const u8,
+    limit: usize,
+    offset: usize,
+    max_records: usize,
+) !InspectionResult {
+    const path = try reviewedCorrectionsPath(allocator, project_shard);
+    defer allocator.free(path);
+    return listReviewedCorrectionsAtPath(allocator, path, project_shard, decision_filter, operation_kind_filter, limit, offset, max_records);
+}
+
+pub fn getReviewedCorrection(allocator: std.mem.Allocator, project_shard: []const u8, id: []const u8, max_records: usize) !GetResult {
+    const path = try reviewedCorrectionsPath(allocator, project_shard);
+    defer allocator.free(path);
+    return getReviewedCorrectionAtPath(allocator, path, project_shard, id, max_records);
+}
+
+pub fn listReviewedCorrectionsAtPath(
+    allocator: std.mem.Allocator,
+    abs_path: []const u8,
+    project_shard: []const u8,
+    decision_filter: DecisionFilter,
+    operation_kind_filter: ?[]const u8,
+    limit: usize,
+    offset: usize,
+    max_records: usize,
+) !InspectionResult {
+    var records = std.ArrayList(ReviewedCorrectionRecord).init(allocator);
+    errdefer {
+        for (records.items) |*record| record.deinit(allocator);
+        records.deinit();
+    }
+    var warnings = std.ArrayList(ReadWarning).init(allocator);
+    errdefer {
+        for (warnings.items) |*warning| warning.deinit(allocator);
+        warnings.deinit();
+    }
+
+    const data = readReviewedFileBounded(allocator, abs_path, &warnings) catch |err| switch (err) {
+        error.FileNotFound => return .{
+            .allocator = allocator,
+            .records = try records.toOwnedSlice(),
+            .warnings = try warnings.toOwnedSlice(),
+            .total_read = 0,
+            .returned_count = 0,
+            .malformed_lines = 0,
+            .truncated = false,
+            .max_records_hit = false,
+            .limit_hit = false,
+            .offset = offset,
+            .limit = limit,
+            .missing_file = true,
+        },
+        else => return err,
+    };
+    defer allocator.free(data.bytes);
+
+    var total_read: usize = 0;
+    var malformed_lines: usize = 0;
+    var matched_seen: usize = 0;
+    var emitted: usize = 0;
+    var limit_hit = false;
+    var max_records_hit = false;
+    var line_number: usize = 1;
+    var lines = std.mem.splitScalar(u8, data.bytes, '\n');
+    while (lines.next()) |raw_line| : (line_number += 1) {
+        const line = std.mem.trim(u8, raw_line, " \r\t");
+        if (line.len == 0) continue;
+        if (total_read >= max_records) {
+            max_records_hit = true;
+            try appendReadWarning(allocator, &warnings, line_number, "reviewed correction record read limit reached");
+            break;
+        }
+        total_read += 1;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch {
+            malformed_lines += 1;
+            try appendReadWarning(allocator, &warnings, line_number, "malformed reviewed correction JSONL line ignored");
+            continue;
+        };
+        defer parsed.deinit();
+
+        const obj = valueObject(parsed.value) orelse {
+            malformed_lines += 1;
+            try appendReadWarning(allocator, &warnings, line_number, "reviewed correction line was not an object");
+            continue;
+        };
+        const record_shard = getStr(obj, "projectShard") orelse {
+            malformed_lines += 1;
+            try appendReadWarning(allocator, &warnings, line_number, "reviewed correction missing projectShard");
+            continue;
+        };
+        if (!std.mem.eql(u8, record_shard, project_shard)) continue;
+        const decision_text = getStr(obj, "reviewDecision") orelse {
+            malformed_lines += 1;
+            try appendReadWarning(allocator, &warnings, line_number, "reviewed correction missing reviewDecision");
+            continue;
+        };
+        const decision = Decision.parse(decision_text) orelse {
+            malformed_lines += 1;
+            try appendReadWarning(allocator, &warnings, line_number, "reviewed correction had invalid reviewDecision");
+            continue;
+        };
+        if (!decision_filter.matches(decision)) continue;
+        const operation_kind = recordOperationKind(obj) orelse "";
+        if (operation_kind_filter) |filter| {
+            if (!std.mem.eql(u8, operation_kind, filter)) continue;
+        }
+
+        if (matched_seen < offset) {
+            matched_seen += 1;
+            continue;
+        }
+        matched_seen += 1;
+        if (emitted >= limit) {
+            limit_hit = true;
+            continue;
+        }
+        try records.append(try duplicateReviewedRecord(allocator, obj, line, decision, operation_kind, line_number));
+        emitted += 1;
+    }
+
+    return .{
+        .allocator = allocator,
+        .records = try records.toOwnedSlice(),
+        .warnings = try warnings.toOwnedSlice(),
+        .total_read = total_read,
+        .returned_count = emitted,
+        .malformed_lines = malformed_lines,
+        .truncated = data.truncated,
+        .max_records_hit = max_records_hit or data.truncated,
+        .limit_hit = limit_hit,
+        .offset = offset,
+        .limit = limit,
+        .missing_file = false,
+    };
+}
+
+pub fn getReviewedCorrectionAtPath(allocator: std.mem.Allocator, abs_path: []const u8, project_shard: []const u8, id: []const u8, max_records: usize) !GetResult {
+    var warnings = std.ArrayList(ReadWarning).init(allocator);
+    errdefer {
+        for (warnings.items) |*warning| warning.deinit(allocator);
+        warnings.deinit();
+    }
+
+    const data = readReviewedFileBounded(allocator, abs_path, &warnings) catch |err| switch (err) {
+        error.FileNotFound => return .{
+            .allocator = allocator,
+            .record = null,
+            .warnings = try warnings.toOwnedSlice(),
+            .total_read = 0,
+            .malformed_lines = 0,
+            .truncated = false,
+            .max_records_hit = false,
+            .missing_file = true,
+        },
+        else => return err,
+    };
+    defer allocator.free(data.bytes);
+
+    var total_read: usize = 0;
+    var malformed_lines: usize = 0;
+    var max_records_hit = false;
+    var line_number: usize = 1;
+    var lines = std.mem.splitScalar(u8, data.bytes, '\n');
+    while (lines.next()) |raw_line| : (line_number += 1) {
+        const line = std.mem.trim(u8, raw_line, " \r\t");
+        if (line.len == 0) continue;
+        if (total_read >= max_records) {
+            max_records_hit = true;
+            try appendReadWarning(allocator, &warnings, line_number, "reviewed correction record read limit reached");
+            break;
+        }
+        total_read += 1;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch {
+            malformed_lines += 1;
+            try appendReadWarning(allocator, &warnings, line_number, "malformed reviewed correction JSONL line ignored");
+            continue;
+        };
+        defer parsed.deinit();
+
+        const obj = valueObject(parsed.value) orelse {
+            malformed_lines += 1;
+            try appendReadWarning(allocator, &warnings, line_number, "reviewed correction line was not an object");
+            continue;
+        };
+        const record_shard = getStr(obj, "projectShard") orelse {
+            malformed_lines += 1;
+            try appendReadWarning(allocator, &warnings, line_number, "reviewed correction missing projectShard");
+            continue;
+        };
+        if (!std.mem.eql(u8, record_shard, project_shard)) continue;
+        const record_id = getStr(obj, "id") orelse {
+            malformed_lines += 1;
+            try appendReadWarning(allocator, &warnings, line_number, "reviewed correction missing id");
+            continue;
+        };
+        const decision_text = getStr(obj, "reviewDecision") orelse {
+            malformed_lines += 1;
+            try appendReadWarning(allocator, &warnings, line_number, "reviewed correction missing reviewDecision");
+            continue;
+        };
+        const decision = Decision.parse(decision_text) orelse {
+            malformed_lines += 1;
+            try appendReadWarning(allocator, &warnings, line_number, "reviewed correction had invalid reviewDecision");
+            continue;
+        };
+        if (std.mem.eql(u8, record_id, id)) {
+            return .{
+                .allocator = allocator,
+                .record = try duplicateReviewedRecord(allocator, obj, line, decision, recordOperationKind(obj) orelse "", line_number),
+                .warnings = try warnings.toOwnedSlice(),
+                .total_read = total_read,
+                .malformed_lines = malformed_lines,
+                .truncated = data.truncated,
+                .max_records_hit = max_records_hit or data.truncated,
+                .missing_file = false,
+            };
+        }
+    }
+
+    return .{
+        .allocator = allocator,
+        .record = null,
+        .warnings = try warnings.toOwnedSlice(),
+        .total_read = total_read,
+        .malformed_lines = malformed_lines,
+        .truncated = data.truncated,
+        .max_records_hit = max_records_hit or data.truncated,
+        .missing_file = false,
+    };
 }
 
 pub fn readAcceptedInfluencesAtPath(allocator: std.mem.Allocator, abs_path: []const u8, project_shard: []const u8, max_records: usize) !ReadResult {
@@ -238,6 +552,46 @@ pub fn readAcceptedInfluencesAtPath(allocator: std.mem.Allocator, abs_path: []co
         .malformed_lines = malformed_lines,
         .truncated = truncated,
     };
+}
+
+const ReviewedFileBytes = struct {
+    bytes: []u8,
+    truncated: bool,
+};
+
+fn readReviewedFileBounded(allocator: std.mem.Allocator, abs_path: []const u8, warnings: *std.ArrayList(ReadWarning)) !ReviewedFileBytes {
+    const file = std.fs.openFileAbsolute(abs_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.FileNotFound,
+        else => return err,
+    };
+    defer file.close();
+
+    const file_size = try file.getEndPos();
+    const read_len: usize = @intCast(@min(file_size, MAX_REVIEWED_CORRECTIONS_BYTES));
+    var data = try allocator.alloc(u8, read_len);
+    errdefer allocator.free(data);
+    const actual = try file.readAll(data);
+    if (actual != read_len) data = try allocator.realloc(data, actual);
+    const truncated = file_size > MAX_REVIEWED_CORRECTIONS_BYTES;
+    if (truncated) try appendReadWarning(allocator, warnings, 0, "reviewed correction file exceeded bounded read size; later records were not read");
+    return .{ .bytes = data, .truncated = truncated };
+}
+
+fn duplicateReviewedRecord(allocator: std.mem.Allocator, obj: std.json.ObjectMap, line: []const u8, decision: Decision, operation_kind: []const u8, line_number: usize) !ReviewedCorrectionRecord {
+    const id = getStr(obj, "id") orelse return error.InvalidReviewedCorrectionRecord;
+    return .{
+        .id = try allocator.dupe(u8, id),
+        .decision = decision,
+        .operation_kind = try allocator.dupe(u8, operation_kind),
+        .record_json = try allocator.dupe(u8, line),
+        .line_number = line_number,
+    };
+}
+
+fn recordOperationKind(obj: std.json.ObjectMap) ?[]const u8 {
+    const candidate_value = obj.get("correctionCandidate") orelse return null;
+    const candidate = valueObject(candidate_value) orelse return null;
+    return getStr(candidate, "originalOperationKind") orelse getStr(candidate, "operationKind");
 }
 
 fn influenceFromRecord(allocator: std.mem.Allocator, obj: std.json.ObjectMap, line_number: usize) !?AcceptedCorrectionInfluence {

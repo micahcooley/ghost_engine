@@ -104,6 +104,8 @@ pub fn dispatch(
         .@"rule.evaluate" => dispatchRuleEvaluate(allocator, request_body),
         .@"correction.propose" => dispatchCorrectionPropose(allocator, request_body),
         .@"correction.review" => dispatchCorrectionReview(allocator, request_body),
+        .@"correction.reviewed.list" => dispatchCorrectionReviewedList(allocator, request_body),
+        .@"correction.reviewed.get" => dispatchCorrectionReviewedGet(allocator, request_body),
         .@"artifact.read" => dispatchArtifactRead(allocator, workspace_root, request_path),
         .@"artifact.list" => dispatchArtifactList(allocator, workspace_root, request_path),
         .@"artifact.patch.propose" => dispatchArtifactPatchPropose(allocator, workspace_root, request_body),
@@ -150,8 +152,8 @@ fn dispatchProtocolDescribe(allocator: std.mem.Allocator) !DispatchResult {
     try w.writeAll("{\"protocol\":{");
     try w.writeAll("\"version\":\"");
     try w.writeAll(core.PROTOCOL_VERSION);
-    try w.writeAll("\",\"implemented\":[\"protocol.describe\",\"capabilities.describe\",\"engine.status\",\"conversation.turn\",\"corpus.ask\",\"rule.evaluate\",\"correction.propose\",\"correction.review\",\"artifact.read\",\"artifact.list\",\"artifact.patch.propose\",\"hypothesis.list\",\"hypothesis.triage\",\"verifier.list\",\"verifier.candidate.execution.list\",\"verifier.candidate.execution.get\",\"correction.list\",\"correction.get\",\"negative_knowledge.candidate.list\",\"negative_knowledge.candidate.get\",\"negative_knowledge.record.list\",\"negative_knowledge.record.get\",\"negative_knowledge.influence.list\",\"trust_decay.candidate.list\",\"negative_knowledge.candidate.review\",\"negative_knowledge.record.expire\",\"negative_knowledge.record.supersede\",\"pack.list\",\"pack.inspect\",\"feedback.summary\",\"session.get\",\"project.autopsy\",\"context.autopsy\"]");
-    try w.writeAll(",\"maturity\":{\"corpus.ask\":\"read_only_live_corpus_grounded_draft\",\"rule.evaluate\":\"bounded_deterministic_non_authorizing_candidates\",\"correction.propose\":\"candidate_only_review_required_no_mutation\",\"correction.review\":\"append_only_reviewed_record_no_hidden_mutation\",\"hypothesis.list\":\"stateless\",\"hypothesis.triage\":\"stateless\",\"verifier.candidate.execution.list\":\"read_only_state_inspection\",\"verifier.candidate.execution.get\":\"read_only_state_inspection\",\"correction.list\":\"read_only_state_inspection\",\"correction.get\":\"read_only_state_inspection\",\"negative_knowledge.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.get\":\"read_only_state_inspection\",\"negative_knowledge.record.list\":\"read_only_state_inspection\",\"negative_knowledge.record.get\":\"read_only_state_inspection\",\"negative_knowledge.influence.list\":\"read_only_state_inspection\",\"trust_decay.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.review\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.expire\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.supersede\":\"structured_unsupported_without_persistence\",\"feedback.summary\":\"requires_workspace_metadata\",\"session.get\":\"requires_existing_session\",\"project.autopsy\":\"read_only_workspace_inspection\",\"context.autopsy\":\"read_only_artifact_and_input_refs_runtime_and_persistent_pack_guidance\"}");
+    try w.writeAll("\",\"implemented\":[\"protocol.describe\",\"capabilities.describe\",\"engine.status\",\"conversation.turn\",\"corpus.ask\",\"rule.evaluate\",\"correction.propose\",\"correction.review\",\"correction.reviewed.list\",\"correction.reviewed.get\",\"artifact.read\",\"artifact.list\",\"artifact.patch.propose\",\"hypothesis.list\",\"hypothesis.triage\",\"verifier.list\",\"verifier.candidate.execution.list\",\"verifier.candidate.execution.get\",\"correction.list\",\"correction.get\",\"negative_knowledge.candidate.list\",\"negative_knowledge.candidate.get\",\"negative_knowledge.record.list\",\"negative_knowledge.record.get\",\"negative_knowledge.influence.list\",\"trust_decay.candidate.list\",\"negative_knowledge.candidate.review\",\"negative_knowledge.record.expire\",\"negative_knowledge.record.supersede\",\"pack.list\",\"pack.inspect\",\"feedback.summary\",\"session.get\",\"project.autopsy\",\"context.autopsy\"]");
+    try w.writeAll(",\"maturity\":{\"corpus.ask\":\"read_only_live_corpus_grounded_draft\",\"rule.evaluate\":\"bounded_deterministic_non_authorizing_candidates\",\"correction.propose\":\"candidate_only_review_required_no_mutation\",\"correction.review\":\"append_only_reviewed_record_no_hidden_mutation\",\"correction.reviewed.list\":\"read_only_reviewed_correction_inspection_non_authorizing\",\"correction.reviewed.get\":\"read_only_reviewed_correction_inspection_non_authorizing\",\"hypothesis.list\":\"stateless\",\"hypothesis.triage\":\"stateless\",\"verifier.candidate.execution.list\":\"read_only_state_inspection\",\"verifier.candidate.execution.get\":\"read_only_state_inspection\",\"correction.list\":\"read_only_state_inspection\",\"correction.get\":\"read_only_state_inspection\",\"negative_knowledge.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.get\":\"read_only_state_inspection\",\"negative_knowledge.record.list\":\"read_only_state_inspection\",\"negative_knowledge.record.get\":\"read_only_state_inspection\",\"negative_knowledge.influence.list\":\"read_only_state_inspection\",\"trust_decay.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.review\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.expire\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.supersede\":\"structured_unsupported_without_persistence\",\"feedback.summary\":\"requires_workspace_metadata\",\"session.get\":\"requires_existing_session\",\"project.autopsy\":\"read_only_workspace_inspection\",\"context.autopsy\":\"read_only_artifact_and_input_refs_runtime_and_persistent_pack_guidance\"}");
     try w.writeAll(",\"unsupported\":[\"artifact.patch.apply\",\"artifact.write.propose\",\"artifact.write.apply\",\"artifact.search\",\"conversation.replay\",\"intent.ground\",\"response.evaluate\",\"verifier.run\",\"verifier.candidate.execute\",\"hypothesis.generate\",\"hypothesis.verifier.schedule\",\"correction.apply\",\"negative_knowledge.promote\",\"pack.update_from_negative_knowledge\",\"trust_decay.apply\",\"pack.mount\",\"pack.unmount\",\"pack.import\",\"pack.export\",\"pack.distill.list\",\"pack.distill.show\",\"pack.distill.export\",\"feedback.record\",\"feedback.replay\",\"session.create\",\"session.update\",\"session.close\",\"command.run\"]");
     try w.writeAll("}}");
 
@@ -179,6 +181,8 @@ fn dispatchCapabilitiesDescribe(allocator: std.mem.Allocator) !DispatchResult {
     try w.writeAll("{\"capability\":\"rule.evaluate\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"note\":\"bounded deterministic rule evaluation over structured facts; emits candidates, pending obligations, unknowns, and explanation traces only; no commands, verifiers, corpus mutation, pack mutation, or negative-knowledge mutation\"},");
     try w.writeAll("{\"capability\":\"correction.propose\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"requiredReview\":true,\"note\":\"proposes correction-native learning candidates only; no corpus, pack, negative-knowledge, command, or verifier mutation\"},");
     try w.writeAll("{\"capability\":\"correction.review\",\"policy\":\"allowed\",\"append_only\":true,\"non_authorizing\":true,\"note\":\"accepts or rejects correction candidates into durable reviewed records only; no corpus, pack, negative-knowledge, command, verifier, or global promotion mutation\"},");
+    try w.writeAll("{\"capability\":\"correction.reviewed.list\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"treated_as_proof\":false,\"note\":\"inspects append-only reviewed correction records without mutation, proof authority, command execution, or verifier execution\"},");
+    try w.writeAll("{\"capability\":\"correction.reviewed.get\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"treated_as_proof\":false,\"note\":\"retrieves one reviewed correction record without mutation, proof authority, command execution, or verifier execution\"},");
     try w.writeAll("{\"capability\":\"hypothesis.list\",\"policy\":\"allowed\",\"read_only\":true},");
     try w.writeAll("{\"capability\":\"hypothesis.triage\",\"policy\":\"allowed\",\"read_only\":true},");
     try w.writeAll("{\"capability\":\"verifier.list\",\"policy\":\"allowed\",\"read_only\":true},");
@@ -631,6 +635,209 @@ fn dispatchCorrectionReview(allocator: std.mem.Allocator, request_body: ?[]const
         .result_json = try out.toOwnedSlice(),
         .allocated_result = true,
     };
+}
+
+fn dispatchCorrectionReviewedList(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
+    const body = request_body orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "request body is required for correction.reviewed.list" },
+    };
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } };
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "correction.reviewed.list request must be a JSON object" } };
+    }
+
+    const obj = parsed.value.object;
+    const project_shard = getStr(obj, "project_shard", "projectShard") orelse shards.DEFAULT_PROJECT_ID;
+    const decision_text = getStr(obj, "decision", "decision") orelse if ((getBool(obj, "include_rejected", "includeRejected") orelse true)) "all" else "accepted";
+    const decision_filter = correction_review.DecisionFilter.parse(decision_text) orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .invalid_request, .message = "decision must be accepted, rejected, or all", .details = decision_text },
+    };
+    const limit = boundedCount(obj, "limit", "limit", correction_review.MAX_REVIEWED_CORRECTIONS_READ, correction_review.MAX_REVIEWED_CORRECTIONS_READ);
+    const offset = boundedCount(obj, "offset", "cursor", 0, correction_review.MAX_REVIEWED_CORRECTIONS_READ);
+    const operation_kind_filter = getStr(obj, "operation_kind", "operationKind");
+
+    var inspected = try correction_review.listReviewedCorrections(
+        allocator,
+        project_shard,
+        decision_filter,
+        operation_kind_filter,
+        limit,
+        offset,
+        correction_review.MAX_REVIEWED_CORRECTIONS_READ,
+    );
+    defer inspected.deinit();
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"correctionReviewedList\":{\"status\":\"ok\",\"projectShard\":\"");
+    try writeEscaped(w, project_shard);
+    try w.writeAll("\",\"decision\":\"");
+    try writeEscaped(w, @tagName(decision_filter));
+    try w.writeAll("\",\"operationKindFilter\":");
+    if (operation_kind_filter) |filter| {
+        try w.writeByte('"');
+        try writeEscaped(w, filter);
+        try w.writeByte('"');
+    } else {
+        try w.writeAll("null");
+    }
+    try w.writeAll(",\"records\":[");
+    for (inspected.records, 0..) |record, i| {
+        if (i != 0) try w.writeByte(',');
+        try w.writeAll("{\"id\":\"");
+        try writeEscaped(w, record.id);
+        try w.writeAll("\",\"reviewDecision\":\"");
+        try writeEscaped(w, @tagName(record.decision));
+        try w.writeAll("\",\"operationKind\":\"");
+        try writeEscaped(w, record.operation_kind);
+        try w.writeAll("\",\"lineNumber\":");
+        try w.print("{d}", .{record.line_number});
+        try w.writeAll(",\"reviewedCorrectionRecord\":");
+        try w.writeAll(record.record_json);
+        try w.writeAll("}");
+    }
+    try w.writeAll("],\"totalRead\":");
+    try w.print("{d}", .{inspected.total_read});
+    try w.writeAll(",\"returnedCount\":");
+    try w.print("{d}", .{inspected.returned_count});
+    try w.writeAll(",\"malformedLines\":");
+    try w.print("{d}", .{inspected.malformed_lines});
+    try w.writeAll(",\"warnings\":");
+    try writeReadWarningsJson(w, inspected.warnings);
+    try w.writeAll(",\"capacityTelemetry\":{");
+    try w.print("\"maxRecordsRead\":{d},\"maxRecordsHit\":{},\"limit\":{d},\"offset\":{d},\"limitHit\":{},\"fileBytesLimit\":{d},\"fileBytesLimitHit\":{}", .{
+        correction_review.MAX_REVIEWED_CORRECTIONS_READ,
+        inspected.max_records_hit,
+        inspected.limit,
+        inspected.offset,
+        inspected.limit_hit,
+        correction_review.MAX_REVIEWED_CORRECTIONS_BYTES,
+        inspected.truncated,
+    });
+    try w.writeAll("},\"storage\":{\"appendOnly\":true,\"missingFile\":");
+    try w.print("{}", .{inspected.missing_file});
+    try w.writeAll(",\"readOnly\":true,\"inPlaceRewrite\":false,\"deletion\":false,\"compaction\":false,\"stableOrdering\":\"file_append_order\"}");
+    try writeReviewedCorrectionSafeguards(w);
+    try w.writeAll("}}");
+
+    var gip_state = schema.draftResultState();
+    gip_state.permission = .none;
+    gip_state.verification_state = .unverified;
+    gip_state.support_minimum_met = false;
+    gip_state.non_authorization_notice = "correction.reviewed.list inspects reviewed records only; records are non-authorizing and not proof";
+
+    return .{
+        .status = .ok,
+        .result_state = gip_state,
+        .result_json = try out.toOwnedSlice(),
+        .allocated_result = true,
+    };
+}
+
+fn dispatchCorrectionReviewedGet(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
+    const body = request_body orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "request body is required for correction.reviewed.get" },
+    };
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } };
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "correction.reviewed.get request must be a JSON object" } };
+    }
+
+    const obj = parsed.value.object;
+    const project_shard = getStr(obj, "project_shard", "projectShard") orelse shards.DEFAULT_PROJECT_ID;
+    const id = getStr(obj, "id", "id") orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "id is required" },
+    };
+
+    var inspected = try correction_review.getReviewedCorrection(allocator, project_shard, id, correction_review.MAX_REVIEWED_CORRECTIONS_READ);
+    defer inspected.deinit();
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"correctionReviewedGet\":{\"status\":\"");
+    try w.writeAll(if (inspected.record != null) "ok" else "not_found");
+    try w.writeAll("\",\"projectShard\":\"");
+    try writeEscaped(w, project_shard);
+    try w.writeAll("\",\"id\":\"");
+    try writeEscaped(w, id);
+    try w.writeAll("\",\"reviewedCorrectionRecord\":");
+    if (inspected.record) |record| {
+        try w.writeAll(record.record_json);
+    } else {
+        try w.writeAll("null,\"unknown\":{\"kind\":\"reviewed_correction_not_found\",\"reason\":\"no same-shard reviewed correction record matched id\"}");
+    }
+    try w.writeAll(",\"totalRead\":");
+    try w.print("{d}", .{inspected.total_read});
+    try w.writeAll(",\"returnedCount\":");
+    try w.print("{d}", .{if (inspected.record != null) @as(usize, 1) else @as(usize, 0)});
+    try w.writeAll(",\"malformedLines\":");
+    try w.print("{d}", .{inspected.malformed_lines});
+    try w.writeAll(",\"warnings\":");
+    try writeReadWarningsJson(w, inspected.warnings);
+    try w.writeAll(",\"capacityTelemetry\":{");
+    try w.print("\"maxRecordsRead\":{d},\"maxRecordsHit\":{},\"fileBytesLimit\":{d},\"fileBytesLimitHit\":{}", .{
+        correction_review.MAX_REVIEWED_CORRECTIONS_READ,
+        inspected.max_records_hit,
+        correction_review.MAX_REVIEWED_CORRECTIONS_BYTES,
+        inspected.truncated,
+    });
+    try w.writeAll("},\"storage\":{\"appendOnly\":true,\"missingFile\":");
+    try w.print("{}", .{inspected.missing_file});
+    try w.writeAll(",\"readOnly\":true,\"inPlaceRewrite\":false,\"deletion\":false,\"compaction\":false,\"stableOrdering\":\"file_append_order\"}");
+    try writeReviewedCorrectionSafeguards(w);
+    try w.writeAll("}}");
+
+    var gip_state = if (inspected.record != null) schema.draftResultState() else schema.unresolvedResultState("reviewed_correction_not_found");
+    gip_state.permission = .none;
+    gip_state.verification_state = .unverified;
+    gip_state.support_minimum_met = false;
+    gip_state.non_authorization_notice = "correction.reviewed.get inspects reviewed records only; records are non-authorizing and not proof";
+
+    return .{
+        .status = if (inspected.record != null) .ok else .unresolved,
+        .result_state = gip_state,
+        .result_json = try out.toOwnedSlice(),
+        .allocated_result = true,
+    };
+}
+
+fn boundedCount(obj: std.json.ObjectMap, snake: []const u8, camel: []const u8, default_value: usize, max_value: usize) usize {
+    const requested = getInt(obj, snake, camel) orelse return default_value;
+    if (requested <= 0) return 0;
+    return @min(@as(usize, @intCast(requested)), max_value);
+}
+
+fn writeReadWarningsJson(w: anytype, warnings: []const correction_review.ReadWarning) !void {
+    try w.writeByte('[');
+    for (warnings, 0..) |warning, i| {
+        if (i != 0) try w.writeByte(',');
+        try w.writeAll("{\"lineNumber\":");
+        try w.print("{d}", .{warning.line_number});
+        try w.writeAll(",\"reason\":\"");
+        try writeEscaped(w, warning.reason);
+        try w.writeAll("\"}");
+    }
+    try w.writeByte(']');
+}
+
+fn writeReviewedCorrectionSafeguards(w: anytype) !void {
+    try w.writeAll(",\"readOnly\":true");
+    try w.writeAll(",\"mutationFlags\":{\"corpusMutation\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false}");
+    try w.writeAll(",\"authority\":{\"nonAuthorizing\":true,\"treatedAsProof\":false,\"supportGranted\":false,\"proofDischarged\":false,\"usedAsEvidence\":false}");
 }
 
 fn stringifyJsonValue(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
@@ -4219,6 +4426,147 @@ test "correction.review malformed and missing decision are structured rejections
     try std.testing.expectEqual(core.ErrorCode.invalid_request, invalid_decision.err.?.code);
 }
 
+test "correction.reviewed.list tolerates missing storage as empty read-only result" {
+    const allocator = std.testing.allocator;
+    const project_shard = "phase9a-gip-missing";
+    try cleanProjectShardForTest(allocator, project_shard);
+    defer cleanProjectShardForTest(allocator, project_shard) catch {};
+
+    const body =
+        \\{"projectShard":"phase9a-gip-missing","decision":"all"}
+    ;
+    var result = try dispatch(allocator, "correction.reviewed.list", core.PROTOCOL_VERSION, null, null, body);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
+    const json = result.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":\"ok\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"records\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"totalRead\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"returnedCount\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"missingFile\":true") != null);
+    try expectReviewedCorrectionSafeguards(json);
+}
+
+test "correction.reviewed.list returns accepted and rejected records in append order with filters" {
+    const allocator = std.testing.allocator;
+    const project_shard = "phase9a-gip-list";
+    try cleanProjectShardForTest(allocator, project_shard);
+    defer cleanProjectShardForTest(allocator, project_shard) catch {};
+
+    const accepted_id = try appendReviewedCorrectionForTest(allocator, project_shard, "phase9a-accepted", .accepted);
+    defer allocator.free(accepted_id);
+    const rejected_id = try appendReviewedCorrectionForTest(allocator, project_shard, "phase9a-rejected", .rejected);
+    defer allocator.free(rejected_id);
+
+    var all = try dispatch(allocator, "correction.reviewed.list", core.PROTOCOL_VERSION, null, null,
+        \\{"projectShard":"phase9a-gip-list","decision":"all"}
+    );
+    defer all.deinit(allocator);
+    const all_json = all.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, all_json, "\"returnedCount\":2") != null);
+    const accepted_pos = std.mem.indexOf(u8, all_json, "phase9a-accepted") orelse return error.MissingAcceptedRecord;
+    const rejected_pos = std.mem.indexOf(u8, all_json, "phase9a-rejected") orelse return error.MissingRejectedRecord;
+    try std.testing.expect(accepted_pos < rejected_pos);
+    try expectReviewedCorrectionSafeguards(all_json);
+
+    var accepted = try dispatch(allocator, "correction.reviewed.list", core.PROTOCOL_VERSION, null, null,
+        \\{"projectShard":"phase9a-gip-list","decision":"accepted"}
+    );
+    defer accepted.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, accepted.result_json.?, "\"returnedCount\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, accepted.result_json.?, "\"reviewDecision\":\"accepted\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, accepted.result_json.?, "\"reviewDecision\":\"rejected\"") == null);
+
+    var rejected = try dispatch(allocator, "correction.reviewed.list", core.PROTOCOL_VERSION, null, null,
+        \\{"projectShard":"phase9a-gip-list","decision":"rejected"}
+    );
+    defer rejected.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, rejected.result_json.?, "\"returnedCount\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rejected.result_json.?, "\"reviewDecision\":\"rejected\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rejected.result_json.?, "\"reviewDecision\":\"accepted\"") == null);
+
+    var operation_filter = try dispatch(allocator, "correction.reviewed.list", core.PROTOCOL_VERSION, null, null,
+        \\{"projectShard":"phase9a-gip-list","decision":"all","operationKind":"rule.evaluate"}
+    );
+    defer operation_filter.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, operation_filter.result_json.?, "\"returnedCount\":0") != null);
+}
+
+test "correction.reviewed.list reports limit and malformed line telemetry" {
+    const allocator = std.testing.allocator;
+    const project_shard = "phase9a-gip-limit";
+    try cleanProjectShardForTest(allocator, project_shard);
+    defer cleanProjectShardForTest(allocator, project_shard) catch {};
+
+    const reviewed_path = try correction_review.reviewedCorrectionsPath(allocator, project_shard);
+    defer allocator.free(reviewed_path);
+    const parent = std.fs.path.dirname(reviewed_path) orelse return error.InvalidPath;
+    try std.fs.cwd().makePath(parent);
+    var file = try std.fs.createFileAbsolute(reviewed_path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll("{malformed json}\n");
+    const first = try reviewedRecordJsonForTest(allocator, project_shard, "limit-one", .accepted, 0);
+    defer allocator.free(first);
+    const second = try reviewedRecordJsonForTest(allocator, project_shard, "limit-two", .accepted, first.len + 1);
+    defer allocator.free(second);
+    try file.writeAll(first);
+    try file.writeAll("\n");
+    try file.writeAll(second);
+    try file.writeAll("\n");
+
+    var result = try dispatch(allocator, "correction.reviewed.list", core.PROTOCOL_VERSION, null, null,
+        \\{"projectShard":"phase9a-gip-limit","decision":"accepted","limit":1}
+    );
+    defer result.deinit(allocator);
+    const json = result.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"returnedCount\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"malformedLines\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "malformed reviewed correction JSONL line ignored") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"limitHit\":true") != null);
+    try expectReviewedCorrectionSafeguards(json);
+}
+
+test "correction.reviewed.get returns existing and missing records without crashing on malformed lines" {
+    const allocator = std.testing.allocator;
+    const project_shard = "phase9a-gip-get";
+    try cleanProjectShardForTest(allocator, project_shard);
+    defer cleanProjectShardForTest(allocator, project_shard) catch {};
+
+    const reviewed_path = try correction_review.reviewedCorrectionsPath(allocator, project_shard);
+    defer allocator.free(reviewed_path);
+    const parent = std.fs.path.dirname(reviewed_path) orelse return error.InvalidPath;
+    try std.fs.cwd().makePath(parent);
+    var file = try std.fs.createFileAbsolute(reviewed_path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll("not json\n");
+    const record_json = try reviewedRecordJsonForTest(allocator, project_shard, "get-existing", .accepted, 0);
+    defer allocator.free(record_json);
+    try file.writeAll(record_json);
+    try file.writeAll("\n");
+
+    const id = try reviewedRecordIdForTest(allocator, record_json);
+    defer allocator.free(id);
+    const get_body = try std.fmt.allocPrint(allocator, "{{\"projectShard\":\"{s}\",\"id\":\"{s}\"}}", .{ project_shard, id });
+    defer allocator.free(get_body);
+
+    var existing = try dispatch(allocator, "correction.reviewed.get", core.PROTOCOL_VERSION, null, null, get_body);
+    defer existing.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, existing.status);
+    try std.testing.expect(std.mem.indexOf(u8, existing.result_json.?, "\"reviewedCorrectionRecord\":{\"id\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, existing.result_json.?, "\"malformedLines\":1") != null);
+    try expectReviewedCorrectionSafeguards(existing.result_json.?);
+
+    var missing = try dispatch(allocator, "correction.reviewed.get", core.PROTOCOL_VERSION, null, null,
+        \\{"projectShard":"phase9a-gip-get","id":"reviewed-correction:missing"}
+    );
+    defer missing.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.unresolved, missing.status);
+    try std.testing.expect(std.mem.indexOf(u8, missing.result_json.?, "\"status\":\"not_found\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missing.result_json.?, "\"kind\":\"reviewed_correction_not_found\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missing.result_json.?, "\"malformedLines\":1") != null);
+    try expectReviewedCorrectionSafeguards(missing.result_json.?);
+}
+
 test "get missing execution returns structured error" {
     const allocator = std.testing.allocator;
     var result = try dispatch(allocator, "verifier.candidate.execution.get", core.PROTOCOL_VERSION, null, null, "{\"executionId\":\"missing-exec\"}");
@@ -4356,6 +4704,8 @@ test "protocol.describe lists new implemented operations exactly" {
     try std.testing.expect(std.mem.indexOf(u8, json, "verifier.candidate.execution.get") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "correction.propose") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "correction.review") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "correction.reviewed.list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "correction.reviewed.get") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "correction.list") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "correction.get") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "negative_knowledge.candidate.list") != null);
@@ -4382,6 +4732,8 @@ test "capabilities.describe reports read-only operations as allowed" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"verifier.candidate.execution.list\",\"policy\":\"allowed\",\"read_only\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"correction.propose\",\"policy\":\"allowed\",\"read_only\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"correction.review\",\"policy\":\"allowed\",\"append_only\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"correction.reviewed.list\",\"policy\":\"allowed\",\"read_only\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"correction.reviewed.get\",\"policy\":\"allowed\",\"read_only\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"correction.list\",\"policy\":\"allowed\",\"read_only\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"negative_knowledge.candidate.list\",\"policy\":\"allowed\",\"read_only\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"negative_knowledge.record.list\",\"policy\":\"allowed\",\"read_only\":true") != null);
@@ -5125,6 +5477,68 @@ fn writeAbsoluteFile(allocator: std.mem.Allocator, abs_path: []const u8, bytes: 
     defer file.close();
     try file.writeAll(bytes);
     _ = allocator;
+}
+
+fn cleanProjectShardForTest(allocator: std.mem.Allocator, project_shard: []const u8) !void {
+    var metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer metadata.deinit();
+    var paths = try shards.resolvePaths(allocator, metadata.metadata);
+    defer paths.deinit();
+    std.fs.deleteTreeAbsolute(paths.root_abs_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+fn reviewedRecordJsonForTest(allocator: std.mem.Allocator, project_shard: []const u8, candidate_id: []const u8, decision: correction_review.Decision, append_offset: u64) ![]u8 {
+    const candidate_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"id\":\"correction:candidate:{s}\",\"originalOperationKind\":\"corpus.ask\",\"originalRequestSummary\":\"phase9a reviewed inspection\",\"disputedOutput\":{{\"kind\":\"answerDraft\",\"summary\":\"phase9a disputed output {s}\"}},\"userCorrection\":\"operator reviewed {s}\",\"correctionType\":\"wrong_answer\"}}",
+        .{ candidate_id, candidate_id, candidate_id },
+    );
+    defer allocator.free(candidate_json);
+    return correction_review.renderRecordJson(allocator, .{
+        .project_shard = project_shard,
+        .decision = decision,
+        .reviewer_note = "phase9a inspection test",
+        .rejected_reason = if (decision == .rejected) "not accepted" else null,
+        .source_candidate_id = candidate_id,
+        .correction_candidate_json = candidate_json,
+        .accepted_learning_outputs_json = "[{\"kind\":\"verifier_check_candidate\",\"status\":\"candidate\"}]",
+    }, append_offset);
+}
+
+fn appendReviewedCorrectionForTest(allocator: std.mem.Allocator, project_shard: []const u8, candidate_id: []const u8, decision: correction_review.Decision) ![]u8 {
+    const body = if (decision == .accepted)
+        try std.fmt.allocPrint(allocator, "{{\"projectShard\":\"{s}\",\"correctionCandidate\":{{\"id\":\"correction:candidate:{s}\",\"originalOperationKind\":\"corpus.ask\",\"originalRequestSummary\":\"phase9a reviewed inspection\",\"disputedOutput\":{{\"kind\":\"answerDraft\",\"summary\":\"phase9a disputed output {s}\"}},\"userCorrection\":\"operator reviewed {s}\",\"correctionType\":\"wrong_answer\"}},\"decision\":\"accepted\",\"reviewerNote\":\"phase9a inspection test\",\"acceptedLearningOutputs\":[{{\"kind\":\"verifier_check_candidate\",\"status\":\"candidate\"}}]}}", .{ project_shard, candidate_id, candidate_id, candidate_id })
+    else
+        try std.fmt.allocPrint(allocator, "{{\"projectShard\":\"{s}\",\"correctionCandidate\":{{\"id\":\"correction:candidate:{s}\",\"originalOperationKind\":\"corpus.ask\",\"originalRequestSummary\":\"phase9a reviewed inspection\",\"disputedOutput\":{{\"kind\":\"answerDraft\",\"summary\":\"phase9a disputed output {s}\"}},\"userCorrection\":\"operator reviewed {s}\",\"correctionType\":\"wrong_answer\"}},\"decision\":\"rejected\",\"reviewerNote\":\"phase9a inspection test\",\"rejectedReason\":\"not accepted\"}}", .{ project_shard, candidate_id, candidate_id, candidate_id });
+    defer allocator.free(body);
+    var result = try dispatch(allocator, "correction.review", core.PROTOCOL_VERSION, null, null, body);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
+    return reviewedRecordIdForTest(allocator, result.result_json.?);
+}
+
+fn reviewedRecordIdForTest(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    const root = valueObject(parsed.value) orelse return error.InvalidJson;
+    const review = valueObject(root.get("correctionReview") orelse parsed.value) orelse root;
+    const record = valueObject(review.get("reviewedCorrectionRecord") orelse parsed.value) orelse return error.InvalidJson;
+    const id = stringField(record, "id") orelse return error.InvalidJson;
+    return allocator.dupe(u8, id);
+}
+
+fn expectReviewedCorrectionSafeguards(json: []const u8) !void {
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"readOnly\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"corpusMutation\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"packMutation\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"negativeKnowledgeMutation\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"commandsExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verifiersExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"nonAuthorizing\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"treatedAsProof\":false") != null);
 }
 
 test "protocol.describe lists context.autopsy as implemented" {

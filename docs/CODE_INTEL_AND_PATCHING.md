@@ -83,6 +83,8 @@ Phase 7 adds that explicit review lifecycle through GIP `correction.review`. Rev
 
 Phase 8 lets accepted reviewed corrections influence later behavior in the same project shard as non-authorizing warnings, stronger-evidence requirements, exact repeated-pattern suppression, or future behavior candidates. The first runtime integration is `corpus.ask`: it reads bounded accepted reviewed correction records from the shard-local append-only JSONL file, tolerates missing or malformed records as warnings, and may emit `correctionInfluences`, `acceptedCorrectionWarnings`, `futureBehaviorCandidates`, and `influenceTelemetry`. Exact repeated bad answer patterns can suppress an `answerDraft`, and missing-evidence or repeated-failed-pattern corrections can propose follow-up evidence or negative-knowledge candidates. Reviewed corrections still never enter `evidenceUsed`, never act as proof, never discharge support gates, never execute checks, and never mutate corpus, packs, or negative knowledge.
 
+Phase 9A adds read-only inspection of reviewed correction records through GIP `correction.reviewed.list` and `correction.reviewed.get`. Both operations read only the same project shard's append-only `corrections/reviewed_corrections.jsonl`, preserve append order, tolerate a missing file as empty/not-found state, report malformed JSONL lines as warnings and telemetry, and never rewrite, compact, delete, accept, reject, promote, execute commands, execute verifiers, mutate corpus, mutate packs, or mutate negative knowledge. Inspection results are operator visibility only: `readOnly:true`, mutation flags are false, `nonAuthorizing:true`, and `treatedAsProof:false`.
+
 Minimal binary-only ingest/apply/ask loop:
 
 ```bash

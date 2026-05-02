@@ -66,6 +66,7 @@ Measured operation groups:
 - `corpus.ask`: no corpus, exact phrase match, weak unrelated evidence, conflicting evidence, approximate-only SimHash hints, capacity-limited retrieval, and larger bounded deterministic ranking
 - `rule.evaluate`: simple match, non-match, multiple deterministic rules, fired-rule cap, output cap, and invalid recursive fact-output rejection
 - `correction.propose`: `wrong_answer`, `missing_evidence`, `repeated_failed_pattern`, and underspecified correction requests
+- `correction.reviewed`: read-only reviewed correction list/get over append-only storage, including malformed-line warning handling
 - `corpus.lifecycle`: isolated fixture corpus creation, ingest/stage, explicit apply-live, exact ask, and review-required correction proposal
 
 Machine-readable scenario metrics include:

@@ -17,6 +17,7 @@ const OperationKind = enum {
     @"corpus.ask",
     @"rule.evaluate",
     @"correction.propose",
+    @"correction.reviewed",
     @"corpus.lifecycle",
 };
 
@@ -107,6 +108,8 @@ pub fn runSuite(allocator: std.mem.Allocator) !SuiteResult {
     try results.append(runCorrectionMissingEvidence());
     try results.append(runCorrectionRepeatedFailedPattern());
     try results.append(runCorrectionUnderspecified());
+    try results.append(try runCorrectionReviewedList(allocator));
+    try results.append(try runCorrectionReviewedGet(allocator));
     try results.append(try runLifecycleScenario(allocator));
 
     return .{
@@ -486,6 +489,83 @@ fn runLifecycleScenario(allocator: std.mem.Allocator) !ScenarioResult {
     return out;
 }
 
+fn runCorrectionReviewedList(allocator: std.mem.Allocator) !ScenarioResult {
+    const shard_id = "bench-compute-dominance-reviewed-list";
+    try cleanProjectShard(allocator, shard_id);
+    defer cleanProjectShard(allocator, shard_id) catch {};
+    const path = try correction_review.reviewedCorrectionsPath(allocator, shard_id);
+    defer allocator.free(path);
+    const first = try reviewedRecordJson(allocator, shard_id, "bench-reviewed-list-accepted", .accepted, 0);
+    defer allocator.free(first);
+    const second = try reviewedRecordJson(allocator, shard_id, "bench-reviewed-list-rejected", .rejected, first.len + 1);
+    defer allocator.free(second);
+    var file = try createReviewedFile(path);
+    defer file.close();
+    try file.writeAll(first);
+    try file.writeAll("\n");
+    try file.writeAll(second);
+    try file.writeAll("\n");
+
+    const started = std.time.nanoTimestamp();
+    var inspected = try correction_review.listReviewedCorrections(allocator, shard_id, .all, null, 8, 0, correction_review.MAX_REVIEWED_CORRECTIONS_READ);
+    defer inspected.deinit();
+
+    return .{
+        .name = "correction.reviewed.list/read_only_append_order",
+        .operation_kind = .@"correction.reviewed",
+        .success = inspected.returned_count == 2 and inspected.malformed_lines == 0 and !inspected.max_records_hit and
+            std.mem.indexOf(u8, inspected.records[0].record_json, "bench-reviewed-list-accepted") != null and
+            std.mem.indexOf(u8, inspected.records[1].record_json, "bench-reviewed-list-rejected") != null,
+        .duration_ns = elapsedNs(started),
+        .input_bytes = first.len + second.len,
+        .correction_candidate_count = inspected.returned_count,
+        .capacity_warning_count = if (inspected.limit_hit or inspected.max_records_hit or inspected.truncated) 1 else 0,
+        .commands_executed = 0,
+        .verifiers_executed = 0,
+        .corpus_mutation = false,
+        .pack_mutation = false,
+        .negative_knowledge_mutation = false,
+        .non_authorizing = true,
+    };
+}
+
+fn runCorrectionReviewedGet(allocator: std.mem.Allocator) !ScenarioResult {
+    const shard_id = "bench-compute-dominance-reviewed-get";
+    try cleanProjectShard(allocator, shard_id);
+    defer cleanProjectShard(allocator, shard_id) catch {};
+    const path = try correction_review.reviewedCorrectionsPath(allocator, shard_id);
+    defer allocator.free(path);
+    const record = try reviewedRecordJson(allocator, shard_id, "bench-reviewed-get", .accepted, 0);
+    defer allocator.free(record);
+    var file = try createReviewedFile(path);
+    defer file.close();
+    try file.writeAll("malformed\n");
+    try file.writeAll(record);
+    try file.writeAll("\n");
+    const id = try reviewedRecordId(allocator, record);
+    defer allocator.free(id);
+
+    const started = std.time.nanoTimestamp();
+    var inspected = try correction_review.getReviewedCorrection(allocator, shard_id, id, correction_review.MAX_REVIEWED_CORRECTIONS_READ);
+    defer inspected.deinit();
+
+    return .{
+        .name = "correction.reviewed.get/read_only_existing_with_malformed_warning",
+        .operation_kind = .@"correction.reviewed",
+        .success = inspected.record != null and inspected.malformed_lines == 1 and !inspected.max_records_hit,
+        .duration_ns = elapsedNs(started),
+        .input_bytes = record.len,
+        .correction_candidate_count = if (inspected.record != null) 1 else 0,
+        .capacity_warning_count = inspected.warnings.len,
+        .commands_executed = 0,
+        .verifiers_executed = 0,
+        .corpus_mutation = false,
+        .pack_mutation = false,
+        .negative_knowledge_mutation = false,
+        .non_authorizing = true,
+    };
+}
+
 const CorpusFile = struct {
     path: []const u8,
     body: []const u8,
@@ -534,6 +614,38 @@ fn cleanProjectShard(allocator: std.mem.Allocator, shard_id: []const u8) !void {
     var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
     defer project_paths.deinit();
     try deleteTreeIfExistsAbsolute(project_paths.root_abs_path);
+}
+
+fn createReviewedFile(path: []const u8) !std.fs.File {
+    try ensureParentDirAbsolute(path);
+    return std.fs.createFileAbsolute(path, .{ .truncate = true });
+}
+
+fn reviewedRecordJson(allocator: std.mem.Allocator, project_shard: []const u8, candidate_id: []const u8, decision: correction_review.Decision, append_offset: u64) ![]u8 {
+    const candidate_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"id\":\"correction:candidate:{s}\",\"originalOperationKind\":\"corpus.ask\",\"originalRequestSummary\":\"compute dominance reviewed inspection\",\"disputedOutput\":{{\"kind\":\"answerDraft\",\"summary\":\"compute dominance disputed output {s}\"}},\"userCorrection\":\"operator reviewed {s}\",\"correctionType\":\"wrong_answer\"}}",
+        .{ candidate_id, candidate_id, candidate_id },
+    );
+    defer allocator.free(candidate_json);
+    return correction_review.renderRecordJson(allocator, .{
+        .project_shard = project_shard,
+        .decision = decision,
+        .reviewer_note = "compute dominance reviewed inspection",
+        .rejected_reason = if (decision == .rejected) "not accepted" else null,
+        .source_candidate_id = candidate_id,
+        .correction_candidate_json = candidate_json,
+        .accepted_learning_outputs_json = "[{\"kind\":\"verifier_check_candidate\",\"status\":\"candidate\"}]",
+    }, append_offset);
+}
+
+fn reviewedRecordId(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    const obj = if (parsed.value == .object) parsed.value.object else return error.InvalidJson;
+    const id_value = obj.get("id") orelse return error.InvalidJson;
+    if (id_value != .string) return error.InvalidJson;
+    return allocator.dupe(u8, id_value.string);
 }
 
 fn scenarioFromAsk(name: []const u8, input_bytes: usize, duration_ns: u64, result: *const corpus_ask.Result) ScenarioResult {
@@ -819,7 +931,7 @@ test "compute dominance report is generated with required scenarios and safety f
     var suite = try runSuite(allocator);
     defer suite.deinit();
 
-    try std.testing.expectEqual(@as(usize, 19), suite.scenarios.len);
+    try std.testing.expectEqual(@as(usize, 21), suite.scenarios.len);
     try std.testing.expect(allScenariosPassed(suite.scenarios));
 
     const json = try renderJsonReport(allocator, suite);
@@ -835,6 +947,8 @@ test "compute dominance report is generated with required scenarios and safety f
     try std.testing.expect(std.mem.indexOf(u8, json, "\"correctionInfluenceCount\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"rule.evaluate/recursive_invalid_output_rejection\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"correction.propose/repeated_failed_pattern\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"correction.reviewed.list/read_only_append_order\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"correction.reviewed.get/read_only_existing_with_malformed_warning\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"end_to_end/lifecycle_ingest_apply_ask_correction_no_hidden_mutation\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"cloudUsed\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"transformersUsed\":false") != null);
