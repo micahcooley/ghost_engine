@@ -521,6 +521,11 @@ fn deleteTreeIfExistsAbsolute(path: []const u8) !void {
     };
 }
 
+fn ensureParentDirAbsolute(path: []const u8) !void {
+    const parent = std.fs.path.dirname(path) orelse return;
+    try std.fs.cwd().makePath(parent);
+}
+
 fn readFileAbsoluteAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     const file = try std.fs.openFileAbsolute(path, .{});
     defer file.close();
@@ -5711,6 +5716,182 @@ test "corpus ask returns draft answer with bounded evidence and weak matches sta
     try std.testing.expectEqual(corpus_ask.AskStatus.unknown, weak.status);
     try std.testing.expectEqual(corpus_ask.UnknownKind.insufficient_evidence, weak.unknowns[0].kind);
     try std.testing.expect(weak.answer_draft == null);
+}
+
+test "corpus ask applies accepted reviewed correction influence without proof or mutation" {
+    const allocator = std.testing.allocator;
+    const project_shard = "corpus-ask-accepted-correction-test";
+    var corpus_fixture = std.testing.tmpDir(.{});
+    defer corpus_fixture.cleanup();
+    const corpus_root = try corpus_fixture.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+    try writeFixtureFile(corpus_fixture.dir, "runtime.md",
+        \\# Runtime Retention
+        \\Retention policy is enabled for event audit logs.
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.root_abs_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.root_abs_path) catch {};
+
+    var stage_result = try corpus_ingest.stage(allocator, .{
+        .corpus_path = corpus_root,
+        .project_shard = project_shard,
+        .trust_class = .project,
+        .source_label = "ask-correction-corpus",
+    });
+    defer stage_result.deinit();
+    try corpus_ingest.applyStaged(allocator, &project_paths);
+
+    var rejected = try correction_review.reviewAndAppend(allocator, .{
+        .project_shard = project_shard,
+        .decision = .rejected,
+        .reviewer_note = "rejected by test",
+        .rejected_reason = "not enough detail",
+        .source_candidate_id = "correction:candidate:rejected",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:rejected","originalOperationKind":"corpus.ask","originalRequestSummary":"is retention policy enabled","disputedOutput":{"kind":"answerDraft","summary":"Retention policy is enabled"},"userCorrection":"ignore","correctionType":"wrong_answer"}
+        ,
+        .accepted_learning_outputs_json = "[]",
+    });
+    defer rejected.deinit();
+    var accepted = try correction_review.reviewAndAppend(allocator, .{
+        .project_shard = project_shard,
+        .decision = .accepted,
+        .reviewer_note = "accepted by test",
+        .rejected_reason = null,
+        .source_candidate_id = "correction:candidate:accepted",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:accepted","originalOperationKind":"corpus.ask","originalRequestSummary":"is retention policy enabled","disputedOutput":{"kind":"answerDraft","summary":"Retention policy is enabled"},"userCorrection":"that exact draft was wrong","correctionType":"wrong_answer"}
+        ,
+        .accepted_learning_outputs_json = "[{\"kind\":\"verifier_check_candidate\",\"status\":\"candidate\"}]",
+    });
+    defer accepted.deinit();
+
+    var result = try corpus_ask.ask(allocator, .{
+        .question = "is retention policy enabled",
+        .project_shard = project_shard,
+        .max_snippet_bytes = 96,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(corpus_ask.AskStatus.unknown, result.status);
+    try std.testing.expect(result.answer_draft == null);
+    try std.testing.expectEqual(@as(usize, 1), result.correction_influences.len);
+    try std.testing.expectEqualStrings("suppress_exact_repeat", result.correction_influences[0].influence_kind);
+    try std.testing.expect(result.correction_influences[0].non_authorizing);
+    try std.testing.expect(!result.correction_influences[0].treated_as_proof);
+    try std.testing.expect(!result.correction_influences[0].global_promotion);
+    try std.testing.expectEqual(@as(usize, 1), result.influence_telemetry.matched_influences);
+    try std.testing.expect(result.influence_telemetry.answer_suppressed);
+    try std.testing.expectEqual(@as(usize, 2), result.influence_telemetry.reviewed_records_read);
+    try std.testing.expectEqual(@as(usize, 1), result.influence_telemetry.accepted_records_read);
+    try std.testing.expectEqual(@as(usize, 1), result.influence_telemetry.rejected_records_read);
+    try std.testing.expect(result.future_behavior_candidates.len >= 1);
+    try std.testing.expectEqualStrings("verifier_check_candidate", result.future_behavior_candidates[0].kind);
+    try std.testing.expect(result.future_behavior_candidates[0].candidate_only);
+    try std.testing.expect(!result.future_behavior_candidates[0].treated_as_proof);
+    try std.testing.expectEqual(@as(usize, 1), result.evidence_used.len);
+    try std.testing.expect(std.mem.indexOf(u8, result.evidence_used[0].item_id, "reviewed-correction:") == null);
+    try std.testing.expect(!result.safety_flags.corpus_mutation);
+    try std.testing.expect(!result.safety_flags.pack_mutation);
+    try std.testing.expect(!result.safety_flags.negative_knowledge_mutation);
+    try std.testing.expect(!result.safety_flags.commands_executed);
+    try std.testing.expect(!result.safety_flags.verifiers_executed);
+
+    const rendered = try corpus_ask.renderJson(allocator, &result);
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"correctionInfluences\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"futureBehaviorCandidates\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"acceptedCorrectionWarnings\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"treatedAsProof\":true") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"corpusMutation\":true") == null);
+
+    var other = try corpus_ask.ask(allocator, .{
+        .question = "is retention policy enabled",
+        .project_shard = "corpus-ask-accepted-correction-other-shard",
+    });
+    defer other.deinit();
+    try std.testing.expectEqual(@as(usize, 0), other.correction_influences.len);
+}
+
+test "corpus ask correction influence emits warning candidates for missing evidence and repeated patterns" {
+    const allocator = std.testing.allocator;
+    const project_shard = "corpus-ask-correction-candidates-test";
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.root_abs_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.root_abs_path) catch {};
+    try std.fs.cwd().makePath(project_paths.root_abs_path);
+
+    const reviewed_path = try correction_review.reviewedCorrectionsPath(allocator, project_shard);
+    defer allocator.free(reviewed_path);
+    try ensureParentDirAbsolute(reviewed_path);
+    var file = try std.fs.createFileAbsolute(reviewed_path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll("{not json}\n");
+
+    var missing = try correction_review.reviewAndAppend(allocator, .{
+        .project_shard = project_shard,
+        .decision = .accepted,
+        .reviewer_note = "missing evidence accepted",
+        .rejected_reason = null,
+        .source_candidate_id = "correction:candidate:missing",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:missing","originalOperationKind":"corpus.ask","originalRequestSummary":"audit retention unknown","disputedOutput":{"kind":"unknown","summary":"audit retention unknown"},"userCorrection":"needs more evidence","correctionType":"missing_evidence"}
+        ,
+        .accepted_learning_outputs_json = "[{\"kind\":\"follow_up_evidence_request\"}]",
+    });
+    defer missing.deinit();
+    var repeated = try correction_review.reviewAndAppend(allocator, .{
+        .project_shard = project_shard,
+        .decision = .accepted,
+        .reviewer_note = "repeated pattern accepted",
+        .rejected_reason = null,
+        .source_candidate_id = "correction:candidate:repeated",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:repeated","originalOperationKind":"corpus.ask","originalRequestSummary":"audit retention unknown","disputedOutput":{"kind":"unknown","summary":"audit retention unknown"},"userCorrection":"repeated failed pattern","correctionType":"repeated_failed_pattern"}
+        ,
+        .accepted_learning_outputs_json = "[{\"kind\":\"negative_knowledge_candidate\"}]",
+    });
+    defer repeated.deinit();
+
+    var result = try corpus_ask.ask(allocator, .{
+        .question = "audit retention unknown",
+        .project_shard = project_shard,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(corpus_ask.AskStatus.unknown, result.status);
+    try std.testing.expect(result.answer_draft == null);
+    try std.testing.expectEqual(@as(usize, 2), result.correction_influences.len);
+    try std.testing.expectEqual(@as(usize, 1), result.accepted_correction_warnings.len);
+    try std.testing.expectEqual(@as(usize, 1), result.influence_telemetry.malformed_lines);
+    try std.testing.expectEqual(@as(usize, 2), result.influence_telemetry.matched_influences);
+    var saw_followup = false;
+    var saw_nk = false;
+    for (result.future_behavior_candidates) |candidate| {
+        if (std.mem.eql(u8, candidate.kind, "follow_up_evidence_request")) saw_followup = true;
+        if (std.mem.eql(u8, candidate.kind, "negative_knowledge_candidate")) {
+            saw_nk = true;
+            try std.testing.expect(candidate.candidate_only);
+            try std.testing.expect(candidate.non_authorizing);
+            try std.testing.expect(!candidate.treated_as_proof);
+            try std.testing.expect(!candidate.mutation_flags.negative_knowledge_mutation);
+        }
+    }
+    try std.testing.expect(saw_followup);
+    try std.testing.expect(saw_nk);
+    try std.testing.expect(!result.safety_flags.negative_knowledge_mutation);
+    try std.testing.expect(!result.safety_flags.corpus_mutation);
+    try std.testing.expect(!result.safety_flags.pack_mutation);
 }
 
 test "corpus ask reports deterministic non-authorizing sketch candidates without drafting" {

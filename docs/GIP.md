@@ -199,6 +199,8 @@ promotion, or pack mutation.
 - Reviewed correction records are stored as project-shard-local JSONL at `corrections/reviewed_corrections.jsonl` under the resolved project shard. The file is append-only: prior records are not rewritten, deleted, or silently compacted, and ordering is file append order.
 - Accepted reviewed corrections are still `nonAuthorizing:true`, `treatedAsProof:false`, and `globalPromotion:false`. They may produce a future-behavior candidate or warning for later explicit lifecycles, but they do not discharge support gates and do not mutate corpus, packs, or negative knowledge.
 - Rejected reviewed corrections persist the rejection and `rejectedReason`; they do not create future influence.
+- `corpus.ask` reads accepted reviewed corrections from the same project shard only, with a bounded read limit. Missing `reviewed_corrections.jsonl` is treated as no influence. Malformed JSONL lines are exposed as `acceptedCorrectionWarnings` / `influenceTelemetry` and do not crash the ask.
+- Accepted reviewed corrections can influence `corpus.ask` only as non-authorizing `correctionInfluences` and `futureBehaviorCandidates`: warnings, stronger-evidence requirements, verifier/check candidates, exact repeated bad-pattern suppression, or candidate-only negative-knowledge/corpus/pack guidance proposals. They are never copied into `evidenceUsed`, never become proof, never execute verifiers, and never mutate corpus, packs, or negative knowledge.
 
 ### Rule Evaluation
 - `rule.evaluate` evaluates request-local structured facts against request-local rules. It is deterministic, bounded, and read-only.
@@ -229,6 +231,7 @@ promotion, or pack mutation.
 
 ### Corpus-Grounded Ask
 - `corpus.ask` — Answer from explicitly ingested live shard corpus evidence **(Implemented)**
+  - **Phase 8 response additions**: `acceptedCorrectionWarnings`, `correctionInfluences`, `futureBehaviorCandidates`, and `influenceTelemetry` may appear when shard-local accepted reviewed corrections are read. All such objects remain `nonAuthorizing:true`, `treatedAsProof:false`, `globalPromotion:false`, with mutation flags false.
   - **Request**: `{"question": string}` or `{"message": string}`, plus optional `projectShard` / `project_shard`, `maxResults` / `max_results`, `maxSnippetBytes` / `max_snippet_bytes`, and `requireCitations` / `require_citations`.
   - **Response**: `{"corpusAsk":{"status":"answered"|"unknown","state":"draft"|"unresolved","permission":"none"|"unresolved","answerDraft": string optional,"evidenceUsed":[...],"unknowns":[...],"candidateFollowups":[...],"learningCandidates":[...],"trace":{...}}}`.
   - Uses only existing live corpus state created through explicit corpus ingestion/lifecycle paths. Staged corpus is not read as active knowledge.
@@ -484,7 +487,8 @@ Maximum timeout: 30 seconds. Maximum output: 256KB.
 12. **Large input stays bounded** — `context.autopsy` uses artifact references, filters, chunked reads, budgets, coverage, and explicit unknowns rather than unbounded stdin JSON
 13. **Corpus ask is not proof** — `corpus.ask` can draft from cited corpus evidence, but corpus text alone does not verify or authorize supported output
 14. **Rules are not proof** — `rule.evaluate` emits candidate checks, obligations, risks, unknowns, and follow-ups only; rule firing cannot authorize supported output
-15. **Reviewed corrections are not proof** — `correction.review` persists explicit accept/reject records, but accepted records remain non-authorizing unless a separate explicit lifecycle later applies a candidate
+15. **Reviewed corrections are not proof** — `correction.review` persists explicit accept/reject records, and accepted records may influence future `corpus.ask` behavior as warnings, exact suppression, or candidate-only follow-ups, but they remain non-authorizing and cannot satisfy proof/support gates
+16. **Reviewed correction influence is shard-scoped and non-mutating** — accepted correction influence reads only the same project shard and does not mutate corpus, packs, negative knowledge, commands, verifiers, or unrelated shards
 
 ## CLI Usage
 

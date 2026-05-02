@@ -6,6 +6,7 @@ const config = core.config;
 const corpus_ask = core.corpus_ask;
 const corpus_ingest = core.corpus_ingest;
 const correction_candidates = core.correction_candidates;
+const correction_review = core.correction_review;
 const rule_reasoning = core.rule_reasoning;
 const shards = core.shards;
 
@@ -31,7 +32,9 @@ const ScenarioResult = struct {
     unknown_count: usize = 0,
     capacity_warning_count: usize = 0,
     correction_candidate_count: usize = 0,
+    correction_influence_count: usize = 0,
     learning_candidate_count: usize = 0,
+    future_behavior_candidate_count: usize = 0,
     commands_executed: u32 = 0,
     verifiers_executed: u32 = 0,
     corpus_mutation: bool = false,
@@ -88,6 +91,7 @@ pub fn runSuite(allocator: std.mem.Allocator) !SuiteResult {
 
     try results.append(try runCorpusNoCorpus(allocator));
     try results.append(try runCorpusExactPhrase(allocator));
+    try results.append(try runCorpusAcceptedCorrectionInfluence(allocator));
     try results.append(try runCorpusWeakUnrelated(allocator));
     try results.append(try runCorpusConflicting(allocator));
     try results.append(try runCorpusApproximateOnly(allocator));
@@ -141,6 +145,40 @@ fn runCorpusExactPhrase(allocator: std.mem.Allocator) !ScenarioResult {
 
     var out = scenarioFromAsk("corpus.ask/exact_phrase_match", question.len, elapsedNs(started), &result);
     out.success = result.status == .answered and result.answer_draft != null and result.evidence_used.len == 1 and result.evidence_used[0].matched_phrase != null;
+    out.setup_corpus_mutation = true;
+    return out;
+}
+
+fn runCorpusAcceptedCorrectionInfluence(allocator: std.mem.Allocator) !ScenarioResult {
+    const shard_id = "bench-compute-dominance-correction-influence";
+    try cleanProjectShard(allocator, shard_id);
+    defer cleanProjectShard(allocator, shard_id) catch {};
+    try withCorpus(allocator, shard_id, &.{
+        .{ .path = "runtime.md", .body = "Retention policy is enabled for event audit logs.\nOperators cite exact local evidence before drafting.\n" },
+    });
+
+    var reviewed = try correction_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .accepted,
+        .reviewer_note = "benchmark accepted repeated bad draft",
+        .rejected_reason = null,
+        .source_candidate_id = "correction:candidate:bench-influence",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:bench-influence","originalOperationKind":"corpus.ask","originalRequestSummary":"is retention policy enabled","disputedOutput":{"kind":"answerDraft","summary":"Retention policy is enabled"},"userCorrection":"that repeated exact answer pattern needs verification","correctionType":"wrong_answer"}
+        ,
+        .accepted_learning_outputs_json = "[{\"kind\":\"verifier_check_candidate\",\"status\":\"candidate\"}]",
+    });
+    defer reviewed.deinit();
+
+    const question = "is retention policy enabled";
+    const started = std.time.nanoTimestamp();
+    var result = try corpus_ask.ask(allocator, .{ .question = question, .project_shard = shard_id, .max_snippet_bytes = 96 });
+    defer result.deinit();
+
+    var out = scenarioFromAsk("corpus.ask/accepted_correction_exact_suppression", question.len, elapsedNs(started), &result);
+    out.success = result.status == .unknown and result.answer_draft == null and result.evidence_used.len == 1 and result.correction_influences.len == 1 and
+        result.future_behavior_candidates.len >= 1 and result.influence_telemetry.answer_suppressed and !result.safety_flags.corpus_mutation and
+        !result.safety_flags.pack_mutation and !result.safety_flags.negative_knowledge_mutation and !result.safety_flags.commands_executed and !result.safety_flags.verifiers_executed;
     out.setup_corpus_mutation = true;
     return out;
 }
@@ -511,6 +549,8 @@ fn scenarioFromAsk(name: []const u8, input_bytes: usize, duration_ns: u64, resul
         .unknown_count = result.unknowns.len,
         .capacity_warning_count = capacityWarningsFromAsk(result.capacity_telemetry),
         .learning_candidate_count = result.learning_candidates.len,
+        .correction_influence_count = result.correction_influences.len,
+        .future_behavior_candidate_count = result.future_behavior_candidates.len,
         .commands_executed = if (result.safety_flags.commands_executed) 1 else 0,
         .verifiers_executed = if (result.safety_flags.verifiers_executed) 1 else 0,
         .corpus_mutation = result.safety_flags.corpus_mutation,
@@ -638,13 +678,15 @@ pub fn renderJsonReport(allocator: std.mem.Allocator, suite: SuiteResult) ![]u8 
         } else {
             try writer.writeAll(",\"corpusEntriesConsidered\":null");
         }
-        try writer.print(",\"evidenceCount\":{d},\"similarCandidateCount\":{d},\"unknownCount\":{d},\"capacityWarningCount\":{d},\"correctionCandidateCount\":{d},\"learningCandidateCount\":{d}", .{
+        try writer.print(",\"evidenceCount\":{d},\"similarCandidateCount\":{d},\"unknownCount\":{d},\"capacityWarningCount\":{d},\"correctionCandidateCount\":{d},\"correctionInfluenceCount\":{d},\"learningCandidateCount\":{d},\"futureBehaviorCandidateCount\":{d}", .{
             scenario.evidence_count,
             scenario.similar_candidate_count,
             scenario.unknown_count,
             scenario.capacity_warning_count,
             scenario.correction_candidate_count,
+            scenario.correction_influence_count,
             scenario.learning_candidate_count,
+            scenario.future_behavior_candidate_count,
         });
         try writer.print(",\"commandsExecuted\":{d},\"verifiersExecuted\":{d}", .{ scenario.commands_executed, scenario.verifiers_executed });
         try writer.print(",\"corpusMutation\":{s},\"packMutation\":{s},\"negativeKnowledgeMutation\":{s},\"answerDraftPresent\":{s},\"nonAuthorizing\":{s}", .{
@@ -681,10 +723,10 @@ pub fn renderMarkdownReport(allocator: std.mem.Allocator, suite: SuiteResult) ![
         suite.scenarios.len - passedCount(suite.scenarios),
         suite.total_duration_ns,
     });
-    try writer.writeAll("| scenario | kind | ok | duration ns | evidence | similar | unknown | capacity | corrections | learning |\n");
-    try writer.writeAll("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    try writer.writeAll("| scenario | kind | ok | duration ns | evidence | similar | unknown | capacity | corrections | influences | learning | future |\n");
+    try writer.writeAll("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
     for (suite.scenarios) |scenario| {
-        try writer.print("| {s} | {s} | {s} | {d} | {d} | {d} | {d} | {d} | {d} | {d} |\n", .{
+        try writer.print("| {s} | {s} | {s} | {d} | {d} | {d} | {d} | {d} | {d} | {d} | {d} | {d} |\n", .{
             scenario.name,
             @tagName(scenario.operation_kind),
             if (scenario.success) "yes" else "no",
@@ -694,7 +736,9 @@ pub fn renderMarkdownReport(allocator: std.mem.Allocator, suite: SuiteResult) ![
             scenario.unknown_count,
             scenario.capacity_warning_count,
             scenario.correction_candidate_count,
+            scenario.correction_influence_count,
             scenario.learning_candidate_count,
+            scenario.future_behavior_candidate_count,
         });
     }
     return out.toOwnedSlice();
@@ -775,7 +819,7 @@ test "compute dominance report is generated with required scenarios and safety f
     var suite = try runSuite(allocator);
     defer suite.deinit();
 
-    try std.testing.expectEqual(@as(usize, 18), suite.scenarios.len);
+    try std.testing.expectEqual(@as(usize, 19), suite.scenarios.len);
     try std.testing.expect(allScenariosPassed(suite.scenarios));
 
     const json = try renderJsonReport(allocator, suite);
@@ -786,7 +830,9 @@ test "compute dominance report is generated with required scenarios and safety f
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"suite\":\"ghost_compute_dominance\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"corpus.ask/no_corpus\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"corpus.ask/accepted_correction_exact_suppression\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"corpus.ask/larger_bounded_corpus_deterministic_ranking\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"correctionInfluenceCount\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"rule.evaluate/recursive_invalid_output_rejection\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"correction.propose/repeated_failed_pattern\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"end_to_end/lifecycle_ingest_apply_ask_correction_no_hidden_mutation\"") != null);

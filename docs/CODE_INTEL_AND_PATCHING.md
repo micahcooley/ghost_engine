@@ -81,6 +81,8 @@ Phase 5 adds correction-native learning candidates through GIP `correction.propo
 
 Phase 7 adds that explicit review lifecycle through GIP `correction.review`. Review accepts or rejects a proposed correction into a project-shard-local append-only JSONL record at `corrections/reviewed_corrections.jsonl`. The reviewed record stores the source candidate reference or inline snapshot, `reviewDecision`, `reviewerNote`, accepted learning outputs or rejected reason, mutation flags, authority flags, and append-order metadata. Accepted records may emit a `futureBehaviorCandidate`, such as stronger-evidence requirements or a later negative-knowledge/pack-guidance candidate, but they do not mutate corpus, packs, negative knowledge, execute verifiers or commands, prove claims, or promote globally.
 
+Phase 8 lets accepted reviewed corrections influence later behavior in the same project shard as non-authorizing warnings, stronger-evidence requirements, exact repeated-pattern suppression, or future behavior candidates. The first runtime integration is `corpus.ask`: it reads bounded accepted reviewed correction records from the shard-local append-only JSONL file, tolerates missing or malformed records as warnings, and may emit `correctionInfluences`, `acceptedCorrectionWarnings`, `futureBehaviorCandidates`, and `influenceTelemetry`. Exact repeated bad answer patterns can suppress an `answerDraft`, and missing-evidence or repeated-failed-pattern corrections can propose follow-up evidence or negative-knowledge candidates. Reviewed corrections still never enter `evidenceUsed`, never act as proof, never discharge support gates, never execute checks, and never mutate corpus, packs, or negative knowledge.
+
 Minimal binary-only ingest/apply/ask loop:
 
 ```bash
