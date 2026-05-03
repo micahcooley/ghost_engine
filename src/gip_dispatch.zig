@@ -27,6 +27,7 @@ const correction_candidates = @import("correction_candidates.zig");
 const correction_review = @import("correction_review.zig");
 const negative_knowledge_review = @import("negative_knowledge_review.zig");
 const learning_status = @import("learning_status.zig");
+const procedure_pack_candidates = @import("procedure_pack_candidates.zig");
 
 pub const DispatchResult = struct {
     status: core.ProtocolStatus,
@@ -110,6 +111,10 @@ pub fn dispatch(
         .@"correction.reviewed.list" => dispatchCorrectionReviewedList(allocator, request_body),
         .@"correction.reviewed.get" => dispatchCorrectionReviewedGet(allocator, request_body),
         .@"correction.influence.status" => dispatchCorrectionInfluenceStatus(allocator, request_body),
+        .@"procedure_pack.candidate.propose" => dispatchProcedurePackCandidatePropose(allocator, request_body),
+        .@"procedure_pack.candidate.review" => dispatchProcedurePackCandidateReview(allocator, request_body),
+        .@"procedure_pack.candidate.reviewed.list" => dispatchProcedurePackCandidateReviewedList(allocator, request_body),
+        .@"procedure_pack.candidate.reviewed.get" => dispatchProcedurePackCandidateReviewedGet(allocator, request_body),
         .@"artifact.read" => dispatchArtifactRead(allocator, workspace_root, request_path),
         .@"artifact.list" => dispatchArtifactList(allocator, workspace_root, request_path),
         .@"artifact.patch.propose" => dispatchArtifactPatchPropose(allocator, workspace_root, request_body),
@@ -159,8 +164,8 @@ fn dispatchProtocolDescribe(allocator: std.mem.Allocator) !DispatchResult {
     try w.writeAll("{\"protocol\":{");
     try w.writeAll("\"version\":\"");
     try w.writeAll(core.PROTOCOL_VERSION);
-    try w.writeAll("\",\"implemented\":[\"protocol.describe\",\"capabilities.describe\",\"engine.status\",\"conversation.turn\",\"corpus.ask\",\"rule.evaluate\",\"learning.status\",\"correction.propose\",\"correction.review\",\"correction.reviewed.list\",\"correction.reviewed.get\",\"correction.influence.status\",\"artifact.read\",\"artifact.list\",\"artifact.patch.propose\",\"hypothesis.list\",\"hypothesis.triage\",\"verifier.list\",\"verifier.candidate.execution.list\",\"verifier.candidate.execution.get\",\"correction.list\",\"correction.get\",\"negative_knowledge.candidate.list\",\"negative_knowledge.candidate.get\",\"negative_knowledge.record.list\",\"negative_knowledge.record.get\",\"negative_knowledge.influence.list\",\"negative_knowledge.review\",\"negative_knowledge.reviewed.list\",\"negative_knowledge.reviewed.get\",\"trust_decay.candidate.list\",\"negative_knowledge.candidate.review\",\"negative_knowledge.record.expire\",\"negative_knowledge.record.supersede\",\"pack.list\",\"pack.inspect\",\"feedback.summary\",\"session.get\",\"project.autopsy\",\"context.autopsy\"]");
-    try w.writeAll(",\"maturity\":{\"corpus.ask\":\"read_only_live_corpus_grounded_draft\",\"rule.evaluate\":\"bounded_deterministic_non_authorizing_candidates\",\"learning.status\":\"read_only_reviewed_learning_loop_scoreboard_non_authorizing\",\"correction.propose\":\"candidate_only_review_required_no_mutation\",\"correction.review\":\"append_only_reviewed_record_no_hidden_mutation\",\"correction.reviewed.list\":\"read_only_reviewed_correction_inspection_non_authorizing\",\"correction.reviewed.get\":\"read_only_reviewed_correction_inspection_non_authorizing\",\"correction.influence.status\":\"read_only_reviewed_correction_influence_summary_non_authorizing\",\"hypothesis.list\":\"stateless\",\"hypothesis.triage\":\"stateless\",\"verifier.candidate.execution.list\":\"read_only_state_inspection\",\"verifier.candidate.execution.get\":\"read_only_state_inspection\",\"correction.list\":\"read_only_state_inspection\",\"correction.get\":\"read_only_state_inspection\",\"negative_knowledge.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.get\":\"read_only_state_inspection\",\"negative_knowledge.record.list\":\"read_only_state_inspection\",\"negative_knowledge.record.get\":\"read_only_state_inspection\",\"negative_knowledge.influence.list\":\"read_only_state_inspection\",\"negative_knowledge.review\":\"append_only_reviewed_negative_knowledge_no_hidden_mutation\",\"negative_knowledge.reviewed.list\":\"read_only_reviewed_negative_knowledge_inspection_non_authorizing\",\"negative_knowledge.reviewed.get\":\"read_only_reviewed_negative_knowledge_inspection_non_authorizing\",\"trust_decay.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.review\":\"structured_unsupported_legacy_review_surface\",\"negative_knowledge.record.expire\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.supersede\":\"structured_unsupported_without_persistence\",\"feedback.summary\":\"requires_workspace_metadata\",\"session.get\":\"requires_existing_session\",\"project.autopsy\":\"read_only_workspace_inspection\",\"context.autopsy\":\"read_only_artifact_and_input_refs_runtime_and_persistent_pack_guidance\"}");
+    try w.writeAll("\",\"implemented\":[\"protocol.describe\",\"capabilities.describe\",\"engine.status\",\"conversation.turn\",\"corpus.ask\",\"rule.evaluate\",\"learning.status\",\"correction.propose\",\"correction.review\",\"correction.reviewed.list\",\"correction.reviewed.get\",\"correction.influence.status\",\"procedure_pack.candidate.propose\",\"procedure_pack.candidate.review\",\"procedure_pack.candidate.reviewed.list\",\"procedure_pack.candidate.reviewed.get\",\"artifact.read\",\"artifact.list\",\"artifact.patch.propose\",\"hypothesis.list\",\"hypothesis.triage\",\"verifier.list\",\"verifier.candidate.execution.list\",\"verifier.candidate.execution.get\",\"correction.list\",\"correction.get\",\"negative_knowledge.candidate.list\",\"negative_knowledge.candidate.get\",\"negative_knowledge.record.list\",\"negative_knowledge.record.get\",\"negative_knowledge.influence.list\",\"negative_knowledge.review\",\"negative_knowledge.reviewed.list\",\"negative_knowledge.reviewed.get\",\"trust_decay.candidate.list\",\"negative_knowledge.candidate.review\",\"negative_knowledge.record.expire\",\"negative_knowledge.record.supersede\",\"pack.list\",\"pack.inspect\",\"feedback.summary\",\"session.get\",\"project.autopsy\",\"context.autopsy\"]");
+    try w.writeAll(",\"maturity\":{\"corpus.ask\":\"read_only_live_corpus_grounded_draft\",\"rule.evaluate\":\"bounded_deterministic_non_authorizing_candidates\",\"learning.status\":\"read_only_reviewed_learning_loop_scoreboard_non_authorizing\",\"correction.propose\":\"candidate_only_review_required_no_mutation\",\"correction.review\":\"append_only_reviewed_record_no_hidden_mutation\",\"correction.reviewed.list\":\"read_only_reviewed_correction_inspection_non_authorizing\",\"correction.reviewed.get\":\"read_only_reviewed_correction_inspection_non_authorizing\",\"correction.influence.status\":\"read_only_reviewed_correction_influence_summary_non_authorizing\",\"procedure_pack.candidate.propose\":\"candidate_only_no_pack_mutation_no_execution\",\"procedure_pack.candidate.review\":\"append_only_reviewed_procedure_pack_candidate_no_pack_mutation\",\"procedure_pack.candidate.reviewed.list\":\"read_only_reviewed_procedure_pack_candidate_inspection_non_authorizing\",\"procedure_pack.candidate.reviewed.get\":\"read_only_reviewed_procedure_pack_candidate_inspection_non_authorizing\",\"hypothesis.list\":\"stateless\",\"hypothesis.triage\":\"stateless\",\"verifier.candidate.execution.list\":\"read_only_state_inspection\",\"verifier.candidate.execution.get\":\"read_only_state_inspection\",\"correction.list\":\"read_only_state_inspection\",\"correction.get\":\"read_only_state_inspection\",\"negative_knowledge.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.get\":\"read_only_state_inspection\",\"negative_knowledge.record.list\":\"read_only_state_inspection\",\"negative_knowledge.record.get\":\"read_only_state_inspection\",\"negative_knowledge.influence.list\":\"read_only_state_inspection\",\"negative_knowledge.review\":\"append_only_reviewed_negative_knowledge_no_hidden_mutation\",\"negative_knowledge.reviewed.list\":\"read_only_reviewed_negative_knowledge_inspection_non_authorizing\",\"negative_knowledge.reviewed.get\":\"read_only_reviewed_negative_knowledge_inspection_non_authorizing\",\"trust_decay.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.review\":\"structured_unsupported_legacy_review_surface\",\"negative_knowledge.record.expire\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.supersede\":\"structured_unsupported_without_persistence\",\"feedback.summary\":\"requires_workspace_metadata\",\"session.get\":\"requires_existing_session\",\"project.autopsy\":\"read_only_workspace_inspection\",\"context.autopsy\":\"read_only_artifact_and_input_refs_runtime_and_persistent_pack_guidance\"}");
     try w.writeAll(",\"unsupported\":[\"artifact.patch.apply\",\"artifact.write.propose\",\"artifact.write.apply\",\"artifact.search\",\"conversation.replay\",\"intent.ground\",\"response.evaluate\",\"verifier.run\",\"verifier.candidate.execute\",\"hypothesis.generate\",\"hypothesis.verifier.schedule\",\"correction.apply\",\"negative_knowledge.promote\",\"pack.update_from_negative_knowledge\",\"trust_decay.apply\",\"pack.mount\",\"pack.unmount\",\"pack.import\",\"pack.export\",\"pack.distill.list\",\"pack.distill.show\",\"pack.distill.export\",\"feedback.record\",\"feedback.replay\",\"session.create\",\"session.update\",\"session.close\",\"command.run\"]");
     try w.writeAll("}}");
 
@@ -192,6 +197,10 @@ fn dispatchCapabilitiesDescribe(allocator: std.mem.Allocator) !DispatchResult {
     try w.writeAll("{\"capability\":\"correction.reviewed.list\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"treated_as_proof\":false,\"note\":\"inspects append-only reviewed correction records without mutation, proof authority, command execution, or verifier execution\"},");
     try w.writeAll("{\"capability\":\"correction.reviewed.get\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"treated_as_proof\":false,\"note\":\"retrieves one reviewed correction record without mutation, proof authority, command execution, or verifier execution\"},");
     try w.writeAll("{\"capability\":\"correction.influence.status\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"treated_as_proof\":false,\"note\":\"summarizes reviewed correction records and possible influence candidates without mutation, proof authority, command execution, or verifier execution\"},");
+    try w.writeAll("{\"capability\":\"procedure_pack.candidate.propose\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"treated_as_proof\":false,\"executes_by_default\":false,\"note\":\"proposes explicit procedure pack candidates from reviewed learning signals; no pack mutation, command execution, verifier execution, proof, evidence, or global promotion\"},");
+    try w.writeAll("{\"capability\":\"procedure_pack.candidate.review\",\"policy\":\"allowed\",\"append_only\":true,\"non_authorizing\":true,\"treated_as_proof\":false,\"executes_by_default\":false,\"note\":\"persists reviewed procedure pack candidates only; no pack mutation, command execution, verifier execution, proof, evidence, or global promotion\"},");
+    try w.writeAll("{\"capability\":\"procedure_pack.candidate.reviewed.list\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"treated_as_proof\":false,\"note\":\"inspects append-only reviewed procedure pack candidate records without mutating packs or executing anything\"},");
+    try w.writeAll("{\"capability\":\"procedure_pack.candidate.reviewed.get\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"treated_as_proof\":false,\"note\":\"retrieves one reviewed procedure pack candidate record without mutating packs or executing anything\"},");
     try w.writeAll("{\"capability\":\"hypothesis.list\",\"policy\":\"allowed\",\"read_only\":true},");
     try w.writeAll("{\"capability\":\"hypothesis.triage\",\"policy\":\"allowed\",\"read_only\":true},");
     try w.writeAll("{\"capability\":\"verifier.list\",\"policy\":\"allowed\",\"read_only\":true},");
@@ -943,6 +952,300 @@ fn dispatchCorrectionInfluenceStatus(allocator: std.mem.Allocator, request_body:
     };
 }
 
+fn dispatchProcedurePackCandidatePropose(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
+    const body = request_body orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "request body is required for procedure_pack.candidate.propose" },
+    };
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } };
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "procedure_pack.candidate.propose request must be a JSON object" } };
+    }
+    const obj = parsed.value.object;
+    const project_shard = getStr(obj, "project_shard", "projectShard") orelse shards.DEFAULT_PROJECT_ID;
+    const source_kind_text = getStr(obj, "source_kind", "sourceKind") orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "sourceKind is required" },
+    };
+    const source_kind = procedure_pack_candidates.SourceKind.parse(source_kind_text) orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .invalid_request, .message = "sourceKind must be reviewed_correction, reviewed_negative_knowledge, or learning_status", .details = source_kind_text },
+    };
+    const source_id = getStr(obj, "source_review_id", "sourceReviewId") orelse getStr(obj, "source_id", "sourceId");
+    if (source_kind != .learning_status and source_id == null) {
+        return .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "sourceReviewId is required for reviewed correction and reviewed negative knowledge sources" } };
+    }
+    const candidate_kind_override = if (getStr(obj, "candidate_kind", "candidateKind")) |text|
+        procedure_pack_candidates.CandidateKind.parse(text) orelse return .{
+            .status = .rejected,
+            .err = .{ .code = .invalid_request, .message = "candidateKind is not a supported procedure kind", .details = text },
+        }
+    else
+        null;
+
+    var proposal = try procedure_pack_candidates.propose(allocator, .{
+        .project_shard = project_shard,
+        .source_kind = source_kind,
+        .source_id = source_id,
+        .candidate_kind_override = candidate_kind_override,
+    });
+    defer proposal.deinit();
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"procedurePackCandidatePropose\":{\"status\":\"");
+    try w.writeAll(if (proposal.missing_source) "not_found" else "candidate");
+    try w.writeAll("\",\"projectShard\":\"");
+    try writeEscaped(w, project_shard);
+    try w.writeAll("\",\"sourceKind\":\"");
+    try writeEscaped(w, @tagName(source_kind));
+    try w.writeAll("\",\"sourceReviewId\":");
+    if (source_id) |id| {
+        try w.writeByte('"');
+        try writeEscaped(w, id);
+        try w.writeByte('"');
+    } else {
+        try w.writeAll("null");
+    }
+    try w.writeAll(",\"procedurePackCandidate\":");
+    try w.writeAll(proposal.candidate_json);
+    try w.writeAll(",\"sourceRecord\":");
+    if (proposal.source_record_json) |record| try w.writeAll(record) else try w.writeAll("null");
+    try w.writeAll(",\"warnings\":");
+    try writeReadWarningsJson(w, proposal.source_warnings);
+    try w.writeAll(",\"storage\":{\"persisted\":false,\"reviewRequiredForPersistence\":true,\"packMutation\":false,\"globalPromotion\":false}");
+    try writeProcedurePackCandidateSafeguards(w, true);
+    try w.writeAll("}}");
+
+    var gip_state = if (proposal.missing_source) schema.unresolvedResultState("procedure_pack_candidate_source_not_found") else schema.draftResultState();
+    gip_state.permission = .none;
+    gip_state.verification_state = .unverified;
+    gip_state.support_minimum_met = false;
+    gip_state.non_authorization_notice = "procedure_pack.candidate.propose emits candidate-only procedure descriptions; candidates are not proof, evidence, pack mutation, execution, or global promotion";
+
+    return .{
+        .status = if (proposal.missing_source) .unresolved else .ok,
+        .result_state = gip_state,
+        .result_json = try out.toOwnedSlice(),
+        .allocated_result = true,
+    };
+}
+
+fn dispatchProcedurePackCandidateReview(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
+    const body = request_body orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "request body is required for procedure_pack.candidate.review" },
+    };
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } };
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "procedure_pack.candidate.review request must be a JSON object" } };
+    }
+    const obj = parsed.value.object;
+    const project_shard = getStr(obj, "project_shard", "projectShard") orelse shards.DEFAULT_PROJECT_ID;
+    const decision_text = getStr(obj, "decision", "decision") orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "decision is required" },
+    };
+    const decision = procedure_pack_candidates.Decision.parse(decision_text) orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .invalid_request, .message = "decision must be accepted or rejected", .details = decision_text },
+    };
+    const reviewer_note = getStr(obj, "reviewer_note", "reviewerNote") orelse "";
+    const rejected_reason = getStr(obj, "rejected_reason", "rejectedReason");
+    const candidate_value = obj.get("procedurePackCandidate") orelse obj.get("procedure_pack_candidate") orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "procedurePackCandidate is required" },
+    };
+    if (candidate_value != .object) {
+        return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "procedurePackCandidate must be an object" } };
+    }
+    const candidate_json = try std.json.stringifyAlloc(allocator, candidate_value, .{});
+    defer allocator.free(candidate_json);
+
+    var reviewed = try procedure_pack_candidates.reviewAndAppend(allocator, .{
+        .project_shard = project_shard,
+        .decision = decision,
+        .reviewer_note = reviewer_note,
+        .rejected_reason = rejected_reason,
+        .procedure_pack_candidate_json = candidate_json,
+    });
+    defer reviewed.deinit();
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"procedurePackCandidateReview\":{\"status\":\"reviewed\",\"reviewedProcedurePackCandidateRecord\":");
+    try w.writeAll(reviewed.record_json);
+    try w.writeAll(",\"storage\":{\"path\":\"");
+    try writeEscaped(w, reviewed.storage_path);
+    try w.writeAll("\",\"appendOnly\":true,\"stableOrdering\":\"file_append_order\",\"inPlaceRewrite\":false,\"deletion\":false,\"compaction\":false,\"packMutation\":false}");
+    try writeProcedurePackCandidateSafeguards(w, false);
+    try w.writeAll("}}");
+
+    var gip_state = schema.draftResultState();
+    gip_state.permission = .none;
+    gip_state.verification_state = .unverified;
+    gip_state.support_minimum_met = false;
+    gip_state.non_authorization_notice = "procedure_pack.candidate.review appends reviewed candidate records only; it does not mutate packs or execute commands/verifiers";
+
+    return .{ .status = .ok, .result_state = gip_state, .result_json = try out.toOwnedSlice(), .allocated_result = true };
+}
+
+fn dispatchProcedurePackCandidateReviewedList(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
+    const body = request_body orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "request body is required for procedure_pack.candidate.reviewed.list" },
+    };
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } };
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "procedure_pack.candidate.reviewed.list request must be a JSON object" } };
+    }
+    const obj = parsed.value.object;
+    const project_shard = getStr(obj, "project_shard", "projectShard") orelse shards.DEFAULT_PROJECT_ID;
+    const decision_text = getStr(obj, "decision", "decision") orelse "all";
+    const decision_filter = procedure_pack_candidates.DecisionFilter.parse(decision_text) orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .invalid_request, .message = "decision must be accepted, rejected, or all", .details = decision_text },
+    };
+    const limit = boundedCount(obj, "limit", "limit", procedure_pack_candidates.MAX_REVIEWED_PROCEDURE_PACK_CANDIDATES_READ, procedure_pack_candidates.MAX_REVIEWED_PROCEDURE_PACK_CANDIDATES_READ);
+    const offset = boundedCount(obj, "offset", "cursor", 0, procedure_pack_candidates.MAX_REVIEWED_PROCEDURE_PACK_CANDIDATES_READ);
+    var inspected = try procedure_pack_candidates.listReviewedCandidates(allocator, project_shard, decision_filter, limit, offset, procedure_pack_candidates.MAX_REVIEWED_PROCEDURE_PACK_CANDIDATES_READ);
+    defer inspected.deinit();
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"procedurePackCandidateReviewedList\":{\"status\":\"ok\",\"projectShard\":\"");
+    try writeEscaped(w, project_shard);
+    try w.writeAll("\",\"records\":[");
+    for (inspected.records, 0..) |record, i| {
+        if (i != 0) try w.writeByte(',');
+        try w.writeAll("{\"id\":\"");
+        try writeEscaped(w, record.id);
+        try w.writeAll("\",\"reviewDecision\":\"");
+        try writeEscaped(w, @tagName(record.decision));
+        try w.writeAll("\",\"candidateId\":\"");
+        try writeEscaped(w, record.candidate_id);
+        try w.writeAll("\",\"candidateKind\":\"");
+        try writeEscaped(w, record.candidate_kind);
+        try w.writeAll("\",\"lineNumber\":");
+        try w.print("{d}", .{record.line_number});
+        try w.writeAll(",\"reviewedProcedurePackCandidateRecord\":");
+        try w.writeAll(record.record_json);
+        try w.writeAll("}");
+    }
+    try w.writeAll("],\"totalRead\":");
+    try w.print("{d}", .{inspected.total_read});
+    try w.writeAll(",\"returnedCount\":");
+    try w.print("{d}", .{inspected.returned_count});
+    try w.writeAll(",\"malformedLines\":");
+    try w.print("{d}", .{inspected.malformed_lines});
+    try w.writeAll(",\"warnings\":");
+    try writeProcedurePackReadWarningsJson(w, inspected.warnings);
+    try w.writeAll(",\"capacityTelemetry\":{");
+    try w.print("\"maxRecordsRead\":{d},\"maxRecordsHit\":{},\"limit\":{d},\"offset\":{d},\"limitHit\":{},\"fileBytesLimit\":{d},\"fileBytesLimitHit\":{}", .{
+        procedure_pack_candidates.MAX_REVIEWED_PROCEDURE_PACK_CANDIDATES_READ,
+        inspected.max_records_hit,
+        inspected.limit,
+        inspected.offset,
+        inspected.limit_hit,
+        procedure_pack_candidates.MAX_REVIEWED_PROCEDURE_PACK_CANDIDATES_BYTES,
+        inspected.truncated,
+    });
+    try w.writeAll("},\"storage\":{\"appendOnly\":true,\"missingFile\":");
+    try w.print("{}", .{inspected.missing_file});
+    try w.writeAll(",\"readOnly\":true,\"inPlaceRewrite\":false,\"deletion\":false,\"compaction\":false,\"stableOrdering\":\"file_append_order\",\"packMutation\":false}");
+    try writeProcedurePackCandidateSafeguards(w, true);
+    try w.writeAll("}}");
+
+    var gip_state = schema.draftResultState();
+    gip_state.permission = .none;
+    gip_state.verification_state = .unverified;
+    gip_state.support_minimum_met = false;
+    gip_state.non_authorization_notice = "procedure_pack.candidate.reviewed.list is read-only inspection; records are non-authorizing and not proof or evidence";
+    return .{ .status = .ok, .result_state = gip_state, .result_json = try out.toOwnedSlice(), .allocated_result = true };
+}
+
+fn dispatchProcedurePackCandidateReviewedGet(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
+    const body = request_body orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "request body is required for procedure_pack.candidate.reviewed.get" },
+    };
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } };
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "procedure_pack.candidate.reviewed.get request must be a JSON object" } };
+    }
+    const obj = parsed.value.object;
+    const project_shard = getStr(obj, "project_shard", "projectShard") orelse shards.DEFAULT_PROJECT_ID;
+    const id = getStr(obj, "id", "id") orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "id is required" },
+    };
+    var inspected = try procedure_pack_candidates.getReviewedCandidate(allocator, project_shard, id, procedure_pack_candidates.MAX_REVIEWED_PROCEDURE_PACK_CANDIDATES_READ);
+    defer inspected.deinit();
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"procedurePackCandidateReviewedGet\":{\"status\":\"");
+    try w.writeAll(if (inspected.record != null) "ok" else "not_found");
+    try w.writeAll("\",\"projectShard\":\"");
+    try writeEscaped(w, project_shard);
+    try w.writeAll("\",\"id\":\"");
+    try writeEscaped(w, id);
+    try w.writeAll("\",\"reviewedProcedurePackCandidateRecord\":");
+    if (inspected.record) |record| {
+        try w.writeAll(record.record_json);
+    } else {
+        try w.writeAll("null,\"unknown\":{\"kind\":\"reviewed_procedure_pack_candidate_not_found\",\"reason\":\"no same-shard reviewed procedure pack candidate matched id\"}");
+    }
+    try w.writeAll(",\"totalRead\":");
+    try w.print("{d}", .{inspected.total_read});
+    try w.writeAll(",\"returnedCount\":");
+    try w.print("{d}", .{if (inspected.record != null) @as(usize, 1) else @as(usize, 0)});
+    try w.writeAll(",\"malformedLines\":");
+    try w.print("{d}", .{inspected.malformed_lines});
+    try w.writeAll(",\"warnings\":");
+    try writeProcedurePackReadWarningsJson(w, inspected.warnings);
+    try w.writeAll(",\"capacityTelemetry\":{");
+    try w.print("\"maxRecordsRead\":{d},\"maxRecordsHit\":{},\"fileBytesLimit\":{d},\"fileBytesLimitHit\":{}", .{
+        procedure_pack_candidates.MAX_REVIEWED_PROCEDURE_PACK_CANDIDATES_READ,
+        inspected.max_records_hit,
+        procedure_pack_candidates.MAX_REVIEWED_PROCEDURE_PACK_CANDIDATES_BYTES,
+        inspected.truncated,
+    });
+    try w.writeAll("},\"storage\":{\"appendOnly\":true,\"missingFile\":");
+    try w.print("{}", .{inspected.missing_file});
+    try w.writeAll(",\"readOnly\":true,\"inPlaceRewrite\":false,\"deletion\":false,\"compaction\":false,\"stableOrdering\":\"file_append_order\",\"packMutation\":false}");
+    try writeProcedurePackCandidateSafeguards(w, true);
+    try w.writeAll("}}");
+
+    var gip_state = if (inspected.record != null) schema.draftResultState() else schema.unresolvedResultState("reviewed_procedure_pack_candidate_not_found");
+    gip_state.permission = .none;
+    gip_state.verification_state = .unverified;
+    gip_state.support_minimum_met = false;
+    gip_state.non_authorization_notice = "procedure_pack.candidate.reviewed.get is read-only inspection; records are non-authorizing and not proof or evidence";
+    return .{
+        .status = if (inspected.record != null) .ok else .unresolved,
+        .result_state = gip_state,
+        .result_json = try out.toOwnedSlice(),
+        .allocated_result = true,
+    };
+}
+
 fn dispatchLearningStatus(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
     var parsed: ?std.json.Parsed(std.json.Value) = null;
     defer if (parsed) |*p| p.deinit();
@@ -1440,6 +1743,25 @@ fn writeReviewedCorrectionSafeguards(w: anytype) !void {
     try w.writeAll(",\"readOnly\":true");
     try w.writeAll(",\"mutationFlags\":{\"corpusMutation\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false}");
     try w.writeAll(",\"authority\":{\"nonAuthorizing\":true,\"treatedAsProof\":false,\"supportGranted\":false,\"proofDischarged\":false,\"usedAsEvidence\":false}");
+}
+
+fn writeProcedurePackReadWarningsJson(w: anytype, warnings: []const procedure_pack_candidates.ReadWarning) !void {
+    try w.writeByte('[');
+    for (warnings, 0..) |warning, i| {
+        if (i != 0) try w.writeByte(',');
+        try w.writeAll("{\"lineNumber\":");
+        try w.print("{d}", .{warning.line_number});
+        try w.writeAll(",\"reason\":\"");
+        try writeEscaped(w, warning.reason);
+        try w.writeAll("\"}");
+    }
+    try w.writeByte(']');
+}
+
+fn writeProcedurePackCandidateSafeguards(w: anytype, read_only: bool) !void {
+    if (read_only) try w.writeAll(",\"readOnly\":true");
+    try w.writeAll(",\"mutationFlags\":{\"corpusMutation\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false}");
+    try w.writeAll(",\"authority\":{\"nonAuthorizing\":true,\"treatedAsProof\":false,\"usedAsEvidence\":false,\"supportGranted\":false,\"proofDischarged\":false,\"executesByDefault\":false,\"packMutation\":false,\"globalPromotion\":false}");
 }
 
 fn writeNegativeKnowledgeReadWarningsJson(w: anytype, warnings: []const negative_knowledge_review.ReadWarning) !void {
@@ -5024,6 +5346,147 @@ test "negative_knowledge.reviewed list and get handle missing and malformed reco
     try std.testing.expect(std.mem.indexOf(u8, missing.result_json.?, "malformed reviewed negative knowledge JSONL line ignored") != null);
 }
 
+test "procedure_pack.candidate.propose creates candidate from reviewed correction without pack mutation" {
+    const allocator = std.testing.allocator;
+    const project_shard = "phase13a-propose-correction";
+    try cleanProjectShardForTest(allocator, project_shard);
+    defer cleanProjectShardForTest(allocator, project_shard) catch {};
+
+    const reviewed_id = try appendReviewedCorrectionForTest(allocator, project_shard, "procedure-correction", .accepted);
+    defer allocator.free(reviewed_id);
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"projectShard\":\"{s}\",\"sourceKind\":\"reviewed_correction\",\"sourceReviewId\":\"{s}\"}}",
+        .{ project_shard, reviewed_id },
+    );
+    defer allocator.free(body);
+
+    var result = try dispatch(allocator, "procedure_pack.candidate.propose", core.PROTOCOL_VERSION, null, null, body);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
+    const json = result.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"procedurePackCandidate\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"sourceKind\":\"reviewed_correction\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"candidateKind\":\"corpus_review_procedure\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"persisted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"nonAuthorizing\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"treatedAsProof\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"usedAsEvidence\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"executesByDefault\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"packMutation\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"globalPromotion\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"commandsExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verifiersExecuted\":false") != null);
+}
+
+test "procedure_pack.candidate.propose creates candidate from reviewed negative knowledge" {
+    const allocator = std.testing.allocator;
+    const project_shard = "phase13a-propose-nk";
+    try cleanProjectShardForTest(allocator, project_shard);
+    defer cleanProjectShardForTest(allocator, project_shard) catch {};
+
+    var reviewed = try negative_knowledge_review.reviewAndAppend(allocator, .{
+        .project_shard = project_shard,
+        .decision = .accepted,
+        .reviewer_note = "accepted procedure source",
+        .rejected_reason = null,
+        .source_candidate_id = "nk:candidate:procedure",
+        .negative_knowledge_candidate_json = "{\"id\":\"nk:candidate:procedure\",\"kind\":\"failed_hypothesis\",\"condition\":\"bad repeated answer\"}",
+    });
+    defer reviewed.deinit();
+    const reviewed_id = try reviewedRecordIdForTest(allocator, reviewed.record_json);
+    defer allocator.free(reviewed_id);
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"projectShard\":\"{s}\",\"sourceKind\":\"reviewed_negative_knowledge\",\"sourceReviewId\":\"{s}\"}}",
+        .{ project_shard, reviewed_id },
+    );
+    defer allocator.free(body);
+
+    var result = try dispatch(allocator, "procedure_pack.candidate.propose", core.PROTOCOL_VERSION, null, null, body);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
+    const json = result.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"sourceKind\":\"reviewed_negative_knowledge\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"candidateKind\":\"negative_knowledge_procedure\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"nonAuthorizing\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"treatedAsProof\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"packMutation\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"commandsExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verifiersExecuted\":false") != null);
+}
+
+test "procedure_pack.candidate review list and get are append-only inspection only" {
+    const allocator = std.testing.allocator;
+    const project_shard = "phase13a-review-list-get";
+    try cleanProjectShardForTest(allocator, project_shard);
+    defer cleanProjectShardForTest(allocator, project_shard) catch {};
+
+    var proposal = try procedure_pack_candidates.propose(allocator, .{
+        .project_shard = project_shard,
+        .source_kind = .learning_status,
+    });
+    defer proposal.deinit();
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"projectShard\":\"{s}\",\"decision\":\"accepted\",\"reviewerNote\":\"phase13a review\",\"procedurePackCandidate\":{s}}}",
+        .{ project_shard, proposal.candidate_json },
+    );
+    defer allocator.free(body);
+
+    var reviewed = try dispatch(allocator, "procedure_pack.candidate.review", core.PROTOCOL_VERSION, null, null, body);
+    defer reviewed.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, reviewed.status);
+    const reviewed_json = reviewed.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, reviewed_json, "\"reviewedProcedurePackCandidateRecord\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reviewed_json, "\"appendOnly\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reviewed_json, "\"packMutation\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reviewed_json, "\"executesByDefault\":false") != null);
+    const reviewed_id = try reviewedProcedurePackCandidateIdForTest(allocator, reviewed_json);
+    defer allocator.free(reviewed_id);
+
+    var listed = try dispatch(allocator, "procedure_pack.candidate.reviewed.list", core.PROTOCOL_VERSION, null, null,
+        \\{"projectShard":"phase13a-review-list-get","decision":"all"}
+    );
+    defer listed.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, listed.status);
+    try std.testing.expect(std.mem.indexOf(u8, listed.result_json.?, "\"returnedCount\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed.result_json.?, "\"readOnly\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed.result_json.?, "\"packMutation\":false") != null);
+
+    const get_body = try std.fmt.allocPrint(allocator, "{{\"projectShard\":\"{s}\",\"id\":\"{s}\"}}", .{ project_shard, reviewed_id });
+    defer allocator.free(get_body);
+    var got = try dispatch(allocator, "procedure_pack.candidate.reviewed.get", core.PROTOCOL_VERSION, null, null, get_body);
+    defer got.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, got.status);
+    try std.testing.expect(std.mem.indexOf(u8, got.result_json.?, "\"returnedCount\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got.result_json.?, "\"usedAsEvidence\":false") != null);
+}
+
+test "procedure_pack.candidate malformed and missing input handled cleanly" {
+    const allocator = std.testing.allocator;
+    var bad_source = try dispatch(allocator, "procedure_pack.candidate.propose", core.PROTOCOL_VERSION, null, null,
+        \\{"projectShard":"phase13a-bad","sourceKind":"pack"}
+    );
+    defer bad_source.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, bad_source.status);
+    try std.testing.expectEqual(core.ErrorCode.invalid_request, bad_source.err.?.code);
+
+    var missing_id = try dispatch(allocator, "procedure_pack.candidate.propose", core.PROTOCOL_VERSION, null, null,
+        \\{"projectShard":"phase13a-bad","sourceKind":"reviewed_correction"}
+    );
+    defer missing_id.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, missing_id.status);
+    try std.testing.expectEqual(core.ErrorCode.missing_required_field, missing_id.err.?.code);
+
+    var bad_review = try dispatch(allocator, "procedure_pack.candidate.review", core.PROTOCOL_VERSION, null, null,
+        \\{"projectShard":"phase13a-bad","decision":"accepted","procedurePackCandidate":42}
+    );
+    defer bad_review.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, bad_review.status);
+    try std.testing.expectEqual(core.ErrorCode.invalid_request, bad_review.err.?.code);
+}
+
 test "correction.propose creates review-required wrong answer candidate" {
     const allocator = std.testing.allocator;
     const body =
@@ -6267,6 +6730,16 @@ fn reviewedRecordIdForTest(allocator: std.mem.Allocator, json: []const u8) ![]u8
     const root = valueObject(parsed.value) orelse return error.InvalidJson;
     const review = valueObject(root.get("correctionReview") orelse parsed.value) orelse root;
     const record = valueObject(review.get("reviewedCorrectionRecord") orelse parsed.value) orelse return error.InvalidJson;
+    const id = stringField(record, "id") orelse return error.InvalidJson;
+    return allocator.dupe(u8, id);
+}
+
+fn reviewedProcedurePackCandidateIdForTest(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    const root = valueObject(parsed.value) orelse return error.InvalidJson;
+    const review = valueObject(root.get("procedurePackCandidateReview") orelse parsed.value) orelse root;
+    const record = valueObject(review.get("reviewedProcedurePackCandidateRecord") orelse parsed.value) orelse return error.InvalidJson;
     const id = stringField(record, "id") orelse return error.InvalidJson;
     return allocator.dupe(u8, id);
 }

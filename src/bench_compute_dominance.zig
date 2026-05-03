@@ -9,6 +9,7 @@ const correction_candidates = core.correction_candidates;
 const correction_review = core.correction_review;
 const learning_status = core.learning_status;
 const negative_knowledge_review = core.negative_knowledge_review;
+const procedure_pack_candidates = core.procedure_pack_candidates;
 const rule_reasoning = core.rule_reasoning;
 const shards = core.shards;
 
@@ -22,6 +23,7 @@ const OperationKind = enum {
     @"correction.reviewed",
     @"negative_knowledge.reviewed",
     @"learning.status",
+    @"procedure_pack.candidate",
     @"corpus.lifecycle",
 };
 
@@ -124,6 +126,7 @@ pub fn runSuite(allocator: std.mem.Allocator) !SuiteResult {
     try results.append(try runNegativeKnowledgeReviewedListGet(allocator));
     try results.append(try runLearningStatusNoFile(allocator));
     try results.append(try runLearningStatusPopulated(allocator));
+    try results.append(try runProcedurePackCandidateLifecycle(allocator));
     try results.append(try runLifecycleScenario(allocator));
 
     return .{
@@ -993,6 +996,83 @@ fn runLearningStatusPopulated(allocator: std.mem.Allocator) !ScenarioResult {
     };
 }
 
+fn runProcedurePackCandidateLifecycle(allocator: std.mem.Allocator) !ScenarioResult {
+    const shard_id = "bench-compute-dominance-procedure-pack-candidate";
+    try cleanProjectShard(allocator, shard_id);
+    defer cleanProjectShard(allocator, shard_id) catch {};
+
+    var reviewed_correction = try correction_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .accepted,
+        .reviewer_note = "benchmark procedure pack source",
+        .rejected_reason = null,
+        .source_candidate_id = "correction:candidate:procedure-pack",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:procedure-pack","originalOperationKind":"corpus.ask","disputedOutput":{"kind":"answerDraft","summary":"bad answer"},"userCorrection":"review the corpus answer before reuse","correctionType":"wrong_answer"}
+        ,
+        .accepted_learning_outputs_json = "[{\"kind\":\"corpus_review_candidate\",\"status\":\"candidate\"}]",
+    });
+    defer reviewed_correction.deinit();
+    const reviewed_id = try reviewedRecordId(allocator, reviewed_correction.record_json);
+    defer allocator.free(reviewed_id);
+
+    const started = std.time.nanoTimestamp();
+    var proposal = try procedure_pack_candidates.propose(allocator, .{
+        .project_shard = shard_id,
+        .source_kind = .reviewed_correction,
+        .source_id = reviewed_id,
+    });
+    defer proposal.deinit();
+    var reviewed_candidate = try procedure_pack_candidates.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .accepted,
+        .reviewer_note = "benchmark accepted procedure pack candidate",
+        .rejected_reason = null,
+        .procedure_pack_candidate_json = proposal.candidate_json,
+    });
+    defer reviewed_candidate.deinit();
+    const reviewed_candidate_id = try reviewedRecordId(allocator, reviewed_candidate.record_json);
+    defer allocator.free(reviewed_candidate_id);
+    var listed = try procedure_pack_candidates.listReviewedCandidates(
+        allocator,
+        shard_id,
+        .all,
+        8,
+        0,
+        procedure_pack_candidates.MAX_REVIEWED_PROCEDURE_PACK_CANDIDATES_READ,
+    );
+    defer listed.deinit();
+    var got = try procedure_pack_candidates.getReviewedCandidate(
+        allocator,
+        shard_id,
+        reviewed_candidate_id,
+        procedure_pack_candidates.MAX_REVIEWED_PROCEDURE_PACK_CANDIDATES_READ,
+    );
+    defer got.deinit();
+
+    return .{
+        .name = "procedure_pack.candidate/propose_review_list_get_no_pack_mutation",
+        .operation_kind = .@"procedure_pack.candidate",
+        .success = !proposal.missing_source and listed.returned_count == 1 and got.record != null and
+            std.mem.indexOf(u8, proposal.candidate_json, "\"nonAuthorizing\":true") != null and
+            std.mem.indexOf(u8, proposal.candidate_json, "\"treatedAsProof\":false") != null and
+            std.mem.indexOf(u8, proposal.candidate_json, "\"executesByDefault\":false") != null and
+            std.mem.indexOf(u8, proposal.candidate_json, "\"packMutation\":false") != null and
+            std.mem.indexOf(u8, reviewed_candidate.record_json, "\"packMutation\":false") != null,
+        .duration_ns = elapsedNs(started),
+        .input_bytes = reviewed_correction.record_json.len + proposal.candidate_json.len + reviewed_candidate.record_json.len,
+        .correction_candidate_count = 1,
+        .future_behavior_candidate_count = 1,
+        .commands_executed = 0,
+        .verifiers_executed = 0,
+        .corpus_mutation = false,
+        .pack_mutation = false,
+        .negative_knowledge_mutation = false,
+        .non_authorizing = true,
+        .required_review = false,
+    };
+}
+
 const CorpusFile = struct {
     path: []const u8,
     body: []const u8,
@@ -1364,7 +1444,7 @@ test "compute dominance report is generated with required scenarios and safety f
     var suite = try runSuite(allocator);
     defer suite.deinit();
 
-    try std.testing.expectEqual(@as(usize, 31), suite.scenarios.len);
+    try std.testing.expectEqual(@as(usize, 32), suite.scenarios.len);
     try std.testing.expect(allScenariosPassed(suite.scenarios));
 
     const json = try renderJsonReport(allocator, suite);
@@ -1392,6 +1472,7 @@ test "compute dominance report is generated with required scenarios and safety f
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"negative_knowledge.reviewed.list_get/read_only_append_order\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"learning.status/no_file_zero_summary\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"learning.status/populated_correction_nk_summary\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"procedure_pack.candidate/propose_review_list_get_no_pack_mutation\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"end_to_end/lifecycle_ingest_apply_ask_correction_no_hidden_mutation\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"cloudUsed\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"transformersUsed\":false") != null);

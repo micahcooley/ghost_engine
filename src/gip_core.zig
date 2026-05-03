@@ -55,6 +55,10 @@ pub const RequestKind = enum {
     @"correction.list",
     @"correction.get",
     @"correction.apply",
+    @"procedure_pack.candidate.propose",
+    @"procedure_pack.candidate.review",
+    @"procedure_pack.candidate.reviewed.list",
+    @"procedure_pack.candidate.reviewed.get",
     @"negative_knowledge.candidate.list",
     @"negative_knowledge.candidate.get",
     @"negative_knowledge.record.list",
@@ -243,6 +247,10 @@ pub const CapabilityName = enum {
     @"correction.list",
     @"correction.get",
     @"correction.apply",
+    @"procedure_pack.candidate.propose",
+    @"procedure_pack.candidate.review",
+    @"procedure_pack.candidate.reviewed.list",
+    @"procedure_pack.candidate.reviewed.get",
     @"negative_knowledge.candidate.list",
     @"negative_knowledge.candidate.get",
     @"negative_knowledge.record.list",
@@ -296,7 +304,7 @@ pub const CapabilityEntry = struct {
     policy: CapabilityPolicy,
 };
 
-pub fn defaultCapabilities() [55]CapabilityEntry {
+pub fn defaultCapabilities() [59]CapabilityEntry {
     return .{
         .{ .capability = .@"artifact.read", .policy = .allowed },
         .{ .capability = .@"artifact.list", .policy = .allowed },
@@ -323,6 +331,10 @@ pub fn defaultCapabilities() [55]CapabilityEntry {
         .{ .capability = .@"correction.list", .policy = .allowed },
         .{ .capability = .@"correction.get", .policy = .allowed },
         .{ .capability = .@"correction.apply", .policy = .denied },
+        .{ .capability = .@"procedure_pack.candidate.propose", .policy = .allowed },
+        .{ .capability = .@"procedure_pack.candidate.review", .policy = .allowed },
+        .{ .capability = .@"procedure_pack.candidate.reviewed.list", .policy = .allowed },
+        .{ .capability = .@"procedure_pack.candidate.reviewed.get", .policy = .allowed },
         .{ .capability = .@"negative_knowledge.candidate.list", .policy = .allowed },
         .{ .capability = .@"negative_knowledge.candidate.get", .policy = .allowed },
         .{ .capability = .@"negative_knowledge.record.list", .policy = .allowed },
@@ -510,6 +522,10 @@ pub const IMPLEMENTED_KINDS = [_]RequestKind{
     .@"correction.reviewed.get",
     .@"correction.influence.status",
     .@"learning.status",
+    .@"procedure_pack.candidate.propose",
+    .@"procedure_pack.candidate.review",
+    .@"procedure_pack.candidate.reviewed.list",
+    .@"procedure_pack.candidate.reviewed.get",
     .@"correction.list",
     .@"correction.get",
     .@"negative_knowledge.candidate.list",

@@ -107,6 +107,10 @@ results when GIP has no active session or workspace metadata:
 | `correction.reviewed.list` | Lists same-shard reviewed correction records from append-only storage with filters, warnings, and capacity telemetry; read-only and not proof | `read_only_reviewed_correction_inspection_non_authorizing` |
 | `correction.reviewed.get` | Retrieves one same-shard reviewed correction record by id; read-only, tolerant of malformed lines, and not proof | `read_only_reviewed_correction_inspection_non_authorizing` |
 | `correction.influence.status` | Summarizes same-shard reviewed correction totals, target operations, possible influence candidates, warnings, and read-cap telemetry; read-only diagnostics and not proof | `read_only_reviewed_correction_influence_summary_non_authorizing` |
+| `procedure_pack.candidate.propose` | Proposes explicit non-executable procedure pack candidates from reviewed corrections, reviewed negative knowledge, or `learning.status`; non-persistent unless separately reviewed | `candidate_only_no_pack_mutation_no_execution` |
+| `procedure_pack.candidate.review` | Appends an accepted/rejected procedure pack candidate review record only; does not mutate packs or promote candidates | `append_only_reviewed_procedure_pack_candidate_no_pack_mutation` |
+| `procedure_pack.candidate.reviewed.list` | Lists same-shard reviewed procedure pack candidate records from append-only storage; read-only and not proof/evidence | `read_only_reviewed_procedure_pack_candidate_inspection_non_authorizing` |
+| `procedure_pack.candidate.reviewed.get` | Retrieves one same-shard reviewed procedure pack candidate record by id; read-only and not proof/evidence | `read_only_reviewed_procedure_pack_candidate_inspection_non_authorizing` |
 | `verifier.candidate.execution.list` | Reads existing task/result support-graph state; returns empty when no state is visible | `read_only_state_inspection` |
 | `verifier.candidate.execution.get` | Reads one existing execution job/result projection; missing IDs return `path_not_found` | `read_only_state_inspection` |
 | `correction.list` | Reads existing correction-event state; returns empty when no state is visible | `read_only_state_inspection` |
@@ -318,6 +322,21 @@ promotion, or pack mutation.
   - **Response**: `{"learningStatus":{"status":"ok","projectShard":string,"readOnly":true,"correctionSummary":{...},"negativeKnowledgeSummary":{...},"influenceSummary":{...},"warningSummary":{...},"capacityTelemetry":{...},"storage":{...},"records":[...] optional,"mutationFlags":...,"authority":{"nonAuthorizing":true,"treatedAsProof":false,"usedAsEvidence":false,"globalPromotion":false,...}}}`.
   - The scoreboard reads only same-shard reviewed JSONL files and treats counts as diagnostics, not proof, evidence, support, review decisions, mutation, hidden learning, or global promotion.
 
+- `procedure_pack.candidate.propose` — Propose an explicit procedure pack candidate **(Implemented; candidate-only, non-persistent)**
+  - **Request**: `{"projectShard": string optional, "sourceKind": "reviewed_correction" | "reviewed_negative_knowledge" | "learning_status", "sourceReviewId": string required except for learning_status, "candidateKind": string optional}`.
+  - **Response**: `{"procedurePackCandidatePropose":{"status":"candidate"|"not_found","procedurePackCandidate":object,"sourceRecord":object|null,"storage":{"persisted":false,...},"mutationFlags":...,"authority":{"nonAuthorizing":true,"treatedAsProof":false,"usedAsEvidence":false,"executesByDefault":false,"packMutation":false,"globalPromotion":false,...}}}`.
+  - Candidate steps are structured descriptions with `executable:false`. Proposals do not persist themselves, mutate packs, execute commands/verifiers, become evidence/proof/support, or promote globally.
+
+- `procedure_pack.candidate.review` — Accept or reject a procedure pack candidate into append-only reviewed candidate storage **(Implemented; append-only candidate review only)**
+  - **Request**: `{"projectShard": string optional, "procedurePackCandidate": object, "decision": "accepted" | "rejected", "reviewerNote": string optional, "rejectedReason": string optional}`.
+  - **Response**: `{"procedurePackCandidateReview":{"status":"reviewed","reviewedProcedurePackCandidateRecord":object,"storage":{"path":string,"appendOnly":true,...},"mutationFlags":...,"authority":...}}`.
+  - Records are appended to `procedure_packs/reviewed_pack_candidates.jsonl` in the selected project shard. Review stores candidate lifecycle state only; it does not write or mutate any pack.
+
+- `procedure_pack.candidate.reviewed.list` / `procedure_pack.candidate.reviewed.get` — Inspect reviewed procedure pack candidate records **(Implemented; read-only inspection only)**
+  - **Request list**: `{"projectShard": string optional, "decision": "accepted" | "rejected" | "all" optional, "limit": int optional, "offset": int optional}`.
+  - **Request get**: `{"projectShard": string optional, "id": string}`.
+  - Both return append-order records, warnings, capacity telemetry, storage flags, false mutation flags, and non-authorizing authority flags. Missing storage is empty/not-found; malformed JSONL lines become warnings.
+
 - `negative_knowledge.review` — Accept or reject a negative-knowledge candidate into append-only reviewed negative-knowledge records **(Implemented; append-only persistence only)**
   - **Request**: `{"projectShard": string optional, "negativeKnowledgeCandidate": object optional, "negativeKnowledgeCandidateId": string optional, "decision": "accepted" | "rejected", "reviewerNote": string, "rejectedReason": string required when rejected, "sourceCorrectionReviewId": string optional}`.
   - **Response**: `{"negativeKnowledgeReview":{"status":"reviewed","reviewedNegativeKnowledgeRecord":object,"requiredReview":false,"readOnly":false,"appendOnly":true,"futureInfluenceCandidate":object|null,"storage":{...},"mutationFlags":...,"authority":...}}`.
@@ -502,6 +521,10 @@ promote global authority.
 | `correction.reviewed.list` | allowed | yes |
 | `correction.reviewed.get` | allowed | yes |
 | `correction.influence.status` | allowed | yes |
+| `procedure_pack.candidate.propose` | allowed | yes |
+| `procedure_pack.candidate.review` | allowed | yes |
+| `procedure_pack.candidate.reviewed.list` | allowed | yes |
+| `procedure_pack.candidate.reviewed.get` | allowed | yes |
 | `hypothesis.list` | allowed | yes |
 | `hypothesis.triage` | allowed | yes |
 | `verifier.list` | allowed | yes |
@@ -566,6 +589,7 @@ Maximum timeout: 30 seconds. Maximum output: 256KB.
 16. **Reviewed correction influence is shard-scoped and non-mutating** — accepted correction influence reads only the same project shard and does not mutate corpus, packs, negative knowledge, commands, verifiers, or unrelated shards
 17. **Reviewed negative knowledge influence is caution only** — accepted reviewed NK can warn, suppress exact repeated known-bad outputs, require stronger evidence/verifier candidates, or propose future behavior candidates for same-shard `corpus.ask` / `rule.evaluate`, but it is never evidence, proof, support, verifier execution, mutation, semantic matching, or global promotion
 18. **Learning status is a scoreboard only** — `learning.status` summarizes reviewed correction and reviewed NK counts for one shard, but the scoreboard is not proof, evidence, support, review authority, hidden learning, mutation, or global promotion
+19. **Procedure pack candidates are lifecycle candidates only** — `procedure_pack.candidate.*` can propose, review, and inspect candidate procedures, but candidates never mutate packs, execute commands/verifiers, become proof/evidence/support, auto-promote, or promote globally
 
 ## CLI Usage
 
