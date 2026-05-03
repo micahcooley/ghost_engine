@@ -25,6 +25,16 @@ pub const RiskSurface = struct {
     non_authorizing: bool = true,
 };
 
+pub const RootCandidate = struct {
+    path: []const u8,
+    kind: []const u8,
+    confidence: []const u8,
+    reason: []const u8,
+    evidence_paths: []const []const u8 = &.{},
+    detected_language: ?[]const u8 = null,
+    non_authorizing: bool = true,
+};
+
 pub const SafeCommandCandidate = struct {
     id: []const u8,
     argv: []const []const u8,
@@ -73,8 +83,8 @@ pub const ProjectProfile = struct {
     ci_configs: []Signal = &.{},
     docs: []Signal = &.{},
     config_files: []Signal = &.{},
-    source_roots: []Signal = &.{},
-    test_roots: []Signal = &.{},
+    source_roots: []RootCandidate = &.{},
+    test_roots: []RootCandidate = &.{},
     entry_points: []Signal = &.{},
     dependency_files: []Signal = &.{},
     risk_surfaces: []RiskSurface = &.{},
@@ -130,8 +140,8 @@ const Builder = struct {
     ci_configs: std.ArrayList(Signal),
     docs: std.ArrayList(Signal),
     config_files: std.ArrayList(Signal),
-    source_roots: std.ArrayList(Signal),
-    test_roots: std.ArrayList(Signal),
+    source_roots: std.ArrayList(RootCandidate),
+    test_roots: std.ArrayList(RootCandidate),
     entry_points: std.ArrayList(Signal),
     dependency_files: std.ArrayList(Signal),
     risk_surfaces: std.ArrayList(RiskSurface),
@@ -200,6 +210,21 @@ const Builder = struct {
         try list.append(try self.signal(name, path, kind, confidence, reason));
     }
 
+    fn appendRootCandidate(self: *Builder, list: *std.ArrayList(RootCandidate), path: []const u8, kind: []const u8, confidence: []const u8, reason: []const u8) !void {
+        if (containsRootCandidate(list.items, path, kind)) return;
+        const evidence_paths = try rootEvidencePaths(self.allocator, self.entries, path);
+        const language_hint = try rootLanguageHint(self.allocator, self.entries, path);
+        try list.append(.{
+            .path = try self.allocator.dupe(u8, path),
+            .kind = try self.allocator.dupe(u8, kind),
+            .confidence = try self.allocator.dupe(u8, confidence),
+            .reason = try self.allocator.dupe(u8, reason),
+            .evidence_paths = evidence_paths,
+            .detected_language = language_hint,
+        });
+        try self.appendSignal(&self.trace, path, path, "root_candidate_evidence", confidence, reason);
+    }
+
     fn appendCommand(self: *Builder, id: []const u8, argv: []const []const u8, detected_from: []const u8, reason: []const u8, risk_level: []const u8) !void {
         for (self.safe_commands.items) |candidate| {
             if (std.mem.eql(u8, candidate.id, id)) return;
@@ -263,8 +288,8 @@ const Builder = struct {
         sortSignals(self.ci_configs.items);
         sortSignals(self.docs.items);
         sortSignals(self.config_files.items);
-        sortSignals(self.source_roots.items);
-        sortSignals(self.test_roots.items);
+        sortRootCandidates(self.source_roots.items);
+        sortRootCandidates(self.test_roots.items);
         sortSignals(self.entry_points.items);
         sortSignals(self.dependency_files.items);
         sortRisks(self.risk_surfaces.items);
@@ -367,8 +392,12 @@ pub fn writeJson(allocator: std.mem.Allocator, workspace_root: []const u8, write
 fn detectCommon(builder: *Builder) !void {
     for (builder.entries) |entry| {
         if (entry.is_dir) {
-            if (std.mem.eql(u8, entry.rel_path, "src")) try builder.appendSignal(&builder.source_roots, "src", entry.rel_path, "source_root", "high", "conventional source directory exists");
-            if (std.mem.eql(u8, entry.rel_path, "test") or std.mem.eql(u8, entry.rel_path, "tests")) try builder.appendSignal(&builder.test_roots, entry.basename, entry.rel_path, "test_root", "high", "conventional test directory exists");
+            if (isConventionalSourceRoot(entry.rel_path)) {
+                try builder.appendRootCandidate(&builder.source_roots, entry.rel_path, "source_root", sourceRootConfidence(entry.rel_path), sourceRootReason(entry.rel_path));
+            }
+            if (isConventionalTestRoot(entry.rel_path)) {
+                try builder.appendRootCandidate(&builder.test_roots, entry.rel_path, "test_root", testRootConfidence(entry.rel_path), testRootReason(entry.rel_path));
+            }
             if (std.mem.eql(u8, entry.rel_path, "docs")) try builder.appendSignal(&builder.docs, "docs", entry.rel_path, "docs_directory", "high", "docs directory exists");
             continue;
         }
@@ -387,6 +416,9 @@ fn detectCommon(builder: *Builder) !void {
         if (isDependencyFile(entry.basename)) try builder.appendSignal(&builder.dependency_files, entry.basename, entry.rel_path, "dependency_file", "high", "recognized dependency or lock file exists");
         if (isPackageManagerFile(entry.basename)) try builder.appendSignal(&builder.package_managers, packageManagerName(entry.basename), entry.rel_path, "package_manager", "high", "package manager file exists");
         if (isEntryPoint(entry.rel_path)) try builder.appendSignal(&builder.entry_points, entry.basename, entry.rel_path, "entry_point", "medium", "conventional entry point path exists");
+        if (isColocatedSourceTest(entry.rel_path)) {
+            try builder.appendRootCandidate(&builder.test_roots, "src", "test_root", "medium", "test-like files are colocated under source root; candidate only, not proof tests are complete");
+        }
     }
 }
 
@@ -516,6 +548,20 @@ fn detectRisks(builder: *Builder) !void {
 }
 
 fn detectGaps(builder: *Builder, options: AnalyzeOptions, entry_count: usize) !void {
+    if (builder.source_roots.items.len == 0) {
+        try builder.appendSignal(&builder.unknowns, "source_root_unknown", "", "unknown", "high", "no source root candidate was determined from bounded structural evidence");
+        try builder.appendSignal(&builder.next_questions, "identify_source_root", "", "next_question", "medium", "Which directory should be treated as the primary source root?");
+    } else if (hasConflictingRootCandidates(builder.source_roots.items)) {
+        try builder.appendSignal(&builder.unknowns, "source_root_ambiguous", "", "unknown", "medium", "multiple plausible source roots were detected and no canonical root was selected");
+        try builder.appendSignal(&builder.next_questions, "choose_canonical_source_root", "", "next_question", "medium", "Which detected source root is canonical for future explicit verification?");
+    }
+    if (builder.test_roots.items.len == 0) {
+        try builder.appendSignal(&builder.unknowns, "test_root_unknown", "", "unknown", "medium", "no test root candidate was determined; absence of evidence is not evidence that tests do not exist");
+        try builder.appendSignal(&builder.next_questions, "identify_test_root", "", "next_question", "medium", "Where should Ghost look for tests during a future explicit verification pass?");
+    } else if (hasConflictingRootCandidates(builder.test_roots.items)) {
+        try builder.appendSignal(&builder.unknowns, "test_root_ambiguous", "", "unknown", "medium", "multiple plausible test roots were detected and no canonical root was selected");
+        try builder.appendSignal(&builder.next_questions, "choose_canonical_test_root", "", "next_question", "medium", "Which detected test root is canonical for future explicit verification?");
+    }
     if (builder.languages.items.len == 0) {
         try builder.appendSignal(&builder.unknowns, "project_type_unknown", "", "unknown", "high", "no known language/toolchain signal was detected");
         try builder.appendSignal(&builder.ambiguous_project_type, "project_type_unknown", "", "ambiguous_project_type", "high", "known Pass 1 project signals were absent");
@@ -689,6 +735,100 @@ fn hasDir(entries: []const Entry, rel_path: []const u8) bool {
     return false;
 }
 
+fn isConventionalSourceRoot(path: []const u8) bool {
+    return std.mem.eql(u8, path, "src") or
+        std.mem.eql(u8, path, "lib") or
+        std.mem.eql(u8, path, "app") or
+        (startsWith(path, "packages/") and endsWith(path, "/src"));
+}
+
+fn isConventionalTestRoot(path: []const u8) bool {
+    const base = std.fs.path.basename(path);
+    return std.mem.eql(u8, path, "test") or
+        std.mem.eql(u8, path, "tests") or
+        std.mem.eql(u8, path, "spec") or
+        std.mem.eql(u8, path, "__tests__") or
+        (startsWith(path, "packages/") and (std.mem.eql(u8, base, "test") or std.mem.eql(u8, base, "tests") or std.mem.eql(u8, base, "spec") or std.mem.eql(u8, base, "__tests__"))) or
+        (startsWith(path, "src/") and (std.mem.eql(u8, base, "test") or std.mem.eql(u8, base, "tests") or std.mem.eql(u8, base, "spec") or std.mem.eql(u8, base, "__tests__")));
+}
+
+fn sourceRootConfidence(path: []const u8) []const u8 {
+    if (std.mem.eql(u8, path, "src")) return "high";
+    return "medium";
+}
+
+fn sourceRootReason(path: []const u8) []const u8 {
+    if (std.mem.eql(u8, path, "src")) return "canonical src directory exists; source root candidate only, not correctness evidence";
+    if (startsWith(path, "packages/")) return "package-local src directory exists within bounded traversal; monorepo source root candidate only";
+    return "conventional source-like directory exists; candidate only and not proof of primary root";
+}
+
+fn testRootConfidence(path: []const u8) []const u8 {
+    if (std.mem.eql(u8, path, "test") or std.mem.eql(u8, path, "tests")) return "high";
+    return "medium";
+}
+
+fn testRootReason(path: []const u8) []const u8 {
+    if (std.mem.eql(u8, path, "test") or std.mem.eql(u8, path, "tests")) return "conventional test directory exists; test root candidate only, not verifier execution evidence";
+    if (startsWith(path, "packages/")) return "package-local test directory exists within bounded traversal; test root candidate only";
+    if (startsWith(path, "src/")) return "test-like directory is colocated under source root; test root candidate only";
+    return "conventional test-like directory exists; candidate only and not proof of test coverage";
+}
+
+fn isColocatedSourceTest(path: []const u8) bool {
+    return startsWith(path, "src/") and !std.mem.eql(u8, path, "src") and
+        (startsWith(std.fs.path.basename(path), "test_") or
+            endsWith(path, "_test.zig") or
+            endsWith(path, ".test.ts") or
+            endsWith(path, ".test.js") or
+            endsWith(path, ".spec.ts") or
+            endsWith(path, ".spec.js"));
+}
+
+fn rootEvidencePaths(allocator: std.mem.Allocator, entries: []const Entry, root_path: []const u8) ![]const []const u8 {
+    var paths = std.ArrayList([]const u8).init(allocator);
+    try paths.append(try allocator.dupe(u8, root_path));
+    for (entries) |entry| {
+        if (entry.is_dir) continue;
+        if (!pathWithinRoot(entry.rel_path, root_path)) continue;
+        if (paths.items.len >= 5) break;
+        try paths.append(try allocator.dupe(u8, entry.rel_path));
+    }
+    return paths.toOwnedSlice();
+}
+
+fn rootLanguageHint(allocator: std.mem.Allocator, entries: []const Entry, root_path: []const u8) !?[]const u8 {
+    var hint: ?[]const u8 = null;
+    for (entries) |entry| {
+        if (entry.is_dir or !pathWithinRoot(entry.rel_path, root_path)) continue;
+        const current = languageHintForPath(entry.rel_path) orelse continue;
+        if (hint) |existing| {
+            if (!std.mem.eql(u8, existing, current)) return try allocator.dupe(u8, "mixed");
+        } else {
+            hint = current;
+        }
+    }
+    if (hint) |value| return try allocator.dupe(u8, value);
+    return null;
+}
+
+fn languageHintForPath(path: []const u8) ?[]const u8 {
+    if (endsWith(path, ".zig")) return "zig";
+    if (endsWith(path, ".rs")) return "rust";
+    if (endsWith(path, ".ts") or endsWith(path, ".tsx")) return "typescript";
+    if (endsWith(path, ".js") or endsWith(path, ".jsx")) return "javascript";
+    if (endsWith(path, ".py")) return "python";
+    if (endsWith(path, ".go")) return "go";
+    if (endsWith(path, ".c") or endsWith(path, ".cc") or endsWith(path, ".cpp") or endsWith(path, ".h") or endsWith(path, ".hpp")) return "c_cpp";
+    if (endsWith(path, ".java") or endsWith(path, ".kt")) return "java_kotlin";
+    return null;
+}
+
+fn pathWithinRoot(path: []const u8, root_path: []const u8) bool {
+    return std.mem.eql(u8, path, root_path) or
+        (startsWith(path, root_path) and path.len > root_path.len and path[root_path.len] == '/');
+}
+
 fn hasExtensionInDir(entries: []const Entry, dir_prefix: []const u8, extension: []const u8) bool {
     for (entries) |entry| {
         if (!entry.is_dir and startsWith(entry.rel_path, dir_prefix) and endsWith(entry.rel_path, extension)) return true;
@@ -738,6 +878,15 @@ fn containsSignal(items: []const Signal, name: []const u8, path: []const u8, kin
     return false;
 }
 
+fn containsRootCandidate(items: []const RootCandidate, path: []const u8, kind: []const u8) bool {
+    for (items) |item| if (std.mem.eql(u8, item.path, path) and std.mem.eql(u8, item.kind, kind)) return true;
+    return false;
+}
+
+fn hasConflictingRootCandidates(items: []const RootCandidate) bool {
+    return items.len > 1;
+}
+
 fn hasBuildCommand(items: []const SafeCommandCandidate) bool {
     for (items) |item| {
         if (std.mem.indexOf(u8, item.id, "build") != null) return true;
@@ -768,6 +917,16 @@ fn signalLessThan(_: void, a: Signal, b: Signal) bool {
 
 fn sortSignals(items: []Signal) void {
     std.mem.sort(Signal, items, {}, signalLessThan);
+}
+
+fn rootCandidateLessThan(_: void, a: RootCandidate, b: RootCandidate) bool {
+    const p = std.mem.order(u8, a.path, b.path);
+    if (p != .eq) return p == .lt;
+    return std.mem.order(u8, a.kind, b.kind) == .lt;
+}
+
+fn sortRootCandidates(items: []RootCandidate) void {
+    std.mem.sort(RootCandidate, items, {}, rootCandidateLessThan);
 }
 
 fn riskLessThan(_: void, a: RiskSurface, b: RiskSurface) bool {
@@ -861,6 +1020,11 @@ fn containsCommand(items: []const SafeCommandCandidate, id: []const u8) bool {
     return false;
 }
 
+fn findRootCandidate(items: []const RootCandidate, path: []const u8) ?RootCandidate {
+    for (items) |item| if (std.mem.eql(u8, item.path, path)) return item;
+    return null;
+}
+
 fn findVerifierPlan(items: []const VerifierPlanCandidate, id: []const u8) ?VerifierPlanCandidate {
     for (items) |item| if (std.mem.eql(u8, item.id, id)) return item;
     return null;
@@ -876,6 +1040,79 @@ test "project autopsy detects Zig project from build.zig" {
     const result = try analyze(std.heap.page_allocator, root, .{});
     try std.testing.expect(containsNamedSignal(result.project_profile.detected_languages, "zig"));
     try std.testing.expect(containsNamedSignal(result.project_profile.build_systems, "zig_build"));
+}
+
+test "project autopsy detects source and test root candidates with evidence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "src/main.zig", "pub fn main() void {}");
+    try makeFile(tmp.dir, "tests/main_test.zig", "test \"x\" {}\n");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+
+    const source = findRootCandidate(result.project_profile.source_roots, "src") orelse return error.MissingSourceRoot;
+    try std.testing.expectEqualStrings("source_root", source.kind);
+    try std.testing.expectEqualStrings("high", source.confidence);
+    try std.testing.expect(source.non_authorizing);
+    try std.testing.expect(source.evidence_paths.len >= 2);
+    try std.testing.expectEqualStrings("src", source.evidence_paths[0]);
+    try std.testing.expect(source.detected_language != null);
+    try std.testing.expectEqualStrings("zig", source.detected_language.?);
+
+    const tests = findRootCandidate(result.project_profile.test_roots, "tests") orelse return error.MissingTestRoot;
+    try std.testing.expectEqualStrings("test_root", tests.kind);
+    try std.testing.expectEqualStrings("high", tests.confidence);
+    try std.testing.expect(tests.non_authorizing);
+    try std.testing.expect(tests.evidence_paths.len >= 2);
+    try std.testing.expectEqualStrings("tests", tests.evidence_paths[0]);
+}
+
+test "project autopsy treats missing test root as unknown not negative evidence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "src/main.zig", "pub fn main() void {}");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+
+    try std.testing.expect(findRootCandidate(result.project_profile.source_roots, "src") != null);
+    try std.testing.expectEqual(@as(usize, 0), result.project_profile.test_roots.len);
+    try std.testing.expect(containsNamedSignal(result.project_profile.unknowns, "test_root_unknown"));
+}
+
+test "project autopsy treats tests only project as unknown source root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "tests/main_test.zig", "test \"x\" {}\n");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+
+    try std.testing.expectEqual(@as(usize, 0), result.project_profile.source_roots.len);
+    try std.testing.expect(findRootCandidate(result.project_profile.test_roots, "tests") != null);
+    try std.testing.expect(containsNamedSignal(result.project_profile.unknowns, "source_root_unknown"));
+}
+
+test "project autopsy reports ambiguous multiple roots with confidence reasons" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "src/main.ts", "export const x = 1;\n");
+    try makeFile(tmp.dir, "lib/helper.ts", "export const y = 1;\n");
+    try makeFile(tmp.dir, "test/main.test.ts", "test('x', () => {});\n");
+    try makeFile(tmp.dir, "spec/helper.spec.ts", "test('y', () => {});\n");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+
+    const src = findRootCandidate(result.project_profile.source_roots, "src") orelse return error.MissingSourceRoot;
+    const lib = findRootCandidate(result.project_profile.source_roots, "lib") orelse return error.MissingSourceRoot;
+    try std.testing.expect(src.reason.len > 0);
+    try std.testing.expect(lib.reason.len > 0);
+    try std.testing.expect(src.evidence_paths.len >= 2);
+    try std.testing.expect(lib.evidence_paths.len >= 2);
+    try std.testing.expect(containsNamedSignal(result.project_profile.unknowns, "source_root_ambiguous"));
+    try std.testing.expect(containsNamedSignal(result.project_profile.unknowns, "test_root_ambiguous"));
 }
 
 test "project autopsy proposes Zig build and test commands without execution" {

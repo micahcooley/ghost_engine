@@ -48,6 +48,30 @@ Pass 1 recognizes common workspace markers:
   `README.md`, `docs/`, `CONTRIBUTING.md`, `LICENSE`, `.editorconfig`,
   `.env.example`, dependency files, and lockfiles
 
+## Source and Test Root Candidates
+
+Source and test roots are candidate/control state, not proof. Each root
+candidate includes:
+
+- `path`
+- `kind`: `source_root` or `test_root`
+- `confidence`
+- `reason`
+- `evidence_paths`
+- `detected_language` when file extensions provide a bounded hint
+- `non_authorizing: true`
+
+Pass 1 detects conventional source roots such as `src/`, `lib/`, `app/`, and
+bounded `packages/*/src` directories. It detects conventional test roots such
+as `test/`, `tests/`, `spec/`, `__tests__/`, package-local test roots, and
+test-like files colocated under `src/`.
+
+If no source or test root can be determined, the profile emits an explicit
+unknown such as `source_root_unknown` or `test_root_unknown`. If multiple
+plausible roots are present and no canonical root is selected, it emits
+`source_root_ambiguous` or `test_root_ambiguous`. Missing test-root evidence
+does not mean tests are absent.
+
 ## Safe Command Candidates
 
 Command candidates are data only. They use `argv[]`, never shell strings, and
