@@ -336,6 +336,8 @@ pub const Result = struct {
     future_behavior_candidates: []FutureBehaviorCandidate = &.{},
     safety_flags: SafetyFlags = .{},
     corpus_entries_considered: usize = 0,
+    corpus_coverage_complete: bool = true,
+    corpus_coverage_next_cursor: ?[]u8 = null,
     max_results: usize = DEFAULT_MAX_RESULTS,
     max_snippet_bytes: usize = DEFAULT_MAX_SNIPPET_BYTES,
     require_citations: bool = true,
@@ -349,6 +351,7 @@ pub const Result = struct {
         self.allocator.free(self.question);
         self.allocator.free(self.shard_kind);
         self.allocator.free(self.shard_id);
+        if (self.corpus_coverage_next_cursor) |value| self.allocator.free(value);
         if (self.answer_draft) |value| self.allocator.free(value);
         for (self.evidence_used) |*item| item.deinit(self.allocator);
         self.allocator.free(self.evidence_used);
@@ -396,6 +399,7 @@ const Candidate = struct {
     matched_phrase: ?[]u8,
     content_hash: u64,
     polarity: Polarity,
+    value_match: bool = false,
     text: []u8,
 
     fn deinit(self: *Candidate, allocator: std.mem.Allocator) void {
@@ -470,6 +474,16 @@ const Polarity = enum {
     negative,
 };
 
+const QueryIntent = enum {
+    general,
+    date_value,
+    numeric_value,
+    path_value,
+    config_value,
+    boolean_value,
+    identity_value,
+};
+
 pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     if (std.mem.trim(u8, options.question, " \r\n\t").len == 0) {
         return malformedResult(allocator, options.question, "question must be non-empty");
@@ -495,13 +509,17 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
 
     const entries = try corpus_ingest.collectLiveScanEntries(allocator, &paths);
     defer corpus_ingest.deinitIndexedEntries(allocator, entries);
+    var live_coverage = try corpus_ingest.liveCoverage(allocator, &paths);
+    defer live_coverage.deinit(allocator);
 
     var tokens = try tokenizeQuery(allocator, options.question);
     defer tokens.deinit(allocator);
+    const query_intent = classifyQueryIntent(options.question, tokens.tokens);
 
     if (entries.len == 0) {
         var result = try unknownResult(allocator, options, &paths, .no_corpus_available, "no live shard corpus is available for this ask request", entries.len, max_results, max_snippet);
         errdefer result.deinit();
+        try attachLiveCoverage(allocator, &result, live_coverage);
         try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
         try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
         return result;
@@ -509,6 +527,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     if (tokens.tokens.len == 0) {
         var result = try unknownResult(allocator, options, &paths, .insufficient_evidence, "question did not contain enough searchable terms", entries.len, max_results, max_snippet);
         errdefer result.deinit();
+        try attachLiveCoverage(allocator, &result, live_coverage);
         try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
         try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
         return result;
@@ -523,6 +542,10 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     defer sketch_candidates.deinit();
     const query_sketch = try corpus_sketch.simHash64(allocator, options.question);
     var telemetry = CapacityTelemetry{};
+    if (!live_coverage.complete) {
+        telemetry.skipped_inputs += 1;
+        telemetry.budget_hits += 1;
+    }
 
     for (entries, 0..) |entry, idx| {
         const read_result = readEntryText(allocator, entry.abs_path) catch {
@@ -559,9 +582,11 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
             allocator.free(file_text);
             continue;
         }
+        const value_match = evidenceMatchesIntent(file_text, query_intent);
+        const value_bonus: u32 = if (query_intent != .general and value_match) 10 else 0;
         candidates.append(.{
             .entry_index = idx,
-            .score = scored.score,
+            .score = scored.score + value_bonus,
             .first_match = scored.first_match,
             .byte_start = scored.byte_start,
             .byte_end = scored.byte_end,
@@ -571,6 +596,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
             .matched_phrase = scored.matched_phrase,
             .content_hash = std.hash.Fnv1a_64.hash(file_text),
             .polarity = detectPolarity(file_text),
+            .value_match = value_match,
             .text = file_text,
         }) catch |err| {
             scored.deinit(allocator);
@@ -587,6 +613,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         if (telemetry.sketch_candidate_cap_hit) telemetry.budget_hits += 1;
         telemetry.expansion_recommended = telemetry.hasPressure();
         result.capacity_telemetry = telemetry;
+        try attachLiveCoverage(allocator, &result, live_coverage);
         try applyCapacityDisclosure(allocator, &result);
         try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
         try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
@@ -613,6 +640,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         }
         telemetry.expansion_recommended = telemetry.hasPressure();
         result.capacity_telemetry = telemetry;
+        try attachLiveCoverage(allocator, &result, live_coverage);
         result.unknowns = try singleUnknown(allocator, .conflicting_evidence, "selected corpus evidence contains conflicting affirmative and negative signals");
         result.candidate_followups = try singleFollowup(allocator, "evidence_to_collect", "provide or ingest an authoritative corpus item that resolves the conflict");
         result.learning_candidates = try singleLearningCandidate(allocator, "correction_candidate", "review the conflicting corpus items and propose a correction or corpus update through an explicit lifecycle", "conflicting evidence cannot authorize an answer");
@@ -634,6 +662,31 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         }
         telemetry.expansion_recommended = telemetry.hasPressure();
         result.capacity_telemetry = telemetry;
+        try attachLiveCoverage(allocator, &result, live_coverage);
+        try applyCapacityDisclosure(allocator, &result);
+        try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
+        try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
+        return result;
+    }
+
+    if (query_intent != .general and !top.value_match) {
+        var result = try buildBaseResult(allocator, options, &paths, .unknown, "unresolved", "unresolved", entries.len, max_results, max_snippet);
+        errdefer result.deinit();
+        result.evidence_used = try buildEvidence(allocator, candidates.items[0..top_count], entries, max_snippet, "candidate evidence matched topic terms but did not contain the requested value shape");
+        result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
+        telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
+        if (telemetry.truncated_snippets != 0) telemetry.budget_hits += 1;
+        telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
+        if (telemetry.sketch_candidate_cap_hit) {
+            telemetry.max_results_hit = true;
+            telemetry.budget_hits += 1;
+        }
+        telemetry.expansion_recommended = true;
+        result.capacity_telemetry = telemetry;
+        try attachLiveCoverage(allocator, &result, live_coverage);
+        result.unknowns = try singleUnknown(allocator, .insufficient_evidence, "matched corpus evidence did not contain the requested exact value");
+        result.candidate_followups = try singleFollowup(allocator, "evidence_to_collect", "ingest exact evidence that contains the requested value, not only related topic words");
+        result.learning_candidates = try singleLearningCandidate(allocator, "corpus_update_candidate", "review whether a value-bearing corpus item should be added through an explicit lifecycle", "topic overlap without the requested value cannot authorize an answer draft");
         try applyCapacityDisclosure(allocator, &result);
         try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
         try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
@@ -653,6 +706,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     }
     telemetry.expansion_recommended = telemetry.hasPressure();
     result.capacity_telemetry = telemetry;
+    try attachLiveCoverage(allocator, &result, live_coverage);
     result.answer_draft = try std.fmt.allocPrint(
         allocator,
         "Draft answer from corpus evidence: {s}",
@@ -1029,6 +1083,20 @@ fn applyCapacityDisclosure(allocator: std.mem.Allocator, result: *Result) !void 
     result.capacity_telemetry.unknowns_created = result.unknowns.len;
 }
 
+fn attachLiveCoverage(allocator: std.mem.Allocator, result: *Result, coverage: corpus_ingest.LiveCoverage) !void {
+    result.corpus_coverage_complete = coverage.complete;
+    if (result.corpus_coverage_next_cursor) |value| {
+        allocator.free(value);
+        result.corpus_coverage_next_cursor = null;
+    }
+    if (coverage.next_cursor) |value| {
+        result.corpus_coverage_next_cursor = try allocator.dupe(u8, value);
+    }
+    if (!coverage.complete) {
+        result.capacity_telemetry.expansion_recommended = true;
+    }
+}
+
 fn singleFollowup(allocator: std.mem.Allocator, kind: []const u8, detail: []const u8) ![]CandidateFollowup {
     const items = try allocator.alloc(CandidateFollowup, 1);
     items[0] = .{
@@ -1311,6 +1379,111 @@ fn detectPolarity(text: []const u8) Polarity {
     if (affirmative and !negative) return .affirmative;
     if (negative and !affirmative) return .negative;
     return .none;
+}
+
+fn classifyQueryIntent(question: []const u8, tokens: []const []const u8) QueryIntent {
+    if (indexOfIgnoreCase(question, "release date") != null or
+        indexOfIgnoreCase(question, "what date") != null or
+        indexOfIgnoreCase(question, "when ") != null)
+    {
+        return .date_value;
+    }
+    if (indexOfIgnoreCase(question, " path") != null or
+        indexOfIgnoreCase(question, " file") != null or
+        indexOfIgnoreCase(question, "where ") != null)
+    {
+        return .path_value;
+    }
+    if (indexOfIgnoreCase(question, " enabled") != null or
+        indexOfIgnoreCase(question, " disabled") != null or
+        indexOfIgnoreCase(question, " true") != null or
+        indexOfIgnoreCase(question, " false") != null or
+        indexOfIgnoreCase(question, " yes") != null or
+        indexOfIgnoreCase(question, " no") != null or
+        startsWithIgnoreCase(question, "is ") or
+        startsWithIgnoreCase(question, "are ") or
+        startsWithIgnoreCase(question, "does ") or
+        startsWithIgnoreCase(question, "do "))
+    {
+        return .boolean_value;
+    }
+    if (indexOfIgnoreCase(question, "version") != null or indexOfIgnoreCase(question, "number") != null or indexOfIgnoreCase(question, "how many") != null) {
+        return .numeric_value;
+    }
+    for (tokens) |token| {
+        if (std.mem.indexOfScalar(u8, token, '_') != null or std.mem.indexOfScalar(u8, token, '-') != null) return .config_value;
+    }
+    if (startsWithIgnoreCase(question, "who ") or
+        indexOfIgnoreCase(question, "owner") != null or
+        indexOfIgnoreCase(question, "author") != null or
+        indexOfIgnoreCase(question, " maintainer") != null or
+        indexOfIgnoreCase(question, " identity") != null)
+    {
+        return .identity_value;
+    }
+    return .general;
+}
+
+fn evidenceMatchesIntent(text: []const u8, intent: QueryIntent) bool {
+    return switch (intent) {
+        .general => true,
+        .date_value => containsDateLike(text),
+        .numeric_value, .config_value => containsNumber(text),
+        .path_value => containsPathLike(text),
+        .boolean_value => detectPolarity(text) != .none,
+        .identity_value => containsIdentityLike(text),
+    };
+}
+
+fn containsNumber(text: []const u8) bool {
+    var idx: usize = 0;
+    while (idx < text.len) : (idx += 1) {
+        if (std.ascii.isDigit(text[idx])) return true;
+    }
+    return false;
+}
+
+fn containsDateLike(text: []const u8) bool {
+    var idx: usize = 0;
+    while (idx + 10 <= text.len) : (idx += 1) {
+        if (std.ascii.isDigit(text[idx]) and
+            std.ascii.isDigit(text[idx + 1]) and
+            std.ascii.isDigit(text[idx + 2]) and
+            std.ascii.isDigit(text[idx + 3]) and
+            (text[idx + 4] == '-' or text[idx + 4] == '/') and
+            std.ascii.isDigit(text[idx + 5]) and
+            std.ascii.isDigit(text[idx + 6]) and
+            (text[idx + 7] == '-' or text[idx + 7] == '/') and
+            std.ascii.isDigit(text[idx + 8]) and
+            std.ascii.isDigit(text[idx + 9]))
+        {
+            return true;
+        }
+    }
+    const months = [_][]const u8{ "january", "february", "march", "april", "may ", "june", "july", "august", "september", "october", "november", "december" };
+    for (months) |month| {
+        if (indexOfIgnoreCase(text, month) != null and containsNumber(text)) return true;
+    }
+    return false;
+}
+
+fn containsPathLike(text: []const u8) bool {
+    return std.mem.indexOfScalar(u8, text, '/') != null or
+        indexOfIgnoreCase(text, ".zig") != null or
+        indexOfIgnoreCase(text, ".md") != null or
+        indexOfIgnoreCase(text, ".json") != null or
+        indexOfIgnoreCase(text, ".toml") != null;
+}
+
+fn containsIdentityLike(text: []const u8) bool {
+    return indexOfIgnoreCase(text, "owner") != null or
+        indexOfIgnoreCase(text, "author") != null or
+        indexOfIgnoreCase(text, "maintainer") != null or
+        indexOfIgnoreCase(text, "by ") != null;
+}
+
+fn startsWithIgnoreCase(text: []const u8, prefix: []const u8) bool {
+    return text.len >= prefix.len and std.ascii.eqlIgnoreCase(text[0..prefix.len], prefix);
 }
 
 fn hasConflict(candidates: []const Candidate) bool {
@@ -1644,6 +1817,10 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
     }
     try w.writeAll("],\"capacityTelemetry\":");
     try writeCapacityTelemetry(w, result.capacity_telemetry);
+    try w.writeAll(",\"coverage\":{");
+    try w.print("\"complete\":{s}", .{if (result.corpus_coverage_complete) "true" else "false"});
+    if (result.corpus_coverage_next_cursor) |value| try writeField(w, "nextCursor", value, false);
+    try w.writeAll("}");
     try w.writeAll(",\"trace\":{");
     try w.print("\"corpusEntriesConsidered\":{d}", .{result.corpus_entries_considered});
     try w.print(",\"maxResults\":{d}", .{result.max_results});

@@ -496,6 +496,9 @@ fn buildEmptyResult(
             .duplicate_items = 0,
             .rejected_items = 0,
             .concept_count = 0,
+            .coverage_complete = true,
+            .next_cursor = null,
+            .capacity_telemetry = .{},
             .items = empty_items,
         },
     };

@@ -5915,6 +5915,162 @@ test "corpus ask applies accepted reviewed correction influence without proof or
     try std.testing.expectEqual(@as(usize, 0), other.correction_influences.len);
 }
 
+test "corpus ingest supports explicit partial batches and live merge" {
+    const allocator = std.testing.allocator;
+    const project_shard = "corpus-ingest-partial-batch-test";
+    var corpus_fixture = std.testing.tmpDir(.{});
+    defer corpus_fixture.cleanup();
+    const corpus_root = try corpus_fixture.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+    try writeFixtureFile(corpus_fixture.dir, "a.md",
+        \\# Alpha
+        \\Alpha batch fact remains available after later corpus batches are applied.
+        \\
+    );
+    try writeFixtureFile(corpus_fixture.dir, "b.md",
+        \\# Beta
+        \\Beta batch fact is the deterministic cursor boundary.
+        \\
+    );
+    try writeFixtureFile(corpus_fixture.dir, "c.md",
+        \\# Gamma
+        \\Gamma batch fact is ingested by the second cursor batch.
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.root_abs_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.root_abs_path) catch {};
+
+    try std.testing.expectError(error.TooManyFiles, corpus_ingest.stage(allocator, .{
+        .corpus_path = corpus_root,
+        .project_shard = project_shard,
+        .max_files = 2,
+    }));
+
+    var first = try corpus_ingest.stage(allocator, .{
+        .corpus_path = corpus_root,
+        .project_shard = project_shard,
+        .trust_class = .project,
+        .source_label = "partial-corpus",
+        .max_files = 2,
+        .allow_partial = true,
+    });
+    defer first.deinit();
+    try std.testing.expect(!first.coverage_complete);
+    try std.testing.expect(first.next_cursor != null);
+    try std.testing.expectEqualStrings("b.md", first.next_cursor.?);
+    try std.testing.expect(first.capacity_telemetry.file_cap_hit);
+    try std.testing.expectEqual(@as(u32, 2), first.scanned_files);
+
+    var staged_only = try corpus_ask.ask(allocator, .{
+        .question = "alpha batch fact",
+        .project_shard = project_shard,
+    });
+    defer staged_only.deinit();
+    try std.testing.expectEqual(corpus_ask.AskStatus.unknown, staged_only.status);
+    try std.testing.expectEqual(corpus_ask.UnknownKind.no_corpus_available, staged_only.unknowns[0].kind);
+
+    try corpus_ingest.applyStaged(allocator, &project_paths);
+
+    var first_live = try corpus_ask.ask(allocator, .{
+        .question = "alpha batch fact",
+        .project_shard = project_shard,
+    });
+    defer first_live.deinit();
+    try std.testing.expectEqual(corpus_ask.AskStatus.answered, first_live.status);
+    try std.testing.expect(!first_live.corpus_coverage_complete);
+    try std.testing.expectEqual(corpus_ask.UnknownKind.capacity_limited, first_live.unknowns[0].kind);
+
+    var second = try corpus_ingest.stage(allocator, .{
+        .corpus_path = corpus_root,
+        .project_shard = project_shard,
+        .trust_class = .project,
+        .source_label = "partial-corpus",
+        .max_files = 2,
+        .allow_partial = true,
+        .cursor_after = first.next_cursor.?,
+    });
+    defer second.deinit();
+    try std.testing.expect(second.coverage_complete);
+    try std.testing.expectEqual(@as(u32, 1), second.scanned_files);
+    try std.testing.expectEqualStrings("c.md", second.next_cursor.?);
+    try corpus_ingest.applyStaged(allocator, &project_paths);
+
+    var alpha = try corpus_ask.ask(allocator, .{
+        .question = "alpha batch fact",
+        .project_shard = project_shard,
+    });
+    defer alpha.deinit();
+    try std.testing.expectEqual(corpus_ask.AskStatus.answered, alpha.status);
+    try std.testing.expect(alpha.corpus_coverage_complete);
+
+    var gamma = try corpus_ask.ask(allocator, .{
+        .question = "gamma batch fact",
+        .project_shard = project_shard,
+    });
+    defer gamma.deinit();
+    try std.testing.expectEqual(corpus_ask.AskStatus.answered, gamma.status);
+}
+
+test "corpus ask requires value-bearing exact evidence for value questions" {
+    const allocator = std.testing.allocator;
+    const project_shard = "corpus-ask-value-gate-test";
+    var corpus_fixture = std.testing.tmpDir(.{});
+    defer corpus_fixture.cleanup();
+    const corpus_root = try corpus_fixture.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+    try writeFixtureFile(corpus_fixture.dir, "docs/runtime_contracts.md",
+        \\# Runtime Contracts
+        \\Worker sync must stay bounded by queue_guard and candidate_surfaces.
+        \\UI theme release timing remains under product review.
+        \\
+    );
+    try writeFixtureFile(corpus_fixture.dir, "configs/runtime.toml",
+        \\queue_guard = 32
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.root_abs_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.root_abs_path) catch {};
+
+    var stage_result = try corpus_ingest.stage(allocator, .{
+        .corpus_path = corpus_root,
+        .project_shard = project_shard,
+        .trust_class = .project,
+        .source_label = "value-corpus",
+    });
+    defer stage_result.deinit();
+    try corpus_ingest.applyStaged(allocator, &project_paths);
+
+    var config_value = try corpus_ask.ask(allocator, .{
+        .question = "What is queue_guard?",
+        .project_shard = project_shard,
+    });
+    defer config_value.deinit();
+    try std.testing.expectEqual(corpus_ask.AskStatus.answered, config_value.status);
+    try std.testing.expect(config_value.answer_draft != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_value.evidence_used[0].source_path, "runtime.toml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_value.answer_draft.?, "32") != null);
+
+    var missing_date = try corpus_ask.ask(allocator, .{
+        .question = "What is the UI theme release date?",
+        .project_shard = project_shard,
+    });
+    defer missing_date.deinit();
+    try std.testing.expectEqual(corpus_ask.AskStatus.unknown, missing_date.status);
+    try std.testing.expect(missing_date.answer_draft == null);
+    try std.testing.expectEqual(corpus_ask.UnknownKind.insufficient_evidence, missing_date.unknowns[0].kind);
+    try std.testing.expect(missing_date.evidence_used.len >= 1);
+}
+
 test "corpus ask applies accepted reviewed negative knowledge influence without proof or mutation" {
     const allocator = std.testing.allocator;
     const project_shard = "corpus-ask-accepted-nk-test";

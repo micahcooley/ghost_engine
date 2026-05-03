@@ -21,6 +21,10 @@ pub fn main() !void {
             std.debug.print("ghost_corpus_ingest: corpus path could not be accessed\nUse --help for usage.\n", .{});
             std.process.exit(1);
         },
+        error.TooManyFiles => {
+            std.debug.print("ghost_corpus_ingest: too_many_files: corpus input exceeded --max-files; rerun with --allow-partial and --batch-size/--max-files for explicit batched ingest\n", .{});
+            std.process.exit(1);
+        },
         else => return err,
     };
 }
@@ -44,6 +48,8 @@ fn mainImpl() !void {
     var source_label: ?[]const u8 = null;
     var max_file_bytes: usize = corpus_ingest.DEFAULT_MAX_FILE_BYTES;
     var max_files: usize = corpus_ingest.DEFAULT_MAX_FILES;
+    var allow_partial = false;
+    var cursor_after: ?[]const u8 = null;
     var apply_staged = false;
 
     for (args[1..]) |arg| {
@@ -53,6 +59,10 @@ fn mainImpl() !void {
         }
         if (std.mem.eql(u8, arg, "--apply-staged")) {
             apply_staged = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--allow-partial")) {
+            allow_partial = true;
             continue;
         }
         if (std.mem.startsWith(u8, arg, "--project-shard=")) {
@@ -77,6 +87,15 @@ fn mainImpl() !void {
             max_files = try std.fmt.parseUnsigned(usize, arg["--max-files=".len..], 10);
             continue;
         }
+        if (std.mem.startsWith(u8, arg, "--batch-size=")) {
+            max_files = try std.fmt.parseUnsigned(usize, arg["--batch-size=".len..], 10);
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--cursor-after=")) {
+            const value = arg["--cursor-after=".len..];
+            if (value.len > 0) cursor_after = value;
+            continue;
+        }
         if (corpus_path == null) {
             corpus_path = arg;
             continue;
@@ -85,7 +104,7 @@ fn mainImpl() !void {
     }
 
     if (apply_staged) {
-        if (corpus_path != null or source_label != null or trust_class != null or max_file_bytes != corpus_ingest.DEFAULT_MAX_FILE_BYTES or max_files != corpus_ingest.DEFAULT_MAX_FILES) {
+        if (corpus_path != null or source_label != null or trust_class != null or max_file_bytes != corpus_ingest.DEFAULT_MAX_FILE_BYTES or max_files != corpus_ingest.DEFAULT_MAX_FILES or allow_partial or cursor_after != null) {
             return error.InvalidArguments;
         }
         try applyStaged(allocator, project_shard);
@@ -104,6 +123,8 @@ fn mainImpl() !void {
         .source_label = source_label,
         .max_file_bytes = max_file_bytes,
         .max_files = max_files,
+        .allow_partial = allow_partial,
+        .cursor_after = cursor_after,
     });
     defer result.deinit();
 
@@ -114,7 +135,7 @@ fn mainImpl() !void {
 
 fn printUsage() void {
     sys.print(
-        "Usage: ghost_corpus_ingest <corpus-path> [--project-shard=id] [--trust-class=exploratory|project|promoted|core] [--source-label=name] [--max-file-bytes=N] [--max-files=N]\n       ghost_corpus_ingest --apply-staged [--project-shard=id]\n",
+        "Usage: ghost_corpus_ingest <corpus-path> [--project-shard=id] [--trust-class=exploratory|project|promoted|core] [--source-label=name] [--max-file-bytes=N] [--max-files=N|--batch-size=N] [--allow-partial] [--cursor-after=rel-path]\n       ghost_corpus_ingest --apply-staged [--project-shard=id]\n",
         .{},
     );
 }

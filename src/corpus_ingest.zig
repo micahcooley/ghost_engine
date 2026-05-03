@@ -11,6 +11,8 @@ pub const CORPUS_REL_PREFIX = "@corpus";
 pub const CONCEPT_PREFIX = "corpus_ingest__";
 pub const DEFAULT_MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
 pub const DEFAULT_MAX_FILES: usize = 512;
+pub const DEFAULT_MAX_CONCEPT_CANDIDATES: usize = 4096;
+pub const DEFAULT_MAX_CONCEPTS: usize = 1024;
 const MAX_TOKEN_COUNT: usize = 24;
 const MAX_PATTERN_COUNT: usize = 12;
 
@@ -35,6 +37,24 @@ pub const RejectReason = enum {
     low_structure,
 };
 
+pub const IngestCapacityTelemetry = struct {
+    too_many_files: bool = false,
+    file_cap_hit: bool = false,
+    concept_candidate_cap_hit: bool = false,
+    concept_emit_cap_hit: bool = false,
+    concept_candidates_considered: usize = 0,
+    concepts_emitted: usize = 0,
+    budget_hits: usize = 0,
+
+    pub fn hasPressure(self: IngestCapacityTelemetry) bool {
+        return self.too_many_files or
+            self.file_cap_hit or
+            self.concept_candidate_cap_hit or
+            self.concept_emit_cap_hit or
+            self.budget_hits != 0;
+    }
+};
+
 pub const Options = struct {
     corpus_path: []const u8,
     project_shard: ?[]const u8 = null,
@@ -42,6 +62,10 @@ pub const Options = struct {
     source_label: ?[]const u8 = null,
     max_file_bytes: usize = DEFAULT_MAX_FILE_BYTES,
     max_files: usize = DEFAULT_MAX_FILES,
+    allow_partial: bool = false,
+    cursor_after: ?[]const u8 = null,
+    max_concept_candidates: usize = DEFAULT_MAX_CONCEPT_CANDIDATES,
+    max_concepts: usize = DEFAULT_MAX_CONCEPTS,
     merge_live: bool = false,
 };
 
@@ -84,6 +108,9 @@ pub const StageResult = struct {
     duplicate_items: u32,
     rejected_items: u32,
     concept_count: u32,
+    coverage_complete: bool,
+    next_cursor: ?[]u8,
+    capacity_telemetry: IngestCapacityTelemetry,
     items: []ItemResult,
 
     pub fn deinit(self: *StageResult) void {
@@ -95,6 +122,21 @@ pub const StageResult = struct {
         self.allocator.free(self.source_label);
         self.allocator.free(self.staged_manifest_path);
         self.allocator.free(self.staged_files_root);
+        if (self.next_cursor) |value| self.allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const LiveCoverage = struct {
+    complete: bool,
+    scanned_files: u32,
+    staged_items: u32,
+    rejected_items: u32,
+    next_cursor: ?[]u8,
+    capacity_telemetry: IngestCapacityTelemetry,
+
+    pub fn deinit(self: *LiveCoverage, allocator: std.mem.Allocator) void {
+        if (self.next_cursor) |value| allocator.free(value);
         self.* = undefined;
     }
 };
@@ -249,6 +291,9 @@ const Manifest = struct {
     items: std.ArrayList(SourceUnit),
     concepts: std.ArrayList(ConceptSpec),
     rejections: std.ArrayList(Rejection),
+    coverage_complete: bool = true,
+    next_cursor: ?[]u8 = null,
+    capacity_telemetry: IngestCapacityTelemetry = .{},
 
     fn init(allocator: std.mem.Allocator, source_root: []const u8, source_label: []const u8) !Manifest {
         return .{
@@ -270,6 +315,7 @@ const Manifest = struct {
         self.rejections.deinit();
         self.allocator.free(self.source_root);
         self.allocator.free(self.source_label);
+        if (self.next_cursor) |value| self.allocator.free(value);
         self.* = undefined;
     }
 };
@@ -352,8 +398,15 @@ pub fn applyStaged(allocator: std.mem.Allocator, paths: *const shards.Paths) !vo
     var loaded_manifest = loaded.manifest;
     defer loaded_manifest.deinit();
 
-    try deleteTreeIfExistsAbsolute(paths.corpus_ingest_live_abs_path);
+    if (pathExists(paths.corpus_ingest_live_manifest_abs_path)) {
+        try mergeLiveManifest(allocator, paths, &loaded_manifest);
+    }
+    try std.fs.cwd().makePath(paths.corpus_ingest_live_abs_path);
     try copyTreeAbsolute(paths.corpus_ingest_staged_abs_path, paths.corpus_ingest_live_abs_path);
+    const live_json = try serializeManifest(allocator, &loaded_manifest);
+    defer allocator.free(live_json);
+    try ensureParentDirAbsolute(paths.corpus_ingest_live_manifest_abs_path);
+    try writeAbsoluteFile(paths.corpus_ingest_live_manifest_abs_path, live_json);
 
     const imported_records = try buildRecordsFromConcepts(allocator, loaded_manifest.concepts.items);
     defer {
@@ -362,6 +415,35 @@ pub fn applyStaged(allocator: std.mem.Allocator, paths: *const shards.Paths) !vo
     }
     try abstractions.replaceImportedLiveRecords(allocator, paths, CONCEPT_PREFIX, imported_records);
     try clearStaged(allocator, paths);
+}
+
+pub fn liveCoverage(allocator: std.mem.Allocator, paths: *const shards.Paths) !LiveCoverage {
+    const loaded = loadManifestFromPath(allocator, paths.corpus_ingest_live_manifest_abs_path) catch |err| switch (err) {
+        error.FileNotFound => return .{
+            .complete = true,
+            .scanned_files = 0,
+            .staged_items = 0,
+            .rejected_items = 0,
+            .next_cursor = null,
+            .capacity_telemetry = .{},
+        },
+        else => return err,
+    };
+    var manifest = loaded.manifest;
+    defer manifest.deinit();
+
+    var unique_items: u32 = 0;
+    for (manifest.items.items) |item| {
+        if (item.dedup == .unique) unique_items += 1;
+    }
+    return .{
+        .complete = manifest.coverage_complete,
+        .scanned_files = @intCast(manifest.items.items.len + manifest.rejections.items.len),
+        .staged_items = unique_items,
+        .rejected_items = @intCast(manifest.rejections.items.len),
+        .next_cursor = if (manifest.next_cursor) |value| try allocator.dupe(u8, value) else null,
+        .capacity_telemetry = manifest.capacity_telemetry,
+    };
 }
 
 pub fn collectLiveScanEntries(allocator: std.mem.Allocator, paths: *const shards.Paths) ![]IndexedEntry {
@@ -507,7 +589,7 @@ pub fn stage(allocator: std.mem.Allocator, options: Options) !StageResult {
     defer deinitExternalMetadataMap(allocator, &external_meta);
 
     try scanCorpusPath(allocator, corpus_root, detectRootHint(corpus_root), source_label, paths.metadata.kind, paths.metadata.id, trust_class, options, &external_meta, &manifest);
-    try buildConceptSpecs(&manifest, paths.metadata.kind, paths.metadata.id);
+    try buildConceptSpecs(&manifest, paths.metadata.kind, paths.metadata.id, options.max_concept_candidates, options.max_concepts);
 
     if (options.merge_live and pathExists(paths.corpus_ingest_live_manifest_abs_path)) {
         try mergeLiveManifest(allocator, &paths, &manifest);
@@ -545,6 +627,9 @@ pub fn stage(allocator: std.mem.Allocator, options: Options) !StageResult {
         .duplicate_items = duplicate_items,
         .rejected_items = @intCast(manifest.rejections.items.len),
         .concept_count = @intCast(manifest.concepts.items.len),
+        .coverage_complete = manifest.coverage_complete,
+        .next_cursor = if (manifest.next_cursor) |value| try allocator.dupe(u8, value) else null,
+        .capacity_telemetry = manifest.capacity_telemetry,
         .items = results,
     };
 }
@@ -555,7 +640,7 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const StageResult) ![]u
     const writer = out.writer();
 
     try writer.writeAll("{");
-    try writeJsonFieldString(writer, "status", "staged", true);
+    try writeJsonFieldString(writer, "status", if (result.coverage_complete) "staged" else "staged_partial", true);
     try writer.writeAll(",\"shard\":{");
     try writeJsonFieldString(writer, "kind", @tagName(result.shard_kind), true);
     try writeJsonFieldString(writer, "id", result.shard_id, false);
@@ -571,6 +656,16 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const StageResult) ![]u
     try writer.print(",\"duplicateItems\":{d}", .{result.duplicate_items});
     try writer.print(",\"rejectedItems\":{d}", .{result.rejected_items});
     try writer.print(",\"conceptCount\":{d}", .{result.concept_count});
+    try writer.writeAll(",\"coverage\":{");
+    try writer.print("\"complete\":{s}", .{if (result.coverage_complete) "true" else "false"});
+    try writer.print(",\"scannedFiles\":{d},\"stagedItems\":{d},\"rejectedItems\":{d}", .{
+        result.scanned_files,
+        result.staged_items,
+        result.rejected_items,
+    });
+    if (result.next_cursor) |value| try writeOptionalStringField(writer, "nextCursor", value);
+    try writer.writeAll("},\"capacityTelemetry\":");
+    try writeIngestCapacityTelemetry(writer, result.capacity_telemetry);
     try writer.writeAll(",\"items\":[");
     for (result.items, 0..) |item, idx| {
         if (idx != 0) try writer.writeByte(',');
@@ -671,7 +766,7 @@ fn loadExternalMetadata(allocator: std.mem.Allocator, corpus_root: []const u8) !
         sources: []const DiskSource,
     };
 
-    const parsed = try std.json.parseFromSlice(DiskManifest, allocator, bytes, .{});
+    const parsed = try std.json.parseFromSlice(DiskManifest, allocator, bytes, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     if (!std.mem.eql(u8, parsed.value.version, "ghost_external_evidence_v1")) return error.InvalidCorpusManifest;
 
@@ -771,8 +866,29 @@ fn scanDirRecursive(
     var dir = try std.fs.openDirAbsolute(abs_dir, .{ .iterate = true });
     defer dir.close();
 
+    const DirEntry = struct {
+        name: []u8,
+        kind: std.fs.File.Kind,
+
+        fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
+            return walkNameLessThan(lhs.name, rhs.name);
+        }
+    };
+    var entries = std.ArrayList(DirEntry).init(allocator);
+    defer {
+        for (entries.items) |entry| allocator.free(entry.name);
+        entries.deinit();
+    }
     var it = dir.iterate();
     while (try it.next()) |entry| {
+        try entries.append(.{
+            .name = try allocator.dupe(u8, entry.name),
+            .kind = entry.kind,
+        });
+    }
+    std.mem.sort(DirEntry, entries.items, {}, DirEntry.lessThan);
+
+    for (entries.items) |entry| {
         const rel_path = if (rel_dir.len == 0)
             try allocator.dupe(u8, entry.name)
         else
@@ -785,12 +901,30 @@ fn scanDirRecursive(
                 const child_abs = try std.fs.path.join(allocator, &.{ abs_dir, entry.name });
                 defer allocator.free(child_abs);
                 try scanDirRecursive(allocator, child_abs, rel_path, root_hint, source_label, owner_kind, owner_id, trust_class, options, external_meta, manifest);
+                if (!manifest.coverage_complete) return;
             },
             .file => {
                 if (std.mem.eql(u8, entry.name, external_evidence.EXTERNAL_METADATA_FILE_NAME)) continue;
+                if (options.cursor_after) |cursor| {
+                    if (std.mem.order(u8, rel_path, cursor) != .gt) continue;
+                }
+                if (manifest.items.items.len + manifest.rejections.items.len >= options.max_files) {
+                    if (!options.allow_partial) {
+                        manifest.capacity_telemetry.too_many_files = true;
+                        manifest.capacity_telemetry.file_cap_hit = true;
+                        manifest.capacity_telemetry.budget_hits += 1;
+                        return error.TooManyFiles;
+                    }
+                    manifest.coverage_complete = false;
+                    manifest.capacity_telemetry.file_cap_hit = true;
+                    manifest.capacity_telemetry.budget_hits += 1;
+                    return;
+                }
                 const abs_path = try std.fs.path.join(allocator, &.{ abs_dir, entry.name });
                 defer allocator.free(abs_path);
                 try scanOneFile(allocator, abs_path, rel_path, root_hint, source_label, owner_kind, owner_id, trust_class, options, external_meta, manifest);
+                if (manifest.next_cursor) |old| allocator.free(old);
+                manifest.next_cursor = try allocator.dupe(u8, rel_path);
             },
             else => {},
         }
@@ -810,8 +944,6 @@ fn scanOneFile(
     external_meta: *const std.StringHashMap(ExternalMetadata),
     manifest: *Manifest,
 ) !void {
-    if (manifest.items.items.len + manifest.rejections.items.len >= options.max_files) return error.TooManyFiles;
-
     const file = try std.fs.openFileAbsolute(abs_path, .{});
     defer file.close();
     const stat = try file.stat();
@@ -917,13 +1049,48 @@ fn scanOneFile(
     try manifest.items.append(unit);
 }
 
-fn buildConceptSpecs(manifest: *Manifest, owner_kind: shards.Kind, owner_id: []const u8) !void {
+const ConceptTarget = struct {
+    item_index: usize,
+    synthetic_rel_path: []const u8,
+    source_rel_path: []const u8,
+};
+
+fn buildConceptSpecs(
+    manifest: *Manifest,
+    owner_kind: shards.Kind,
+    owner_id: []const u8,
+    max_candidates: usize,
+    max_concepts: usize,
+) !void {
+    var targets = std.ArrayList(ConceptTarget).init(manifest.allocator);
+    defer targets.deinit();
+    for (manifest.items.items, 0..) |target, target_index| {
+        if (target.dedup != .unique) continue;
+        try targets.append(.{
+            .item_index = target_index,
+            .synthetic_rel_path = target.synthetic_rel_path,
+            .source_rel_path = target.source_rel_path,
+        });
+    }
+
     for (manifest.items.items, 0..) |*source, source_index| {
         if (source.class == .code or source.dedup != .unique or source.lower_text == null) continue;
         const source_text = source.lower_text.?;
-        for (manifest.items.items, 0..) |target, target_index| {
-            if (source_index == target_index or target.dedup != .unique) continue;
-            if (!mentionsTarget(source_text, target.synthetic_rel_path, target.source_rel_path)) continue;
+        for (targets.items) |target_info| {
+            if (manifest.capacity_telemetry.concept_candidates_considered >= max_candidates) {
+                manifest.capacity_telemetry.concept_candidate_cap_hit = true;
+                manifest.capacity_telemetry.budget_hits += 1;
+                return;
+            }
+            if (manifest.concepts.items.len >= max_concepts) {
+                manifest.capacity_telemetry.concept_emit_cap_hit = true;
+                manifest.capacity_telemetry.budget_hits += 1;
+                return;
+            }
+            if (source_index == target_info.item_index) continue;
+            manifest.capacity_telemetry.concept_candidates_considered += 1;
+            if (!mentionsTarget(source_text, target_info.synthetic_rel_path, target_info.source_rel_path)) continue;
+            const target = manifest.items.items[target_info.item_index];
 
             source.target_rel_path = if (source.target_rel_path) |existing|
                 existing
@@ -983,8 +1150,10 @@ fn buildConceptSpecs(manifest: *Manifest, owner_kind: shards.Kind, owner_id: []c
                 .support_score = 760,
                 .promotion_ready = source.trust_class != .exploratory,
             });
+            manifest.capacity_telemetry.concepts_emitted = manifest.concepts.items.len;
         }
     }
+    manifest.capacity_telemetry.concepts_emitted = manifest.concepts.items.len;
 }
 
 fn persistStagedState(allocator: std.mem.Allocator, paths: *const shards.Paths, manifest: *Manifest, max_file_bytes: usize) !void {
@@ -1258,6 +1427,24 @@ fn shouldSkipWalkPath(base: []const u8) bool {
         std.mem.eql(u8, base, "state");
 }
 
+fn walkNameLessThan(lhs: []const u8, rhs: []const u8) bool {
+    const lhs_stem = std.fs.path.stem(lhs);
+    const rhs_stem = std.fs.path.stem(rhs);
+    if (lhs_stem.len > rhs_stem.len and
+        std.mem.startsWith(u8, lhs_stem, rhs_stem) and
+        lhs_stem[rhs_stem.len] == '-')
+    {
+        return false;
+    }
+    if (rhs_stem.len > lhs_stem.len and
+        std.mem.startsWith(u8, rhs_stem, lhs_stem) and
+        rhs_stem[lhs_stem.len] == '-')
+    {
+        return true;
+    }
+    return std.mem.lessThan(u8, lhs, rhs);
+}
+
 fn rewritePackSyntheticRelPath(allocator: std.mem.Allocator, pack_prefix: []const u8, synthetic_rel_path: []const u8) ![]u8 {
     if (std.mem.startsWith(u8, synthetic_rel_path, CORPUS_REL_PREFIX ++ "/")) {
         return std.fmt.allocPrint(allocator, "{s}/{s}", .{ pack_prefix, synthetic_rel_path[CORPUS_REL_PREFIX.len + 1 ..] });
@@ -1446,6 +1633,16 @@ fn serializeManifest(allocator: std.mem.Allocator, manifest: *Manifest) ![]u8 {
     try writeJsonFieldString(writer, "version", MANIFEST_VERSION, true);
     try writeOptionalStringField(writer, "sourceRoot", manifest.source_root);
     try writeOptionalStringField(writer, "sourceLabel", manifest.source_label);
+    try writer.writeAll(",\"coverage\":{");
+    try writer.print("\"complete\":{s}", .{if (manifest.coverage_complete) "true" else "false"});
+    try writer.print(",\"scannedFiles\":{d},\"stagedItems\":{d},\"rejectedItems\":{d}", .{
+        manifest.items.items.len + manifest.rejections.items.len,
+        manifest.items.items.len,
+        manifest.rejections.items.len,
+    });
+    if (manifest.next_cursor) |value| try writeOptionalStringField(writer, "nextCursor", value);
+    try writer.writeAll("},\"capacityTelemetry\":");
+    try writeIngestCapacityTelemetry(writer, manifest.capacity_telemetry);
     try writer.writeAll(",\"items\":[");
     for (manifest.items.items, 0..) |item, idx| {
         if (idx != 0) try writer.writeByte(',');
@@ -1557,21 +1754,50 @@ fn loadManifestFromPath(allocator: std.mem.Allocator, abs_path: []const u8) !str
         sourceRelPath: []const u8,
         reason: []const u8,
     };
+    const DiskCoverage = struct {
+        complete: bool = true,
+        scannedFiles: u32 = 0,
+        stagedItems: u32 = 0,
+        rejectedItems: u32 = 0,
+        nextCursor: ?[]const u8 = null,
+    };
+    const DiskCapacityTelemetry = struct {
+        tooManyFiles: bool = false,
+        fileCapHit: bool = false,
+        conceptCandidateCapHit: bool = false,
+        conceptEmitCapHit: bool = false,
+        conceptCandidatesConsidered: usize = 0,
+        conceptsEmitted: usize = 0,
+        budgetHits: usize = 0,
+    };
     const DiskManifest = struct {
         version: []const u8,
         sourceRoot: []const u8,
         sourceLabel: []const u8,
+        coverage: DiskCoverage = .{},
+        capacityTelemetry: DiskCapacityTelemetry = .{},
         items: []const DiskItem,
         concepts: []const DiskConcept,
         rejections: []const DiskRejection,
     };
 
-    const parsed = try std.json.parseFromSlice(DiskManifest, allocator, bytes, .{});
+    const parsed = try std.json.parseFromSlice(DiskManifest, allocator, bytes, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     if (!std.mem.eql(u8, parsed.value.version, MANIFEST_VERSION)) return error.InvalidCorpusManifest;
 
     var manifest = try Manifest.init(allocator, parsed.value.sourceRoot, parsed.value.sourceLabel);
     errdefer manifest.deinit();
+    manifest.coverage_complete = parsed.value.coverage.complete;
+    manifest.next_cursor = if (parsed.value.coverage.nextCursor) |value| try allocator.dupe(u8, value) else null;
+    manifest.capacity_telemetry = .{
+        .too_many_files = parsed.value.capacityTelemetry.tooManyFiles,
+        .file_cap_hit = parsed.value.capacityTelemetry.fileCapHit,
+        .concept_candidate_cap_hit = parsed.value.capacityTelemetry.conceptCandidateCapHit,
+        .concept_emit_cap_hit = parsed.value.capacityTelemetry.conceptEmitCapHit,
+        .concept_candidates_considered = parsed.value.capacityTelemetry.conceptCandidatesConsidered,
+        .concepts_emitted = parsed.value.capacityTelemetry.conceptsEmitted,
+        .budget_hits = parsed.value.capacityTelemetry.budgetHits,
+    };
 
     for (parsed.value.items) |item| {
         try manifest.items.append(.{
@@ -1747,6 +1973,37 @@ fn writeStringArray(writer: anytype, items: []const []const u8) !void {
         try writeJsonString(writer, item);
     }
     try writer.writeAll("]");
+}
+
+fn writeIngestCapacityTelemetry(writer: anytype, telemetry: IngestCapacityTelemetry) !void {
+    try writer.writeAll("{");
+    try writer.print("\"tooManyFiles\":{s},\"fileCapHit\":{s}", .{
+        if (telemetry.too_many_files) "true" else "false",
+        if (telemetry.file_cap_hit) "true" else "false",
+    });
+    try writer.print(",\"conceptCandidateCapHit\":{s},\"conceptEmitCapHit\":{s}", .{
+        if (telemetry.concept_candidate_cap_hit) "true" else "false",
+        if (telemetry.concept_emit_cap_hit) "true" else "false",
+    });
+    try writer.print(",\"conceptCandidatesConsidered\":{d},\"conceptsEmitted\":{d},\"budgetHits\":{d}", .{
+        telemetry.concept_candidates_considered,
+        telemetry.concepts_emitted,
+        telemetry.budget_hits,
+    });
+    try writer.writeAll(",\"capacityWarnings\":[");
+    var wrote = false;
+    try writeTelemetryWarning(writer, &wrote, telemetry.too_many_files, "too_many_files");
+    try writeTelemetryWarning(writer, &wrote, telemetry.file_cap_hit, "file_cap_hit");
+    try writeTelemetryWarning(writer, &wrote, telemetry.concept_candidate_cap_hit, "concept_candidate_cap_hit");
+    try writeTelemetryWarning(writer, &wrote, telemetry.concept_emit_cap_hit, "concept_emit_cap_hit");
+    try writer.writeAll("]}");
+}
+
+fn writeTelemetryWarning(writer: anytype, wrote: *bool, condition: bool, text: []const u8) !void {
+    if (!condition) return;
+    if (wrote.*) try writer.writeByte(',');
+    wrote.* = true;
+    try writeJsonString(writer, text);
 }
 
 fn writeJsonFieldString(writer: anytype, field: []const u8, value: []const u8, first: bool) !void {
