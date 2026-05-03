@@ -119,6 +119,22 @@ The Linux shell surface is:
 
 ## Sigil, Scratch, And Replay
 
+Sigil is a bounded Ghost procedure/control DSL, not an authority language.
+
+Sigil can express:
+
+- local control-plane tuning such as `MOOD`, `LOOM`, `LOCK`, and `SCAN`
+- scratch-session meaning candidates through `BIND`, `ETCH`, and `VOID`
+- explicit lifecycle commands routed through snapshot control
+
+Sigil cannot authorize final support, create proof, execute arbitrary shell,
+promote negative knowledge, silently mutate packs, or bypass support/proof
+gates. Sigil VM output is candidate/control/procedure state only until external
+verifier evidence supports a claim through the normal proof path. Static
+validation runs before VM execution and fails closed on unknown statements,
+unsupported `LOOM` commands, authority-forbidden tokens, invalid bytecode shape,
+and meaning mutations outside an explicit scratch-session execution scope.
+
 `POST /api/sigil` accepts:
 
 - Sigil VM source

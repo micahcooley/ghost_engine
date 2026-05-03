@@ -57,6 +57,33 @@ pub const Program = struct {
     }
 };
 
+/// Sigil is a bounded Ghost procedure/control DSL. Its compiler recognizes only
+/// the opcodes in this file; unknown source statements must fail closed instead
+/// of becoming comments or implicit authority. Sigil can steer local control
+/// state and stage scratch-session meaning candidates. It cannot grant support,
+/// execute shell commands, promote negative knowledge, mutate packs directly, or
+/// bypass verifier/proof gates.
+pub const ValidationScope = enum {
+    boot_control,
+    scratch_session,
+};
+
+pub const ValidationIssueCode = enum {
+    missing_halt,
+    invalid_operand_mode,
+    invalid_string_index,
+    invalid_jump_target,
+    unsupported_loom_command,
+    forbidden_authority_token,
+    mutation_requires_scratch_session,
+};
+
+pub const ValidationIssue = struct {
+    code: ValidationIssueCode,
+    instruction_index: usize,
+    message: []const u8,
+};
+
 const AtomTag = enum {
     keyword_bind,
     keyword_etch,
@@ -281,7 +308,11 @@ const Parser = struct {
                 reportError(token.line, token.col, "Invalid token", token.text);
                 return error.ParseFailed;
             },
-            else => self.advance(),
+            else => {
+                const token = self.current();
+                reportError(token.line, token.col, "Unknown Sigil statement", token.text);
+                return error.ParseFailed;
+            },
         }
     }
 
@@ -444,6 +475,169 @@ pub fn compileScript(allocator: std.mem.Allocator, source: []const u8) !Program 
     };
 }
 
+pub fn validateProgram(program: *const Program, scope: ValidationScope) !void {
+    const validation_issue = firstValidationIssue(program, scope) orelse return;
+    reportValidationIssue(validation_issue);
+    return error.SigilValidationFailed;
+}
+
+pub fn firstValidationIssue(program: *const Program, scope: ValidationScope) ?ValidationIssue {
+    if (program.instructions.len == 0 or program.instructions[program.instructions.len - 1].opcode != .halt) {
+        return issue(.missing_halt, program.instructions.len, "Sigil program must end with HALT");
+    }
+
+    for (program.instructions, 0..) |inst, index| {
+        if (!operandModeAllowed(inst.opcode, inst.mode)) {
+            return issue(.invalid_operand_mode, index, "Sigil instruction has an invalid operand mode");
+        }
+        if (inst.mode == .string or inst.mode == .rune_and_string) {
+            if (inst.string_index == INVALID_STRING_INDEX or inst.string_index >= program.strings.len) {
+                return issue(.invalid_string_index, index, "Sigil instruction references an invalid string");
+            }
+            if (isForbiddenAuthorityToken(program.strings[inst.string_index])) {
+                return issue(.forbidden_authority_token, index, "Sigil source names an authority-forbidden operation");
+            }
+        }
+        switch (inst.opcode) {
+            .loom => {
+                if (inst.a < 0 or inst.a > std.math.maxInt(u8)) {
+                    return issue(.unsupported_loom_command, index, "Sigil LOOM command is unsupported");
+                }
+                const command = std.meta.intToEnum(LoomCommand, @as(u8, @intCast(inst.a))) catch .none;
+                if (command == .none) {
+                    return issue(.unsupported_loom_command, index, "Sigil LOOM command is unsupported");
+                }
+            },
+            .bind, .etch, .void_op => {
+                if (scope != .scratch_session) {
+                    return issue(.mutation_requires_scratch_session, index, "Sigil meaning mutation requires an explicit scratch session");
+                }
+            },
+            .jmp_if_false => {
+                if (inst.b < 0 or @as(usize, @intCast(inst.b)) > program.instructions.len) {
+                    return issue(.invalid_jump_target, index, "Sigil jump target is outside the program");
+                }
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn issue(code: ValidationIssueCode, instruction_index: usize, message: []const u8) ValidationIssue {
+    return .{
+        .code = code,
+        .instruction_index = instruction_index,
+        .message = message,
+    };
+}
+
+fn operandModeAllowed(opcode: Opcode, mode: OperandMode) bool {
+    return switch (opcode) {
+        .halt => mode == .none,
+        .mood => mode == .string or mode == .integer,
+        .loom => mode == .loom_command,
+        .lock => mode == .integer or mode == .string,
+        .scan => mode == .string,
+        .bind => mode == .rune_and_string,
+        .etch => mode == .string,
+        .void_op => mode == .string,
+        .jmp_if_false => mode == .immediate_bool,
+    };
+}
+
+fn isForbiddenAuthorityToken(text: []const u8) bool {
+    const forbidden = [_][]const u8{
+        "support",
+        "supported",
+        "grant_support",
+        "proof_grant",
+        "bypass_proof",
+        "shell",
+        "exec",
+        "execute_shell",
+        "system",
+        "sh",
+        "bash",
+        "negative_knowledge.promote",
+        "nk_promote",
+        "promote_negative_knowledge",
+        "pack_mutate",
+        "pack_commit",
+        "pack.update_from_negative_knowledge",
+    };
+    for (forbidden) |item| {
+        if (std.ascii.eqlIgnoreCase(text, item)) return true;
+    }
+    return false;
+}
+
+fn reportValidationIssue(validation_issue: ValidationIssue) void {
+    std.debug.print(
+        "[SIGIL VALIDATION] instruction={d} code={s}: {s}\n",
+        .{ validation_issue.instruction_index, @tagName(validation_issue.code), validation_issue.message },
+    );
+}
+
+test "sigil validation accepts bounded control scripts" {
+    const allocator = std.testing.allocator;
+
+    var program = try compileScript(allocator,
+        \\MOOD "focused"
+        \\LOOM CPU_ONLY
+        \\LOOM TIER_1
+        \\LOCK 7
+        \\SCAN "system_memory"
+    );
+    defer program.deinit();
+
+    try validateProgram(&program, .boot_control);
+}
+
+test "sigil validation keeps meaning mutation scratch scoped" {
+    const allocator = std.testing.allocator;
+
+    var program = try compileScript(allocator,
+        \\BIND 65 TO alpha
+        \\ETCH "candidate_anchor" @2
+        \\VOID "candidate_void"
+    );
+    defer program.deinit();
+
+    try validateProgram(&program, .scratch_session);
+    try std.testing.expectError(error.SigilValidationFailed, validateProgram(&program, .boot_control));
+}
+
+test "sigil validation fails unknown source and unsupported loom" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectError(error.ParseFailed, compileScript(allocator, "SHELL \"echo hidden\""));
+
+    var program = try compileScript(allocator, "LOOM SUPPORT");
+    defer program.deinit();
+    const validation_issue = firstValidationIssue(&program, .scratch_session) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(ValidationIssueCode.unsupported_loom_command, validation_issue.code);
+}
+
+test "sigil validation blocks authority and global mutation tokens" {
+    const allocator = std.testing.allocator;
+
+    var support_program = try compileScript(allocator, "SCAN \"support\"");
+    defer support_program.deinit();
+    const support_issue = firstValidationIssue(&support_program, .scratch_session) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(ValidationIssueCode.forbidden_authority_token, support_issue.code);
+
+    var nk_program = try compileScript(allocator, "SCAN \"negative_knowledge.promote\"");
+    defer nk_program.deinit();
+    const nk_issue = firstValidationIssue(&nk_program, .scratch_session) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(ValidationIssueCode.forbidden_authority_token, nk_issue.code);
+
+    var pack_program = try compileScript(allocator, "SCAN \"pack.update_from_negative_knowledge\"");
+    defer pack_program.deinit();
+    const pack_issue = firstValidationIssue(&pack_program, .scratch_session) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(ValidationIssueCode.forbidden_authority_token, pack_issue.code);
+}
+
 pub fn serializeProgram(allocator: std.mem.Allocator, program: *const Program) ![]u8 {
     var output = std.ArrayList(u8).init(allocator);
     errdefer output.deinit();
@@ -490,9 +684,7 @@ fn isNumberChar(c: u8) bool {
 }
 
 fn reportError(line: u32, col: u32, msg: []const u8, extra: []const u8) void {
-    var buf: [256]u8 = undefined;
-    const rendered = std.fmt.bufPrint(&buf, "[SIGIL ERR {d}:{d}] {s}: {s}\n", .{ line, col, msg, extra }) catch return;
-    sys.printOut(rendered);
+    std.debug.print("[SIGIL ERR {d}:{d}] {s}: {s}\n", .{ line, col, msg, extra });
 }
 
 pub fn main() !void {
@@ -516,6 +708,7 @@ pub fn main() !void {
 
     var program = try compileScript(allocator, buffer);
     defer program.deinit();
+    try validateProgram(&program, .scratch_session);
 
     const output_path = if (args.len >= 3) args[2] else blk: {
         const ext = std.fs.path.extension(input_path);

@@ -1107,6 +1107,7 @@ fn handleSigilRequest(sock: usize, allocator: std.mem.Allocator, body: []const u
             sigil_vm.executeSource(&vm_ctx, script) catch |err| {
                 switch (err) {
                     error.ParseFailed => sendJsonError(sock, .bad_request, "Invalid Sigil script"),
+                    error.SigilValidationFailed => sendJsonError(sock, .bad_request, "Sigil script violates the bounded control/procedure safety contract"),
                     else => sendJsonError(sock, .internal_server_error, "Sigil execution failed"),
                 }
                 return;

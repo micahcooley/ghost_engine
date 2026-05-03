@@ -56,6 +56,7 @@ pub const MeaningSurface = union(enum) {
 pub const Context = struct {
     allocator: std.mem.Allocator,
     control: *sigil_runtime.ControlPlane,
+    validation_scope: sigil_core.ValidationScope = .scratch_session,
     meaning: ?*MeaningSurface = null,
     soul: ?*ghost_state.GhostSoul = null,
     lattice: ?*ghost_state.UnifiedLattice = null,
@@ -84,6 +85,8 @@ pub fn executeSource(ctx: *Context, source: []const u8) !void {
 }
 
 pub fn executeProgram(ctx: *Context, program: *const sigil_core.Program) !void {
+    try sigil_core.validateProgram(program, ctx.validation_scope);
+
     var ip: usize = 0;
     while (ip < program.instructions.len) {
         const inst = program.instructions[ip];
@@ -300,4 +303,21 @@ fn countUsedTags(tags: []const u64) usize {
         if (tag != 0) used += 1;
     }
     return used;
+}
+
+test "sigil vm validates before permanent mutation execution" {
+    const allocator = std.testing.allocator;
+
+    var control = sigil_runtime.ControlPlane.init(allocator);
+    defer control.deinit();
+
+    var program = try sigil_core.compileScript(allocator, "ETCH \"candidate_anchor\" @1");
+    defer program.deinit();
+
+    var ctx = Context{
+        .allocator = allocator,
+        .control = &control,
+        .validation_scope = .boot_control,
+    };
+    try std.testing.expectError(error.SigilValidationFailed, executeProgram(&ctx, &program));
 }

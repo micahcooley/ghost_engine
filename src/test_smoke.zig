@@ -8,6 +8,8 @@ const mc = @import("inference.zig");
 const layer2a_gpu = @import("layer2a_gpu.zig");
 const sys = @import("sys.zig");
 const sigil_runtime = @import("sigil_runtime.zig");
+const sigil_core = @import("sigil_core.zig");
+const sigil_vm = @import("sigil_vm.zig");
 const sigil_snapshot = @import("sigil_snapshot.zig");
 const scratchpad = @import("scratchpad.zig");
 const panic_dump = @import("panic_dump.zig");
@@ -1081,6 +1083,97 @@ test "sigil snapshot command parser recognizes control commands" {
     try std.testing.expectEqual(sigil_snapshot.Command.revert, sigil_snapshot.parseCommand("ReVeRt"));
     try std.testing.expectEqual(sigil_snapshot.Command.rollback, sigil_snapshot.parseCommand("rollback"));
     try std.testing.expectEqual(sigil_snapshot.Command.none, sigil_snapshot.parseCommand("ETCH \"anchor\" @2"));
+}
+
+test "sigil safe control scripts compile and validate" {
+    const allocator = std.testing.allocator;
+
+    var program = try sigil_core.compileScript(allocator,
+        \\MOOD "focused"
+        \\LOOM CPU_ONLY
+        \\LOOM TIER_1
+        \\LOCK 7
+        \\SCAN "system_memory"
+    );
+    defer program.deinit();
+
+    try sigil_core.validateProgram(&program, .boot_control);
+}
+
+test "sigil safe scratch mutations validate only in scratch scope" {
+    const allocator = std.testing.allocator;
+
+    var program = try sigil_core.compileScript(allocator,
+        \\BIND 65 TO alpha
+        \\ETCH "candidate_anchor" @2
+        \\VOID "candidate_void"
+    );
+    defer program.deinit();
+
+    try sigil_core.validateProgram(&program, .scratch_session);
+    try std.testing.expectError(error.SigilValidationFailed, sigil_core.validateProgram(&program, .boot_control));
+}
+
+test "sigil invalid unknown statements fail safely" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectError(error.ParseFailed, sigil_core.compileScript(allocator, "SUPPORT GRANT"));
+    try std.testing.expectError(error.ParseFailed, sigil_core.compileScript(allocator, "SHELL \"echo hidden\""));
+}
+
+test "sigil cannot grant support permission" {
+    const allocator = std.testing.allocator;
+
+    var program = try sigil_core.compileScript(allocator, "SCAN \"support\"");
+    defer program.deinit();
+
+    const validation_issue = sigil_core.firstValidationIssue(&program, .scratch_session) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(sigil_core.ValidationIssueCode.forbidden_authority_token, validation_issue.code);
+}
+
+test "sigil cannot use unsupported loom commands as authority or shell escape" {
+    const allocator = std.testing.allocator;
+
+    var support_program = try sigil_core.compileScript(allocator, "LOOM SUPPORT");
+    defer support_program.deinit();
+    const support_issue = sigil_core.firstValidationIssue(&support_program, .scratch_session) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(sigil_core.ValidationIssueCode.unsupported_loom_command, support_issue.code);
+
+    var shell_program = try sigil_core.compileScript(allocator, "LOOM SHELL");
+    defer shell_program.deinit();
+    const shell_issue = sigil_core.firstValidationIssue(&shell_program, .scratch_session) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(sigil_core.ValidationIssueCode.unsupported_loom_command, shell_issue.code);
+}
+
+test "sigil cannot promote negative knowledge or mutate packs through VM source" {
+    const allocator = std.testing.allocator;
+
+    var nk_program = try sigil_core.compileScript(allocator, "SCAN \"negative_knowledge.promote\"");
+    defer nk_program.deinit();
+    const nk_issue = sigil_core.firstValidationIssue(&nk_program, .scratch_session) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(sigil_core.ValidationIssueCode.forbidden_authority_token, nk_issue.code);
+
+    var pack_program = try sigil_core.compileScript(allocator, "SCAN \"pack.update_from_negative_knowledge\"");
+    defer pack_program.deinit();
+    const pack_issue = sigil_core.firstValidationIssue(&pack_program, .scratch_session) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(sigil_core.ValidationIssueCode.forbidden_authority_token, pack_issue.code);
+}
+
+test "sigil vm refuses silent permanent mutation outside explicit lifecycle" {
+    const allocator = std.testing.allocator;
+
+    var control = sigil_runtime.ControlPlane.init(allocator);
+    defer control.deinit();
+
+    var program = try sigil_core.compileScript(allocator, "ETCH \"candidate_anchor\" @1");
+    defer program.deinit();
+
+    var ctx = sigil_vm.Context{
+        .allocator = allocator,
+        .control = &control,
+        .validation_scope = .boot_control,
+    };
+    try std.testing.expectError(error.SigilValidationFailed, sigil_vm.executeProgram(&ctx, &program));
 }
 
 test "scratchpad overlay isolates semantic writes from permanent state" {

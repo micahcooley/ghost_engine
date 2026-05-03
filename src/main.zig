@@ -317,6 +317,7 @@ fn executeBootSigil(
     var vm_ctx = sigil_vm.Context{
         .allocator = allocator,
         .control = control,
+        .validation_scope = .boot_control,
         .meaning = &meaning_surface,
         .soul = soul,
     };

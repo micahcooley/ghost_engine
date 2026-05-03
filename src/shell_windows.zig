@@ -907,6 +907,10 @@ fn handleSigilRequest(sock: usize, allocator: std.mem.Allocator, body: []const u
             sendJsonError(sock, .service_unavailable, "Scratchpad unavailable");
             return;
         };
+        if (!live_scratchpad.isSessionActive()) {
+            sendJsonError(sock, .conflict, "Scratch session is not active; begin scratch first");
+            return;
+        }
         var meaning_surface = sigil_vm.MeaningSurface{ .scratchpad = live_scratchpad.meaning() };
         var vm_ctx = sigil_vm.Context{
             .allocator = allocator,
@@ -918,6 +922,7 @@ fn handleSigilRequest(sock: usize, allocator: std.mem.Allocator, body: []const u
         sigil_vm.executeSource(&vm_ctx, script) catch |err| {
             switch (err) {
                 error.ParseFailed => sendJsonError(sock, .bad_request, "Invalid Sigil script"),
+                error.SigilValidationFailed => sendJsonError(sock, .bad_request, "Sigil script violates the bounded control/procedure safety contract"),
                 else => sendJsonError(sock, .internal_server_error, "Sigil execution failed"),
             }
             return;
