@@ -137,74 +137,8 @@ pub fn validateCommandTimeout(timeout_ms: ?u32) ?schema.GipError {
 // ── Capability Gate ───────────────────────────────────────────────────
 
 pub fn checkCapability(kind: core.RequestKind) struct { cap: ?core.CapabilityName, policy: core.CapabilityPolicy } {
-    const caps = core.defaultCapabilities();
-    const cap_name: ?core.CapabilityName = switch (kind) {
-        .@"artifact.read" => .@"artifact.read",
-        .@"artifact.list" => .@"artifact.list",
-        .@"artifact.search" => .@"artifact.search",
-        .@"corpus.ask" => .@"corpus.ask",
-        .@"rule.evaluate" => .@"rule.evaluate",
-        .@"learning.status" => .@"learning.status",
-        .@"artifact.patch.propose" => .@"artifact.patch.propose",
-        .@"artifact.patch.apply" => .@"artifact.patch.apply",
-        .@"artifact.write.propose" => .@"artifact.write.propose",
-        .@"artifact.write.apply" => .@"artifact.write.apply",
-        .@"command.run" => .@"command.run",
-        .@"verifier.run" => .@"verifier.run",
-        .@"verifier.list" => .@"verifier.list",
-        .@"verifier.candidate.execution.list" => .@"verifier.candidate.execution.list",
-        .@"verifier.candidate.execution.get" => .@"verifier.candidate.execution.get",
-        .@"verifier.candidate.execute" => .@"verifier.candidate.execute",
-        .@"hypothesis.list" => .@"hypothesis.list",
-        .@"hypothesis.triage" => .@"hypothesis.triage",
-        .@"correction.propose" => .@"correction.propose",
-        .@"correction.review" => .@"correction.review",
-        .@"correction.reviewed.list" => .@"correction.reviewed.list",
-        .@"correction.reviewed.get" => .@"correction.reviewed.get",
-        .@"correction.influence.status" => .@"correction.influence.status",
-        .@"procedure_pack.candidate.propose" => .@"procedure_pack.candidate.propose",
-        .@"procedure_pack.candidate.review" => .@"procedure_pack.candidate.review",
-        .@"procedure_pack.candidate.reviewed.list" => .@"procedure_pack.candidate.reviewed.list",
-        .@"procedure_pack.candidate.reviewed.get" => .@"procedure_pack.candidate.reviewed.get",
-        .@"correction.list" => .@"correction.list",
-        .@"correction.get" => .@"correction.get",
-        .@"correction.apply" => .@"correction.apply",
-        .@"negative_knowledge.candidate.list" => .@"negative_knowledge.candidate.list",
-        .@"negative_knowledge.candidate.get" => .@"negative_knowledge.candidate.get",
-        .@"negative_knowledge.record.list" => .@"negative_knowledge.record.list",
-        .@"negative_knowledge.record.get" => .@"negative_knowledge.record.get",
-        .@"negative_knowledge.influence.list" => .@"negative_knowledge.influence.list",
-        .@"negative_knowledge.review" => .@"negative_knowledge.review",
-        .@"negative_knowledge.reviewed.list" => .@"negative_knowledge.reviewed.list",
-        .@"negative_knowledge.reviewed.get" => .@"negative_knowledge.reviewed.get",
-        .@"negative_knowledge.candidate.review" => .@"negative_knowledge.candidate.review",
-        .@"negative_knowledge.record.expire" => .@"negative_knowledge.record.expire",
-        .@"negative_knowledge.record.supersede" => .@"negative_knowledge.record.supersede",
-        .@"negative_knowledge.promote" => .@"negative_knowledge.promote",
-        .@"trust_decay.candidate.list" => .@"trust_decay.candidate.list",
-        .@"trust_decay.apply" => .@"trust_decay.apply",
-        .@"pack.inspect" => .@"pack.inspect",
-        .@"pack.list" => .@"pack.list",
-        .@"pack.mount" => .@"pack.mount",
-        .@"pack.unmount" => .@"pack.unmount",
-        .@"pack.import" => .@"pack.import",
-        .@"pack.export" => .@"pack.export",
-        .@"pack.update_from_negative_knowledge" => .@"pack.update_from_negative_knowledge",
-        .@"feedback.summary" => .@"feedback.summary",
-        .@"feedback.record" => .@"feedback.record",
-        .@"session.get" => .@"session.get",
-        .@"session.create", .@"session.update", .@"session.close" => .@"session.write",
-        .@"project.autopsy" => .@"project.autopsy",
-        .@"context.autopsy" => .@"context.autopsy",
-        else => null,
-    };
-
-    if (cap_name) |cn| {
-        for (caps) |cap| {
-            if (cap.capability == cn) return .{ .cap = cn, .policy = cap.policy };
-        }
-    }
-    return .{ .cap = cap_name, .policy = .allowed };
+    const cap_name = core.requestCapabilityName(kind);
+    return .{ .cap = cap_name, .policy = core.capabilityPolicyForRequestKind(kind) };
 }
 
 pub fn validateCapability(kind: core.RequestKind) ?schema.GipError {
@@ -272,4 +206,12 @@ test "validateCapability blocks denied operations" {
 
     // artifact.read should pass
     try std.testing.expect(validateCapability(.@"artifact.read") == null);
+
+    const denied = validateCapability(.@"correction.apply");
+    try std.testing.expect(denied != null);
+    try std.testing.expectEqual(core.ErrorCode.capability_denied, denied.?.code);
+
+    const nk_review = validateCapability(.@"negative_knowledge.candidate.review");
+    try std.testing.expect(nk_review != null);
+    try std.testing.expectEqual(core.ErrorCode.approval_required, nk_review.?.code);
 }

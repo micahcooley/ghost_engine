@@ -523,6 +523,25 @@ pub fn renderProtocolDescription(allocator: std.mem.Allocator) ![]u8 {
     try w.writeAll(",\"protocolStatuses\":");
     try w.writeAll(statuses);
 
+    var unsupported_kinds_list = std.ArrayList([]const u8).init(allocator);
+    defer unsupported_kinds_list.deinit();
+    inline for (std.meta.fields(core.RequestKind)) |field| {
+        const kind: core.RequestKind = @enumFromInt(field.value);
+        if (!core.isImplemented(kind)) try unsupported_kinds_list.append(field.name);
+    }
+    const unsupported_kinds = try renderJsonStringArray(allocator, unsupported_kinds_list.items);
+    defer allocator.free(unsupported_kinds);
+    try w.writeAll(",\"unsupportedRequestKinds\":");
+    try w.writeAll(unsupported_kinds);
+
+    try w.writeAll(",\"operationMaturity\":[");
+    inline for (std.meta.fields(core.RequestKind), 0..) |field, idx| {
+        if (idx != 0) try w.writeByte(',');
+        const kind: core.RequestKind = @enumFromInt(field.value);
+        try writeOperationMaturity(w, core.operationMaturity(kind));
+    }
+    try w.writeAll("]");
+
     try w.writeAll("}");
     return out.toOwnedSlice();
 }
@@ -534,15 +553,111 @@ pub fn renderCapabilitiesDescription(allocator: std.mem.Allocator) ![]u8 {
     const w = out.writer();
 
     try w.writeAll("{\"capabilities\":[");
-    for (caps, 0..) |cap, idx| {
-        if (idx != 0) try w.writeByte(',');
+    try w.writeAll("{\"capability\":\"protocol.describe\",\"policy\":\"allowed\"},");
+    try w.writeAll("{\"capability\":\"capabilities.describe\",\"policy\":\"allowed\"},");
+    try w.writeAll("{\"capability\":\"engine.status\",\"policy\":\"allowed\"}");
+    for (caps) |cap| {
+        try w.writeByte(',');
         try w.writeAll("{");
         try writeStr(w, "capability", cap.capability.asText(), true);
         try writeStr(w, "policy", cap.policy.name(), false);
+        try writeCapabilityDetails(w, cap.capability, cap.policy);
         try w.writeAll("}");
+    }
+    try w.writeAll("],\"operationMaturity\":[");
+    inline for (std.meta.fields(core.RequestKind), 0..) |field, idx| {
+        if (idx != 0) try w.writeByte(',');
+        const kind: core.RequestKind = @enumFromInt(field.value);
+        try writeOperationMaturity(w, core.operationMaturity(kind));
     }
     try w.writeAll("]}");
     return out.toOwnedSlice();
+}
+
+fn writeOperationMaturity(w: anytype, maturity: core.OperationMaturity) !void {
+    try w.writeAll("{");
+    try writeStr(w, "kind", maturity.kind.name(), true);
+    try writeBool(w, "declared", maturity.declared, false);
+    try writeBool(w, "implemented", maturity.implemented, false);
+    try writeBool(w, "wired", maturity.wired, false);
+    try writeBool(w, "mutatesState", maturity.mutates_state, false);
+    try writeBool(w, "requiresApproval", maturity.requires_approval, false);
+    try writeStr(w, "capabilityPolicy", maturity.capability_policy.name(), false);
+    try writeStr(w, "authorityEffect", maturity.authority_effect.name(), false);
+    try writeBool(w, "productReady", maturity.product_ready, false);
+    try writeStr(w, "maturity", maturity.maturity, false);
+    try w.writeAll("}");
+}
+
+fn writeCapabilityDetails(w: anytype, capability: core.CapabilityName, policy: core.CapabilityPolicy) !void {
+    switch (capability) {
+        .@"verifier.run",
+        .@"command.run",
+        => try writeStr(w, "note", "not yet implemented", false),
+        .@"correction.review",
+        .@"procedure_pack.candidate.review",
+        .@"negative_knowledge.review",
+        => try writeBool(w, "append_only", true, false),
+        .@"artifact.read",
+        .@"artifact.list",
+        .@"artifact.search",
+        .@"artifact.patch.propose",
+        .@"artifact.write.propose",
+        .@"verifier.list",
+        .@"verifier.candidate.execution.list",
+        .@"verifier.candidate.execution.get",
+        .@"hypothesis.list",
+        .@"hypothesis.triage",
+        .@"corpus.ask",
+        .@"rule.evaluate",
+        .@"learning.status",
+        .@"correction.propose",
+        .@"correction.reviewed.list",
+        .@"correction.reviewed.get",
+        .@"correction.influence.status",
+        .@"procedure_pack.candidate.propose",
+        .@"procedure_pack.candidate.reviewed.list",
+        .@"procedure_pack.candidate.reviewed.get",
+        .@"correction.list",
+        .@"correction.get",
+        .@"negative_knowledge.candidate.list",
+        .@"negative_knowledge.candidate.get",
+        .@"negative_knowledge.record.list",
+        .@"negative_knowledge.record.get",
+        .@"negative_knowledge.influence.list",
+        .@"negative_knowledge.reviewed.list",
+        .@"negative_knowledge.reviewed.get",
+        .@"trust_decay.candidate.list",
+        .@"pack.list",
+        .@"pack.inspect",
+        .@"feedback.summary",
+        .@"session.get",
+        .@"project.autopsy",
+        .@"context.autopsy",
+        => try writeBool(w, "read_only", true, false),
+        else => {},
+    }
+
+    if (policy == .denied or policy == .requires_approval) {
+        switch (capability) {
+            .@"artifact.patch.apply",
+            .@"artifact.write.apply",
+            .@"verifier.candidate.execute",
+            .@"correction.apply",
+            .@"negative_knowledge.candidate.review",
+            .@"negative_knowledge.record.expire",
+            .@"negative_knowledge.record.supersede",
+            .@"negative_knowledge.promote",
+            .@"trust_decay.apply",
+            .@"pack.mount",
+            .@"pack.unmount",
+            .@"pack.import",
+            .@"pack.export",
+            .@"pack.update_from_negative_knowledge",
+            => try writeBool(w, "mutation", true, false),
+            else => {},
+        }
+    }
 }
 
 pub fn renderEngineStatus(allocator: std.mem.Allocator) ![]u8 {

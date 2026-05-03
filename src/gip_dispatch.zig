@@ -85,16 +85,16 @@ pub fn dispatch(
     }
     const kind = core.parseRequestKind(kind_text.?).?;
 
-    // Check implemented
-    if (validation.validateImplemented(kind)) |err| {
-        return .{ .status = .unsupported, .err = err, .result_state = schema.unsupportedResultState() };
-    }
-
     // Capability gate
     if (validation.validateCapability(kind)) |err| {
         if (err.code == .capability_denied) {
             return .{ .status = .rejected, .err = err };
         }
+    }
+
+    // Check implemented
+    if (validation.validateImplemented(kind)) |err| {
+        return .{ .status = .unsupported, .err = err, .result_state = schema.unsupportedResultState() };
     }
 
     // Dispatch by kind
@@ -157,89 +157,17 @@ pub fn dispatch(
 }
 
 fn dispatchProtocolDescribe(allocator: std.mem.Allocator) !DispatchResult {
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-    const w = out.writer();
-
-    try w.writeAll("{\"protocol\":{");
-    try w.writeAll("\"version\":\"");
-    try w.writeAll(core.PROTOCOL_VERSION);
-    try w.writeAll("\",\"implemented\":[\"protocol.describe\",\"capabilities.describe\",\"engine.status\",\"conversation.turn\",\"corpus.ask\",\"rule.evaluate\",\"learning.status\",\"correction.propose\",\"correction.review\",\"correction.reviewed.list\",\"correction.reviewed.get\",\"correction.influence.status\",\"procedure_pack.candidate.propose\",\"procedure_pack.candidate.review\",\"procedure_pack.candidate.reviewed.list\",\"procedure_pack.candidate.reviewed.get\",\"artifact.read\",\"artifact.list\",\"artifact.patch.propose\",\"hypothesis.list\",\"hypothesis.triage\",\"verifier.list\",\"verifier.candidate.execution.list\",\"verifier.candidate.execution.get\",\"correction.list\",\"correction.get\",\"negative_knowledge.candidate.list\",\"negative_knowledge.candidate.get\",\"negative_knowledge.record.list\",\"negative_knowledge.record.get\",\"negative_knowledge.influence.list\",\"negative_knowledge.review\",\"negative_knowledge.reviewed.list\",\"negative_knowledge.reviewed.get\",\"trust_decay.candidate.list\",\"negative_knowledge.candidate.review\",\"negative_knowledge.record.expire\",\"negative_knowledge.record.supersede\",\"pack.list\",\"pack.inspect\",\"feedback.summary\",\"session.get\",\"project.autopsy\",\"context.autopsy\"]");
-    try w.writeAll(",\"maturity\":{\"corpus.ask\":\"read_only_live_corpus_grounded_draft\",\"rule.evaluate\":\"bounded_deterministic_non_authorizing_candidates\",\"learning.status\":\"read_only_reviewed_learning_loop_scoreboard_non_authorizing\",\"correction.propose\":\"candidate_only_review_required_no_mutation\",\"correction.review\":\"append_only_reviewed_record_no_hidden_mutation\",\"correction.reviewed.list\":\"read_only_reviewed_correction_inspection_non_authorizing\",\"correction.reviewed.get\":\"read_only_reviewed_correction_inspection_non_authorizing\",\"correction.influence.status\":\"read_only_reviewed_correction_influence_summary_non_authorizing\",\"procedure_pack.candidate.propose\":\"candidate_only_no_pack_mutation_no_execution\",\"procedure_pack.candidate.review\":\"append_only_reviewed_procedure_pack_candidate_no_pack_mutation\",\"procedure_pack.candidate.reviewed.list\":\"read_only_reviewed_procedure_pack_candidate_inspection_non_authorizing\",\"procedure_pack.candidate.reviewed.get\":\"read_only_reviewed_procedure_pack_candidate_inspection_non_authorizing\",\"hypothesis.list\":\"stateless\",\"hypothesis.triage\":\"stateless\",\"verifier.candidate.execution.list\":\"read_only_state_inspection\",\"verifier.candidate.execution.get\":\"read_only_state_inspection\",\"correction.list\":\"read_only_state_inspection\",\"correction.get\":\"read_only_state_inspection\",\"negative_knowledge.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.get\":\"read_only_state_inspection\",\"negative_knowledge.record.list\":\"read_only_state_inspection\",\"negative_knowledge.record.get\":\"read_only_state_inspection\",\"negative_knowledge.influence.list\":\"read_only_state_inspection\",\"negative_knowledge.review\":\"append_only_reviewed_negative_knowledge_no_hidden_mutation\",\"negative_knowledge.reviewed.list\":\"read_only_reviewed_negative_knowledge_inspection_non_authorizing\",\"negative_knowledge.reviewed.get\":\"read_only_reviewed_negative_knowledge_inspection_non_authorizing\",\"trust_decay.candidate.list\":\"read_only_state_inspection\",\"negative_knowledge.candidate.review\":\"structured_unsupported_legacy_review_surface\",\"negative_knowledge.record.expire\":\"structured_unsupported_without_persistence\",\"negative_knowledge.record.supersede\":\"structured_unsupported_without_persistence\",\"feedback.summary\":\"requires_workspace_metadata\",\"session.get\":\"requires_existing_session\",\"project.autopsy\":\"read_only_workspace_inspection\",\"context.autopsy\":\"read_only_artifact_and_input_refs_runtime_and_persistent_pack_guidance\"}");
-    try w.writeAll(",\"unsupported\":[\"artifact.patch.apply\",\"artifact.write.propose\",\"artifact.write.apply\",\"artifact.search\",\"conversation.replay\",\"intent.ground\",\"response.evaluate\",\"verifier.run\",\"verifier.candidate.execute\",\"hypothesis.generate\",\"hypothesis.verifier.schedule\",\"correction.apply\",\"negative_knowledge.promote\",\"pack.update_from_negative_knowledge\",\"trust_decay.apply\",\"pack.mount\",\"pack.unmount\",\"pack.import\",\"pack.export\",\"pack.distill.list\",\"pack.distill.show\",\"pack.distill.export\",\"feedback.record\",\"feedback.replay\",\"session.create\",\"session.update\",\"session.close\",\"command.run\"]");
-    try w.writeAll("}}");
-
     return .{
         .status = .ok,
-        .result_json = try out.toOwnedSlice(),
+        .result_json = try schema.renderProtocolDescription(allocator),
         .allocated_result = true,
     };
 }
 
 fn dispatchCapabilitiesDescribe(allocator: std.mem.Allocator) !DispatchResult {
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-    const w = out.writer();
-
-    try w.writeAll("{\"capabilities\":[");
-    try w.writeAll("{\"capability\":\"protocol.describe\",\"policy\":\"allowed\"},");
-    try w.writeAll("{\"capability\":\"capabilities.describe\",\"policy\":\"allowed\"},");
-    try w.writeAll("{\"capability\":\"engine.status\",\"policy\":\"allowed\"},");
-    try w.writeAll("{\"capability\":\"artifact.read\",\"policy\":\"allowed\"},");
-    try w.writeAll("{\"capability\":\"artifact.list\",\"policy\":\"allowed\"},");
-    try w.writeAll("{\"capability\":\"artifact.patch.propose\",\"policy\":\"allowed\"},");
-    try w.writeAll("{\"capability\":\"conversation.turn\",\"policy\":\"allowed\"},");
-    try w.writeAll("{\"capability\":\"corpus.ask\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"note\":\"bounded live-corpus retrieval with explicit evidence, unknowns, and candidate-only learning; no commands, verifiers, pack mutation, corpus mutation, or negative-knowledge mutation\"},");
-    try w.writeAll("{\"capability\":\"rule.evaluate\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"note\":\"bounded deterministic rule evaluation over structured facts; emits candidates, pending obligations, unknowns, and explanation traces only; no commands, verifiers, corpus mutation, pack mutation, or negative-knowledge mutation\"},");
-    try w.writeAll("{\"capability\":\"learning.status\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"treated_as_proof\":false,\"note\":\"summarizes same-shard reviewed correction and reviewed negative-knowledge learning-loop diagnostics only; no mutation, command execution, verifier execution, proof, evidence, or global promotion\"},");
-    try w.writeAll("{\"capability\":\"correction.propose\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"requiredReview\":true,\"note\":\"proposes correction-native learning candidates only; no corpus, pack, negative-knowledge, command, or verifier mutation\"},");
-    try w.writeAll("{\"capability\":\"correction.review\",\"policy\":\"allowed\",\"append_only\":true,\"non_authorizing\":true,\"note\":\"accepts or rejects correction candidates into durable reviewed records only; no corpus, pack, negative-knowledge, command, verifier, or global promotion mutation\"},");
-    try w.writeAll("{\"capability\":\"correction.reviewed.list\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"treated_as_proof\":false,\"note\":\"inspects append-only reviewed correction records without mutation, proof authority, command execution, or verifier execution\"},");
-    try w.writeAll("{\"capability\":\"correction.reviewed.get\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"treated_as_proof\":false,\"note\":\"retrieves one reviewed correction record without mutation, proof authority, command execution, or verifier execution\"},");
-    try w.writeAll("{\"capability\":\"correction.influence.status\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"treated_as_proof\":false,\"note\":\"summarizes reviewed correction records and possible influence candidates without mutation, proof authority, command execution, or verifier execution\"},");
-    try w.writeAll("{\"capability\":\"procedure_pack.candidate.propose\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"treated_as_proof\":false,\"executes_by_default\":false,\"note\":\"proposes explicit procedure pack candidates from reviewed learning signals; no pack mutation, command execution, verifier execution, proof, evidence, or global promotion\"},");
-    try w.writeAll("{\"capability\":\"procedure_pack.candidate.review\",\"policy\":\"allowed\",\"append_only\":true,\"non_authorizing\":true,\"treated_as_proof\":false,\"executes_by_default\":false,\"note\":\"persists reviewed procedure pack candidates only; no pack mutation, command execution, verifier execution, proof, evidence, or global promotion\"},");
-    try w.writeAll("{\"capability\":\"procedure_pack.candidate.reviewed.list\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"treated_as_proof\":false,\"note\":\"inspects append-only reviewed procedure pack candidate records without mutating packs or executing anything\"},");
-    try w.writeAll("{\"capability\":\"procedure_pack.candidate.reviewed.get\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"treated_as_proof\":false,\"note\":\"retrieves one reviewed procedure pack candidate record without mutating packs or executing anything\"},");
-    try w.writeAll("{\"capability\":\"hypothesis.list\",\"policy\":\"allowed\",\"read_only\":true},");
-    try w.writeAll("{\"capability\":\"hypothesis.triage\",\"policy\":\"allowed\",\"read_only\":true},");
-    try w.writeAll("{\"capability\":\"verifier.list\",\"policy\":\"allowed\",\"read_only\":true},");
-    try w.writeAll("{\"capability\":\"verifier.candidate.execution.list\",\"policy\":\"allowed\",\"read_only\":true},");
-    try w.writeAll("{\"capability\":\"verifier.candidate.execution.get\",\"policy\":\"allowed\",\"read_only\":true},");
-    try w.writeAll("{\"capability\":\"correction.list\",\"policy\":\"allowed\",\"read_only\":true},");
-    try w.writeAll("{\"capability\":\"correction.get\",\"policy\":\"allowed\",\"read_only\":true},");
-    try w.writeAll("{\"capability\":\"negative_knowledge.candidate.list\",\"policy\":\"allowed\",\"read_only\":true},");
-    try w.writeAll("{\"capability\":\"negative_knowledge.candidate.get\",\"policy\":\"allowed\",\"read_only\":true},");
-    try w.writeAll("{\"capability\":\"negative_knowledge.record.list\",\"policy\":\"allowed\",\"read_only\":true},");
-    try w.writeAll("{\"capability\":\"negative_knowledge.record.get\",\"policy\":\"allowed\",\"read_only\":true},");
-    try w.writeAll("{\"capability\":\"negative_knowledge.influence.list\",\"policy\":\"allowed\",\"read_only\":true},");
-    try w.writeAll("{\"capability\":\"negative_knowledge.review\",\"policy\":\"allowed\",\"append_only\":true,\"non_authorizing\":true,\"treated_as_proof\":false,\"note\":\"accepts or rejects negative knowledge candidates into durable reviewed records only; no corpus, pack, command, verifier, or global promotion mutation\"},");
-    try w.writeAll("{\"capability\":\"negative_knowledge.reviewed.list\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"treated_as_proof\":false,\"note\":\"inspects append-only reviewed negative knowledge records without mutation, proof authority, command execution, or verifier execution\"},");
-    try w.writeAll("{\"capability\":\"negative_knowledge.reviewed.get\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"treated_as_proof\":false,\"note\":\"retrieves one reviewed negative knowledge record without mutation, proof authority, command execution, or verifier execution\"},");
-    try w.writeAll("{\"capability\":\"trust_decay.candidate.list\",\"policy\":\"allowed\",\"read_only\":true},");
-    try w.writeAll("{\"capability\":\"negative_knowledge.candidate.review\",\"policy\":\"requires_approval\",\"mutation\":true,\"note\":\"structured unsupported until safe append-only persistence is available\"},");
-    try w.writeAll("{\"capability\":\"negative_knowledge.record.expire\",\"policy\":\"requires_approval\",\"mutation\":true,\"note\":\"structured unsupported until safe append-only persistence is available\"},");
-    try w.writeAll("{\"capability\":\"negative_knowledge.record.supersede\",\"policy\":\"requires_approval\",\"mutation\":true,\"note\":\"structured unsupported until safe append-only persistence is available\"},");
-    try w.writeAll("{\"capability\":\"pack.list\",\"policy\":\"allowed\",\"read_only\":true},");
-    try w.writeAll("{\"capability\":\"pack.inspect\",\"policy\":\"allowed\",\"read_only\":true},");
-    try w.writeAll("{\"capability\":\"feedback.summary\",\"policy\":\"allowed\",\"read_only\":true},");
-    try w.writeAll("{\"capability\":\"session.get\",\"policy\":\"allowed\",\"read_only\":true},");
-    try w.writeAll("{\"capability\":\"context.autopsy\",\"policy\":\"allowed\",\"read_only\":true,\"non_authorizing\":true,\"note\":\"runtime and persisted mounted-pack guidance plus bounded artifact/input references; no commands, verifiers, or mutations\"},");
-    try w.writeAll("{\"capability\":\"artifact.patch.apply\",\"policy\":\"requires_approval\",\"mutation\":true},");
-    try w.writeAll("{\"capability\":\"verifier.run\",\"policy\":\"allowed\",\"note\":\"not yet implemented\"},");
-    try w.writeAll("{\"capability\":\"verifier.candidate.execute\",\"policy\":\"denied\",\"mutation\":true,\"note\":\"future work; not implemented\"},");
-    try w.writeAll("{\"capability\":\"correction.apply\",\"policy\":\"denied\",\"mutation\":true,\"note\":\"future work; not implemented\"},");
-    try w.writeAll("{\"capability\":\"negative_knowledge.promote\",\"policy\":\"denied\",\"mutation\":true,\"note\":\"future work; not implemented\"},");
-    try w.writeAll("{\"capability\":\"pack.update_from_negative_knowledge\",\"policy\":\"denied\",\"mutation\":true,\"note\":\"future work; not implemented\"},");
-    try w.writeAll("{\"capability\":\"trust_decay.apply\",\"policy\":\"denied\",\"mutation\":true,\"note\":\"future work; not implemented\"},");
-    try w.writeAll("{\"capability\":\"command.run\",\"policy\":\"allowlist\",\"note\":\"not yet implemented\"},");
-    try w.writeAll("{\"capability\":\"network.access\",\"policy\":\"denied\"},");
-    try w.writeAll("{\"capability\":\"project.autopsy\",\"policy\":\"allowed\",\"read_only\":true,\"note\":\"bounded read-only workspace inspection; no commands executed\"}");
-    try w.writeAll("]}");
-
     return .{
         .status = .ok,
-        .result_json = try out.toOwnedSlice(),
+        .result_json = try schema.renderCapabilitiesDescription(allocator),
         .allocated_result = true,
     };
 }
@@ -5232,6 +5160,41 @@ test "negative_knowledge.candidate.review validates approval and persistence hon
     try std.testing.expect(std.mem.indexOf(u8, accepted.result_json.?, "\"support_authority\":false") != null);
 }
 
+test "gip maturity metadata is exposed and unsupported operations do not fake success" {
+    const allocator = std.testing.allocator;
+
+    var protocol = try dispatch(allocator, "protocol.describe", core.PROTOCOL_VERSION, null, null, null);
+    defer protocol.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, protocol.status);
+    try std.testing.expect(std.mem.indexOf(u8, protocol.result_json.?, "\"operationMaturity\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, protocol.result_json.?, "\"kind\":\"conversation.replay\",\"declared\":true,\"implemented\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, protocol.result_json.?, "\"productReady\":false") != null);
+
+    var caps = try dispatch(allocator, "capabilities.describe", core.PROTOCOL_VERSION, null, null, null);
+    defer caps.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, caps.status);
+    try std.testing.expect(std.mem.indexOf(u8, caps.result_json.?, "\"operationMaturity\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, caps.result_json.?, "\"kind\":\"artifact.patch.apply\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, caps.result_json.?, "\"requiresApproval\":true") != null);
+
+    var unsupported = try dispatch(allocator, "conversation.replay", core.PROTOCOL_VERSION, null, null, "{}");
+    defer unsupported.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.unsupported, unsupported.status);
+    try std.testing.expect(unsupported.err != null);
+    try std.testing.expectEqual(core.ErrorCode.unsupported_operation, unsupported.err.?.code);
+    try std.testing.expect(unsupported.result_state != null);
+    try std.testing.expectEqual(core.SemanticState.unresolved, unsupported.result_state.?.state);
+}
+
+test "gip denied mutation operations remain denied before implementation fallback" {
+    const allocator = std.testing.allocator;
+    var denied = try dispatch(allocator, "correction.apply", core.PROTOCOL_VERSION, null, null, "{}");
+    defer denied.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, denied.status);
+    try std.testing.expect(denied.err != null);
+    try std.testing.expectEqual(core.ErrorCode.capability_denied, denied.err.?.code);
+}
+
 test "negative_knowledge.review appends accepted and rejected reviewed records" {
     const allocator = std.testing.allocator;
     const project_shard = "phase11a-gip-review";
@@ -5992,23 +5955,28 @@ test "unsupported operations remain unsupported" {
 
     var r4 = try dispatch(allocator, "verifier.candidate.execute", core.PROTOCOL_VERSION, null, null, "{}");
     defer r4.deinit(allocator);
-    try std.testing.expectEqual(core.ProtocolStatus.unsupported, r4.status);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, r4.status);
+    try std.testing.expectEqual(core.ErrorCode.capability_denied, r4.err.?.code);
 
     var r5 = try dispatch(allocator, "correction.apply", core.PROTOCOL_VERSION, null, null, "{}");
     defer r5.deinit(allocator);
-    try std.testing.expectEqual(core.ProtocolStatus.unsupported, r5.status);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, r5.status);
+    try std.testing.expectEqual(core.ErrorCode.capability_denied, r5.err.?.code);
 
     var r6 = try dispatch(allocator, "negative_knowledge.promote", core.PROTOCOL_VERSION, null, null, "{}");
     defer r6.deinit(allocator);
-    try std.testing.expectEqual(core.ProtocolStatus.unsupported, r6.status);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, r6.status);
+    try std.testing.expectEqual(core.ErrorCode.capability_denied, r6.err.?.code);
 
     var r7 = try dispatch(allocator, "pack.update_from_negative_knowledge", core.PROTOCOL_VERSION, null, null, "{}");
     defer r7.deinit(allocator);
-    try std.testing.expectEqual(core.ProtocolStatus.unsupported, r7.status);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, r7.status);
+    try std.testing.expectEqual(core.ErrorCode.capability_denied, r7.err.?.code);
 
     var r8 = try dispatch(allocator, "trust_decay.apply", core.PROTOCOL_VERSION, null, null, "{}");
     defer r8.deinit(allocator);
-    try std.testing.expectEqual(core.ProtocolStatus.unsupported, r8.status);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, r8.status);
+    try std.testing.expectEqual(core.ErrorCode.capability_denied, r8.err.?.code);
 }
 
 // ── project.autopsy tests ─────────────────────────────────────────────

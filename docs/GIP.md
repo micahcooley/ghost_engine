@@ -77,7 +77,32 @@ explicit verification.
 
 ## Read-Only Inspection vs. Mutating Operations
 
-GIP operations are divided into three maturity categories:
+GIP operations are divided into operation-maturity metadata and human-readable
+categories. The machine-readable source of truth is exposed by
+`protocol.describe` and `capabilities.describe` under `operationMaturity`.
+
+Each `operationMaturity` entry includes:
+
+| Field | Meaning |
+|-------|---------|
+| `kind` | GIP request kind |
+| `declared` | The kind exists in the protocol enum |
+| `implemented` | The kind is present in the engine `IMPLEMENTED_KINDS` table |
+| `wired` | The dispatcher has a concrete route for the kind |
+| `mutatesState` | The operation can write/apply/append/execute state when implemented |
+| `requiresApproval` | The default capability policy requires explicit approval |
+| `capabilityPolicy` | Default policy: `allowed`, `denied`, `requires_approval`, `allowlist`, or `dry_run_only` |
+| `authorityEffect` | Maximum declared effect: `none`, `candidate`, `evidence`, or `support` |
+| `productReady` | Whether the operation is ready to present as product-complete |
+| `maturity` | Short stable maturity label for clients and tests |
+
+`declared` does not mean implemented. `implemented` does not mean product-ready.
+`wired` does not mean support authority. Current GIP v0.1 metadata is
+conservative: operations are not marked `productReady:true` by default, and no
+operation is marked with `authorityEffect:"support"` unless proof/support gates
+are actually discharged.
+
+Human-readable categories:
 
 ### Fully implemented (real engine data queried)
 
@@ -144,6 +169,12 @@ fields must not be interpreted as authorization, proof, approval, execution,
 promotion, or pack mutation.
 
 ### Unsupported (structured unsupported response)
+
+Kinds declared in `RequestKind` but absent from `IMPLEMENTED_KINDS` are exposed
+in `operationMaturity` with `implemented:false`, `wired:false`, and
+`productReady:false`. Requests to unsupported allowed operations return a
+structured `unsupported` response or structured error rather than fake success.
+Denied future mutations remain denied by capability policy.
 
 | Operation | Status |
 |-----------|--------|

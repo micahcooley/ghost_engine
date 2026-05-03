@@ -343,9 +343,9 @@ pub fn defaultCapabilities() [59]CapabilityEntry {
         .{ .capability = .@"negative_knowledge.review", .policy = .allowed },
         .{ .capability = .@"negative_knowledge.reviewed.list", .policy = .allowed },
         .{ .capability = .@"negative_knowledge.reviewed.get", .policy = .allowed },
-        .{ .capability = .@"negative_knowledge.candidate.review", .policy = .allowed },
-        .{ .capability = .@"negative_knowledge.record.expire", .policy = .allowed },
-        .{ .capability = .@"negative_knowledge.record.supersede", .policy = .allowed },
+        .{ .capability = .@"negative_knowledge.candidate.review", .policy = .requires_approval },
+        .{ .capability = .@"negative_knowledge.record.expire", .policy = .requires_approval },
+        .{ .capability = .@"negative_knowledge.record.supersede", .policy = .requires_approval },
         .{ .capability = .@"negative_knowledge.promote", .policy = .denied },
         .{ .capability = .@"trust_decay.candidate.list", .policy = .allowed },
         .{ .capability = .@"trust_decay.apply", .policy = .denied },
@@ -365,6 +365,224 @@ pub fn defaultCapabilities() [59]CapabilityEntry {
         .{ .capability = .@"rule.evaluate", .policy = .allowed },
         .{ .capability = .@"project.autopsy", .policy = .allowed },
         .{ .capability = .@"context.autopsy", .policy = .allowed },
+    };
+}
+
+pub fn requestCapabilityName(kind: RequestKind) ?CapabilityName {
+    return switch (kind) {
+        .@"artifact.read" => .@"artifact.read",
+        .@"artifact.list" => .@"artifact.list",
+        .@"artifact.search" => .@"artifact.search",
+        .@"corpus.ask" => .@"corpus.ask",
+        .@"rule.evaluate" => .@"rule.evaluate",
+        .@"learning.status" => .@"learning.status",
+        .@"artifact.patch.propose" => .@"artifact.patch.propose",
+        .@"artifact.patch.apply" => .@"artifact.patch.apply",
+        .@"artifact.write.propose" => .@"artifact.write.propose",
+        .@"artifact.write.apply" => .@"artifact.write.apply",
+        .@"command.run" => .@"command.run",
+        .@"verifier.run" => .@"verifier.run",
+        .@"verifier.list" => .@"verifier.list",
+        .@"verifier.candidate.execution.list" => .@"verifier.candidate.execution.list",
+        .@"verifier.candidate.execution.get" => .@"verifier.candidate.execution.get",
+        .@"verifier.candidate.execute" => .@"verifier.candidate.execute",
+        .@"hypothesis.list" => .@"hypothesis.list",
+        .@"hypothesis.triage" => .@"hypothesis.triage",
+        .@"correction.propose" => .@"correction.propose",
+        .@"correction.review" => .@"correction.review",
+        .@"correction.reviewed.list" => .@"correction.reviewed.list",
+        .@"correction.reviewed.get" => .@"correction.reviewed.get",
+        .@"correction.influence.status" => .@"correction.influence.status",
+        .@"procedure_pack.candidate.propose" => .@"procedure_pack.candidate.propose",
+        .@"procedure_pack.candidate.review" => .@"procedure_pack.candidate.review",
+        .@"procedure_pack.candidate.reviewed.list" => .@"procedure_pack.candidate.reviewed.list",
+        .@"procedure_pack.candidate.reviewed.get" => .@"procedure_pack.candidate.reviewed.get",
+        .@"correction.list" => .@"correction.list",
+        .@"correction.get" => .@"correction.get",
+        .@"correction.apply" => .@"correction.apply",
+        .@"negative_knowledge.candidate.list" => .@"negative_knowledge.candidate.list",
+        .@"negative_knowledge.candidate.get" => .@"negative_knowledge.candidate.get",
+        .@"negative_knowledge.record.list" => .@"negative_knowledge.record.list",
+        .@"negative_knowledge.record.get" => .@"negative_knowledge.record.get",
+        .@"negative_knowledge.influence.list" => .@"negative_knowledge.influence.list",
+        .@"negative_knowledge.review" => .@"negative_knowledge.review",
+        .@"negative_knowledge.reviewed.list" => .@"negative_knowledge.reviewed.list",
+        .@"negative_knowledge.reviewed.get" => .@"negative_knowledge.reviewed.get",
+        .@"negative_knowledge.candidate.review" => .@"negative_knowledge.candidate.review",
+        .@"negative_knowledge.record.expire" => .@"negative_knowledge.record.expire",
+        .@"negative_knowledge.record.supersede" => .@"negative_knowledge.record.supersede",
+        .@"negative_knowledge.promote" => .@"negative_knowledge.promote",
+        .@"trust_decay.candidate.list" => .@"trust_decay.candidate.list",
+        .@"trust_decay.apply" => .@"trust_decay.apply",
+        .@"pack.inspect" => .@"pack.inspect",
+        .@"pack.list" => .@"pack.list",
+        .@"pack.mount" => .@"pack.mount",
+        .@"pack.unmount" => .@"pack.unmount",
+        .@"pack.import" => .@"pack.import",
+        .@"pack.export" => .@"pack.export",
+        .@"pack.update_from_negative_knowledge" => .@"pack.update_from_negative_knowledge",
+        .@"feedback.summary" => .@"feedback.summary",
+        .@"feedback.record" => .@"feedback.record",
+        .@"session.get" => .@"session.get",
+        .@"session.create", .@"session.update", .@"session.close" => .@"session.write",
+        .@"project.autopsy" => .@"project.autopsy",
+        .@"context.autopsy" => .@"context.autopsy",
+        else => null,
+    };
+}
+
+pub fn capabilityPolicyForRequestKind(kind: RequestKind) CapabilityPolicy {
+    const cap_name = requestCapabilityName(kind) orelse return .allowed;
+    const caps = defaultCapabilities();
+    for (caps) |cap| {
+        if (cap.capability == cap_name) return cap.policy;
+    }
+    return .allowed;
+}
+
+pub const AuthorityEffect = enum {
+    none,
+    candidate,
+    evidence,
+    support,
+
+    pub fn name(self: AuthorityEffect) []const u8 {
+        return @tagName(self);
+    }
+};
+
+pub const OperationMaturity = struct {
+    kind: RequestKind,
+    declared: bool,
+    implemented: bool,
+    wired: bool,
+    mutates_state: bool,
+    requires_approval: bool,
+    capability_policy: CapabilityPolicy,
+    authority_effect: AuthorityEffect,
+    product_ready: bool,
+    maturity: []const u8,
+};
+
+pub fn operationMaturity(kind: RequestKind) OperationMaturity {
+    const policy = capabilityPolicyForRequestKind(kind);
+    return .{
+        .kind = kind,
+        .declared = true,
+        .implemented = isImplemented(kind),
+        .wired = isImplemented(kind),
+        .mutates_state = operationMutatesState(kind),
+        .requires_approval = policy == .requires_approval,
+        .capability_policy = policy,
+        .authority_effect = operationAuthorityEffect(kind),
+        .product_ready = false,
+        .maturity = operationMaturityLabel(kind),
+    };
+}
+
+pub fn operationMutatesState(kind: RequestKind) bool {
+    return switch (kind) {
+        .@"artifact.patch.apply",
+        .@"artifact.write.apply",
+        .@"verifier.run",
+        .@"verifier.candidate.execute",
+        .@"correction.review",
+        .@"correction.apply",
+        .@"procedure_pack.candidate.review",
+        .@"negative_knowledge.review",
+        .@"negative_knowledge.candidate.review",
+        .@"negative_knowledge.record.expire",
+        .@"negative_knowledge.record.supersede",
+        .@"negative_knowledge.promote",
+        .@"trust_decay.apply",
+        .@"pack.mount",
+        .@"pack.unmount",
+        .@"pack.import",
+        .@"pack.export",
+        .@"pack.update_from_negative_knowledge",
+        .@"feedback.record",
+        .@"feedback.replay",
+        .@"session.create",
+        .@"session.update",
+        .@"session.close",
+        .@"command.run",
+        => true,
+        else => false,
+    };
+}
+
+pub fn operationAuthorityEffect(kind: RequestKind) AuthorityEffect {
+    return switch (kind) {
+        .@"artifact.read",
+        .@"corpus.ask",
+        .@"verifier.candidate.execution.list",
+        .@"verifier.candidate.execution.get",
+        => .evidence,
+        .@"conversation.turn",
+        .@"rule.evaluate",
+        .@"artifact.patch.propose",
+        .@"artifact.write.propose",
+        .@"hypothesis.generate",
+        .@"hypothesis.triage",
+        .@"hypothesis.list",
+        .@"hypothesis.verifier.schedule",
+        .@"correction.propose",
+        .@"correction.review",
+        .@"correction.influence.status",
+        .@"procedure_pack.candidate.propose",
+        .@"procedure_pack.candidate.review",
+        .@"negative_knowledge.candidate.list",
+        .@"negative_knowledge.candidate.get",
+        .@"negative_knowledge.influence.list",
+        .@"negative_knowledge.review",
+        .@"negative_knowledge.candidate.review",
+        .@"trust_decay.candidate.list",
+        .@"project.autopsy",
+        .@"context.autopsy",
+        => .candidate,
+        else => .none,
+    };
+}
+
+pub fn operationMaturityLabel(kind: RequestKind) []const u8 {
+    if (!isImplemented(kind)) return "declared_not_implemented";
+    return switch (kind) {
+        .@"protocol.describe" => "metadata_declared",
+        .@"capabilities.describe" => "metadata_declared",
+        .@"engine.status" => "status_probe",
+        .@"conversation.turn" => "wired_draft_or_verified_response_state",
+        .@"corpus.ask" => "read_only_live_corpus_grounded_draft",
+        .@"rule.evaluate" => "bounded_deterministic_non_authorizing_candidates",
+        .@"learning.status" => "read_only_reviewed_learning_loop_scoreboard_non_authorizing",
+        .@"correction.propose" => "candidate_only_review_required_no_mutation",
+        .@"correction.review" => "append_only_reviewed_record_no_hidden_mutation",
+        .@"correction.reviewed.list", .@"correction.reviewed.get" => "read_only_reviewed_correction_inspection_non_authorizing",
+        .@"correction.influence.status" => "read_only_reviewed_correction_influence_summary_non_authorizing",
+        .@"procedure_pack.candidate.propose" => "candidate_only_no_pack_mutation_no_execution",
+        .@"procedure_pack.candidate.review" => "append_only_reviewed_procedure_pack_candidate_no_pack_mutation",
+        .@"procedure_pack.candidate.reviewed.list", .@"procedure_pack.candidate.reviewed.get" => "read_only_reviewed_procedure_pack_candidate_inspection_non_authorizing",
+        .@"artifact.read", .@"artifact.list", .@"pack.list", .@"pack.inspect", .@"verifier.list" => "read_only_inspection",
+        .@"artifact.patch.propose" => "candidate_only_patch_proposal_no_apply",
+        .@"hypothesis.list", .@"hypothesis.triage" => "stateless_non_authorizing",
+        .@"verifier.candidate.execution.list", .@"verifier.candidate.execution.get" => "read_only_state_inspection",
+        .@"correction.list",
+        .@"correction.get",
+        .@"negative_knowledge.candidate.list",
+        .@"negative_knowledge.candidate.get",
+        .@"negative_knowledge.record.list",
+        .@"negative_knowledge.record.get",
+        .@"negative_knowledge.influence.list",
+        .@"trust_decay.candidate.list",
+        .@"feedback.summary",
+        .@"session.get",
+        => "read_only_state_inspection",
+        .@"negative_knowledge.review" => "append_only_reviewed_negative_knowledge_no_hidden_mutation",
+        .@"negative_knowledge.reviewed.list", .@"negative_knowledge.reviewed.get" => "read_only_reviewed_negative_knowledge_inspection_non_authorizing",
+        .@"negative_knowledge.candidate.review" => "wired_structured_unsupported_legacy_review_surface",
+        .@"negative_knowledge.record.expire", .@"negative_knowledge.record.supersede" => "wired_structured_unsupported_without_persistence",
+        .@"project.autopsy" => "read_only_workspace_inspection",
+        .@"context.autopsy" => "read_only_artifact_and_input_refs_runtime_and_persistent_pack_guidance",
+        else => "implemented_not_product_ready",
     };
 }
 
@@ -623,4 +841,72 @@ test "command allowlist rejects arbitrary commands" {
     try std.testing.expect(!isCommandAllowed("curl"));
     try std.testing.expect(!isCommandAllowed("bash"));
     try std.testing.expect(!isCommandAllowed("sh"));
+}
+
+test "every request kind has operation maturity metadata" {
+    inline for (std.meta.fields(RequestKind)) |field| {
+        const kind: RequestKind = @enumFromInt(field.value);
+        const maturity = operationMaturity(kind);
+        try std.testing.expectEqual(kind, maturity.kind);
+        try std.testing.expect(maturity.declared);
+        try std.testing.expect(maturity.maturity.len > 0);
+        if (!isImplemented(kind)) {
+            try std.testing.expect(!maturity.implemented);
+            try std.testing.expect(!maturity.product_ready);
+            try std.testing.expectEqualStrings("declared_not_implemented", maturity.maturity);
+        }
+    }
+}
+
+test "every implemented kind has operation maturity metadata" {
+    for (IMPLEMENTED_KINDS) |kind| {
+        const maturity = operationMaturity(kind);
+        try std.testing.expect(maturity.declared);
+        try std.testing.expect(maturity.implemented);
+        try std.testing.expect(maturity.wired);
+        try std.testing.expect(maturity.maturity.len > 0);
+    }
+}
+
+test "maturity preserves denied and approval-required mutation policies" {
+    const denied_mutations = [_]RequestKind{
+        .@"verifier.candidate.execute",
+        .@"correction.apply",
+        .@"negative_knowledge.promote",
+        .@"pack.update_from_negative_knowledge",
+        .@"trust_decay.apply",
+    };
+    for (denied_mutations) |kind| {
+        const maturity = operationMaturity(kind);
+        try std.testing.expect(maturity.mutates_state);
+        try std.testing.expectEqual(CapabilityPolicy.denied, maturity.capability_policy);
+        try std.testing.expect(!maturity.product_ready);
+    }
+
+    const approval_mutations = [_]RequestKind{
+        .@"artifact.patch.apply",
+        .@"artifact.write.apply",
+        .@"negative_knowledge.candidate.review",
+        .@"negative_knowledge.record.expire",
+        .@"negative_knowledge.record.supersede",
+        .@"pack.mount",
+        .@"pack.unmount",
+        .@"pack.import",
+        .@"pack.export",
+    };
+    for (approval_mutations) |kind| {
+        const maturity = operationMaturity(kind);
+        try std.testing.expect(maturity.mutates_state);
+        try std.testing.expect(maturity.requires_approval);
+        try std.testing.expectEqual(CapabilityPolicy.requires_approval, maturity.capability_policy);
+        try std.testing.expect(!maturity.product_ready);
+    }
+}
+
+test "no operation metadata grants support authority" {
+    inline for (std.meta.fields(RequestKind)) |field| {
+        const kind: RequestKind = @enumFromInt(field.value);
+        const maturity = operationMaturity(kind);
+        try std.testing.expect(maturity.authority_effect != .support);
+    }
 }
