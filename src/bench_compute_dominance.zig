@@ -7,6 +7,7 @@ const corpus_ask = core.corpus_ask;
 const corpus_ingest = core.corpus_ingest;
 const correction_candidates = core.correction_candidates;
 const correction_review = core.correction_review;
+const learning_status = core.learning_status;
 const negative_knowledge_review = core.negative_knowledge_review;
 const rule_reasoning = core.rule_reasoning;
 const shards = core.shards;
@@ -20,6 +21,7 @@ const OperationKind = enum {
     @"correction.propose",
     @"correction.reviewed",
     @"negative_knowledge.reviewed",
+    @"learning.status",
     @"corpus.lifecycle",
 };
 
@@ -120,6 +122,8 @@ pub fn runSuite(allocator: std.mem.Allocator) !SuiteResult {
     try results.append(try runNegativeKnowledgeReviewAccepted(allocator));
     try results.append(try runNegativeKnowledgeReviewRejected(allocator));
     try results.append(try runNegativeKnowledgeReviewedListGet(allocator));
+    try results.append(try runLearningStatusNoFile(allocator));
+    try results.append(try runLearningStatusPopulated(allocator));
     try results.append(try runLifecycleScenario(allocator));
 
     return .{
@@ -887,6 +891,108 @@ fn runNegativeKnowledgeReviewedListGet(allocator: std.mem.Allocator) !ScenarioRe
     };
 }
 
+fn runLearningStatusNoFile(allocator: std.mem.Allocator) !ScenarioResult {
+    const shard_id = "bench-compute-dominance-learning-status-empty";
+    try cleanProjectShard(allocator, shard_id);
+    defer cleanProjectShard(allocator, shard_id) catch {};
+
+    const started = std.time.nanoTimestamp();
+    var status = try learning_status.readStatus(allocator, .{ .project_shard = shard_id });
+    defer status.deinit();
+
+    return .{
+        .name = "learning.status/no_file_zero_summary",
+        .operation_kind = .@"learning.status",
+        .success = status.storage.correction_missing_file and status.storage.negative_knowledge_missing_file and
+            status.correction_status.summary.total_records == 0 and status.negative_knowledge_summary.reviewed_records == 0 and
+            status.records.len == 0 and !status.warning_summary.read_caps_hit and !status.warning_summary.byte_caps_hit,
+        .duration_ns = elapsedNs(started),
+        .capacity_warning_count = status.warning_summary.capacity_warnings,
+        .commands_executed = 0,
+        .verifiers_executed = 0,
+        .corpus_mutation = false,
+        .pack_mutation = false,
+        .negative_knowledge_mutation = false,
+        .non_authorizing = true,
+    };
+}
+
+fn runLearningStatusPopulated(allocator: std.mem.Allocator) !ScenarioResult {
+    const shard_id = "bench-compute-dominance-learning-status-populated";
+    try cleanProjectShard(allocator, shard_id);
+    defer cleanProjectShard(allocator, shard_id) catch {};
+
+    var correction_accepted = try correction_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .accepted,
+        .reviewer_note = "benchmark learning status accepted correction",
+        .rejected_reason = null,
+        .source_candidate_id = "correction:candidate:bench-learning-status",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:bench-learning-status","originalOperationKind":"corpus.ask","disputedOutput":{"kind":"answerDraft","summary":"bad answer"},"userCorrection":"suppress bad answer","correctionType":"wrong_answer"}
+        ,
+        .accepted_learning_outputs_json = "[{\"kind\":\"verifier_check_candidate\",\"status\":\"candidate\"}]",
+    });
+    defer correction_accepted.deinit();
+    var correction_rejected = try correction_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .rejected,
+        .reviewer_note = "benchmark learning status rejected correction",
+        .rejected_reason = "not valid",
+        .source_candidate_id = "correction:candidate:bench-learning-status-rejected",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:bench-learning-status-rejected","originalOperationKind":"rule.evaluate","disputedOutput":{"kind":"rule_candidate","summary":"rule"},"userCorrection":"ignore","correctionType":"misleading_rule"}
+        ,
+        .accepted_learning_outputs_json = "[]",
+    });
+    defer correction_rejected.deinit();
+    var nk_accepted = try negative_knowledge_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .accepted,
+        .reviewer_note = "benchmark learning status accepted NK",
+        .rejected_reason = null,
+        .source_candidate_id = "nk:candidate:bench-learning-status",
+        .negative_knowledge_candidate_json =
+        \\{"id":"nk:candidate:bench-learning-status","operationKind":"rule.evaluate","kind":"overbroad_rule","condition":"bad rule","ruleUpdateCandidate":"tighten","nonAuthorizing":true}
+        ,
+    });
+    defer nk_accepted.deinit();
+    var nk_rejected = try negative_knowledge_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .rejected,
+        .reviewer_note = "benchmark learning status rejected NK",
+        .rejected_reason = "not valid",
+        .source_candidate_id = "nk:candidate:bench-learning-status-rejected",
+        .negative_knowledge_candidate_json = "{\"id\":\"nk:candidate:bench-learning-status-rejected\"}",
+    });
+    defer nk_rejected.deinit();
+
+    const started = std.time.nanoTimestamp();
+    var status = try learning_status.readStatus(allocator, .{ .project_shard = shard_id, .include_records = true, .limit = 2 });
+    defer status.deinit();
+
+    return .{
+        .name = "learning.status/populated_correction_nk_summary",
+        .operation_kind = .@"learning.status",
+        .success = status.correction_status.summary.total_records == 2 and status.correction_status.summary.accepted_records == 1 and
+            status.correction_status.summary.rejected_records == 1 and status.negative_knowledge_summary.reviewed_records == 2 and
+            status.negative_knowledge_summary.accepted_records == 1 and status.negative_knowledge_summary.rejected_records == 1 and
+            status.records.len == 2 and status.capacity_telemetry.limit_hit and status.warning_summary.capacity_warnings == 0,
+        .duration_ns = elapsedNs(started),
+        .input_bytes = correction_accepted.record_json.len + correction_rejected.record_json.len + nk_accepted.record_json.len + nk_rejected.record_json.len,
+        .correction_candidate_count = status.correction_status.summary.total_records,
+        .correction_influence_count = status.correction_status.summary.suppression_candidate_count + status.negative_knowledge_summary.rule_update_candidate_count,
+        .future_behavior_candidate_count = status.correction_status.summary.future_behavior_candidate_count + status.negative_knowledge_summary.future_behavior_candidate_count,
+        .capacity_warning_count = status.warning_summary.capacity_warnings,
+        .commands_executed = 0,
+        .verifiers_executed = 0,
+        .corpus_mutation = false,
+        .pack_mutation = false,
+        .negative_knowledge_mutation = false,
+        .non_authorizing = true,
+    };
+}
+
 const CorpusFile = struct {
     path: []const u8,
     body: []const u8,
@@ -1258,7 +1364,7 @@ test "compute dominance report is generated with required scenarios and safety f
     var suite = try runSuite(allocator);
     defer suite.deinit();
 
-    try std.testing.expectEqual(@as(usize, 29), suite.scenarios.len);
+    try std.testing.expectEqual(@as(usize, 31), suite.scenarios.len);
     try std.testing.expect(allScenariosPassed(suite.scenarios));
 
     const json = try renderJsonReport(allocator, suite);
@@ -1284,6 +1390,8 @@ test "compute dominance report is generated with required scenarios and safety f
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"negative_knowledge.review/accepted_append_only\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"negative_knowledge.review/rejected_append_only\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"negative_knowledge.reviewed.list_get/read_only_append_order\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"learning.status/no_file_zero_summary\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"learning.status/populated_correction_nk_summary\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scenarioName\":\"end_to_end/lifecycle_ingest_apply_ask_correction_no_hidden_mutation\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"cloudUsed\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"transformersUsed\":false") != null);

@@ -38,6 +38,7 @@ const correction_candidates = @import("correction_candidates.zig");
 const correction_review = @import("correction_review.zig");
 const negative_knowledge = @import("negative_knowledge.zig");
 const negative_knowledge_review = @import("negative_knowledge_review.zig");
+const learning_status = @import("learning_status.zig");
 const support_routing = @import("support_routing.zig");
 const repo_hygiene = @import("repo_hygiene.zig");
 const hypothesis_core = @import("hypothesis_core.zig");
@@ -61,6 +62,7 @@ comptime {
     _ = correction_hooks;
     _ = correction_candidates;
     _ = correction_review;
+    _ = learning_status;
     _ = negative_knowledge;
     _ = support_routing;
 }
@@ -6498,6 +6500,121 @@ test "gip correction influence status summarizes reviewed corrections read-only"
     try std.testing.expect(std.mem.indexOf(u8, filtered.result_json.?, "\"acceptedRecords\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, filtered.result_json.?, "\"rejectedRecords\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, filtered.result_json.?, "\"records\"") == null);
+}
+
+test "gip learning status summarizes reviewed learning loop read-only" {
+    const allocator = std.testing.allocator;
+    const shard_id = "phase12a-learning-status-smoke";
+    var metadata = try shards.resolveProjectMetadata(allocator, shard_id);
+    defer metadata.deinit();
+    var paths = try shards.resolvePaths(allocator, metadata.metadata);
+    defer paths.deinit();
+    try deleteTreeIfExistsAbsolute(paths.root_abs_path);
+    defer deleteTreeIfExistsAbsolute(paths.root_abs_path) catch {};
+
+    var protocol = try gip.dispatch.dispatch(allocator, "protocol.describe", gip.core.PROTOCOL_VERSION, null, null, null);
+    defer protocol.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, protocol.result_json.?, "\"learning.status\"") != null);
+    var caps = try gip.dispatch.dispatch(allocator, "capabilities.describe", gip.core.PROTOCOL_VERSION, null, null, null);
+    defer caps.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, caps.result_json.?, "\"capability\":\"learning.status\"") != null);
+
+    var no_file = try gip.dispatch.dispatch(allocator, "learning.status", gip.core.PROTOCOL_VERSION, null, null,
+        \\{"projectShard":"phase12a-learning-status-smoke"}
+    );
+    defer no_file.deinit(allocator);
+    try std.testing.expectEqual(gip.core.ProtocolStatus.ok, no_file.status);
+    try std.testing.expect(std.mem.indexOf(u8, no_file.result_json.?, "\"reviewedCorrectionRecords\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, no_file.result_json.?, "\"reviewedNegativeKnowledgeRecords\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, no_file.result_json.?, "\"records\"") == null);
+
+    var correction_accepted = try correction_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .accepted,
+        .reviewer_note = "accepted correction for learning status",
+        .rejected_reason = null,
+        .source_candidate_id = "correction:candidate:learning-status",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:learning-status","originalOperationKind":"corpus.ask","originalRequestSummary":"retention enabled","disputedOutput":{"kind":"answerDraft","summary":"Retention policy is enabled"},"userCorrection":"suppress this exact bad answer","correctionType":"wrong_answer"}
+        ,
+        .accepted_learning_outputs_json = "[{\"kind\":\"verifier_check_candidate\",\"status\":\"candidate\"}]",
+    });
+    defer correction_accepted.deinit();
+    var correction_rejected = try correction_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .rejected,
+        .reviewer_note = "rejected correction for learning status",
+        .rejected_reason = "not valid",
+        .source_candidate_id = "correction:candidate:learning-status-rejected",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:learning-status-rejected","originalOperationKind":"rule.evaluate","disputedOutput":{"kind":"rule_candidate","summary":"rule output"},"userCorrection":"ignore","correctionType":"misleading_rule"}
+        ,
+        .accepted_learning_outputs_json = "[]",
+    });
+    defer correction_rejected.deinit();
+    var nk_accepted = try negative_knowledge_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .accepted,
+        .reviewer_note = "accepted reviewed NK for learning status",
+        .rejected_reason = null,
+        .source_candidate_id = "nk:candidate:learning-status",
+        .negative_knowledge_candidate_json =
+        \\{"id":"nk:candidate:learning-status","operationKind":"rule.evaluate","kind":"unsafe_verifier_candidate","condition":"unsafe candidate","verifier_requirement":"explicit verifier candidate","nonAuthorizing":true}
+        ,
+    });
+    defer nk_accepted.deinit();
+    var nk_rejected = try negative_knowledge_review.reviewAndAppend(allocator, .{
+        .project_shard = shard_id,
+        .decision = .rejected,
+        .reviewer_note = "rejected reviewed NK for learning status",
+        .rejected_reason = "too broad",
+        .source_candidate_id = "nk:candidate:learning-status-rejected",
+        .negative_knowledge_candidate_json = "{\"id\":\"nk:candidate:learning-status-rejected\"}",
+    });
+    defer nk_rejected.deinit();
+
+    const correction_path = try correction_review.reviewedCorrectionsPath(allocator, shard_id);
+    defer allocator.free(correction_path);
+    var correction_file = try std.fs.openFileAbsolute(correction_path, .{ .mode = .write_only });
+    defer correction_file.close();
+    try correction_file.seekFromEnd(0);
+    try correction_file.writeAll("{malformed correction line}\n");
+    const nk_path = try negative_knowledge_review.reviewedNegativeKnowledgePath(allocator, shard_id);
+    defer allocator.free(nk_path);
+    var nk_file = try std.fs.openFileAbsolute(nk_path, .{ .mode = .write_only });
+    defer nk_file.close();
+    try nk_file.seekFromEnd(0);
+    try nk_file.writeAll("{malformed nk line}\n");
+
+    var populated = try gip.dispatch.dispatch(allocator, "learning.status", gip.core.PROTOCOL_VERSION, null, null,
+        \\{"projectShard":"phase12a-learning-status-smoke","includeRecords":true,"limit":2}
+    );
+    defer populated.deinit(allocator);
+    try std.testing.expectEqual(gip.core.ProtocolStatus.ok, populated.status);
+    const json = populated.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"reviewedCorrectionRecords\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"acceptedReviewedCorrections\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"rejectedReviewedCorrections\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"malformedCorrectionLines\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"reviewedNegativeKnowledgeRecords\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"acceptedReviewedNegativeKnowledge\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"rejectedReviewedNegativeKnowledge\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"malformedNegativeKnowledgeLines\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"corpusAskCorrectionInfluenceAvailable\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"ruleEvaluateNegativeKnowledgeInfluenceAvailable\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"suppressionCapableRecords\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verifierCandidateCount\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"records\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"limitHit\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"corpusMutation\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"correctionMutation\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"negativeKnowledgeMutation\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"commandsExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verifiersExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"nonAuthorizing\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"treatedAsProof\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"usedAsEvidence\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"supportGranted\":false") != null);
 }
 
 test "gip rule evaluate emits bounded non-authorizing candidates obligations unknowns" {

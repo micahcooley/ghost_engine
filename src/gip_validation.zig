@@ -144,6 +144,7 @@ pub fn checkCapability(kind: core.RequestKind) struct { cap: ?core.CapabilityNam
         .@"artifact.search" => .@"artifact.search",
         .@"corpus.ask" => .@"corpus.ask",
         .@"rule.evaluate" => .@"rule.evaluate",
+        .@"learning.status" => .@"learning.status",
         .@"artifact.patch.propose" => .@"artifact.patch.propose",
         .@"artifact.patch.apply" => .@"artifact.patch.apply",
         .@"artifact.write.propose" => .@"artifact.write.propose",

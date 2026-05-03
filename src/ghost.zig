@@ -46,6 +46,7 @@ pub const correction_candidates = @import("correction_candidates.zig");
 pub const correction_review = @import("correction_review.zig");
 pub const negative_knowledge = @import("negative_knowledge.zig");
 pub const negative_knowledge_review = @import("negative_knowledge_review.zig");
+pub const learning_status = @import("learning_status.zig");
 pub const repo_hygiene = @import("repo_hygiene.zig");
 pub const project_autopsy = @import("project_autopsy.zig");
 pub const context_autopsy = @import("context_autopsy.zig");

@@ -25,6 +25,7 @@ pub const RequestKind = enum {
     @"conversation.replay",
     @"corpus.ask",
     @"rule.evaluate",
+    @"learning.status",
     @"intent.ground",
     @"response.evaluate",
 
@@ -238,6 +239,7 @@ pub const CapabilityName = enum {
     @"correction.reviewed.list",
     @"correction.reviewed.get",
     @"correction.influence.status",
+    @"learning.status",
     @"correction.list",
     @"correction.get",
     @"correction.apply",
@@ -294,7 +296,7 @@ pub const CapabilityEntry = struct {
     policy: CapabilityPolicy,
 };
 
-pub fn defaultCapabilities() [54]CapabilityEntry {
+pub fn defaultCapabilities() [55]CapabilityEntry {
     return .{
         .{ .capability = .@"artifact.read", .policy = .allowed },
         .{ .capability = .@"artifact.list", .policy = .allowed },
@@ -317,6 +319,7 @@ pub fn defaultCapabilities() [54]CapabilityEntry {
         .{ .capability = .@"correction.reviewed.list", .policy = .allowed },
         .{ .capability = .@"correction.reviewed.get", .policy = .allowed },
         .{ .capability = .@"correction.influence.status", .policy = .allowed },
+        .{ .capability = .@"learning.status", .policy = .allowed },
         .{ .capability = .@"correction.list", .policy = .allowed },
         .{ .capability = .@"correction.get", .policy = .allowed },
         .{ .capability = .@"correction.apply", .policy = .denied },
@@ -506,6 +509,7 @@ pub const IMPLEMENTED_KINDS = [_]RequestKind{
     .@"correction.reviewed.list",
     .@"correction.reviewed.get",
     .@"correction.influence.status",
+    .@"learning.status",
     .@"correction.list",
     .@"correction.get",
     .@"negative_knowledge.candidate.list",
