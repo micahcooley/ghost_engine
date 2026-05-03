@@ -126,6 +126,7 @@ results when GIP has no active session or workspace metadata:
 | `hypothesis.triage` | Returns empty triage summary with scoring policy version | `stateless` |
 | `corpus.ask` | Reads existing live shard corpus; returns explicit unknown when no corpus/evidence is visible; may include non-authorizing local sketch candidates and capacity telemetry | `read_only_live_corpus_grounded_draft` |
 | `rule.evaluate` | Evaluates bounded deterministic rules over request facts and emits candidate-only outputs with explanation traces and capacity telemetry | `bounded_deterministic_non_authorizing_candidates` |
+| `sigil.inspect` | Compiles and validates Sigil source, then returns bytecode disassembly and procedure inspection records without VM execution or mutation | `read_only_sigil_bytecode_inspection_non_authorizing` |
 | `learning.status` | Summarizes same-shard reviewed correction and reviewed negative-knowledge scoreboard diagnostics; read-only and not proof/evidence | `read_only_reviewed_learning_loop_scoreboard_non_authorizing` |
 | `correction.propose` | Converts a user-disputed output into a review-required correction candidate plus non-authorizing learning candidates; performs no mutation or execution | `candidate_only_review_required_no_mutation` |
 | `correction.review` | Accepts or rejects a correction candidate into an append-only reviewed correction record; performs no corpus, pack, negative-knowledge, command, verifier, or global promotion mutation | `append_only_reviewed_record_no_hidden_mutation` |
@@ -223,6 +224,16 @@ Denied future mutations remain denied by capability policy.
   - The stdin JSON limit remains the 1 MiB control-plane boundary. Large content is referenced by path and read through bounded file/chunk/aggregate budgets.
   - Skipped, filtered, unsupported, unread, or truncated regions create explicit unknowns. They are not treated as false claims.
   - Loads only persisted autopsy guidance declared by mounted Knowledge Pack manifests; pack content remains a signal source, not proof.
+
+### Sigil Inspection
+- `sigil.inspect` — Inspect compiled Sigil bytecode and procedure records through GIP **(Implemented)**
+  - **Request**: `{"source": string, "validationScope": "boot_control"|"scratch_session"}`. `sigilSource` and `validation_scope` are accepted aliases. If omitted, `validationScope` defaults to `boot_control`.
+  - **Response**: `{"sigilInspection": {"status": "ok"|"validation_failed"|"parse_failed", "validation": {...}, "instructions": [...], "procedureInspectionRecords": [...], "safety": {...}, "disassemblyText": "..."}}`.
+  - Compiles and validates Sigil source, then renders deterministic inspection data from the compiled program. It does not execute VM code.
+  - Always reports `non_authorizing:true`, `read_only:true`, `executed:false`, `mutates_state:false`, and `authority_effect:"candidate"` in the safety block.
+  - It cannot execute shell commands, mutate artifacts, packs, corpus, negative knowledge, trust state, snapshots, or scratch state, grant support, or bypass proof gates.
+  - Scratch mutation-like procedure records such as BIND / ETCH / VOID remain candidate-only and require review plus verification.
+  - Syntax and validation failures fail closed with structured GIP output and no execution.
 
 ### Corpus Ask
 - `corpus.ask` reads only the selected live shard corpus. It does not ingest, mutate packs, mutate negative knowledge, run commands, run verifiers, or treat staged corpus as active knowledge.
@@ -546,6 +557,7 @@ promote global authority.
 | `artifact.write.apply` | requires_approval | no (mutation) |
 | `corpus.ask` | allowed | yes |
 | `rule.evaluate` | allowed | yes |
+| `sigil.inspect` | allowed | yes |
 | `learning.status` | allowed | yes |
 | `correction.propose` | allowed | yes |
 | `correction.review` | allowed | yes |
@@ -649,6 +661,7 @@ echo '{"gipVersion":"gip.v0.1","kind":"feedback.summary"}' | ghost_gip --stdin -
 echo '{"gipVersion":"gip.v0.1","kind":"session.get","sessionId":"my-session"}' | ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"corpus.ask","projectShard":"my-project","question":"what does the corpus say about retention?","maxResults":3}' | ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"rule.evaluate","facts":[{"subject":"change","predicate":"touches","object":"runtime"}],"rules":[{"id":"runtime-check","name":"Runtime check expectation","when":{"all":[{"subject":"change","predicate":"touches","object":"runtime"}]},"emit":[{"kind":"check_candidate","id":"check-runtime","summary":"Review runtime behavior before support."}]}]}' | ghost_gip --stdin
+echo '{"gipVersion":"gip.v0.1","kind":"sigil.inspect","source":"LOOM CPU_ONLY\nSCAN \"system_memory\"","validationScope":"boot_control"}' | ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"correction.review","projectShard":"my-project","correctionCandidateId":"correction:candidate:example","decision":"accepted","reviewerNote":"reviewed by operator","acceptedLearningOutputs":[{"kind":"verifier_check_candidate","status":"candidate"}]}' | ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"project.autopsy"}' | ghost_gip --stdin --workspace /path/to/project
 echo '{"gipVersion":"gip.v0.1","kind":"context.autopsy","context":{"summary":"inspect source context"},"artifactRefs":[{"kind":"directory","path":".","include":["src/**/*.zig"],"exclude":[".git/**","zig-out/**",".zig-cache/**","node_modules/**"],"maxChunkBytes":32768,"maxFiles":64}]}' | ghost_gip --stdin --workspace /path/to/project

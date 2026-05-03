@@ -28,6 +28,7 @@ const correction_review = @import("correction_review.zig");
 const negative_knowledge_review = @import("negative_knowledge_review.zig");
 const learning_status = @import("learning_status.zig");
 const procedure_pack_candidates = @import("procedure_pack_candidates.zig");
+const sigil_core = @import("sigil_core.zig");
 
 pub const DispatchResult = struct {
     status: core.ProtocolStatus,
@@ -105,6 +106,7 @@ pub fn dispatch(
         .@"conversation.turn" => dispatchConversationTurn(allocator, workspace_root, request_body),
         .@"corpus.ask" => dispatchCorpusAsk(allocator, request_body),
         .@"rule.evaluate" => dispatchRuleEvaluate(allocator, request_body),
+        .@"sigil.inspect" => dispatchSigilInspect(allocator, request_body),
         .@"learning.status" => dispatchLearningStatus(allocator, request_body),
         .@"correction.propose" => dispatchCorrectionPropose(allocator, request_body),
         .@"correction.review" => dispatchCorrectionReview(allocator, request_body),
@@ -408,6 +410,85 @@ fn dispatchRuleEvaluate(allocator: std.mem.Allocator, request_body: ?[]const u8)
 
     return .{
         .status = .ok,
+        .result_state = gip_state,
+        .result_json = rendered,
+        .allocated_result = true,
+    };
+}
+
+fn dispatchSigilInspect(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
+    const body = request_body orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "request body is required for sigil.inspect" },
+    };
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } };
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) {
+        return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "sigil.inspect request must be a JSON object" } };
+    }
+
+    const obj = parsed.value.object;
+    const source = getStr(obj, "source", "source") orelse getStr(obj, "sigil_source", "sigilSource") orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "source or sigilSource is required for sigil.inspect" },
+    };
+
+    const scope_text = getStr(obj, "validation_scope", "validationScope") orelse getStr(obj, "scope", "scope") orelse "boot_control";
+    const scope = parseSigilValidationScope(scope_text) orelse return .{
+        .status = .rejected,
+        .err = .{
+            .code = .invalid_request,
+            .message = "invalid sigil.inspect validation scope",
+            .details = scope_text,
+            .fix_hint = "use boot_control or scratch_session",
+        },
+    };
+
+    var program = sigil_core.compileScript(allocator, source) catch |err| {
+        const rendered = try renderSigilParseFailure(allocator, source, scope, @errorName(err));
+        errdefer allocator.free(rendered);
+        const gip_state = failedSigilInspectionState("sigil syntax rejected before inspection");
+        return .{
+            .status = .rejected,
+            .result_state = gip_state,
+            .result_json = rendered,
+            .err = .{
+                .code = .invalid_request,
+                .message = "invalid Sigil source",
+                .details = @errorName(err),
+                .fix_hint = "provide source using supported Sigil statements only",
+            },
+            .allocated_result = true,
+        };
+    };
+    defer program.deinit();
+
+    var disassembly = try sigil_core.disassembleProgram(allocator, &program, scope);
+    defer disassembly.deinit();
+
+    const rendered_text = try sigil_core.renderDisassembly(allocator, &program, scope);
+    defer allocator.free(rendered_text);
+
+    const validation_failed = disassembly.validation_issue != null;
+    const rendered = try renderSigilInspection(allocator, source, &program, &disassembly, rendered_text);
+    errdefer allocator.free(rendered);
+
+    var gip_state = if (validation_failed)
+        failedSigilInspectionState("sigil validation failed")
+    else
+        schema.draftResultState();
+    if (!validation_failed) {
+        gip_state.stop_reason = .none;
+        gip_state.unresolved_reason = null;
+        gip_state.non_authorization_notice = "sigil.inspect output is read-only candidate/control inspection; no VM code was executed and no proof/support gate was discharged";
+    }
+
+    return .{
+        .status = if (validation_failed) .rejected else .ok,
         .result_state = gip_state,
         .result_json = rendered,
         .allocated_result = true,
@@ -4588,6 +4669,164 @@ fn dispatchProjectAutopsy(allocator: std.mem.Allocator, workspace_root: ?[]const
     };
 }
 
+fn parseSigilValidationScope(text: []const u8) ?sigil_core.ValidationScope {
+    if (std.ascii.eqlIgnoreCase(text, "boot_control")) return .boot_control;
+    if (std.ascii.eqlIgnoreCase(text, "scratch_session")) return .scratch_session;
+    return null;
+}
+
+fn failedSigilInspectionState(reason: []const u8) schema.ResultState {
+    var state = schema.draftResultState();
+    state.state = .failed;
+    state.permission = .none;
+    state.is_draft = false;
+    state.verification_state = .unverified;
+    state.support_minimum_met = false;
+    state.stop_reason = .failed;
+    state.failure_reason = reason;
+    state.unresolved_reason = null;
+    state.non_authorization_notice = "sigil.inspect failed closed; no VM code was executed and no support/proof authority was granted";
+    return state;
+}
+
+fn renderSigilParseFailure(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    scope: sigil_core.ValidationScope,
+    error_name: []const u8,
+) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+
+    try w.writeAll("{\"sigilInspection\":{");
+    try w.writeAll("\"status\":\"parse_failed\"");
+    try w.print(",\"sourceBytes\":{d}", .{source.len});
+    try w.writeAll(",\"validation\":{\"scope\":\"");
+    try w.writeAll(@tagName(scope));
+    try w.writeAll("\",\"status\":\"failed\",\"issue\":{\"code\":\"parse_failed\",\"instructionIndex\":null,\"message\":\"");
+    try writeEscaped(w, error_name);
+    try w.writeAll("\"}}");
+    try writeSigilSafety(w, false, false);
+    try w.writeAll(",\"instructions\":[],\"procedureInspectionRecords\":[],\"disassemblyText\":null");
+    try w.writeAll("}}");
+    return out.toOwnedSlice();
+}
+
+fn renderSigilInspection(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    program: *const sigil_core.Program,
+    disassembly: *const sigil_core.Disassembly,
+    rendered_text: []const u8,
+) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+
+    var requires_review = false;
+    var requires_verification = false;
+    for (disassembly.procedure_records) |record| {
+        requires_review = requires_review or record.requires_review;
+        requires_verification = requires_verification or record.requires_verification;
+    }
+
+    try w.writeAll("{\"sigilInspection\":{");
+    try w.writeAll("\"status\":\"");
+    try w.writeAll(if (disassembly.validation_issue == null) "ok" else "validation_failed");
+    try w.writeByte('"');
+    try w.print(",\"sourceBytes\":{d},\"instructionCount\":{d},\"stringCount\":{d}", .{
+        source.len,
+        program.instructions.len,
+        program.strings.len,
+    });
+    try w.writeAll(",\"validation\":{\"scope\":\"");
+    try w.writeAll(@tagName(disassembly.validation_scope));
+    try w.writeAll("\",\"status\":\"");
+    if (disassembly.validation_issue) |issue| {
+        try w.writeAll("failed\",\"issue\":{\"code\":\"");
+        try w.writeAll(@tagName(issue.code));
+        try w.print("\",\"instructionIndex\":{d},\"message\":\"", .{issue.instruction_index});
+        try writeEscaped(w, issue.message);
+        try w.writeAll("\"}");
+    } else {
+        try w.writeAll("ok\",\"issue\":null");
+    }
+    try w.writeAll("}");
+    try writeSigilSafety(w, requires_review, requires_verification);
+    try w.writeAll(",\"instructions\":[");
+    for (disassembly.instructions, 0..) |inst, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{");
+        try w.print("\"instructionIndex\":{d},\"opcode\":\"{s}\",\"mode\":\"{s}\",\"a\":{d},\"b\":{d},\"stringIndex\":", .{
+            inst.instruction_index,
+            @tagName(inst.opcode),
+            @tagName(inst.mode),
+            inst.a,
+            inst.b,
+        });
+        try writeNullableStringIndexJson(w, inst.string_index);
+        try w.writeAll(",\"stringPayload\":");
+        try writeNullableStringJson(w, inst.string_payload);
+        try w.writeAll("}");
+    }
+    try w.writeAll("],\"procedureInspectionRecords\":[");
+    for (disassembly.procedure_records, 0..) |record, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{");
+        try w.print("\"instructionIndex\":{d},\"kind\":\"{s}\",\"opcode\":\"{s}\",\"operandMode\":\"{s}\",\"a\":{d},\"b\":{d},\"stringIndex\":", .{
+            record.instruction_index,
+            @tagName(record.kind),
+            @tagName(record.opcode),
+            @tagName(record.operand_mode),
+            record.a,
+            record.b,
+        });
+        try writeNullableStringIndexJson(w, record.string_index);
+        try w.writeAll(",\"stringPayload\":");
+        try writeNullableStringJson(w, record.string_payload);
+        try w.writeAll(",\"non_authorizing\":");
+        try w.writeAll(if (record.non_authorizing) "true" else "false");
+        try w.writeAll(",\"authority_effect\":\"");
+        try writeEscaped(w, record.authority_effect);
+        try w.writeAll("\",\"requires_review\":");
+        try w.writeAll(if (record.requires_review) "true" else "false");
+        try w.writeAll(",\"requires_verification\":");
+        try w.writeAll(if (record.requires_verification) "true" else "false");
+        try w.writeAll("}");
+    }
+    try w.writeAll("],\"disassemblyText\":\"");
+    try writeEscaped(w, rendered_text);
+    try w.writeAll("\"}}");
+    return out.toOwnedSlice();
+}
+
+fn writeSigilSafety(w: anytype, requires_review: bool, requires_verification: bool) !void {
+    try w.writeAll(",\"safety\":{\"non_authorizing\":true,\"read_only\":true,\"executed\":false,\"mutates_state\":false,\"authority_effect\":\"candidate\",\"requires_review\":");
+    try w.writeAll(if (requires_review) "true" else "false");
+    try w.writeAll(",\"requires_verification\":");
+    try w.writeAll(if (requires_verification) "true" else "false");
+    try w.writeAll(",\"vm_execution\":false,\"commands_executed\":false,\"corpus_mutation\":false,\"pack_mutation\":false,\"negative_knowledge_mutation\":false,\"trust_state_mutation\":false,\"scratch_state_mutation\":false,\"support_granted\":false,\"proof_gate_bypassed\":false}");
+}
+
+fn writeNullableStringIndexJson(w: anytype, index: u32) !void {
+    if (index == sigil_core.INVALID_STRING_INDEX) {
+        try w.writeAll("null");
+    } else {
+        try w.print("{d}", .{index});
+    }
+}
+
+fn writeNullableStringJson(w: anytype, value: ?[]const u8) !void {
+    if (value) |text| {
+        try w.writeByte('"');
+        try writeEscaped(w, text);
+        try w.writeByte('"');
+    } else {
+        try w.writeAll("null");
+    }
+}
+
 fn writeEscaped(w: anytype, s: []const u8) !void {
     for (s) |c| {
         switch (c) {
@@ -5193,6 +5432,136 @@ test "gip denied mutation operations remain denied before implementation fallbac
     try std.testing.expectEqual(core.ProtocolStatus.rejected, denied.status);
     try std.testing.expect(denied.err != null);
     try std.testing.expectEqual(core.ErrorCode.capability_denied, denied.err.?.code);
+}
+
+test "sigil.inspect is advertised as read-only candidate inspection" {
+    const allocator = std.testing.allocator;
+
+    var protocol = try dispatch(allocator, "protocol.describe", core.PROTOCOL_VERSION, null, null, null);
+    defer protocol.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, protocol.status);
+    const protocol_json = protocol.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, protocol_json, "\"kind\":\"sigil.inspect\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, protocol_json, "\"kind\":\"sigil.inspect\",\"declared\":true,\"implemented\":true,\"wired\":true,\"mutatesState\":false,\"requiresApproval\":false,\"capabilityPolicy\":\"allowed\",\"authorityEffect\":\"candidate\",\"productReady\":false") != null);
+
+    var caps = try dispatch(allocator, "capabilities.describe", core.PROTOCOL_VERSION, null, null, null);
+    defer caps.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, caps.status);
+    const caps_json = caps.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, caps_json, "\"capability\":\"sigil.inspect\",\"policy\":\"allowed\",\"read_only\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, caps_json, "\"authorityEffect\":\"support\"") == null);
+}
+
+test "sigil.inspect disassembles safe control source without execution" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"source":"MOOD \"focused\"\nLOOM CPU_ONLY\nSCAN \"system_memory\"","validationScope":"boot_control"}
+    ;
+
+    var result = try dispatch(allocator, "sigil.inspect", core.PROTOCOL_VERSION, null, null, body);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
+    const state = result.result_state orelse return error.MissingResultState;
+    try std.testing.expectEqual(core.Permission.none, state.permission);
+    try std.testing.expect(!state.support_minimum_met);
+    const json = result.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"sigilInspection\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":\"ok\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scope\":\"boot_control\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"validation\":{\"scope\":\"boot_control\",\"status\":\"ok\",\"issue\":null}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"opcode\":\"loom\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"stringPayload\":\"system_memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"non_authorizing\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"read_only\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"executed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"mutates_state\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"vm_execution\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"commands_executed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"support_granted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"proof_gate_bypassed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"authority_effect\":\"support\"") == null);
+}
+
+test "sigil.inspect exposes test block jump target through GIP" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"source":"TEST FALSE {\n  SCAN \"system_memory\"\n}","validationScope":"boot_control"}
+    ;
+
+    var result = try dispatch(allocator, "sigil.inspect", core.PROTOCOL_VERSION, null, null, body);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
+    const json = result.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"test_jump\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"opcode\":\"jmp_if_false\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"b\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "0000 opcode=jmp_if_false mode=immediate_bool a=0 b=2") != null);
+}
+
+test "sigil.inspect scratch scope returns candidate-only mutation records" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"source":"BIND 65 TO alpha\nETCH \"candidate_anchor\" @2\nVOID \"candidate_void\"","validationScope":"scratch_session"}
+    ;
+
+    var result = try dispatch(allocator, "sigil.inspect", core.PROTOCOL_VERSION, null, null, body);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
+    const json = result.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"bind_candidate\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"etch_candidate\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"void_candidate\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"authority_effect\":\"candidate\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"requires_review\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"requires_verification\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scratch_state_mutation\":false") != null);
+}
+
+test "sigil.inspect fails validation for forbidden authority sources without execution" {
+    const allocator = std.testing.allocator;
+
+    const forbidden_sources = [_][]const u8{
+        "SCAN \\\"support\\\"",
+        "SCAN \\\"negative_knowledge.promote\\\"",
+        "SCAN \\\"pack.update_from_negative_knowledge\\\"",
+        "LOOM SHELL",
+    };
+    for (forbidden_sources) |source| {
+        const body = try std.fmt.allocPrint(allocator, "{{\"source\":\"{s}\",\"validationScope\":\"scratch_session\"}}", .{source});
+        defer allocator.free(body);
+        var result = try dispatch(allocator, "sigil.inspect", core.PROTOCOL_VERSION, null, null, body);
+        defer result.deinit(allocator);
+        try std.testing.expectEqual(core.ProtocolStatus.rejected, result.status);
+        const state = result.result_state orelse return error.MissingResultState;
+        try std.testing.expectEqual(core.SemanticState.failed, state.state);
+        const json = result.result_json orelse return error.MissingResult;
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":\"validation_failed\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"executed\":false") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"commands_executed\":false") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"pack_mutation\":false") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"negative_knowledge_mutation\":false") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"support_granted\":false") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"authority_effect\":\"support\"") == null);
+    }
+}
+
+test "sigil.inspect invalid syntax fails closed before disassembly" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"source":"SHELL \"echo hidden\"","validationScope":"scratch_session"}
+    ;
+
+    var result = try dispatch(allocator, "sigil.inspect", core.PROTOCOL_VERSION, null, null, body);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, result.status);
+    try std.testing.expectEqual(core.ErrorCode.invalid_request, result.err.?.code);
+    const state = result.result_state orelse return error.MissingResultState;
+    try std.testing.expectEqual(core.SemanticState.failed, state.state);
+    const json = result.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":\"parse_failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"instructions\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"procedureInspectionRecords\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"executed\":false") != null);
 }
 
 test "negative_knowledge.review appends accepted and rejected reviewed records" {

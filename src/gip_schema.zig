@@ -610,6 +610,7 @@ fn writeCapabilityDetails(w: anytype, capability: core.CapabilityName, policy: c
         .@"hypothesis.triage",
         .@"corpus.ask",
         .@"rule.evaluate",
+        .@"sigil.inspect",
         .@"learning.status",
         .@"correction.propose",
         .@"correction.reviewed.list",

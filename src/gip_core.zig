@@ -25,6 +25,7 @@ pub const RequestKind = enum {
     @"conversation.replay",
     @"corpus.ask",
     @"rule.evaluate",
+    @"sigil.inspect",
     @"learning.status",
     @"intent.ground",
     @"response.evaluate",
@@ -279,6 +280,7 @@ pub const CapabilityName = enum {
     @"network.access",
     @"corpus.ask",
     @"rule.evaluate",
+    @"sigil.inspect",
     @"project.autopsy",
     @"context.autopsy",
 
@@ -304,7 +306,7 @@ pub const CapabilityEntry = struct {
     policy: CapabilityPolicy,
 };
 
-pub fn defaultCapabilities() [59]CapabilityEntry {
+pub fn defaultCapabilities() [60]CapabilityEntry {
     return .{
         .{ .capability = .@"artifact.read", .policy = .allowed },
         .{ .capability = .@"artifact.list", .policy = .allowed },
@@ -363,6 +365,7 @@ pub fn defaultCapabilities() [59]CapabilityEntry {
         .{ .capability = .@"network.access", .policy = .denied },
         .{ .capability = .@"corpus.ask", .policy = .allowed },
         .{ .capability = .@"rule.evaluate", .policy = .allowed },
+        .{ .capability = .@"sigil.inspect", .policy = .allowed },
         .{ .capability = .@"project.autopsy", .policy = .allowed },
         .{ .capability = .@"context.autopsy", .policy = .allowed },
     };
@@ -375,6 +378,7 @@ pub fn requestCapabilityName(kind: RequestKind) ?CapabilityName {
         .@"artifact.search" => .@"artifact.search",
         .@"corpus.ask" => .@"corpus.ask",
         .@"rule.evaluate" => .@"rule.evaluate",
+        .@"sigil.inspect" => .@"sigil.inspect",
         .@"learning.status" => .@"learning.status",
         .@"artifact.patch.propose" => .@"artifact.patch.propose",
         .@"artifact.patch.apply" => .@"artifact.patch.apply",
@@ -520,6 +524,7 @@ pub fn operationAuthorityEffect(kind: RequestKind) AuthorityEffect {
         => .evidence,
         .@"conversation.turn",
         .@"rule.evaluate",
+        .@"sigil.inspect",
         .@"artifact.patch.propose",
         .@"artifact.write.propose",
         .@"hypothesis.generate",
@@ -553,6 +558,7 @@ pub fn operationMaturityLabel(kind: RequestKind) []const u8 {
         .@"conversation.turn" => "wired_draft_or_verified_response_state",
         .@"corpus.ask" => "read_only_live_corpus_grounded_draft",
         .@"rule.evaluate" => "bounded_deterministic_non_authorizing_candidates",
+        .@"sigil.inspect" => "read_only_sigil_bytecode_inspection_non_authorizing",
         .@"learning.status" => "read_only_reviewed_learning_loop_scoreboard_non_authorizing",
         .@"correction.propose" => "candidate_only_review_required_no_mutation",
         .@"correction.review" => "append_only_reviewed_record_no_hidden_mutation",
@@ -726,6 +732,7 @@ pub const IMPLEMENTED_KINDS = [_]RequestKind{
     .@"conversation.turn",
     .@"corpus.ask",
     .@"rule.evaluate",
+    .@"sigil.inspect",
     .@"artifact.read",
     .@"artifact.list",
     .@"artifact.patch.propose",
@@ -808,6 +815,8 @@ test "default capabilities have safe defaults" {
     try std.testing.expectEqual(CapabilityPolicy.allowed, capabilityPolicy(&caps, .@"corpus.ask").?);
     // rule.evaluate should be allowed (read-only/non-authorizing)
     try std.testing.expectEqual(CapabilityPolicy.allowed, capabilityPolicy(&caps, .@"rule.evaluate").?);
+    // sigil.inspect should be allowed (read-only/non-authorizing)
+    try std.testing.expectEqual(CapabilityPolicy.allowed, capabilityPolicy(&caps, .@"sigil.inspect").?);
     // correction.propose should be allowed (candidate-only/non-authorizing)
     try std.testing.expectEqual(CapabilityPolicy.allowed, capabilityPolicy(&caps, .@"correction.propose").?);
     // correction.review should be allowed as append-only reviewed record persistence.
