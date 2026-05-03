@@ -3,7 +3,11 @@
 Project Autopsy Pass 1 builds a deterministic, bounded, read-only profile of a
 workspace before deeper reasoning or debugging.
 
-It produces two draft, non-authorizing artifacts:
+It produces three draft, non-authorizing artifacts:
+
+- `operator_summary`: a compact decision-grade overview of project shape,
+  unknowns, risk surfaces, verifier gaps, guidance candidates, and safe next
+  action candidates.
 
 - `project_profile`: detected project signals such as languages, build systems,
   package managers, CI files, docs, config files, source/test roots, risk
@@ -18,6 +22,42 @@ candidates, and `recommended_guidance_candidates`, a draft list of procedure
 guidance candidates derived from detected structure, risks, and verifier gaps.
 These are proposals only; Autopsy does not approve, register, schedule, execute,
 mount, import, update, promote, or apply them.
+
+## Operator Summary
+
+The top-level `operator_summary` is rendering/explanation data only. It gives
+an operator a bounded overview before inspecting the full profile. It includes:
+
+- `project_shape_summary`
+- `primary_languages`
+- `primary_build_systems`
+- `source_root_count`
+- `test_root_count`
+- `ci_detected`
+- `docs_detected`
+- `config_surface_count`
+- `safe_command_candidate_count`
+- `risk_surface_count`
+- `verifier_gap_count`
+- `guidance_candidate_count`
+- `top_unknowns`
+- `top_risks`
+- `top_verifier_gaps`
+- `suggested_next_actions`
+- `non_authorizing: true`
+- `read_only: true`
+
+The top lists are capped and sorted by the same deterministic ordering as the
+underlying profile data. Summary unknowns remain unknowns, risk surfaces remain
+candidates rather than defect claims, and verifier gaps remain missing-evidence
+indicators rather than negative evidence.
+
+`suggested_next_actions` are candidates only. They reference detected safe
+command candidates, verifier gaps, guidance candidates, or next-question
+signals by ID where possible. They always include `candidate_only: true`,
+`non_authorizing: true`, `read_only: true`, `executes_by_default: false`, and
+`applies_by_default: false`. Autopsy does not execute or apply any suggested
+next action.
 
 ## Read-Only Contract
 

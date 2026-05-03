@@ -3,6 +3,7 @@ const std = @import("std");
 pub const DEFAULT_MAX_ENTRIES: usize = 4096;
 pub const DEFAULT_MAX_DEPTH: usize = 6;
 pub const MAX_FILE_READ_BYTES: usize = 128 * 1024;
+const MAX_OPERATOR_SUMMARY_ITEMS: usize = 5;
 
 pub const AnalyzeOptions = struct {
     max_entries: usize = DEFAULT_MAX_ENTRIES,
@@ -104,6 +105,47 @@ pub const RecommendedGuidanceCandidate = struct {
     applies_by_default: bool = false,
 };
 
+pub const OperatorSummaryItem = struct {
+    id: []const u8,
+    kind: []const u8,
+    reason: []const u8,
+    evidence_paths: []const []const u8 = &.{},
+    non_authorizing: bool = true,
+};
+
+pub const OperatorSummaryActionCandidate = struct {
+    id: []const u8,
+    kind: []const u8,
+    reason: []const u8,
+    references: []const []const u8 = &.{},
+    candidate_only: bool = true,
+    non_authorizing: bool = true,
+    read_only: bool = true,
+    executes_by_default: bool = false,
+    applies_by_default: bool = false,
+};
+
+pub const OperatorSummary = struct {
+    project_shape_summary: []const u8,
+    primary_languages: []const []const u8 = &.{},
+    primary_build_systems: []const []const u8 = &.{},
+    source_root_count: usize = 0,
+    test_root_count: usize = 0,
+    ci_detected: bool = false,
+    docs_detected: bool = false,
+    config_surface_count: usize = 0,
+    safe_command_candidate_count: usize = 0,
+    risk_surface_count: usize = 0,
+    verifier_gap_count: usize = 0,
+    guidance_candidate_count: usize = 0,
+    top_unknowns: []OperatorSummaryItem = &.{},
+    top_risks: []OperatorSummaryItem = &.{},
+    top_verifier_gaps: []OperatorSummaryItem = &.{},
+    suggested_next_actions: []OperatorSummaryActionCandidate = &.{},
+    non_authorizing: bool = true,
+    read_only: bool = true,
+};
+
 pub const VerifierGapSummary = struct {
     known_possible_verifier_adapters: []Signal = &.{},
     missing_likely_verifier_adapters: []VerifierGapCandidate = &.{},
@@ -150,6 +192,7 @@ pub const ProjectGapReport = struct {
 };
 
 pub const AutopsyResult = struct {
+    operator_summary: OperatorSummary,
     project_profile: ProjectProfile,
     project_gap_report: ProjectGapReport,
     verifier_plan_candidates: []VerifierPlanCandidate = &.{},
@@ -436,8 +479,10 @@ const Builder = struct {
             try self.signal("missing_docs", "", "gap", "medium", "no README or docs directory was detected")
         else
             null;
+        const operator_summary = try buildOperatorSummary(self);
 
         return .{
+            .operator_summary = operator_summary,
             .project_profile = .{
                 .workspace_root = try self.allocator.dupe(u8, self.root_abs),
                 .detected_languages = try self.languages.toOwnedSlice(),
@@ -1458,6 +1503,152 @@ fn detectedLanguageNames(allocator: std.mem.Allocator, items: []const Signal) ![
     return names.toOwnedSlice();
 }
 
+fn buildOperatorSummary(builder: *Builder) !OperatorSummary {
+    const language_names = try cappedSignalNames(builder.allocator, builder.languages.items, MAX_OPERATOR_SUMMARY_ITEMS);
+    const build_system_names = try cappedSignalNames(builder.allocator, builder.build_systems.items, MAX_OPERATOR_SUMMARY_ITEMS);
+    const shape = try std.fmt.allocPrint(
+        builder.allocator,
+        "shape candidate: languages={d}, build_systems={d}, source_roots={d}, test_roots={d}, ci_detected={}, docs_detected={}, config_surfaces={d}; draft summary only",
+        .{
+            builder.languages.items.len,
+            builder.build_systems.items.len,
+            builder.source_roots.items.len,
+            builder.test_roots.items.len,
+            builder.ci_configs.items.len > 0,
+            builder.docs.items.len > 0,
+            builder.config_files.items.len,
+        },
+    );
+
+    return .{
+        .project_shape_summary = shape,
+        .primary_languages = language_names,
+        .primary_build_systems = build_system_names,
+        .source_root_count = builder.source_roots.items.len,
+        .test_root_count = builder.test_roots.items.len,
+        .ci_detected = builder.ci_configs.items.len > 0,
+        .docs_detected = builder.docs.items.len > 0,
+        .config_surface_count = builder.config_files.items.len,
+        .safe_command_candidate_count = builder.safe_commands.items.len,
+        .risk_surface_count = builder.risk_surfaces.items.len,
+        .verifier_gap_count = builder.gap_missing_verifiers.items.len,
+        .guidance_candidate_count = builder.recommended_guidance_candidates.items.len,
+        .top_unknowns = try topUnknownItems(builder.allocator, builder.unknowns.items),
+        .top_risks = try topRiskItems(builder.allocator, builder.risk_surfaces.items),
+        .top_verifier_gaps = try topVerifierGapItems(builder.allocator, builder.gap_missing_verifiers.items),
+        .suggested_next_actions = try summaryNextActions(builder),
+    };
+}
+
+fn cappedSignalNames(allocator: std.mem.Allocator, items: []const Signal, cap: usize) ![]const []const u8 {
+    if (items.len == 0 or cap == 0) return &.{};
+    var names = std.ArrayList([]const u8).init(allocator);
+    for (items) |item| {
+        if (containsString(names.items, item.name)) continue;
+        try names.append(try allocator.dupe(u8, item.name));
+        if (names.items.len >= cap) break;
+    }
+    return names.toOwnedSlice();
+}
+
+fn topUnknownItems(allocator: std.mem.Allocator, items: []const Signal) ![]OperatorSummaryItem {
+    var summary = std.ArrayList(OperatorSummaryItem).init(allocator);
+    for (items) |item| {
+        try summary.append(.{
+            .id = try allocator.dupe(u8, item.name),
+            .kind = try allocator.dupe(u8, item.kind),
+            .reason = try allocator.dupe(u8, item.reason),
+            .evidence_paths = try dupeStringSlice(allocator, item.evidence_paths),
+        });
+        if (summary.items.len >= MAX_OPERATOR_SUMMARY_ITEMS) break;
+    }
+    return summary.toOwnedSlice();
+}
+
+fn topRiskItems(allocator: std.mem.Allocator, items: []const RiskSurface) ![]OperatorSummaryItem {
+    var summary = std.ArrayList(OperatorSummaryItem).init(allocator);
+    for (items) |item| {
+        try summary.append(.{
+            .id = try allocator.dupe(u8, item.id),
+            .kind = try allocator.dupe(u8, item.kind),
+            .reason = try allocator.dupe(u8, item.reason),
+            .evidence_paths = try dupeStringSlice(allocator, item.evidence_paths),
+        });
+        if (summary.items.len >= MAX_OPERATOR_SUMMARY_ITEMS) break;
+    }
+    return summary.toOwnedSlice();
+}
+
+fn topVerifierGapItems(allocator: std.mem.Allocator, items: []const VerifierGapCandidate) ![]OperatorSummaryItem {
+    var summary = std.ArrayList(OperatorSummaryItem).init(allocator);
+    for (items) |item| {
+        try summary.append(.{
+            .id = try allocator.dupe(u8, item.id),
+            .kind = try allocator.dupe(u8, item.kind),
+            .reason = try allocator.dupe(u8, item.reason),
+            .evidence_paths = try dupeStringSlice(allocator, item.evidence_paths),
+        });
+        if (summary.items.len >= MAX_OPERATOR_SUMMARY_ITEMS) break;
+    }
+    return summary.toOwnedSlice();
+}
+
+fn summaryNextActions(builder: *Builder) ![]OperatorSummaryActionCandidate {
+    var actions = std.ArrayList(OperatorSummaryActionCandidate).init(builder.allocator);
+    for (builder.safe_commands.items) |item| {
+        try actions.append(try summaryAction(
+            builder.allocator,
+            "review_safe_command_candidate",
+            "safe_command_candidate",
+            item.id,
+            "review safe command candidate metadata; command remains unexecuted unless separately approved outside Autopsy",
+        ));
+        if (actions.items.len >= MAX_OPERATOR_SUMMARY_ITEMS) return actions.toOwnedSlice();
+    }
+    for (builder.gap_missing_verifiers.items) |item| {
+        try actions.append(try summaryAction(
+            builder.allocator,
+            "resolve_verifier_gap_candidate",
+            "verifier_gap_candidate",
+            item.id,
+            "inspect missing-verifier gap and choose explicit evidence needed before support claims",
+        ));
+        if (actions.items.len >= MAX_OPERATOR_SUMMARY_ITEMS) return actions.toOwnedSlice();
+    }
+    for (builder.recommended_guidance_candidates.items) |item| {
+        try actions.append(try summaryAction(
+            builder.allocator,
+            "review_guidance_candidate",
+            "guidance_candidate",
+            item.id,
+            "review guidance candidate; guidance is not applied or mounted by Autopsy",
+        ));
+        if (actions.items.len >= MAX_OPERATOR_SUMMARY_ITEMS) return actions.toOwnedSlice();
+    }
+    for (builder.next_questions.items) |item| {
+        try actions.append(try summaryAction(
+            builder.allocator,
+            "answer_next_question_candidate",
+            "next_question_candidate",
+            item.name,
+            item.reason,
+        ));
+        if (actions.items.len >= MAX_OPERATOR_SUMMARY_ITEMS) return actions.toOwnedSlice();
+    }
+    return actions.toOwnedSlice();
+}
+
+fn summaryAction(allocator: std.mem.Allocator, prefix: []const u8, kind: []const u8, reference_id: []const u8, reason: []const u8) !OperatorSummaryActionCandidate {
+    const refs = try allocator.alloc([]const u8, 1);
+    refs[0] = try allocator.dupe(u8, reference_id);
+    return .{
+        .id = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ prefix, reference_id }),
+        .kind = try allocator.dupe(u8, kind),
+        .reason = try allocator.dupe(u8, reason),
+        .references = refs,
+    };
+}
+
 fn verifierPlanPurpose(id: []const u8) []const u8 {
     if (std.mem.indexOf(u8, id, "bench") != null) return "benchmark verifier plan candidate";
     if (std.mem.indexOf(u8, id, "test") != null or std.mem.eql(u8, id, "pytest")) return "test verifier plan candidate";
@@ -1549,6 +1740,18 @@ fn findVerifierPlan(items: []const VerifierPlanCandidate, id: []const u8) ?Verif
 }
 
 fn findGuidanceCandidate(items: []const RecommendedGuidanceCandidate, id: []const u8) ?RecommendedGuidanceCandidate {
+    for (items) |item| if (std.mem.eql(u8, item.id, id)) return item;
+    return null;
+}
+
+fn findSummaryAction(items: []const OperatorSummaryActionCandidate, reference_id: []const u8) ?OperatorSummaryActionCandidate {
+    for (items) |item| {
+        if (containsString(item.references, reference_id)) return item;
+    }
+    return null;
+}
+
+fn findSummaryItem(items: []const OperatorSummaryItem, id: []const u8) ?OperatorSummaryItem {
     for (items) |item| if (std.mem.eql(u8, item.id, id)) return item;
     return null;
 }
@@ -2111,6 +2314,97 @@ test "project autopsy emits multiple review-required guidance candidates for amb
     try std.testing.expect(node.candidate_only);
     try std.testing.expect(rust.candidate_only);
     try std.testing.expect(containsNamedSignal(result.project_profile.unknowns, "project_config_ambiguous"));
+}
+
+test "project autopsy operator summary captures rich project shape and top fields" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "build.zig", "pub fn build(b: *std.Build) void { _ = b.step(\"test\", \"\"); }");
+    try makeFile(tmp.dir, "src/main.zig", "pub fn main() void {}\n");
+    try makeFile(tmp.dir, "tests/main_test.zig", "test \"x\" {}\n");
+    try makeFile(tmp.dir, ".github/workflows/ci.yml", "name: ci\n");
+    try makeFile(tmp.dir, "README.md", "# docs\n");
+    try makeFile(tmp.dir, ".env.example", "PORT=1\n");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+
+    const summary = result.operator_summary;
+    try std.testing.expectEqualStrings("zig", summary.primary_languages[0]);
+    try std.testing.expectEqualStrings("zig_build", summary.primary_build_systems[0]);
+    try std.testing.expectEqual(@as(usize, 1), summary.source_root_count);
+    try std.testing.expectEqual(@as(usize, 1), summary.test_root_count);
+    try std.testing.expect(summary.ci_detected);
+    try std.testing.expect(summary.docs_detected);
+    try std.testing.expect(summary.config_surface_count >= 2);
+    try std.testing.expectEqual(summary.safe_command_candidate_count, result.project_profile.safe_command_candidates.len);
+    try std.testing.expectEqual(summary.risk_surface_count, result.project_profile.risk_surfaces.len);
+    try std.testing.expectEqual(summary.verifier_gap_count, result.project_gap_report.missing_verifier_adapters.len);
+    try std.testing.expectEqual(summary.guidance_candidate_count, result.project_profile.recommended_guidance_candidates.len);
+    try std.testing.expect(summary.top_risks.len <= MAX_OPERATOR_SUMMARY_ITEMS);
+    try std.testing.expect(summary.top_unknowns.len <= MAX_OPERATOR_SUMMARY_ITEMS);
+    try std.testing.expect(summary.top_verifier_gaps.len <= MAX_OPERATOR_SUMMARY_ITEMS);
+    try std.testing.expect(summary.suggested_next_actions.len <= MAX_OPERATOR_SUMMARY_ITEMS);
+    try std.testing.expect(std.mem.indexOf(u8, summary.project_shape_summary, "draft summary only") != null);
+}
+
+test "project autopsy operator summary keeps no-test project as missing evidence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "src/main.zig", "pub fn main() void {}\n");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+    const summary = result.operator_summary;
+
+    try std.testing.expectEqual(@as(usize, 1), summary.source_root_count);
+    try std.testing.expectEqual(@as(usize, 0), summary.test_root_count);
+    const unknown = findSummaryItem(summary.top_unknowns, "test_root_unknown") orelse return error.MissingSummaryUnknown;
+    try std.testing.expectEqualStrings("test_root_unknown", unknown.id);
+    try std.testing.expect(std.mem.indexOf(u8, unknown.reason, "absence of evidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unknown.reason, "tests do not exist") != null);
+    const gap = findVerifierGap(result.project_gap_report.missing_verifier_adapters, "gap.test_root_verifier_missing") orelse return error.MissingVerifierGap;
+    try std.testing.expect(std.mem.indexOf(u8, gap.reason, "missing evidence") != null);
+}
+
+test "project autopsy operator summary references guidance candidates as candidate-only next actions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "Dockerfile", "FROM scratch\n");
+    try makeFile(tmp.dir, "compose.yml", "services: {}\n");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+
+    _ = findGuidanceCandidate(result.project_profile.recommended_guidance_candidates, "guidance.container_runtime_guidance") orelse return error.MissingGuidanceCandidate;
+    const action = findSummaryAction(result.operator_summary.suggested_next_actions, "guidance.container_runtime_guidance") orelse return error.MissingSummaryAction;
+    try std.testing.expectEqualStrings("guidance_candidate", action.kind);
+    try std.testing.expect(action.candidate_only);
+    try std.testing.expect(action.non_authorizing);
+    try std.testing.expect(action.read_only);
+    try std.testing.expect(!action.executes_by_default);
+    try std.testing.expect(!action.applies_by_default);
+    try std.testing.expect(std.mem.indexOf(u8, action.reason, "not applied") != null);
+}
+
+test "project autopsy operator summary preserves read-only non-authorizing invariants" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "build.zig", "pub fn build(b: *std.Build) void { _ = b.step(\"test\", \"\"); }");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+    const summary = result.operator_summary;
+
+    try std.testing.expect(summary.non_authorizing);
+    try std.testing.expect(summary.read_only);
+    for (summary.suggested_next_actions) |action| {
+        try std.testing.expect(action.candidate_only);
+        try std.testing.expect(action.non_authorizing);
+        try std.testing.expect(action.read_only);
+        try std.testing.expect(!action.executes_by_default);
+        try std.testing.expect(!action.applies_by_default);
+    }
 }
 
 test "project autopsy does not report false missing test gap when tests and safe command exist" {
