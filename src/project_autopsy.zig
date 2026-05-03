@@ -21,11 +21,28 @@ pub const Signal = struct {
 };
 
 pub const RiskSurface = struct {
+    id: []const u8,
+    kind: []const u8,
     path: []const u8,
+    related_paths: []const []const u8 = &.{},
+    risk_level: []const u8,
     risk_kind: []const u8,
     reason: []const u8,
+    evidence_paths: []const []const u8 = &.{},
     suggested_caution: []const u8,
     non_authorizing: bool = true,
+    requires_verification: bool = true,
+};
+
+pub const VerifierGapCandidate = struct {
+    id: []const u8,
+    kind: []const u8 = "verifier_gap",
+    missing_verifier: []const u8,
+    reason: []const u8,
+    related_paths: []const []const u8 = &.{},
+    evidence_paths: []const []const u8 = &.{},
+    non_authorizing: bool = true,
+    blocks_support: bool = true,
 };
 
 pub const RootCandidate = struct {
@@ -71,7 +88,7 @@ pub const VerifierPlanCandidate = struct {
 
 pub const VerifierGapSummary = struct {
     known_possible_verifier_adapters: []Signal = &.{},
-    missing_likely_verifier_adapters: []Signal = &.{},
+    missing_likely_verifier_adapters: []VerifierGapCandidate = &.{},
     unknown_verifier_status: []Signal = &.{},
     recommended_next_checks: []Signal = &.{},
 };
@@ -105,7 +122,7 @@ pub const ProjectGapReport = struct {
     missing_build_command: ?Signal = null,
     missing_ci: ?Signal = null,
     missing_docs: ?Signal = null,
-    missing_verifier_adapters: []Signal = &.{},
+    missing_verifier_adapters: []VerifierGapCandidate = &.{},
     missing_pack_recommendations: []Signal = &.{},
     ambiguous_project_type: []Signal = &.{},
     unsafe_or_unknown_commands: []Signal = &.{},
@@ -154,10 +171,10 @@ const Builder = struct {
     unknowns: std.ArrayList(Signal),
     trace: std.ArrayList(Signal),
     possible_verifiers: std.ArrayList(Signal),
-    missing_verifiers: std.ArrayList(Signal),
+    missing_verifiers: std.ArrayList(VerifierGapCandidate),
     unknown_verifiers: std.ArrayList(Signal),
     next_checks: std.ArrayList(Signal),
-    gap_missing_verifiers: std.ArrayList(Signal),
+    gap_missing_verifiers: std.ArrayList(VerifierGapCandidate),
     missing_pack_recommendations: std.ArrayList(Signal),
     ambiguous_project_type: std.ArrayList(Signal),
     unsafe_or_unknown_commands: std.ArrayList(Signal),
@@ -213,6 +230,48 @@ const Builder = struct {
     fn appendSignal(self: *Builder, list: *std.ArrayList(Signal), name: []const u8, path: []const u8, kind: []const u8, confidence: []const u8, reason: []const u8) !void {
         if (containsSignal(list.items, name, path, kind)) return;
         try list.append(try self.signal(name, path, kind, confidence, reason));
+    }
+
+    fn appendRisk(self: *Builder, id: []const u8, kind: []const u8, path: []const u8, risk_level: []const u8, reason_text: []const u8, caution: []const u8) !void {
+        const paths = if (path.len == 0) &.{} else &[_][]const u8{path};
+        try self.appendRiskWithPaths(id, kind, path, paths, risk_level, reason_text, caution);
+    }
+
+    fn appendRiskWithPaths(self: *Builder, id: []const u8, kind: []const u8, path: []const u8, related_paths: []const []const u8, risk_level: []const u8, reason_text: []const u8, caution: []const u8) !void {
+        if (containsRisk(self.risk_surfaces.items, id)) return;
+        const related = try dupeStringSlice(self.allocator, related_paths);
+        const evidence = try dupeStringSlice(self.allocator, related_paths);
+        try self.risk_surfaces.append(.{
+            .id = try self.allocator.dupe(u8, id),
+            .kind = try self.allocator.dupe(u8, kind),
+            .path = try self.allocator.dupe(u8, path),
+            .related_paths = related,
+            .risk_level = try self.allocator.dupe(u8, risk_level),
+            .risk_kind = try self.allocator.dupe(u8, kind),
+            .reason = try self.allocator.dupe(u8, reason_text),
+            .evidence_paths = evidence,
+            .suggested_caution = try self.allocator.dupe(u8, caution),
+        });
+    }
+
+    fn appendVerifierGap(self: *Builder, id: []const u8, missing_verifier: []const u8, reason_text: []const u8, related_paths: []const []const u8, blocks_support: bool) !void {
+        if (containsVerifierGap(self.gap_missing_verifiers.items, id)) return;
+        const candidate = try self.verifierGap(id, missing_verifier, reason_text, related_paths, blocks_support);
+        try self.gap_missing_verifiers.append(candidate);
+        if (!containsVerifierGap(self.missing_verifiers.items, id)) {
+            try self.missing_verifiers.append(try self.verifierGap(id, missing_verifier, reason_text, related_paths, blocks_support));
+        }
+    }
+
+    fn verifierGap(self: *Builder, id: []const u8, missing_verifier: []const u8, reason_text: []const u8, related_paths: []const []const u8, blocks_support: bool) !VerifierGapCandidate {
+        return .{
+            .id = try self.allocator.dupe(u8, id),
+            .missing_verifier = try self.allocator.dupe(u8, missing_verifier),
+            .reason = try self.allocator.dupe(u8, reason_text),
+            .related_paths = try dupeStringSlice(self.allocator, related_paths),
+            .evidence_paths = try dupeStringSlice(self.allocator, related_paths),
+            .blocks_support = blocks_support,
+        };
     }
 
     fn appendRootCandidate(self: *Builder, list: *std.ArrayList(RootCandidate), path: []const u8, kind: []const u8, confidence: []const u8, reason: []const u8) !void {
@@ -304,10 +363,10 @@ const Builder = struct {
         sortSignals(self.unknowns.items);
         sortSignals(self.trace.items);
         sortSignals(self.possible_verifiers.items);
-        sortSignals(self.missing_verifiers.items);
+        sortVerifierGaps(self.missing_verifiers.items);
         sortSignals(self.unknown_verifiers.items);
         sortSignals(self.next_checks.items);
-        sortSignals(self.gap_missing_verifiers.items);
+        sortVerifierGaps(self.gap_missing_verifiers.items);
         sortSignals(self.missing_pack_recommendations.items);
         sortSignals(self.ambiguous_project_type.items);
         sortSignals(self.unsafe_or_unknown_commands.items);
@@ -525,30 +584,31 @@ fn detectRisks(builder: *Builder) !void {
         const lower = try std.ascii.allocLowerString(builder.allocator, path);
         defer builder.allocator.free(lower);
         if (containsAny(lower, &.{ "auth", "security", "secret", "token", "password" })) {
-            try builder.risk_surfaces.append(try risk(builder, path, "auth_security", "security-sensitive name detected", "treat as routing signal only; require explicit evidence before claims"));
+            try builder.appendRisk("risk.auth_security", "auth_security", path, "medium", "security-sensitive name detected; candidate only, not evidence of a defect", "treat as routing signal only; require explicit evidence before claims");
         }
         if (containsAny(lower, &.{ "migration", "database", "schema.sql", "db/" })) {
-            try builder.risk_surfaces.append(try risk(builder, path, "database_migration", "database or migration path detected", "inspect ordering and reversibility before recommending changes"));
+            try builder.appendRisk("risk.database_migration", "database_migration", path, "medium", "database or migration path detected; candidate only, not evidence of a defect", "inspect ordering and reversibility before recommending changes");
         }
         if (startsWith(path, ".github/") or std.mem.eql(u8, path, ".gitlab-ci.yml") or containsAny(lower, &.{ "deploy", "release" })) {
-            try builder.risk_surfaces.append(try risk(builder, path, "ci_deployment", "CI or deployment surface detected", "do not infer deployment safety from presence alone"));
+            try builder.appendRisk("risk.ci_deployment", "ci_deployment", path, "medium", "CI or deployment surface detected; intended workflow evidence only", "do not infer deployment safety from presence alone");
         }
         if (isDependencyFile(entry.basename) or std.mem.eql(u8, entry.basename, "build.zig") or std.mem.eql(u8, entry.basename, "Makefile") or std.mem.eql(u8, entry.basename, "CMakeLists.txt")) {
-            try builder.risk_surfaces.append(try risk(builder, path, "build_dependency", "build or dependency file detected", "command candidates still require confirmation and execution evidence"));
+            try builder.appendRisk("risk.build_dependency", "build_dependency", path, "medium", "build or dependency file detected; structural evidence only", "command candidates still require confirmation and execution evidence");
         }
         if (containsAny(lower, &.{ "concurrency", "sync", "runtime", "thread", "mutex" })) {
-            try builder.risk_surfaces.append(try risk(builder, path, "concurrency_runtime", "runtime/concurrency-related name detected", "avoid broad behavioral claims without verifier evidence"));
+            try builder.appendRisk("risk.concurrency_runtime", "concurrency_runtime", path, "medium", "runtime/concurrency-related name detected; candidate only, not evidence of behavior", "avoid broad behavioral claims without verifier evidence");
         }
         if (endsWith(path, ".sh")) {
-            try builder.risk_surfaces.append(try risk(builder, path, "shell_script", "shell script detected", "inspect argv semantics before any execution proposal"));
+            try builder.appendRisk("risk.shell_script", "shell_script", path, "medium", "shell script detected; candidate execution semantics are unknown", "inspect argv semantics before any execution proposal");
         }
         if (std.mem.startsWith(u8, entry.basename, ".env") or containsAny(lower, &.{ "config", ".toml", ".yaml", ".yml", ".json" })) {
-            try builder.risk_surfaces.append(try risk(builder, path, "config_env", "configuration or environment-like file detected", "unknown values are not evidence of runtime behavior"));
+            try builder.appendRisk("risk.config_env", "config_env", path, "low", "configuration or environment-like file detected; values were not verified", "unknown values are not evidence of runtime behavior");
         }
         if (containsAny(lower, &.{ "verifier", "test_", "_test", "tests", "bench" })) {
-            try builder.risk_surfaces.append(try risk(builder, path, "verifier_test_harness", "test/verifier/benchmark surface detected", "keep proposed checks separate from executed verifier results"));
+            try builder.appendRisk("risk.verifier_test_harness", "verifier_test_harness", path, "low", "test/verifier/benchmark surface detected; candidate only", "keep proposed checks separate from executed verifier results");
         }
     }
+    try detectStructuralRisks(builder);
 }
 
 fn detectGaps(builder: *Builder, options: AnalyzeOptions, entry_count: usize) !void {
@@ -565,6 +625,22 @@ fn detectGaps(builder: *Builder, options: AnalyzeOptions, entry_count: usize) !v
     } else if (hasConflictingRootCandidates(builder.test_roots.items)) {
         try builder.appendSignal(&builder.unknowns, "test_root_ambiguous", "", "unknown", "medium", "multiple plausible test roots were detected and no canonical root was selected");
         try builder.appendSignal(&builder.next_questions, "choose_canonical_test_root", "", "next_question", "medium", "Which detected test root is canonical for future explicit verification?");
+    }
+    if (builder.source_roots.items.len > 0 and builder.test_roots.items.len == 0) {
+        const paths = try pathsFromRootCandidates(builder.allocator, builder.source_roots.items);
+        try builder.appendVerifierGap("gap.test_root_verifier_missing", "test_root_verifier", "source roots were detected but no test root was detected; this is missing evidence, not evidence tests are absent", paths, true);
+    }
+    if (builder.ci_configs.items.len > 0 and builder.test_commands.items.len == 0) {
+        const paths = try pathsFromSignals(builder.allocator, builder.ci_configs.items);
+        try builder.appendVerifierGap("gap.ci_test_command_missing", "test_command_verifier", "CI configuration was detected but no safe test command candidate was detected; workflow status remains unknown", paths, true);
+    }
+    if ((has(builder.entries, "Dockerfile") or has(builder.entries, "docker-compose.yml") or has(builder.entries, "compose.yml")) and !hasRuntimeVerifierCandidate(builder.safe_commands.items)) {
+        const paths = try matchingEntryPaths(builder.allocator, builder.entries, dockerOrComposeEntry);
+        try builder.appendVerifierGap("gap.runtime_verifier_missing", "runtime_container_verifier", "Docker or Compose configuration was detected but no runtime verifier candidate was detected", paths, true);
+    }
+    if (hasTerraformConfig(builder.entries) and !hasConfigValidationCandidate(builder.safe_commands.items)) {
+        const paths = try matchingEntryPaths(builder.allocator, builder.entries, terraformEntry);
+        try builder.appendVerifierGap("gap.config_validation_missing", "config_validation_verifier", "Terraform/config-heavy files were detected but no validation verifier candidate was detected", paths, true);
     }
     if (builder.languages.items.len == 0) {
         try builder.appendSignal(&builder.unknowns, "project_type_unknown", "", "unknown", "high", "no known language/toolchain signal was detected");
@@ -591,17 +667,39 @@ fn detectGaps(builder: *Builder, options: AnalyzeOptions, entry_count: usize) !v
         try builder.appendSignal(&builder.missing_pack_recommendations, "no_pack_recommendation", "", "gap", "medium", "Pass 1 does not auto-select or mount Knowledge Packs");
     }
     try builder.appendSignal(&builder.unknown_verifiers, "verifier_registration_status", "", "unknown", "high", "Project Autopsy only proposes verifier candidates; it does not inspect registry state or register adapters");
-    try builder.appendSignal(&builder.gap_missing_verifiers, "verifier_execution_not_run", "", "verifier_gap", "high", "No verifier execution result exists because autopsy is read-only");
+    try builder.appendVerifierGap("gap.verifier_execution_not_run", "verifier_execution_result", "No verifier execution result exists because autopsy is read-only; this is missing evidence, not negative evidence", &.{}, true);
     if (entry_count >= options.max_entries) try builder.appendSignal(&builder.unknowns, "traversal_entry_limit_reached", "", "unknown", "medium", "directory traversal hit max_entries bound");
 }
 
-fn risk(builder: *Builder, path: []const u8, kind: []const u8, reason_text: []const u8, caution: []const u8) !RiskSurface {
-    return .{
-        .path = try builder.allocator.dupe(u8, path),
-        .risk_kind = try builder.allocator.dupe(u8, kind),
-        .reason = try builder.allocator.dupe(u8, reason_text),
-        .suggested_caution = try builder.allocator.dupe(u8, caution),
-    };
+fn detectStructuralRisks(builder: *Builder) !void {
+    if (builder.source_roots.items.len > 0 and builder.test_roots.items.len == 0) {
+        const paths = try pathsFromRootCandidates(builder.allocator, builder.source_roots.items);
+        try builder.appendRiskWithPaths("risk.source_without_tests", "source_without_tests", "", paths, "medium", "source root candidates exist but no test root candidate was detected; missing evidence is not negative evidence", "identify or verify test roots before making coverage claims");
+    }
+    if (builder.config_files.items.len > 0 and builder.ci_configs.items.len == 0) {
+        const paths = try pathsFromSignals(builder.allocator, builder.config_files.items);
+        try builder.appendRiskWithPaths("risk.config_without_ci", "config_without_ci", "", paths, "medium", "build/package configuration exists but no CI config was detected in the inspected workspace", "do not infer CI absence globally; confirm intended verification workflow");
+    }
+    if (hasAmbiguousConfigSurfaces(builder.config_files.items)) {
+        const paths = try pathsFromSignals(builder.allocator, builder.config_files.items);
+        try builder.appendRiskWithPaths("risk.multiple_config_systems", "multiple_config_systems", "", paths, "medium", "multiple plausible project configuration systems were detected and no canonical system was selected", "choose the canonical config before deriving verifier expectations");
+    }
+    if (builder.docs.items.len > 0 and builder.config_files.items.len == 0) {
+        const paths = try pathsFromSignals(builder.allocator, builder.docs.items);
+        try builder.appendRiskWithPaths("risk.docs_without_config", "docs_without_config", "", paths, "low", "documentation exists but no project configuration surface was detected", "treat docs as claims until project configuration evidence is found");
+    }
+    if (builder.ci_configs.items.len > 0 and builder.test_commands.items.len == 0) {
+        const paths = try pathsFromSignals(builder.allocator, builder.ci_configs.items);
+        try builder.appendRiskWithPaths("risk.ci_without_test_candidate", "ci_without_test_candidate", "", paths, "medium", "CI configuration exists but no safe test command candidate was detected", "inspect CI intent or project scripts before claiming tests are runnable");
+    }
+    if (has(builder.entries, "Dockerfile") or has(builder.entries, "docker-compose.yml") or has(builder.entries, "compose.yml")) {
+        const paths = try matchingEntryPaths(builder.allocator, builder.entries, dockerOrComposeEntry);
+        try builder.appendRiskWithPaths("risk.container_runtime_unverified", "container_runtime_unverified", "", paths, "medium", "Docker or Compose configuration exists and runtime behavior remains unverified", "require an explicit runtime verifier before making container behavior claims");
+    }
+    if (hasTerraformConfig(builder.entries)) {
+        const paths = try matchingEntryPaths(builder.allocator, builder.entries, terraformEntry);
+        try builder.appendRiskWithPaths("risk.config_validation_missing", "config_validation_missing", "", paths, "medium", "Terraform/config-heavy files exist and no validation result was produced", "require explicit config validation evidence before support claims");
+    }
 }
 
 fn collectEntries(allocator: std.mem.Allocator, root_abs: []const u8, options: AnalyzeOptions) ![]Entry {
@@ -859,6 +957,76 @@ fn signalEvidencePaths(allocator: std.mem.Allocator, path: []const u8) ![]const 
     return paths;
 }
 
+fn dupeStringSlice(allocator: std.mem.Allocator, items: []const []const u8) ![]const []const u8 {
+    if (items.len == 0) return &.{};
+    const copy = try allocator.alloc([]const u8, items.len);
+    for (items, 0..) |item, i| copy[i] = try allocator.dupe(u8, item);
+    return copy;
+}
+
+fn pathsFromSignals(allocator: std.mem.Allocator, items: []const Signal) ![]const []const u8 {
+    var paths = std.ArrayList([]const u8).init(allocator);
+    for (items) |item| {
+        if (item.path.len == 0) continue;
+        if (containsString(paths.items, item.path)) continue;
+        try paths.append(try allocator.dupe(u8, item.path));
+        if (paths.items.len >= 8) break;
+    }
+    return paths.toOwnedSlice();
+}
+
+fn pathsFromRootCandidates(allocator: std.mem.Allocator, items: []const RootCandidate) ![]const []const u8 {
+    var paths = std.ArrayList([]const u8).init(allocator);
+    for (items) |item| {
+        if (containsString(paths.items, item.path)) continue;
+        try paths.append(try allocator.dupe(u8, item.path));
+        if (paths.items.len >= 8) break;
+    }
+    return paths.toOwnedSlice();
+}
+
+fn matchingEntryPaths(allocator: std.mem.Allocator, entries: []const Entry, comptime predicate: fn (Entry) bool) ![]const []const u8 {
+    var paths = std.ArrayList([]const u8).init(allocator);
+    for (entries) |entry| {
+        if (entry.is_dir or !predicate(entry)) continue;
+        if (containsString(paths.items, entry.rel_path)) continue;
+        try paths.append(try allocator.dupe(u8, entry.rel_path));
+        if (paths.items.len >= 8) break;
+    }
+    return paths.toOwnedSlice();
+}
+
+fn dockerOrComposeEntry(entry: Entry) bool {
+    return std.mem.eql(u8, entry.basename, "Dockerfile") or
+        std.mem.eql(u8, entry.basename, "docker-compose.yml") or
+        std.mem.eql(u8, entry.basename, "compose.yml");
+}
+
+fn terraformEntry(entry: Entry) bool {
+    return endsWith(entry.rel_path, ".tf");
+}
+
+fn hasTerraformConfig(entries: []const Entry) bool {
+    for (entries) |entry| {
+        if (!entry.is_dir and terraformEntry(entry)) return true;
+    }
+    return false;
+}
+
+fn hasRuntimeVerifierCandidate(items: []const SafeCommandCandidate) bool {
+    for (items) |item| {
+        if (containsAny(item.id, &.{ "runtime", "docker", "compose", "container" })) return true;
+    }
+    return false;
+}
+
+fn hasConfigValidationCandidate(items: []const SafeCommandCandidate) bool {
+    for (items) |item| {
+        if (containsAny(item.id, &.{ "validate", "lint", "fmt", "terraform" })) return true;
+    }
+    return false;
+}
+
 fn ciSurfaceName(path: []const u8) ?[]const u8 {
     if (startsWith(path, ".github/workflows/") and (endsWith(path, ".yml") or endsWith(path, ".yaml"))) return "github_actions";
     if (std.mem.eql(u8, path, ".gitlab-ci.yml")) return "gitlab_ci";
@@ -986,6 +1154,21 @@ fn containsSignal(items: []const Signal, name: []const u8, path: []const u8, kin
     return false;
 }
 
+fn containsRisk(items: []const RiskSurface, id: []const u8) bool {
+    for (items) |item| if (std.mem.eql(u8, item.id, id)) return true;
+    return false;
+}
+
+fn containsVerifierGap(items: []const VerifierGapCandidate, id: []const u8) bool {
+    for (items) |item| if (std.mem.eql(u8, item.id, id)) return true;
+    return false;
+}
+
+fn containsString(items: []const []const u8, value: []const u8) bool {
+    for (items) |item| if (std.mem.eql(u8, item, value)) return true;
+    return false;
+}
+
 fn containsRootCandidate(items: []const RootCandidate, path: []const u8, kind: []const u8) bool {
     for (items) |item| if (std.mem.eql(u8, item.path, path) and std.mem.eql(u8, item.kind, kind)) return true;
     return false;
@@ -1038,13 +1221,21 @@ fn sortRootCandidates(items: []RootCandidate) void {
 }
 
 fn riskLessThan(_: void, a: RiskSurface, b: RiskSurface) bool {
-    const p = std.mem.order(u8, a.path, b.path);
+    const p = std.mem.order(u8, a.id, b.id);
     if (p != .eq) return p == .lt;
-    return std.mem.order(u8, a.risk_kind, b.risk_kind) == .lt;
+    return std.mem.order(u8, a.path, b.path) == .lt;
 }
 
 fn sortRisks(items: []RiskSurface) void {
     std.mem.sort(RiskSurface, items, {}, riskLessThan);
+}
+
+fn verifierGapLessThan(_: void, a: VerifierGapCandidate, b: VerifierGapCandidate) bool {
+    return std.mem.order(u8, a.id, b.id) == .lt;
+}
+
+fn sortVerifierGaps(items: []VerifierGapCandidate) void {
+    std.mem.sort(VerifierGapCandidate, items, {}, verifierGapLessThan);
 }
 
 fn commandLessThan(_: void, a: SafeCommandCandidate, b: SafeCommandCandidate) bool {
@@ -1125,6 +1316,16 @@ fn containsNamedSignal(items: []const Signal, name: []const u8) bool {
 
 fn findSignal(items: []const Signal, name: []const u8) ?Signal {
     for (items) |item| if (std.mem.eql(u8, item.name, name)) return item;
+    return null;
+}
+
+fn findRisk(items: []const RiskSurface, id: []const u8) ?RiskSurface {
+    for (items) |item| if (std.mem.eql(u8, item.id, id)) return item;
+    return null;
+}
+
+fn findVerifierGap(items: []const VerifierGapCandidate, id: []const u8) ?VerifierGapCandidate {
+    for (items) |item| if (std.mem.eql(u8, item.id, id)) return item;
     return null;
 }
 
@@ -1539,6 +1740,112 @@ test "project autopsy detects build config security migration and runtime risks"
     try std.testing.expect(result.project_profile.risk_surfaces.len >= 5);
 }
 
+test "project autopsy reports source without tests as risk and verifier gap" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "src/main.zig", "pub fn main() void {}\n");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+
+    const risk_item = findRisk(result.project_profile.risk_surfaces, "risk.source_without_tests") orelse return error.MissingRisk;
+    try std.testing.expectEqualStrings("source_without_tests", risk_item.kind);
+    try std.testing.expectEqualStrings("medium", risk_item.risk_level);
+    try std.testing.expect(risk_item.non_authorizing);
+    try std.testing.expect(risk_item.requires_verification);
+    try std.testing.expect(risk_item.evidence_paths.len > 0);
+    try std.testing.expectEqualStrings("src", risk_item.evidence_paths[0]);
+
+    const gap = findVerifierGap(result.project_gap_report.missing_verifier_adapters, "gap.test_root_verifier_missing") orelse return error.MissingVerifierGap;
+    try std.testing.expectEqualStrings("test_root_verifier", gap.missing_verifier);
+    try std.testing.expect(gap.non_authorizing);
+    try std.testing.expect(gap.blocks_support);
+    try std.testing.expect(std.mem.indexOf(u8, gap.reason, "missing evidence") != null);
+}
+
+test "project autopsy reports CI without safe test command as verifier gap" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, ".github/workflows/ci.yml", "name: ci\n");
+    try makeFile(tmp.dir, "README.md", "# docs\n");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+
+    const risk_item = findRisk(result.project_profile.risk_surfaces, "risk.ci_without_test_candidate") orelse return error.MissingRisk;
+    try std.testing.expectEqualStrings("ci_without_test_candidate", risk_item.kind);
+    try std.testing.expectEqualStrings(".github/workflows/ci.yml", risk_item.evidence_paths[0]);
+    const gap = findVerifierGap(result.project_profile.verifier_gap_summary.missing_likely_verifier_adapters, "gap.ci_test_command_missing") orelse return error.MissingVerifierGap;
+    try std.testing.expectEqualStrings("test_command_verifier", gap.missing_verifier);
+    try std.testing.expect(gap.blocks_support);
+}
+
+test "project autopsy reports multiple config systems as risk surface" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "package.json", "{}\n");
+    try makeFile(tmp.dir, "pyproject.toml", "[project]\nname = \"x\"\n");
+    try makeFile(tmp.dir, "Cargo.toml", "[package]\nname = \"x\"\n");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+
+    const risk_item = findRisk(result.project_profile.risk_surfaces, "risk.multiple_config_systems") orelse return error.MissingRisk;
+    try std.testing.expectEqualStrings("multiple_config_systems", risk_item.kind);
+    try std.testing.expect(risk_item.evidence_paths.len >= 3);
+    try std.testing.expect(risk_item.requires_verification);
+    try std.testing.expect(containsNamedSignal(result.project_profile.unknowns, "project_config_ambiguous"));
+}
+
+test "project autopsy reports Docker runtime verifier gap" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "Dockerfile", "FROM scratch\n");
+    try makeFile(tmp.dir, "compose.yml", "services: {}\n");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+
+    const risk_item = findRisk(result.project_profile.risk_surfaces, "risk.container_runtime_unverified") orelse return error.MissingRisk;
+    try std.testing.expectEqualStrings("container_runtime_unverified", risk_item.kind);
+    try std.testing.expect(risk_item.evidence_paths.len >= 2);
+    const gap = findVerifierGap(result.project_gap_report.missing_verifier_adapters, "gap.runtime_verifier_missing") orelse return error.MissingVerifierGap;
+    try std.testing.expectEqualStrings("runtime_container_verifier", gap.missing_verifier);
+    try std.testing.expect(gap.non_authorizing);
+}
+
+test "project autopsy reports config validation gap for terraform" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "infra/main.tf", "terraform {}\n");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+
+    const risk_item = findRisk(result.project_profile.risk_surfaces, "risk.config_validation_missing") orelse return error.MissingRisk;
+    try std.testing.expectEqualStrings("config_validation_missing", risk_item.kind);
+    try std.testing.expectEqualStrings("infra/main.tf", risk_item.evidence_paths[0]);
+    const gap = findVerifierGap(result.project_gap_report.missing_verifier_adapters, "gap.config_validation_missing") orelse return error.MissingVerifierGap;
+    try std.testing.expectEqualStrings("config_validation_verifier", gap.missing_verifier);
+}
+
+test "project autopsy does not report false missing test gap when tests and safe command exist" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "build.zig", "pub fn build(b: *std.Build) void { _ = b.step(\"test\", \"\"); }");
+    try makeFile(tmp.dir, "src/main.zig", "pub fn main() void {}\n");
+    try makeFile(tmp.dir, "tests/main_test.zig", "test \"x\" {}\n");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+
+    try std.testing.expect(findRisk(result.project_profile.risk_surfaces, "risk.source_without_tests") == null);
+    try std.testing.expect(findRisk(result.project_profile.risk_surfaces, "risk.ci_without_test_candidate") == null);
+    try std.testing.expect(findVerifierGap(result.project_gap_report.missing_verifier_adapters, "gap.test_root_verifier_missing") == null);
+    try std.testing.expect(result.project_gap_report.missing_test_command == null);
+    try std.testing.expect(containsCommand(result.project_profile.safe_command_candidates, "zig_build_test"));
+}
+
 test "project autopsy gap report includes missing test command" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1613,6 +1920,15 @@ test "project autopsy JSON output keeps stable draft safety fields" {
 
     const profile_obj = root_obj.get("project_profile").?.object;
     try std.testing.expect(profile_obj.get("non_authorizing").?.bool);
+    for (profile_obj.get("risk_surfaces").?.array.items) |risk_value| {
+        const risk_obj = risk_value.object;
+        try std.testing.expect(risk_obj.get("id").?.string.len > 0);
+        try std.testing.expect(risk_obj.get("kind").?.string.len > 0);
+        try std.testing.expect(risk_obj.get("risk_level").?.string.len > 0);
+        try std.testing.expect(risk_obj.get("evidence_paths").?.array.items.len > 0);
+        try std.testing.expect(risk_obj.get("requires_verification").?.bool);
+        try std.testing.expect(risk_obj.get("non_authorizing").?.bool);
+    }
     for (profile_obj.get("safe_command_candidates").?.array.items) |candidate_value| {
         const candidate = candidate_value.object;
         try std.testing.expect(candidate.get("purpose").?.string.len > 0);
@@ -1630,6 +1946,16 @@ test "project autopsy JSON output keeps stable draft safety fields" {
         try std.testing.expect(plan.get("requires_user_confirmation").?.bool);
         try std.testing.expect(plan.get("non_authorizing").?.bool);
         try std.testing.expect(!plan.get("executes_by_default").?.bool);
+    }
+
+    const gap_report_obj = root_obj.get("project_gap_report").?.object;
+    for (gap_report_obj.get("missing_verifier_adapters").?.array.items) |gap_value| {
+        const gap_obj = gap_value.object;
+        try std.testing.expect(gap_obj.get("id").?.string.len > 0);
+        try std.testing.expectEqualStrings("verifier_gap", gap_obj.get("kind").?.string);
+        try std.testing.expect(gap_obj.get("missing_verifier").?.string.len > 0);
+        try std.testing.expect(gap_obj.get("blocks_support").?.bool);
+        try std.testing.expect(gap_obj.get("non_authorizing").?.bool);
     }
 }
 

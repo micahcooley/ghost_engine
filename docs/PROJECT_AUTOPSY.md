@@ -164,7 +164,46 @@ as auth/security names, migrations/database areas, CI/deployment files, build
 and dependency files, runtime/concurrency files, shell scripts, config/env files,
 and verifier/test harness files.
 
-These signals do not authorize correctness claims or edits.
+Risk surfaces include:
+
+- `id`
+- `kind`
+- `path`
+- `related_paths`
+- `risk_level`
+- `reason`
+- `evidence_paths`
+- `requires_verification: true`
+- `non_authorizing: true`
+
+Pass 1 also derives conservative structural risk surfaces such as source roots
+without detected test roots, build/package config without detected CI,
+ambiguous package/config systems, docs without project config, CI without a
+safe test command candidate, container runtime config without a runtime
+verifier candidate, and Terraform/config-heavy files without a validation
+candidate.
+
+These signals do not authorize correctness claims or edits. They are candidates
+for future explicit verification, not proof of defects.
+
+## Verifier Gaps
+
+Verifier gaps are missing-evidence indicators, not failures. Each gap includes:
+
+- `id`
+- `kind: verifier_gap`
+- `missing_verifier`
+- `reason`
+- `related_paths`
+- `evidence_paths`
+- `blocks_support`
+- `non_authorizing: true`
+
+Examples include detected source roots without detected test roots, CI config
+without a safe test command candidate, Docker/Compose surfaces without a runtime
+verifier candidate, and Terraform/config-heavy files without a validation
+candidate. `blocks_support: true` means Ghost should not treat the related
+claim as supported until separate explicit verifier evidence exists.
 
 ## Future Learning Loop Role
 
