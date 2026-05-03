@@ -54,15 +54,22 @@ Command candidates are data only. They use `argv[]`, never shell strings, and
 always include:
 
 - `cwd`
+- `purpose`
 - `reason`
 - `detected_from`
 - `risk_level`
+- `read_only: false`
+- `mutation_risk_disclosure`
+- `why_candidate_exists`
+- `executes_by_default: false`
 - `requires_user_confirmation: true`
 - `non_authorizing: true`
 
 Pass 1 rejects sudo, install, shell-string, network, and arbitrary mutation
 commands. A candidate is not evidence that a command succeeds; it is only a
-future verifier candidate.
+future verifier candidate. `read_only: false` is intentional because even safe
+build/test command candidates may write caches, build outputs, snapshots, or
+reports if a user later chooses to execute them outside Autopsy.
 
 ## Verifier Plan Candidates
 

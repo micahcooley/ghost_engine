@@ -29,9 +29,14 @@ pub const SafeCommandCandidate = struct {
     id: []const u8,
     argv: []const []const u8,
     cwd: []const u8,
+    purpose: []const u8,
     reason: []const u8,
     detected_from: []const u8,
     risk_level: []const u8,
+    read_only: bool = false,
+    mutation_risk_disclosure: []const u8,
+    why_candidate_exists: []const u8,
+    executes_by_default: bool = false,
     requires_user_confirmation: bool = true,
     non_authorizing: bool = true,
 };
@@ -211,9 +216,12 @@ const Builder = struct {
             .id = try self.allocator.dupe(u8, id),
             .argv = argv_copy,
             .cwd = try self.allocator.dupe(u8, self.root_abs),
+            .purpose = try self.allocator.dupe(u8, verifierPlanPurpose(id)),
             .reason = try self.allocator.dupe(u8, reason),
             .detected_from = try self.allocator.dupe(u8, detected_from),
             .risk_level = try self.allocator.dupe(u8, risk_level),
+            .mutation_risk_disclosure = try self.allocator.dupe(u8, commandMutationRiskDisclosure(id)),
+            .why_candidate_exists = try std.fmt.allocPrint(self.allocator, "{s}; detected from {s}; candidate only and not executed", .{ reason, detected_from }),
         });
         try self.appendVerifierPlan(id, argv, detected_from, reason, risk_level);
     }
@@ -795,6 +803,13 @@ fn verifierPlanPurpose(id: []const u8) []const u8 {
     return "bounded verifier plan candidate";
 }
 
+fn commandMutationRiskDisclosure(id: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, id, "bench") != null) return "candidate may write benchmark outputs, caches, or reports if a user later executes it";
+    if (std.mem.indexOf(u8, id, "test") != null or std.mem.eql(u8, id, "pytest")) return "candidate may write test caches, snapshots, coverage, or temporary outputs if a user later executes it";
+    if (std.mem.indexOf(u8, id, "build") != null) return "candidate may write build artifacts or caches if a user later executes it";
+    return "candidate execution effects are unknown because Project Autopsy does not run commands";
+}
+
 fn verifierPlanConfidence(id: []const u8, detected_from: []const u8) []const u8 {
     if (detected_from.len == 0) return "unknown";
     if (std.mem.indexOf(u8, id, "bench") != null or std.mem.indexOf(u8, id, "parity") != null) return "medium";
@@ -1034,9 +1049,32 @@ test "project autopsy safe command candidates are argv only and require confirma
     const result = try analyze(std.heap.page_allocator, root, .{});
     for (result.project_profile.safe_command_candidates) |candidate| {
         try std.testing.expect(candidate.argv.len > 0);
+        try std.testing.expect(candidate.purpose.len > 0);
+        try std.testing.expect(!candidate.read_only);
+        try std.testing.expect(candidate.mutation_risk_disclosure.len > 0);
+        try std.testing.expect(candidate.why_candidate_exists.len > 0);
+        try std.testing.expect(!candidate.executes_by_default);
         try std.testing.expect(candidate.requires_user_confirmation);
         try std.testing.expect(candidate.non_authorizing);
         for (candidate.argv) |part| try std.testing.expect(std.mem.indexOfScalar(u8, part, ';') == null);
+    }
+}
+
+test "project autopsy command candidates disclose candidate-only authority and mutation risk" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "build.zig", "pub fn build(b: *std.Build) void { _ = b.step(\"test\", \"\"); _ = b.step(\"bench-serious-workflows\", \"\"); }");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+
+    for (result.project_profile.safe_command_candidates) |candidate| {
+        try std.testing.expectEqual(false, candidate.executes_by_default);
+        try std.testing.expectEqual(false, candidate.read_only);
+        try std.testing.expect(std.mem.indexOf(u8, candidate.why_candidate_exists, "candidate only and not executed") != null);
+        try std.testing.expect(std.mem.indexOf(u8, candidate.mutation_risk_disclosure, "if a user later executes it") != null);
+        try std.testing.expect(std.mem.indexOf(u8, candidate.mutation_risk_disclosure, "unknown") != null or
+            std.mem.indexOf(u8, candidate.mutation_risk_disclosure, "write") != null);
     }
 }
 
@@ -1146,6 +1184,11 @@ test "project autopsy JSON output keeps stable draft safety fields" {
     try std.testing.expect(profile_obj.get("non_authorizing").?.bool);
     for (profile_obj.get("safe_command_candidates").?.array.items) |candidate_value| {
         const candidate = candidate_value.object;
+        try std.testing.expect(candidate.get("purpose").?.string.len > 0);
+        try std.testing.expect(!candidate.get("read_only").?.bool);
+        try std.testing.expect(candidate.get("mutation_risk_disclosure").?.string.len > 0);
+        try std.testing.expect(candidate.get("why_candidate_exists").?.string.len > 0);
+        try std.testing.expect(!candidate.get("executes_by_default").?.bool);
         try std.testing.expect(candidate.get("requires_user_confirmation").?.bool);
         try std.testing.expect(candidate.get("non_authorizing").?.bool);
         try std.testing.expect(candidate.get("argv").?.array.items.len > 0);
