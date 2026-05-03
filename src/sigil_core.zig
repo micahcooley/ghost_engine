@@ -84,6 +84,57 @@ pub const ValidationIssue = struct {
     message: []const u8,
 };
 
+pub const DisassemblyInstruction = struct {
+    instruction_index: usize,
+    opcode: Opcode,
+    mode: OperandMode,
+    a: i64,
+    b: i64,
+    string_index: u32,
+    string_payload: ?[]const u8,
+};
+
+pub const ProcedureCandidateKind = enum {
+    halt,
+    mood_control,
+    loom_control,
+    lock_control,
+    scan_target,
+    bind_candidate,
+    etch_candidate,
+    void_candidate,
+    test_jump,
+    unknown_procedure,
+};
+
+pub const ProcedureInspectionRecord = struct {
+    instruction_index: usize,
+    kind: ProcedureCandidateKind,
+    opcode: Opcode,
+    operand_mode: OperandMode,
+    a: i64,
+    b: i64,
+    string_index: u32,
+    string_payload: ?[]const u8,
+    non_authorizing: bool = true,
+    authority_effect: []const u8,
+    requires_review: bool,
+    requires_verification: bool,
+};
+
+pub const Disassembly = struct {
+    allocator: std.mem.Allocator,
+    validation_scope: ValidationScope,
+    validation_issue: ?ValidationIssue,
+    instructions: []DisassemblyInstruction,
+    procedure_records: []ProcedureInspectionRecord,
+
+    pub fn deinit(self: *Disassembly) void {
+        self.allocator.free(self.instructions);
+        self.allocator.free(self.procedure_records);
+    }
+};
+
 const AtomTag = enum {
     keyword_bind,
     keyword_etch,
@@ -524,6 +575,168 @@ pub fn firstValidationIssue(program: *const Program, scope: ValidationScope) ?Va
     return null;
 }
 
+pub fn disassembleProgram(allocator: std.mem.Allocator, program: *const Program, scope: ValidationScope) !Disassembly {
+    var instructions = std.ArrayList(DisassemblyInstruction).init(allocator);
+    errdefer instructions.deinit();
+
+    var procedure_records = std.ArrayList(ProcedureInspectionRecord).init(allocator);
+    errdefer procedure_records.deinit();
+
+    for (program.instructions, 0..) |inst, index| {
+        const payload = instructionStringPayload(program, inst);
+        try instructions.append(.{
+            .instruction_index = index,
+            .opcode = inst.opcode,
+            .mode = inst.mode,
+            .a = inst.a,
+            .b = inst.b,
+            .string_index = inst.string_index,
+            .string_payload = payload,
+        });
+        try procedure_records.append(procedureRecordForInstruction(index, inst, payload));
+    }
+
+    return .{
+        .allocator = allocator,
+        .validation_scope = scope,
+        .validation_issue = firstValidationIssue(program, scope),
+        .instructions = try instructions.toOwnedSlice(),
+        .procedure_records = try procedure_records.toOwnedSlice(),
+    };
+}
+
+pub fn renderDisassembly(allocator: std.mem.Allocator, program: *const Program, scope: ValidationScope) ![]u8 {
+    var disassembly = try disassembleProgram(allocator, program, scope);
+    defer disassembly.deinit();
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const writer = out.writer();
+
+    try writer.print("sigil_disassembly version={s} scope={s} instructions={d} strings={d}\n", .{
+        VERSION,
+        @tagName(scope),
+        program.instructions.len,
+        program.strings.len,
+    });
+    if (disassembly.validation_issue) |validation_issue| {
+        try writer.print("validation=failed instruction={d} code={s} message=\"{s}\"\n", .{
+            validation_issue.instruction_index,
+            @tagName(validation_issue.code),
+            validation_issue.message,
+        });
+    } else {
+        try writer.writeAll("validation=ok safety=\"candidate/control only; not proof; not support; no VM execution\"\n");
+    }
+
+    try writer.writeAll("[instructions]\n");
+    for (disassembly.instructions) |inst| {
+        try writer.print(
+            "{d:0>4} opcode={s} mode={s} a={d} b={d} string_index=",
+            .{
+                inst.instruction_index,
+                @tagName(inst.opcode),
+                @tagName(inst.mode),
+                inst.a,
+                inst.b,
+            },
+        );
+        try writeStringIndex(writer, inst.string_index);
+        if (inst.string_payload) |payload| {
+            try writer.print(" string=\"{s}\"", .{payload});
+        }
+        try writer.writeByte('\n');
+    }
+
+    try writer.writeAll("[procedure_records]\n");
+    for (disassembly.procedure_records) |record| {
+        try writer.print(
+            "{d:0>4} kind={s} opcode={s} mode={s} authority_effect={s} non_authorizing={s} requires_review={s} requires_verification={s}",
+            .{
+                record.instruction_index,
+                @tagName(record.kind),
+                @tagName(record.opcode),
+                @tagName(record.operand_mode),
+                record.authority_effect,
+                boolText(record.non_authorizing),
+                boolText(record.requires_review),
+                boolText(record.requires_verification),
+            },
+        );
+        if (record.string_payload) |payload| {
+            try writer.print(" payload=\"{s}\"", .{payload});
+        }
+        try writer.print(" a={d} b={d} string_index=", .{
+            record.a,
+            record.b,
+        });
+        try writeStringIndex(writer, record.string_index);
+        try writer.writeByte('\n');
+    }
+
+    return out.toOwnedSlice();
+}
+
+fn instructionStringPayload(program: *const Program, inst: Instruction) ?[]const u8 {
+    if ((inst.mode == .string or inst.mode == .rune_and_string) and inst.string_index != INVALID_STRING_INDEX and inst.string_index < program.strings.len) {
+        return program.strings[inst.string_index];
+    }
+    return null;
+}
+
+fn procedureRecordForInstruction(index: usize, inst: Instruction, payload: ?[]const u8) ProcedureInspectionRecord {
+    const kind: ProcedureCandidateKind = switch (inst.opcode) {
+        .halt => .halt,
+        .mood => .mood_control,
+        .loom => .loom_control,
+        .lock => .lock_control,
+        .scan => .scan_target,
+        .bind => .bind_candidate,
+        .etch => .etch_candidate,
+        .void_op => .void_candidate,
+        .jmp_if_false => .test_jump,
+    };
+    const requires_review = switch (kind) {
+        .bind_candidate, .etch_candidate, .void_candidate => true,
+        else => false,
+    };
+    const requires_verification = switch (kind) {
+        .scan_target, .bind_candidate, .etch_candidate, .void_candidate => true,
+        else => false,
+    };
+    const authority_effect: []const u8 = switch (kind) {
+        .halt, .test_jump => "none",
+        else => "candidate",
+    };
+
+    return .{
+        .instruction_index = index,
+        .kind = kind,
+        .opcode = inst.opcode,
+        .operand_mode = inst.mode,
+        .a = inst.a,
+        .b = inst.b,
+        .string_index = inst.string_index,
+        .string_payload = payload,
+        .non_authorizing = true,
+        .authority_effect = authority_effect,
+        .requires_review = requires_review,
+        .requires_verification = requires_verification,
+    };
+}
+
+fn writeStringIndex(writer: anytype, index: u32) !void {
+    if (index == INVALID_STRING_INDEX) {
+        try writer.writeAll("none");
+    } else {
+        try writer.print("{d}", .{index});
+    }
+}
+
+fn boolText(value: bool) []const u8 {
+    return if (value) "true" else "false";
+}
+
 fn issue(code: ValidationIssueCode, instruction_index: usize, message: []const u8) ValidationIssue {
     return .{
         .code = code,
@@ -638,6 +851,105 @@ test "sigil validation blocks authority and global mutation tokens" {
     try std.testing.expectEqual(ValidationIssueCode.forbidden_authority_token, pack_issue.code);
 }
 
+test "sigil disassembly is deterministic for safe loom scripts" {
+    const allocator = std.testing.allocator;
+
+    var program = try compileScript(allocator,
+        \\LOOM CPU_ONLY
+        \\LOOM TIER_1
+        \\SCAN "system_memory"
+    );
+    defer program.deinit();
+
+    const rendered = try renderDisassembly(allocator, &program, .boot_control);
+    defer allocator.free(rendered);
+
+    try std.testing.expectEqualStrings(
+        \\sigil_disassembly version=SVM1 scope=boot_control instructions=4 strings=1
+        \\validation=ok safety="candidate/control only; not proof; not support; no VM execution"
+        \\[instructions]
+        \\0000 opcode=loom mode=loom_command a=2 b=0 string_index=none
+        \\0001 opcode=loom mode=loom_command a=5 b=0 string_index=none
+        \\0002 opcode=scan mode=string a=0 b=0 string_index=0 string="system_memory"
+        \\0003 opcode=halt mode=none a=0 b=0 string_index=none
+        \\[procedure_records]
+        \\0000 kind=loom_control opcode=loom mode=loom_command authority_effect=candidate non_authorizing=true requires_review=false requires_verification=false a=2 b=0 string_index=none
+        \\0001 kind=loom_control opcode=loom mode=loom_command authority_effect=candidate non_authorizing=true requires_review=false requires_verification=false a=5 b=0 string_index=none
+        \\0002 kind=scan_target opcode=scan mode=string authority_effect=candidate non_authorizing=true requires_review=false requires_verification=true payload="system_memory" a=0 b=0 string_index=0
+        \\0003 kind=halt opcode=halt mode=none authority_effect=none non_authorizing=true requires_review=false requires_verification=false a=0 b=0 string_index=none
+        \\
+    , rendered);
+}
+
+test "sigil disassembly exposes test block jump targets without executing" {
+    const allocator = std.testing.allocator;
+
+    var program = try compileScript(allocator,
+        \\TEST FALSE {
+        \\  SCAN "system_memory"
+        \\}
+    );
+    defer program.deinit();
+
+    var disassembly = try disassembleProgram(allocator, &program, .boot_control);
+    defer disassembly.deinit();
+
+    try std.testing.expect(disassembly.validation_issue == null);
+    try std.testing.expectEqual(@as(usize, 3), disassembly.instructions.len);
+    try std.testing.expectEqual(Opcode.jmp_if_false, disassembly.instructions[0].opcode);
+    try std.testing.expectEqual(@as(i64, 0), disassembly.instructions[0].a);
+    try std.testing.expectEqual(@as(i64, 2), disassembly.instructions[0].b);
+    try std.testing.expectEqual(ProcedureCandidateKind.test_jump, disassembly.procedure_records[0].kind);
+    try std.testing.expectEqualStrings("none", disassembly.procedure_records[0].authority_effect);
+}
+
+test "sigil disassembly marks scratch mutation procedure records as candidates only" {
+    const allocator = std.testing.allocator;
+
+    var program = try compileScript(allocator,
+        \\BIND 65 TO alpha
+        \\ETCH "candidate_anchor" @2
+        \\VOID "candidate_void"
+    );
+    defer program.deinit();
+
+    var disassembly = try disassembleProgram(allocator, &program, .scratch_session);
+    defer disassembly.deinit();
+
+    try std.testing.expect(disassembly.validation_issue == null);
+    try std.testing.expectEqual(ProcedureCandidateKind.bind_candidate, disassembly.procedure_records[0].kind);
+    try std.testing.expectEqual(ProcedureCandidateKind.etch_candidate, disassembly.procedure_records[1].kind);
+    try std.testing.expectEqual(ProcedureCandidateKind.void_candidate, disassembly.procedure_records[2].kind);
+    for (disassembly.procedure_records[0..3]) |record| {
+        try std.testing.expect(record.non_authorizing);
+        try std.testing.expectEqualStrings("candidate", record.authority_effect);
+        try std.testing.expect(record.requires_review);
+        try std.testing.expect(record.requires_verification);
+    }
+
+    const boot_issue = firstValidationIssue(&program, .boot_control) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(ValidationIssueCode.mutation_requires_scratch_session, boot_issue.code);
+}
+
+test "sigil disassembly reports validation failure without VM execution" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectError(error.ParseFailed, compileScript(allocator, "SHELL \"echo hidden\""));
+
+    var program = try compileScript(allocator, "SCAN \"support\"");
+    defer program.deinit();
+
+    var disassembly = try disassembleProgram(allocator, &program, .scratch_session);
+    defer disassembly.deinit();
+
+    const validation_issue = disassembly.validation_issue orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(ValidationIssueCode.forbidden_authority_token, validation_issue.code);
+    try std.testing.expectEqual(@as(usize, 0), validation_issue.instruction_index);
+    try std.testing.expectEqual(ProcedureCandidateKind.scan_target, disassembly.procedure_records[0].kind);
+    try std.testing.expect(disassembly.procedure_records[0].non_authorizing);
+    try std.testing.expect(disassembly.procedure_records[0].requires_verification);
+}
+
 pub fn serializeProgram(allocator: std.mem.Allocator, program: *const Program) ![]u8 {
     var output = std.ArrayList(u8).init(allocator);
     errdefer output.deinit();
@@ -687,6 +999,12 @@ fn reportError(line: u32, col: u32, msg: []const u8, extra: []const u8) void {
     std.debug.print("[SIGIL ERR {d}:{d}] {s}: {s}\n", .{ line, col, msg, extra });
 }
 
+fn parseValidationScope(text: []const u8) ?ValidationScope {
+    if (std.ascii.eqlIgnoreCase(text, "boot_control")) return .boot_control;
+    if (std.ascii.eqlIgnoreCase(text, "scratch_session")) return .scratch_session;
+    return null;
+}
+
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -695,10 +1013,18 @@ pub fn main() !void {
     const args = try sys.getArgs(allocator);
     if (args.len < 2) {
         sys.printOut("Usage: sigil_core <script.sigil> [output.sigbc]\n");
+        sys.printOut("       sigil_core --disassemble <script.sigil> [boot_control|scratch_session]\n");
         return;
     }
 
-    const input_path = args[1];
+    const disassemble_only = std.mem.eql(u8, args[1], "--disassemble");
+    const input_path = if (disassemble_only) blk: {
+        if (args.len < 3) {
+            sys.printOut("Usage: sigil_core --disassemble <script.sigil> [boot_control|scratch_session]\n");
+            return;
+        }
+        break :blk args[2];
+    } else args[1];
     const input_handle = try sys.openForRead(allocator, input_path);
     defer sys.closeFile(input_handle);
 
@@ -708,6 +1034,18 @@ pub fn main() !void {
 
     var program = try compileScript(allocator, buffer);
     defer program.deinit();
+
+    if (disassemble_only) {
+        const scope = if (args.len >= 4) parseValidationScope(args[3]) orelse {
+            std.debug.print("[SIGIL ERR] unknown validation scope: {s}\n", .{args[3]});
+            return error.SigilValidationFailed;
+        } else ValidationScope.scratch_session;
+        const rendered = try renderDisassembly(allocator, &program, scope);
+        const stdout = std.io.getStdOut().writer();
+        try stdout.writeAll(rendered);
+        return;
+    }
+
     try validateProgram(&program, .scratch_session);
 
     const output_path = if (args.len >= 3) args[2] else blk: {
