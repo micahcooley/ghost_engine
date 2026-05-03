@@ -14,8 +14,10 @@ It produces two draft, non-authorizing artifacts:
   recommendation, unsafe command candidate, or next question.
 
 It also emits `verifier_plan_candidates`, a draft list derived from safe command
-candidates. These are proposed verifier plans only; Autopsy does not approve,
-register, schedule, or execute them.
+candidates, and `recommended_guidance_candidates`, a draft list of procedure
+guidance candidates derived from detected structure, risks, and verifier gaps.
+These are proposals only; Autopsy does not approve, register, schedule, execute,
+mount, import, update, promote, or apply them.
 
 ## Read-Only Contract
 
@@ -204,6 +206,54 @@ without a safe test command candidate, Docker/Compose surfaces without a runtime
 verifier candidate, and Terraform/config-heavy files without a validation
 candidate. `blocks_support: true` means Ghost should not treat the related
 claim as supported until separate explicit verifier evidence exists.
+
+## Recommended Guidance Candidates
+
+Recommended guidance candidates are review-required routing hints only. They do
+not claim that a Knowledge Pack exists, is mounted, or is available. When no
+registry-safe availability check exists, Autopsy emits `guidance_id` values and
+leaves `pack_id` null.
+
+Each candidate includes:
+
+- `id`
+- `kind: pack_guidance_candidate`
+- `pack_id: null`
+- `guidance_id`
+- `reason`
+- `evidence_paths`
+- `related_languages`
+- `related_risks`
+- `related_verifier_gaps`
+- `suggested_next_action`
+- `non_authorizing: true`
+- `candidate_only: true`
+- `requires_review: true`
+- `mutates_state: false`
+- `applies_by_default: false`
+
+Current conservative candidates include:
+
+- `zig_project_baseline`
+- `node_project_baseline`
+- `python_project_baseline`
+- `rust_project_baseline`
+- `container_runtime_guidance`
+- `terraform_validation_guidance`
+- `ci_workflow_guidance`
+- `test_discovery_guidance`
+
+Autopsy links candidates to relevant detected languages, risk-surface IDs, and
+verifier-gap IDs when those signals exist. For example, Docker/Compose surfaces
+can recommend `container_runtime_guidance` and link
+`gap.runtime_verifier_missing`; Terraform files can recommend
+`terraform_validation_guidance` and link `gap.config_validation_missing`.
+Ambiguous or multi-language projects may emit multiple review-required
+candidates without choosing one as authoritative.
+
+If no known pattern matches, Autopsy emits no fake available pack. It reports an
+explicit unknown such as `pack_guidance_candidates_unknown` and keeps
+`recommended_guidance_candidates` empty.
 
 ## Future Learning Loop Role
 

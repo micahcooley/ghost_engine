@@ -86,6 +86,24 @@ pub const VerifierPlanCandidate = struct {
     unknowns: []const []const u8 = &.{},
 };
 
+pub const RecommendedGuidanceCandidate = struct {
+    id: []const u8,
+    kind: []const u8,
+    pack_id: ?[]const u8 = null,
+    guidance_id: []const u8,
+    reason: []const u8,
+    evidence_paths: []const []const u8 = &.{},
+    related_languages: []const []const u8 = &.{},
+    related_risks: []const []const u8 = &.{},
+    related_verifier_gaps: []const []const u8 = &.{},
+    suggested_next_action: []const u8,
+    non_authorizing: bool = true,
+    candidate_only: bool = true,
+    requires_review: bool = true,
+    mutates_state: bool = false,
+    applies_by_default: bool = false,
+};
+
 pub const VerifierGapSummary = struct {
     known_possible_verifier_adapters: []Signal = &.{},
     missing_likely_verifier_adapters: []VerifierGapCandidate = &.{},
@@ -111,6 +129,7 @@ pub const ProjectProfile = struct {
     safe_command_candidates: []SafeCommandCandidate = &.{},
     verifier_gap_summary: VerifierGapSummary = .{},
     recommended_packs: []Signal = &.{},
+    recommended_guidance_candidates: []RecommendedGuidanceCandidate = &.{},
     unknowns: []Signal = &.{},
     confidence_summary: []const u8 = "draft profile; no correctness claims",
     non_authorizing: bool = true,
@@ -168,6 +187,7 @@ const Builder = struct {
     safe_commands: std.ArrayList(SafeCommandCandidate),
     verifier_plans: std.ArrayList(VerifierPlanCandidate),
     recommended_packs: std.ArrayList(Signal),
+    recommended_guidance_candidates: std.ArrayList(RecommendedGuidanceCandidate),
     unknowns: std.ArrayList(Signal),
     trace: std.ArrayList(Signal),
     possible_verifiers: std.ArrayList(Signal),
@@ -201,6 +221,7 @@ const Builder = struct {
             .safe_commands = .init(allocator),
             .verifier_plans = .init(allocator),
             .recommended_packs = .init(allocator),
+            .recommended_guidance_candidates = .init(allocator),
             .unknowns = .init(allocator),
             .trace = .init(allocator),
             .possible_verifiers = .init(allocator),
@@ -343,6 +364,32 @@ const Builder = struct {
         });
     }
 
+    fn appendGuidanceCandidate(
+        self: *Builder,
+        id: []const u8,
+        kind: []const u8,
+        guidance_id: []const u8,
+        reason_text: []const u8,
+        evidence_paths: []const []const u8,
+        related_languages: []const []const u8,
+        related_risks: []const []const u8,
+        related_verifier_gaps: []const []const u8,
+        suggested_next_action: []const u8,
+    ) !void {
+        if (containsGuidanceCandidate(self.recommended_guidance_candidates.items, id)) return;
+        try self.recommended_guidance_candidates.append(.{
+            .id = try self.allocator.dupe(u8, id),
+            .kind = try self.allocator.dupe(u8, kind),
+            .guidance_id = try self.allocator.dupe(u8, guidance_id),
+            .reason = try self.allocator.dupe(u8, reason_text),
+            .evidence_paths = try dupeStringSlice(self.allocator, evidence_paths),
+            .related_languages = try dupeStringSlice(self.allocator, related_languages),
+            .related_risks = try dupeStringSlice(self.allocator, related_risks),
+            .related_verifier_gaps = try dupeStringSlice(self.allocator, related_verifier_gaps),
+            .suggested_next_action = try self.allocator.dupe(u8, suggested_next_action),
+        });
+    }
+
     fn finish(self: *Builder) !AutopsyResult {
         sortSignals(self.languages.items);
         sortSignals(self.frameworks.items);
@@ -360,6 +407,7 @@ const Builder = struct {
         sortCommands(self.safe_commands.items);
         sortVerifierPlans(self.verifier_plans.items);
         sortSignals(self.recommended_packs.items);
+        sortGuidanceCandidates(self.recommended_guidance_candidates.items);
         sortSignals(self.unknowns.items);
         sortSignals(self.trace.items);
         sortSignals(self.possible_verifiers.items);
@@ -413,6 +461,7 @@ const Builder = struct {
                     .recommended_next_checks = try self.next_checks.toOwnedSlice(),
                 },
                 .recommended_packs = try self.recommended_packs.toOwnedSlice(),
+                .recommended_guidance_candidates = try self.recommended_guidance_candidates.toOwnedSlice(),
                 .unknowns = try self.unknowns.toOwnedSlice(),
                 .confidence_summary = if (self.unknowns.items.len == 0) "high confidence for detected signals only; no correctness claims" else "partial profile; unknowns remain explicit and non-authorizing",
                 .trace = try self.trace.toOwnedSlice(),
@@ -445,6 +494,8 @@ pub fn analyze(allocator: std.mem.Allocator, workspace_root: []const u8, options
     try detectLanguagesAndCommands(&builder);
     try detectRisks(&builder);
     try detectGaps(&builder, options, entries.len);
+    try detectRecommendedGuidance(&builder);
+    try detectGuidanceGaps(&builder);
     return builder.finish();
 }
 
@@ -663,12 +714,126 @@ fn detectGaps(builder: *Builder, options: AnalyzeOptions, entry_count: usize) !v
         try builder.appendSignal(&builder.unknowns, "safe_command_candidates_unknown", "", "unknown", "medium", "no safe command candidates were inferred");
         try builder.appendSignal(&builder.next_questions, "test_build_commands", "", "next_question", "medium", "What build or test command should be considered for future explicit verification?");
     }
-    if (builder.recommended_packs.items.len == 0) {
-        try builder.appendSignal(&builder.missing_pack_recommendations, "no_pack_recommendation", "", "gap", "medium", "Pass 1 does not auto-select or mount Knowledge Packs");
-    }
     try builder.appendSignal(&builder.unknown_verifiers, "verifier_registration_status", "", "unknown", "high", "Project Autopsy only proposes verifier candidates; it does not inspect registry state or register adapters");
     try builder.appendVerifierGap("gap.verifier_execution_not_run", "verifier_execution_result", "No verifier execution result exists because autopsy is read-only; this is missing evidence, not negative evidence", &.{}, true);
     if (entry_count >= options.max_entries) try builder.appendSignal(&builder.unknowns, "traversal_entry_limit_reached", "", "unknown", "medium", "directory traversal hit max_entries bound");
+}
+
+fn detectRecommendedGuidance(builder: *Builder) !void {
+    if (findSignal(builder.languages.items, "zig")) |signal| {
+        try builder.appendGuidanceCandidate(
+            "guidance.zig_project_baseline",
+            "pack_guidance_candidate",
+            "zig_project_baseline",
+            "Zig project structure was detected; recommend review of Zig baseline procedure guidance only",
+            signal.evidence_paths,
+            &.{"zig"},
+            try riskIdsPresent(builder.allocator, builder.risk_surfaces.items, &.{ "risk.build_dependency", "risk.source_without_tests" }),
+            try gapIdsPresent(builder.allocator, builder.gap_missing_verifiers.items, &.{ "gap.test_root_verifier_missing", "gap.verifier_execution_not_run" }),
+            "review candidate guidance before explicitly selecting any verifier or pack",
+        );
+    }
+    if (findSignal(builder.languages.items, "javascript_typescript")) |signal| {
+        try builder.appendGuidanceCandidate(
+            "guidance.node_project_baseline",
+            "pack_guidance_candidate",
+            "node_project_baseline",
+            "Node/JavaScript/TypeScript project structure was detected; recommend review of Node baseline procedure guidance only",
+            signal.evidence_paths,
+            &.{"javascript_typescript"},
+            try riskIdsPresent(builder.allocator, builder.risk_surfaces.items, &.{ "risk.build_dependency", "risk.source_without_tests" }),
+            try gapIdsPresent(builder.allocator, builder.gap_missing_verifiers.items, &.{ "gap.test_root_verifier_missing", "gap.ci_test_command_missing", "gap.verifier_execution_not_run" }),
+            "review package scripts and candidate guidance before explicit verification",
+        );
+    }
+    if (findSignal(builder.languages.items, "python")) |signal| {
+        try builder.appendGuidanceCandidate(
+            "guidance.python_project_baseline",
+            "pack_guidance_candidate",
+            "python_project_baseline",
+            "Python project structure was detected; recommend review of Python baseline procedure guidance only",
+            signal.evidence_paths,
+            &.{"python"},
+            try riskIdsPresent(builder.allocator, builder.risk_surfaces.items, &.{ "risk.build_dependency", "risk.source_without_tests" }),
+            try gapIdsPresent(builder.allocator, builder.gap_missing_verifiers.items, &.{ "gap.test_root_verifier_missing", "gap.verifier_execution_not_run" }),
+            "review Python packaging and test guidance before explicit verification",
+        );
+    }
+    if (findSignal(builder.languages.items, "rust")) |signal| {
+        try builder.appendGuidanceCandidate(
+            "guidance.rust_project_baseline",
+            "pack_guidance_candidate",
+            "rust_project_baseline",
+            "Rust project structure was detected; recommend review of Rust baseline procedure guidance only",
+            signal.evidence_paths,
+            &.{"rust"},
+            try riskIdsPresent(builder.allocator, builder.risk_surfaces.items, &.{ "risk.build_dependency", "risk.source_without_tests" }),
+            try gapIdsPresent(builder.allocator, builder.gap_missing_verifiers.items, &.{ "gap.test_root_verifier_missing", "gap.verifier_execution_not_run" }),
+            "review Cargo guidance before explicit verification",
+        );
+    }
+    if (has(builder.entries, "Dockerfile") or has(builder.entries, "docker-compose.yml") or has(builder.entries, "compose.yml")) {
+        const paths = try matchingEntryPaths(builder.allocator, builder.entries, dockerOrComposeEntry);
+        try builder.appendGuidanceCandidate(
+            "guidance.container_runtime_guidance",
+            "pack_guidance_candidate",
+            "container_runtime_guidance",
+            "Docker or Compose runtime surface was detected; recommend review of container runtime guidance only",
+            paths,
+            try detectedLanguageNames(builder.allocator, builder.languages.items),
+            try riskIdsPresent(builder.allocator, builder.risk_surfaces.items, &.{"risk.container_runtime_unverified"}),
+            try gapIdsPresent(builder.allocator, builder.gap_missing_verifiers.items, &.{ "gap.runtime_verifier_missing", "gap.verifier_execution_not_run" }),
+            "review runtime guidance and choose an explicit verifier before making container behavior claims",
+        );
+    }
+    if (hasTerraformConfig(builder.entries)) {
+        const paths = try matchingEntryPaths(builder.allocator, builder.entries, terraformEntry);
+        try builder.appendGuidanceCandidate(
+            "guidance.terraform_validation_guidance",
+            "pack_guidance_candidate",
+            "terraform_validation_guidance",
+            "Terraform configuration was detected; recommend review of validation guidance only",
+            paths,
+            try detectedLanguageNames(builder.allocator, builder.languages.items),
+            try riskIdsPresent(builder.allocator, builder.risk_surfaces.items, &.{"risk.config_validation_missing"}),
+            try gapIdsPresent(builder.allocator, builder.gap_missing_verifiers.items, &.{ "gap.config_validation_missing", "gap.verifier_execution_not_run" }),
+            "review Terraform validation guidance before explicitly selecting validation commands",
+        );
+    }
+    if (builder.ci_configs.items.len > 0) {
+        const paths = try pathsFromSignals(builder.allocator, builder.ci_configs.items);
+        try builder.appendGuidanceCandidate(
+            "guidance.ci_workflow_guidance",
+            "pack_guidance_candidate",
+            "ci_workflow_guidance",
+            "CI configuration was detected; recommend review of CI workflow guidance only",
+            paths,
+            try detectedLanguageNames(builder.allocator, builder.languages.items),
+            try riskIdsPresent(builder.allocator, builder.risk_surfaces.items, &.{ "risk.ci_deployment", "risk.ci_without_test_candidate" }),
+            try gapIdsPresent(builder.allocator, builder.gap_missing_verifiers.items, &.{ "gap.ci_test_command_missing", "gap.verifier_execution_not_run" }),
+            "review CI intent and candidate verifier gaps before treating workflow config as evidence",
+        );
+    }
+    if (findRisk(builder.risk_surfaces.items, "risk.source_without_tests")) |risk| {
+        try builder.appendGuidanceCandidate(
+            "guidance.test_discovery_guidance",
+            "pack_guidance_candidate",
+            "test_discovery_guidance",
+            "Source roots were detected without a test root candidate; recommend review of test discovery guidance only",
+            risk.evidence_paths,
+            try detectedLanguageNames(builder.allocator, builder.languages.items),
+            &.{"risk.source_without_tests"},
+            try gapIdsPresent(builder.allocator, builder.gap_missing_verifiers.items, &.{ "gap.test_root_verifier_missing", "gap.verifier_execution_not_run" }),
+            "identify test roots and explicit verifier candidates before making coverage claims",
+        );
+    }
+}
+
+fn detectGuidanceGaps(builder: *Builder) !void {
+    if (builder.recommended_guidance_candidates.items.len == 0) {
+        try builder.appendSignal(&builder.unknowns, "pack_guidance_candidates_unknown", "", "unknown", "medium", "no known procedure guidance candidate matched bounded Project Autopsy signals; no pack availability was inferred");
+        try builder.appendSignal(&builder.missing_pack_recommendations, "no_pack_recommendation", "", "gap", "medium", "Pass 1 does not auto-select or mount Knowledge Packs");
+    }
 }
 
 fn detectStructuralRisks(builder: *Builder) !void {
@@ -1164,6 +1329,11 @@ fn containsVerifierGap(items: []const VerifierGapCandidate, id: []const u8) bool
     return false;
 }
 
+fn containsGuidanceCandidate(items: []const RecommendedGuidanceCandidate, id: []const u8) bool {
+    for (items) |item| if (std.mem.eql(u8, item.id, id)) return true;
+    return false;
+}
+
 fn containsString(items: []const []const u8, value: []const u8) bool {
     for (items) |item| if (std.mem.eql(u8, item, value)) return true;
     return false;
@@ -1252,6 +1422,40 @@ fn verifierPlanLessThan(_: void, a: VerifierPlanCandidate, b: VerifierPlanCandid
 
 fn sortVerifierPlans(items: []VerifierPlanCandidate) void {
     std.mem.sort(VerifierPlanCandidate, items, {}, verifierPlanLessThan);
+}
+
+fn guidanceCandidateLessThan(_: void, a: RecommendedGuidanceCandidate, b: RecommendedGuidanceCandidate) bool {
+    return std.mem.order(u8, a.id, b.id) == .lt;
+}
+
+fn sortGuidanceCandidates(items: []RecommendedGuidanceCandidate) void {
+    std.mem.sort(RecommendedGuidanceCandidate, items, {}, guidanceCandidateLessThan);
+}
+
+fn riskIdsPresent(allocator: std.mem.Allocator, items: []const RiskSurface, ids: []const []const u8) ![]const []const u8 {
+    var present = std.ArrayList([]const u8).init(allocator);
+    for (ids) |id| {
+        if (findRisk(items, id) != null) try present.append(id);
+    }
+    return present.toOwnedSlice();
+}
+
+fn gapIdsPresent(allocator: std.mem.Allocator, items: []const VerifierGapCandidate, ids: []const []const u8) ![]const []const u8 {
+    var present = std.ArrayList([]const u8).init(allocator);
+    for (ids) |id| {
+        if (findVerifierGap(items, id) != null) try present.append(id);
+    }
+    return present.toOwnedSlice();
+}
+
+fn detectedLanguageNames(allocator: std.mem.Allocator, items: []const Signal) ![]const []const u8 {
+    if (items.len == 0) return &.{};
+    var names = std.ArrayList([]const u8).init(allocator);
+    for (items) |item| {
+        if (containsString(names.items, item.name)) continue;
+        try names.append(item.name);
+    }
+    return names.toOwnedSlice();
 }
 
 fn verifierPlanPurpose(id: []const u8) []const u8 {
@@ -1344,6 +1548,11 @@ fn findVerifierPlan(items: []const VerifierPlanCandidate, id: []const u8) ?Verif
     return null;
 }
 
+fn findGuidanceCandidate(items: []const RecommendedGuidanceCandidate, id: []const u8) ?RecommendedGuidanceCandidate {
+    for (items) |item| if (std.mem.eql(u8, item.id, id)) return item;
+    return null;
+}
+
 test "project autopsy detects Zig project from build.zig" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1354,6 +1563,29 @@ test "project autopsy detects Zig project from build.zig" {
     const result = try analyze(std.heap.page_allocator, root, .{});
     try std.testing.expect(containsNamedSignal(result.project_profile.detected_languages, "zig"));
     try std.testing.expect(containsNamedSignal(result.project_profile.build_systems, "zig_build"));
+}
+
+test "project autopsy recommends Zig baseline guidance candidate" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "build.zig", "pub fn build(b: *std.Build) void { _ = b.step(\"test\", \"\"); }");
+    try makeFile(tmp.dir, "src/main.zig", "pub fn main() void {}\n");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+
+    const candidate = findGuidanceCandidate(result.project_profile.recommended_guidance_candidates, "guidance.zig_project_baseline") orelse return error.MissingGuidanceCandidate;
+    try std.testing.expectEqualStrings("pack_guidance_candidate", candidate.kind);
+    try std.testing.expect(candidate.pack_id == null);
+    try std.testing.expectEqualStrings("zig_project_baseline", candidate.guidance_id);
+    try std.testing.expect(candidate.evidence_paths.len > 0);
+    try std.testing.expectEqualStrings("build.zig", candidate.evidence_paths[0]);
+    try std.testing.expectEqualStrings("zig", candidate.related_languages[0]);
+    try std.testing.expect(candidate.non_authorizing);
+    try std.testing.expect(candidate.candidate_only);
+    try std.testing.expect(candidate.requires_review);
+    try std.testing.expect(!candidate.mutates_state);
+    try std.testing.expect(!candidate.applies_by_default);
 }
 
 test "project autopsy detects source and test root candidates with evidence" {
@@ -1521,6 +1753,24 @@ test "project autopsy detects Node package scripts" {
     try std.testing.expect(containsNamedSignal(result.project_profile.detected_languages, "javascript_typescript"));
     try std.testing.expect(containsCommand(result.project_profile.safe_command_candidates, "npm_test"));
     try std.testing.expect(containsCommand(result.project_profile.safe_command_candidates, "npm_run_build"));
+}
+
+test "project autopsy recommends Node baseline guidance candidate" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "package.json", "{\"scripts\":{\"test\":\"vitest\"}}");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+
+    const candidate = findGuidanceCandidate(result.project_profile.recommended_guidance_candidates, "guidance.node_project_baseline") orelse return error.MissingGuidanceCandidate;
+    try std.testing.expectEqualStrings("node_project_baseline", candidate.guidance_id);
+    try std.testing.expect(candidate.pack_id == null);
+    try std.testing.expectEqualStrings("package.json", candidate.evidence_paths[0]);
+    try std.testing.expectEqualStrings("javascript_typescript", candidate.related_languages[0]);
+    try std.testing.expect(candidate.requires_review);
+    try std.testing.expect(!candidate.mutates_state);
+    try std.testing.expect(!candidate.applies_by_default);
 }
 
 test "project autopsy verifier plans are derived only from detected ecosystem artifacts" {
@@ -1812,6 +2062,14 @@ test "project autopsy reports Docker runtime verifier gap" {
     const gap = findVerifierGap(result.project_gap_report.missing_verifier_adapters, "gap.runtime_verifier_missing") orelse return error.MissingVerifierGap;
     try std.testing.expectEqualStrings("runtime_container_verifier", gap.missing_verifier);
     try std.testing.expect(gap.non_authorizing);
+
+    const candidate = findGuidanceCandidate(result.project_profile.recommended_guidance_candidates, "guidance.container_runtime_guidance") orelse return error.MissingGuidanceCandidate;
+    try std.testing.expectEqualStrings("container_runtime_guidance", candidate.guidance_id);
+    try std.testing.expect(candidate.evidence_paths.len >= 2);
+    try std.testing.expectEqualStrings("risk.container_runtime_unverified", candidate.related_risks[0]);
+    try std.testing.expect(containsString(candidate.related_verifier_gaps, "gap.runtime_verifier_missing"));
+    try std.testing.expect(candidate.candidate_only);
+    try std.testing.expect(!candidate.applies_by_default);
 }
 
 test "project autopsy reports config validation gap for terraform" {
@@ -1827,6 +2085,32 @@ test "project autopsy reports config validation gap for terraform" {
     try std.testing.expectEqualStrings("infra/main.tf", risk_item.evidence_paths[0]);
     const gap = findVerifierGap(result.project_gap_report.missing_verifier_adapters, "gap.config_validation_missing") orelse return error.MissingVerifierGap;
     try std.testing.expectEqualStrings("config_validation_verifier", gap.missing_verifier);
+
+    const candidate = findGuidanceCandidate(result.project_profile.recommended_guidance_candidates, "guidance.terraform_validation_guidance") orelse return error.MissingGuidanceCandidate;
+    try std.testing.expectEqualStrings("terraform_validation_guidance", candidate.guidance_id);
+    try std.testing.expectEqualStrings("infra/main.tf", candidate.evidence_paths[0]);
+    try std.testing.expectEqualStrings("risk.config_validation_missing", candidate.related_risks[0]);
+    try std.testing.expect(containsString(candidate.related_verifier_gaps, "gap.config_validation_missing"));
+    try std.testing.expect(candidate.requires_review);
+    try std.testing.expect(!candidate.mutates_state);
+}
+
+test "project autopsy emits multiple review-required guidance candidates for ambiguous project" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "package.json", "{\"scripts\":{\"test\":\"vitest\"}}\n");
+    try makeFile(tmp.dir, "Cargo.toml", "[package]\nname = \"x\"\n");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+
+    const node = findGuidanceCandidate(result.project_profile.recommended_guidance_candidates, "guidance.node_project_baseline") orelse return error.MissingGuidanceCandidate;
+    const rust = findGuidanceCandidate(result.project_profile.recommended_guidance_candidates, "guidance.rust_project_baseline") orelse return error.MissingGuidanceCandidate;
+    try std.testing.expect(node.requires_review);
+    try std.testing.expect(rust.requires_review);
+    try std.testing.expect(node.candidate_only);
+    try std.testing.expect(rust.candidate_only);
+    try std.testing.expect(containsNamedSignal(result.project_profile.unknowns, "project_config_ambiguous"));
 }
 
 test "project autopsy does not report false missing test gap when tests and safe command exist" {
@@ -1869,6 +2153,20 @@ test "project autopsy gap report records missing build ci and docs as gaps" {
     try std.testing.expect(result.project_gap_report.non_authorizing);
     try std.testing.expect(containsNamedSignal(result.project_profile.unknowns, "project_type_unknown"));
     try std.testing.expect(containsNamedSignal(result.project_profile.unknowns, "safe_command_candidates_unknown"));
+}
+
+test "project autopsy emits no fake available pack for unknown project" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "notes.txt", "plain\n");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+
+    try std.testing.expectEqual(@as(usize, 0), result.project_profile.recommended_guidance_candidates.len);
+    try std.testing.expectEqual(@as(usize, 0), result.project_profile.recommended_packs.len);
+    try std.testing.expect(containsNamedSignal(result.project_profile.unknowns, "pack_guidance_candidates_unknown"));
+    try std.testing.expect(containsNamedSignal(result.project_gap_report.missing_pack_recommendations, "no_pack_recommendation"));
 }
 
 test "project autopsy non-authorizing invariant is preserved" {
@@ -1946,6 +2244,20 @@ test "project autopsy JSON output keeps stable draft safety fields" {
         try std.testing.expect(plan.get("requires_user_confirmation").?.bool);
         try std.testing.expect(plan.get("non_authorizing").?.bool);
         try std.testing.expect(!plan.get("executes_by_default").?.bool);
+    }
+
+    for (profile_obj.get("recommended_guidance_candidates").?.array.items) |candidate_value| {
+        const candidate = candidate_value.object;
+        try std.testing.expectEqualStrings("pack_guidance_candidate", candidate.get("kind").?.string);
+        try std.testing.expect(candidate.get("pack_id").? == .null);
+        try std.testing.expect(candidate.get("guidance_id").?.string.len > 0);
+        try std.testing.expect(candidate.get("reason").?.string.len > 0);
+        try std.testing.expect(candidate.get("suggested_next_action").?.string.len > 0);
+        try std.testing.expect(candidate.get("non_authorizing").?.bool);
+        try std.testing.expect(candidate.get("candidate_only").?.bool);
+        try std.testing.expect(candidate.get("requires_review").?.bool);
+        try std.testing.expect(!candidate.get("mutates_state").?.bool);
+        try std.testing.expect(!candidate.get("applies_by_default").?.bool);
     }
 
     const gap_report_obj = root_obj.get("project_gap_report").?.object;
