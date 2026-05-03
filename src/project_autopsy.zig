@@ -15,6 +15,9 @@ pub const Signal = struct {
     kind: []const u8,
     confidence: []const u8,
     reason: []const u8,
+    evidence_paths: []const []const u8 = &.{},
+    non_authorizing: bool = true,
+    freshness_unknown: bool = true,
 };
 
 pub const RiskSurface = struct {
@@ -196,12 +199,14 @@ const Builder = struct {
     }
 
     fn signal(self: *Builder, name: []const u8, path: []const u8, kind: []const u8, confidence: []const u8, reason: []const u8) !Signal {
+        const evidence_paths = try signalEvidencePaths(self.allocator, path);
         return .{
             .name = try self.allocator.dupe(u8, name),
             .path = try self.allocator.dupe(u8, path),
             .kind = try self.allocator.dupe(u8, kind),
             .confidence = try self.allocator.dupe(u8, confidence),
             .reason = try self.allocator.dupe(u8, reason),
+            .evidence_paths = evidence_paths,
         };
     }
 
@@ -398,21 +403,21 @@ fn detectCommon(builder: *Builder) !void {
             if (isConventionalTestRoot(entry.rel_path)) {
                 try builder.appendRootCandidate(&builder.test_roots, entry.rel_path, "test_root", testRootConfidence(entry.rel_path), testRootReason(entry.rel_path));
             }
-            if (std.mem.eql(u8, entry.rel_path, "docs")) try builder.appendSignal(&builder.docs, "docs", entry.rel_path, "docs_directory", "high", "docs directory exists");
+            if (std.mem.eql(u8, entry.rel_path, "docs")) try builder.appendSignal(&builder.docs, "docs", entry.rel_path, "documentation", "high", "docs directory exists; documentation is a claim surface, not proof");
             continue;
         }
 
-        if (std.mem.eql(u8, entry.rel_path, ".github/workflows") or startsWith(entry.rel_path, ".github/workflows/")) {
-            if (endsWith(entry.rel_path, ".yml") or endsWith(entry.rel_path, ".yaml")) try builder.appendSignal(&builder.ci_configs, "github_actions", entry.rel_path, "ci_config", "high", "GitHub Actions workflow file exists");
-        } else if (std.mem.eql(u8, entry.rel_path, ".gitlab-ci.yml")) {
-            try builder.appendSignal(&builder.ci_configs, "gitlab_ci", entry.rel_path, "ci_config", "high", "GitLab CI file exists");
+        if (ciSurfaceName(entry.rel_path)) |name| {
+            try builder.appendSignal(&builder.ci_configs, name, entry.rel_path, "ci_config", "high", "CI configuration file exists; intended workflow evidence only, not proof it passes");
         }
 
-        if (std.ascii.eqlIgnoreCase(entry.basename, "README.md")) try builder.appendSignal(&builder.docs, "README.md", entry.rel_path, "readme", "high", "README file exists");
-        if (std.ascii.eqlIgnoreCase(entry.basename, "CONTRIBUTING.md")) try builder.appendSignal(&builder.docs, "CONTRIBUTING.md", entry.rel_path, "contributing", "high", "contributing guide exists");
-        if (std.mem.eql(u8, entry.basename, "LICENSE")) try builder.appendSignal(&builder.docs, "LICENSE", entry.rel_path, "license", "high", "license file exists");
+        if (documentationSurfaceName(entry.rel_path, entry.basename)) |name| {
+            try builder.appendSignal(&builder.docs, name, entry.rel_path, "documentation", documentationConfidence(entry.rel_path, entry.basename), "documentation surface exists; docs are claims and not authority");
+        }
 
-        if (isConfigFile(entry.basename)) try builder.appendSignal(&builder.config_files, entry.basename, entry.rel_path, "config_file", "high", "recognized configuration file exists");
+        if (configSurfaceName(entry.rel_path, entry.basename)) |name| {
+            try builder.appendSignal(&builder.config_files, name, entry.rel_path, "project_config", "high", "recognized project configuration surface exists; structural evidence only");
+        }
         if (isDependencyFile(entry.basename)) try builder.appendSignal(&builder.dependency_files, entry.basename, entry.rel_path, "dependency_file", "high", "recognized dependency or lock file exists");
         if (isPackageManagerFile(entry.basename)) try builder.appendSignal(&builder.package_managers, packageManagerName(entry.basename), entry.rel_path, "package_manager", "high", "package manager file exists");
         if (isEntryPoint(entry.rel_path)) try builder.appendSignal(&builder.entry_points, entry.basename, entry.rel_path, "entry_point", "medium", "conventional entry point path exists");
@@ -510,7 +515,6 @@ fn detectLanguagesAndCommands(builder: *Builder) !void {
     if (has(builder.entries, "Dockerfile") or has(builder.entries, "docker-compose.yml")) {
         const path = if (has(builder.entries, "Dockerfile")) "Dockerfile" else "docker-compose.yml";
         try builder.appendSignal(&builder.languages, "docker", path, "runtime_surface", "medium", "Docker configuration detected");
-        try builder.appendSignal(&builder.config_files, "docker", path, "container_config", "high", "Docker config exists");
     }
 }
 
@@ -566,6 +570,18 @@ fn detectGaps(builder: *Builder, options: AnalyzeOptions, entry_count: usize) !v
         try builder.appendSignal(&builder.unknowns, "project_type_unknown", "", "unknown", "high", "no known language/toolchain signal was detected");
         try builder.appendSignal(&builder.ambiguous_project_type, "project_type_unknown", "", "ambiguous_project_type", "high", "known Pass 1 project signals were absent");
         try builder.appendSignal(&builder.next_questions, "identify_project_type", "", "next_question", "high", "Which toolchain should Ghost inspect for this workspace?");
+    }
+    if (builder.ci_configs.items.len == 0) {
+        try builder.appendSignal(&builder.unknowns, "ci_config_unknown", "", "unknown", "medium", "no CI configuration was detected inside the inspected workspace; this does not claim CI is absent globally");
+    }
+    if (builder.docs.items.len == 0) {
+        try builder.appendSignal(&builder.unknowns, "documentation_unknown", "", "unknown", "medium", "no documentation surface was detected inside the inspected workspace; this does not claim documentation is absent globally");
+    }
+    if (builder.config_files.items.len == 0) {
+        try builder.appendSignal(&builder.unknowns, "project_config_unknown", "", "unknown", "medium", "no project configuration surface was detected inside the inspected workspace; absence of evidence is not negative evidence");
+    } else if (hasAmbiguousConfigSurfaces(builder.config_files.items)) {
+        try builder.appendSignal(&builder.unknowns, "project_config_ambiguous", "", "unknown", "medium", "multiple project configuration surfaces were detected and no canonical config was selected");
+        try builder.appendSignal(&builder.next_questions, "choose_canonical_project_config", "", "next_question", "medium", "Which detected project configuration surface should anchor future explicit verification?");
     }
     if (builder.safe_commands.items.len == 0) {
         try builder.appendSignal(&builder.unknowns, "safe_command_candidates_unknown", "", "unknown", "medium", "no safe command candidates were inferred");
@@ -836,10 +852,102 @@ fn hasExtensionInDir(entries: []const Entry, dir_prefix: []const u8, extension: 
     return false;
 }
 
+fn signalEvidencePaths(allocator: std.mem.Allocator, path: []const u8) ![]const []const u8 {
+    if (path.len == 0) return &.{};
+    const paths = try allocator.alloc([]const u8, 1);
+    paths[0] = try allocator.dupe(u8, path);
+    return paths;
+}
+
+fn ciSurfaceName(path: []const u8) ?[]const u8 {
+    if (startsWith(path, ".github/workflows/") and (endsWith(path, ".yml") or endsWith(path, ".yaml"))) return "github_actions";
+    if (std.mem.eql(u8, path, ".gitlab-ci.yml")) return "gitlab_ci";
+    if (std.mem.eql(u8, path, ".circleci/config.yml") or std.mem.eql(u8, path, "circleci/config.yml")) return "circleci";
+    if (std.mem.eql(u8, path, ".buildkite/pipeline.yml") or std.mem.eql(u8, path, "buildkite/pipeline.yml")) return "buildkite";
+    if (std.mem.eql(u8, path, "Jenkinsfile")) return "jenkins";
+    return null;
+}
+
+fn documentationSurfaceName(path: []const u8, basename: []const u8) ?[]const u8 {
+    if (startsWithReadme(basename)) return "README";
+    if (std.ascii.eqlIgnoreCase(basename, "CONTRIBUTING.md")) return "CONTRIBUTING";
+    if (std.ascii.eqlIgnoreCase(basename, "CHANGELOG.md")) return "CHANGELOG";
+    if (std.ascii.eqlIgnoreCase(basename, "SECURITY.md")) return "SECURITY";
+    if (std.mem.eql(u8, basename, "LICENSE")) return "LICENSE";
+    if (isAdrOrArchitectureDoc(path, basename)) return "architecture_doc";
+    return null;
+}
+
+fn documentationConfidence(path: []const u8, basename: []const u8) []const u8 {
+    _ = path;
+    if (startsWithReadme(basename) or std.ascii.eqlIgnoreCase(basename, "SECURITY.md")) return "high";
+    return "medium";
+}
+
+fn startsWithReadme(basename: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(basename, "README") or
+        (basename.len > "README.".len and std.ascii.eqlIgnoreCase(basename[0.."README".len], "README") and basename["README".len] == '.');
+}
+
+fn isAdrOrArchitectureDoc(path: []const u8, basename: []const u8) bool {
+    const lower_base = std.ascii.eqlIgnoreCase(basename, "ARCHITECTURE.md") or
+        std.ascii.eqlIgnoreCase(basename, "ADR.md");
+    return lower_base or
+        (startsWith(path, "docs/adr/") and endsWith(path, ".md")) or
+        (startsWith(path, "docs/architecture/") and endsWith(path, ".md"));
+}
+
+fn configSurfaceName(path: []const u8, basename: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, basename, "package.json")) return "package.json";
+    if (std.mem.eql(u8, basename, "pyproject.toml")) return "pyproject.toml";
+    if (std.mem.eql(u8, basename, "Cargo.toml")) return "Cargo.toml";
+    if (std.mem.eql(u8, basename, "go.mod")) return "go.mod";
+    if (std.mem.eql(u8, basename, "build.zig")) return "build.zig";
+    if (std.mem.eql(u8, basename, "Makefile")) return "Makefile";
+    if (std.mem.eql(u8, basename, "Dockerfile")) return "Dockerfile";
+    if (std.mem.eql(u8, basename, "docker-compose.yml")) return "docker-compose.yml";
+    if (std.mem.eql(u8, basename, "compose.yml")) return "compose.yml";
+    if (std.mem.eql(u8, basename, "tsconfig.json")) return "tsconfig.json";
+    if (std.mem.eql(u8, basename, "pytest.ini")) return "pytest.ini";
+    if (std.mem.eql(u8, basename, ".editorconfig")) return ".editorconfig";
+    if (std.mem.eql(u8, basename, ".env.example")) return ".env.example";
+    if (isEslintOrPrettierConfig(basename)) return "js_lint_format_config";
+    if (endsWith(path, ".tf")) return "terraform_config";
+    return null;
+}
+
+fn isEslintOrPrettierConfig(basename: []const u8) bool {
+    return std.mem.eql(u8, basename, ".eslintrc") or
+        startsWith(basename, ".eslintrc.") or
+        std.mem.eql(u8, basename, "eslint.config.js") or
+        std.mem.eql(u8, basename, "eslint.config.mjs") or
+        std.mem.eql(u8, basename, "eslint.config.cjs") or
+        std.mem.eql(u8, basename, ".prettierrc") or
+        startsWith(basename, ".prettierrc.") or
+        std.mem.eql(u8, basename, "prettier.config.js") or
+        std.mem.eql(u8, basename, "prettier.config.mjs") or
+        std.mem.eql(u8, basename, "prettier.config.cjs");
+}
+
+fn hasAmbiguousConfigSurfaces(items: []const Signal) bool {
+    var canonical_count: usize = 0;
+    for (items) |item| {
+        if (isCanonicalProjectConfigName(item.name)) canonical_count += 1;
+    }
+    return canonical_count > 1;
+}
+
+fn isCanonicalProjectConfigName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "package.json") or
+        std.mem.eql(u8, name, "pyproject.toml") or
+        std.mem.eql(u8, name, "Cargo.toml") or
+        std.mem.eql(u8, name, "go.mod") or
+        std.mem.eql(u8, name, "build.zig") or
+        std.mem.eql(u8, name, "Makefile");
+}
+
 fn isConfigFile(name: []const u8) bool {
-    return std.mem.eql(u8, name, ".editorconfig") or std.mem.eql(u8, name, ".env.example") or
-        std.mem.eql(u8, name, "Dockerfile") or std.mem.eql(u8, name, "docker-compose.yml") or
-        std.mem.eql(u8, name, "tsconfig.json") or std.mem.eql(u8, name, "pytest.ini");
+    return configSurfaceName(name, name) != null;
 }
 
 fn isDependencyFile(name: []const u8) bool {
@@ -1013,6 +1121,11 @@ fn makeFile(dir: std.fs.Dir, path: []const u8, content: []const u8) !void {
 fn containsNamedSignal(items: []const Signal, name: []const u8) bool {
     for (items) |item| if (std.mem.eql(u8, item.name, name)) return true;
     return false;
+}
+
+fn findSignal(items: []const Signal, name: []const u8) ?Signal {
+    for (items) |item| if (std.mem.eql(u8, item.name, name)) return item;
+    return null;
 }
 
 fn containsCommand(items: []const SafeCommandCandidate, id: []const u8) bool {
@@ -1256,14 +1369,95 @@ test "project autopsy detects CI docs and config files" {
     defer tmp.cleanup();
     try makeFile(tmp.dir, ".github/workflows/ci.yml", "name: ci\n");
     try makeFile(tmp.dir, "README.md", "# x\n");
+    try makeFile(tmp.dir, "package.json", "{\"scripts\":{\"test\":\"node test.js\"}}\n");
     try makeFile(tmp.dir, ".editorconfig", "root=true\n");
     try makeFile(tmp.dir, ".env.example", "PORT=1\n");
     const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
     defer std.heap.page_allocator.free(root);
     const result = try analyze(std.heap.page_allocator, root, .{});
-    try std.testing.expect(containsNamedSignal(result.project_profile.ci_configs, "github_actions"));
-    try std.testing.expect(containsNamedSignal(result.project_profile.docs, "README.md"));
+    const ci = findSignal(result.project_profile.ci_configs, "github_actions") orelse return error.MissingCiConfig;
+    try std.testing.expectEqualStrings("ci_config", ci.kind);
+    try std.testing.expect(ci.non_authorizing);
+    try std.testing.expect(ci.freshness_unknown);
+    try std.testing.expectEqual(@as(usize, 1), ci.evidence_paths.len);
+    try std.testing.expectEqualStrings(".github/workflows/ci.yml", ci.evidence_paths[0]);
+
+    const docs = findSignal(result.project_profile.docs, "README") orelse return error.MissingDocs;
+    try std.testing.expectEqualStrings("documentation", docs.kind);
+    try std.testing.expect(docs.non_authorizing);
+    try std.testing.expect(docs.freshness_unknown);
+    try std.testing.expectEqualStrings("README.md", docs.evidence_paths[0]);
+
+    const config_file = findSignal(result.project_profile.config_files, "package.json") orelse return error.MissingConfig;
+    try std.testing.expectEqualStrings("project_config", config_file.kind);
+    try std.testing.expect(config_file.non_authorizing);
+    try std.testing.expect(config_file.freshness_unknown);
+    try std.testing.expectEqualStrings("package.json", config_file.evidence_paths[0]);
     try std.testing.expect(containsNamedSignal(result.project_profile.config_files, ".editorconfig"));
+}
+
+test "project autopsy detects common CI config surfaces conservatively" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, ".github/workflows/ci.yaml", "name: ci\n");
+    try makeFile(tmp.dir, ".gitlab-ci.yml", "stages: []\n");
+    try makeFile(tmp.dir, ".circleci/config.yml", "version: 2.1\n");
+    try makeFile(tmp.dir, "buildkite/pipeline.yml", "steps: []\n");
+    try makeFile(tmp.dir, "Jenkinsfile", "pipeline {}\n");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+    try std.testing.expect(containsNamedSignal(result.project_profile.ci_configs, "github_actions"));
+    try std.testing.expect(containsNamedSignal(result.project_profile.ci_configs, "gitlab_ci"));
+    try std.testing.expect(containsNamedSignal(result.project_profile.ci_configs, "circleci"));
+    try std.testing.expect(containsNamedSignal(result.project_profile.ci_configs, "buildkite"));
+    try std.testing.expect(containsNamedSignal(result.project_profile.ci_configs, "jenkins"));
+}
+
+test "project autopsy emits scoped CI unknown when no CI config is found" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "README.md", "# docs\n");
+    try makeFile(tmp.dir, "package.json", "{}\n");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+    try std.testing.expectEqual(@as(usize, 0), result.project_profile.ci_configs.len);
+    const unknown = findSignal(result.project_profile.unknowns, "ci_config_unknown") orelse return error.MissingCiUnknown;
+    try std.testing.expect(std.mem.indexOf(u8, unknown.reason, "inspected workspace") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unknown.reason, "globally") != null);
+}
+
+test "project autopsy reports docs directory without README as documentation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "docs/guide.md", "# guide\n");
+    try makeFile(tmp.dir, "pyproject.toml", "[project]\nname = \"x\"\n");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+    const docs = findSignal(result.project_profile.docs, "docs") orelse return error.MissingDocsDirectory;
+    try std.testing.expectEqualStrings("documentation", docs.kind);
+    try std.testing.expectEqualStrings("docs", docs.evidence_paths[0]);
+    try std.testing.expect(result.project_gap_report.missing_docs == null);
+}
+
+test "project autopsy reports multiple config surfaces as candidates and ambiguity" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFile(tmp.dir, "package.json", "{}\n");
+    try makeFile(tmp.dir, "pyproject.toml", "[project]\nname = \"x\"\n");
+    try makeFile(tmp.dir, "Cargo.toml", "[package]\nname = \"x\"\n");
+    try makeFile(tmp.dir, "infra/main.tf", "terraform {}\n");
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+    try std.testing.expect(containsNamedSignal(result.project_profile.config_files, "package.json"));
+    try std.testing.expect(containsNamedSignal(result.project_profile.config_files, "pyproject.toml"));
+    try std.testing.expect(containsNamedSignal(result.project_profile.config_files, "Cargo.toml"));
+    try std.testing.expect(containsNamedSignal(result.project_profile.config_files, "terraform_config"));
+    try std.testing.expect(containsNamedSignal(result.project_profile.unknowns, "project_config_ambiguous"));
+    try std.testing.expect(containsNamedSignal(result.project_gap_report.next_questions, "choose_canonical_project_config"));
 }
 
 test "project autopsy unknown project preserves unknowns instead of false claims" {

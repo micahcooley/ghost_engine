@@ -45,8 +45,37 @@ Pass 1 recognizes common workspace markers:
 - Java/Kotlin: `pom.xml`, `build.gradle`, `settings.gradle`
 - Docker: `Dockerfile`, `docker-compose.yml`
 - CI/docs/config: `.github/workflows/*.yml`, `.gitlab-ci.yml`,
-  `README.md`, `docs/`, `CONTRIBUTING.md`, `LICENSE`, `.editorconfig`,
-  `.env.example`, dependency files, and lockfiles
+  `.circleci/config.yml`, `circleci/config.yml`, `.buildkite/pipeline.yml`,
+  `buildkite/pipeline.yml`, `Jenkinsfile`, `README.*`, `docs/`,
+  `CONTRIBUTING.md`, `CHANGELOG.md`, `SECURITY.md`, architecture/ADR docs,
+  `package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod`, `build.zig`,
+  `Makefile`, Docker/Compose files, TypeScript/lint/format configs,
+  Terraform files, `.editorconfig`, `.env.example`, dependency files, and
+  lockfiles
+
+CI, documentation, and project configuration discoveries are structural
+surfaces only. They include:
+
+- `path`
+- `kind`: `ci_config`, `documentation`, or `project_config`
+- `confidence`
+- `reason`
+- `evidence_paths`
+- `non_authorizing: true`
+- `freshness_unknown: true`
+
+CI config indicates an intended workflow; it is not evidence that the workflow
+passes. Documentation is a claim surface, not authority. Project configuration
+indicates possible tooling or runtime shape, not correctness. Pass 1 does not
+read timestamps for these surfaces, so freshness remains explicit unknown state.
+
+If no CI config, documentation surface, or project configuration surface is
+detected in the inspected workspace, Autopsy emits scoped unknowns such as
+`ci_config_unknown`, `documentation_unknown`, or `project_config_unknown`.
+These do not claim the surfaces are absent globally. If multiple plausible
+canonical project config surfaces are detected, Autopsy emits
+`project_config_ambiguous` and asks which config should anchor future explicit
+verification.
 
 ## Source and Test Root Candidates
 
