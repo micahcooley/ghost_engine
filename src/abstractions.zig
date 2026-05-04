@@ -6044,24 +6044,30 @@ test "trust decay: contradictions degrade promoted and core knowledge unless imm
     allocator.free(immune_core.concept_id);
 }
 
-test "parseTier and parseCategory correctly parse legacy names as aliases" {
+test "parseTier and parseCategory correctly parse standard names" {
     // Tests for Tier parsing
     try std.testing.expectEqual(Tier.pattern, parseTier("pattern"));
     try std.testing.expectEqual(Tier.convention, parseTier("convention"));
-    try std.testing.expectEqual(Tier.convention, parseTier("idiom")); // legacy alias
     try std.testing.expectEqual(Tier.logic, parseTier("logic"));
-    try std.testing.expectEqual(Tier.logic, parseTier("mechanism")); // legacy alias
     try std.testing.expectEqual(Tier.contract, parseTier("contract"));
 
     // Tests for Category parsing
     try std.testing.expectEqual(Category.structural, parseCategory("structural"));
-    try std.testing.expectEqual(Category.structural, parseCategory("syntax")); // legacy alias
     try std.testing.expectEqual(Category.procedural, parseCategory("procedural"));
-    try std.testing.expectEqual(Category.procedural, parseCategory("control_flow")); // legacy alias
     try std.testing.expectEqual(Category.relational, parseCategory("relational"));
-    try std.testing.expectEqual(Category.relational, parseCategory("data_flow")); // legacy alias
     try std.testing.expectEqual(Category.boundary, parseCategory("boundary"));
-    try std.testing.expectEqual(Category.boundary, parseCategory("interface")); // legacy alias
     try std.testing.expectEqual(Category.state, parseCategory("state"));
     try std.testing.expectEqual(Category.invariant, parseCategory("invariant"));
+}
+
+test "parseTier and parseCategory correctly parse legacy aliases" {
+    // Tier legacy aliases
+    try std.testing.expectEqual(Tier.convention, parseTier("idiom"));
+    try std.testing.expectEqual(Tier.logic, parseTier("mechanism"));
+
+    // Category legacy aliases
+    try std.testing.expectEqual(Category.structural, parseCategory("syntax"));
+    try std.testing.expectEqual(Category.procedural, parseCategory("control_flow"));
+    try std.testing.expectEqual(Category.relational, parseCategory("data_flow"));
+    try std.testing.expectEqual(Category.boundary, parseCategory("interface"));
 }
