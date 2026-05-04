@@ -3,6 +3,16 @@
 Project Autopsy Pass 1 builds a deterministic, bounded, read-only profile of a
 workspace before deeper reasoning or debugging.
 
+The v1 top-level result always carries the explicit safety contract:
+
+- `autopsy_schema_version: "project_autopsy.v1"`
+- `read_only: true`
+- `non_authorizing: true`
+- `commands_executed: false`
+- `verifiers_executed: false`
+- `mutates_state: false`
+- `state: "draft"`
+
 It produces three draft, non-authorizing artifacts:
 
 - `operator_summary`: a compact decision-grade overview of project shape,
@@ -73,6 +83,13 @@ Autopsy must not:
 - mount or mutate Knowledge Packs
 - register, approve, or run verifiers
 - promote any profile signal into proof of correctness
+- mutate corpus, correction state, negative knowledge, trust state, snapshots,
+  scratch state, or learning-loop state
+
+The output contract is deliberately redundant about authority. Candidate groups
+carry their own `non_authorizing`, `candidate_only`, `executes_by_default`, or
+`applies_by_default` flags where relevant so downstream renderers do not need
+to infer safety from the group name.
 
 ## Detected Signals
 
@@ -130,6 +147,7 @@ candidate includes:
 - `reason`
 - `evidence_paths`
 - `detected_language` when file extensions provide a bounded hint
+- `candidate_only: true`
 - `non_authorizing: true`
 
 Pass 1 detects conventional source roots such as `src/`, `lib/`, `app/`, and
@@ -148,16 +166,20 @@ does not mean tests are absent.
 Command candidates are data only. They use `argv[]`, never shell strings, and
 always include:
 
+- `id`
+- `argv`
 - `cwd`
 - `purpose`
 - `reason`
 - `detected_from`
+- `evidence_paths`
 - `risk_level`
 - `read_only: false`
 - `mutation_risk_disclosure`
 - `why_candidate_exists`
 - `executes_by_default: false`
 - `requires_user_confirmation: true`
+- `candidate_only: true`
 - `non_authorizing: true`
 
 Pass 1 rejects sudo, install, shell-string, network, and arbitrary mutation
@@ -171,6 +193,7 @@ reports if a user later chooses to execute them outside Autopsy.
 Verifier plan candidates are derived from detected Autopsy command candidates
 and remain non-authorizing. Each plan includes:
 
+- `id`
 - `argv`
 - `cwd_hint`
 - `purpose`
@@ -180,8 +203,10 @@ and remain non-authorizing. Each plan includes:
 - `non_authorizing: true`
 - `executes_by_default: false`
 - `source_evidence_paths`
+- `evidence_paths`
 - `why_candidate_exists`
 - `unknowns`
+- `candidate_only: true`
 
 Zig workspaces may propose `zig build` from `build.zig`. Custom Zig step plans
 such as `zig build test`, `zig build bench-serious-workflows`, and
@@ -210,11 +235,13 @@ Risk surfaces include:
 
 - `id`
 - `kind`
+- `risk_kind`
 - `path`
 - `related_paths`
 - `risk_level`
 - `reason`
 - `evidence_paths`
+- `candidate_only: true`
 - `requires_verification: true`
 - `non_authorizing: true`
 
@@ -238,6 +265,7 @@ Verifier gaps are missing-evidence indicators, not failures. Each gap includes:
 - `reason`
 - `related_paths`
 - `evidence_paths`
+- `candidate_only: true`
 - `blocks_support`
 - `non_authorizing: true`
 

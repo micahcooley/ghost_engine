@@ -31,6 +31,7 @@ pub const RiskSurface = struct {
     reason: []const u8,
     evidence_paths: []const []const u8 = &.{},
     suggested_caution: []const u8,
+    candidate_only: bool = true,
     non_authorizing: bool = true,
     requires_verification: bool = true,
 };
@@ -42,6 +43,7 @@ pub const VerifierGapCandidate = struct {
     reason: []const u8,
     related_paths: []const []const u8 = &.{},
     evidence_paths: []const []const u8 = &.{},
+    candidate_only: bool = true,
     non_authorizing: bool = true,
     blocks_support: bool = true,
 };
@@ -53,6 +55,7 @@ pub const RootCandidate = struct {
     reason: []const u8,
     evidence_paths: []const []const u8 = &.{},
     detected_language: ?[]const u8 = null,
+    candidate_only: bool = true,
     non_authorizing: bool = true,
 };
 
@@ -63,12 +66,14 @@ pub const SafeCommandCandidate = struct {
     purpose: []const u8,
     reason: []const u8,
     detected_from: []const u8,
+    evidence_paths: []const []const u8 = &.{},
     risk_level: []const u8,
     read_only: bool = false,
     mutation_risk_disclosure: []const u8,
     why_candidate_exists: []const u8,
     executes_by_default: bool = false,
     requires_user_confirmation: bool = true,
+    candidate_only: bool = true,
     non_authorizing: bool = true,
 };
 
@@ -83,8 +88,10 @@ pub const VerifierPlanCandidate = struct {
     non_authorizing: bool = true,
     executes_by_default: bool = false,
     source_evidence_paths: []const []const u8 = &.{},
+    evidence_paths: []const []const u8 = &.{},
     why_candidate_exists: []const u8,
     unknowns: []const []const u8 = &.{},
+    candidate_only: bool = true,
 };
 
 pub const RecommendedGuidanceCandidate = struct {
@@ -192,6 +199,11 @@ pub const ProjectGapReport = struct {
 };
 
 pub const AutopsyResult = struct {
+    autopsy_schema_version: []const u8 = "project_autopsy.v1",
+    read_only: bool = true,
+    commands_executed: bool = false,
+    verifiers_executed: bool = false,
+    mutates_state: bool = false,
     operator_summary: OperatorSummary,
     project_profile: ProjectProfile,
     project_gap_report: ProjectGapReport,
@@ -365,6 +377,7 @@ const Builder = struct {
         }
         const argv_copy = try self.allocator.alloc([]const u8, argv.len);
         for (argv, 0..) |part, i| argv_copy[i] = try self.allocator.dupe(u8, part);
+        const evidence_paths = try signalEvidencePaths(self.allocator, detected_from);
         try self.safe_commands.append(.{
             .id = try self.allocator.dupe(u8, id),
             .argv = argv_copy,
@@ -372,6 +385,7 @@ const Builder = struct {
             .purpose = try self.allocator.dupe(u8, verifierPlanPurpose(id)),
             .reason = try self.allocator.dupe(u8, reason),
             .detected_from = try self.allocator.dupe(u8, detected_from),
+            .evidence_paths = evidence_paths,
             .risk_level = try self.allocator.dupe(u8, risk_level),
             .mutation_risk_disclosure = try self.allocator.dupe(u8, commandMutationRiskDisclosure(id)),
             .why_candidate_exists = try std.fmt.allocPrint(self.allocator, "{s}; detected from {s}; candidate only and not executed", .{ reason, detected_from }),
@@ -389,6 +403,8 @@ const Builder = struct {
 
         const source_paths = try self.allocator.alloc([]const u8, 1);
         source_paths[0] = try self.allocator.dupe(u8, detected_from);
+        const evidence_paths = try self.allocator.alloc([]const u8, 1);
+        evidence_paths[0] = try self.allocator.dupe(u8, detected_from);
 
         const unknown_templates = verifierPlanUnknowns(id);
         const unknowns = try self.allocator.alloc([]const u8, unknown_templates.len);
@@ -402,6 +418,7 @@ const Builder = struct {
             .risk_level = try self.allocator.dupe(u8, risk_level),
             .confidence = try self.allocator.dupe(u8, verifierPlanConfidence(id, detected_from)),
             .source_evidence_paths = source_paths,
+            .evidence_paths = evidence_paths,
             .why_candidate_exists = try std.fmt.allocPrint(self.allocator, "{s}; derived from autopsy command candidate and not executed", .{reason}),
             .unknowns = unknowns,
         });
@@ -2507,8 +2524,17 @@ test "project autopsy JSON output keeps stable draft safety fields" {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, first.items, .{});
     defer parsed.deinit();
     const root_obj = parsed.value.object;
+    try std.testing.expectEqualStrings("project_autopsy.v1", root_obj.get("autopsy_schema_version").?.string);
+    try std.testing.expect(root_obj.get("read_only").?.bool);
+    try std.testing.expect(!root_obj.get("commands_executed").?.bool);
+    try std.testing.expect(!root_obj.get("verifiers_executed").?.bool);
+    try std.testing.expect(!root_obj.get("mutates_state").?.bool);
     try std.testing.expectEqualStrings("draft", root_obj.get("state").?.string);
     try std.testing.expect(root_obj.get("non_authorizing").?.bool);
+
+    const summary_obj = root_obj.get("operator_summary").?.object;
+    try std.testing.expect(summary_obj.get("read_only").?.bool);
+    try std.testing.expect(summary_obj.get("non_authorizing").?.bool);
 
     const profile_obj = root_obj.get("project_profile").?.object;
     try std.testing.expect(profile_obj.get("non_authorizing").?.bool);
@@ -2519,25 +2545,30 @@ test "project autopsy JSON output keeps stable draft safety fields" {
         try std.testing.expect(risk_obj.get("risk_level").?.string.len > 0);
         try std.testing.expect(risk_obj.get("evidence_paths").?.array.items.len > 0);
         try std.testing.expect(risk_obj.get("requires_verification").?.bool);
+        try std.testing.expect(risk_obj.get("candidate_only").?.bool);
         try std.testing.expect(risk_obj.get("non_authorizing").?.bool);
     }
     for (profile_obj.get("safe_command_candidates").?.array.items) |candidate_value| {
         const candidate = candidate_value.object;
         try std.testing.expect(candidate.get("purpose").?.string.len > 0);
+        try std.testing.expect(candidate.get("evidence_paths").?.array.items.len > 0);
         try std.testing.expect(!candidate.get("read_only").?.bool);
         try std.testing.expect(candidate.get("mutation_risk_disclosure").?.string.len > 0);
         try std.testing.expect(candidate.get("why_candidate_exists").?.string.len > 0);
         try std.testing.expect(!candidate.get("executes_by_default").?.bool);
         try std.testing.expect(candidate.get("requires_user_confirmation").?.bool);
+        try std.testing.expect(candidate.get("candidate_only").?.bool);
         try std.testing.expect(candidate.get("non_authorizing").?.bool);
         try std.testing.expect(candidate.get("argv").?.array.items.len > 0);
     }
 
     for (root_obj.get("verifier_plan_candidates").?.array.items) |plan_value| {
         const plan = plan_value.object;
+        try std.testing.expect(plan.get("evidence_paths").?.array.items.len > 0);
         try std.testing.expect(plan.get("requires_user_confirmation").?.bool);
         try std.testing.expect(plan.get("non_authorizing").?.bool);
         try std.testing.expect(!plan.get("executes_by_default").?.bool);
+        try std.testing.expect(plan.get("candidate_only").?.bool);
     }
 
     for (profile_obj.get("recommended_guidance_candidates").?.array.items) |candidate_value| {
@@ -2561,6 +2592,7 @@ test "project autopsy JSON output keeps stable draft safety fields" {
         try std.testing.expectEqualStrings("verifier_gap", gap_obj.get("kind").?.string);
         try std.testing.expect(gap_obj.get("missing_verifier").?.string.len > 0);
         try std.testing.expect(gap_obj.get("blocks_support").?.bool);
+        try std.testing.expect(gap_obj.get("candidate_only").?.bool);
         try std.testing.expect(gap_obj.get("non_authorizing").?.bool);
     }
 }

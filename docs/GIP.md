@@ -208,10 +208,10 @@ Denied future mutations remain denied by capability policy.
 ### Project Inspection
 - `project.autopsy` — Perform a read-only static analysis of the workspace **(Implemented)**
   - **Request**: `{"workspaceRoot": string}` (Note: GIP `workspace` CLI arg often maps to this)
-  - **Response**: `{"projectAutopsy": {"workspace_root": "...", "project_type": "...", "build_system": "...", "source_directories": [...], "entry_points": [...], "readOnly": true, "commandsExecuted": false, "verifiersRegistered": false, "non_authorizing": true, "verifier_plan_candidates": [...]}}`
+  - **Response**: `{"projectAutopsy": {"autopsy_schema_version": "project_autopsy.v1", "read_only": true, "commands_executed": false, "verifiers_executed": false, "mutates_state": false, "operator_summary": {...}, "project_profile": {...}, "project_gap_report": {...}, "verifier_plan_candidates": [...], "state": "draft", "non_authorizing": true}, "readOnly": true, "commandsExecuted": false, "verifiersExecuted": false, "verifiersRegistered": false, "mutatesState": false, "non_authorizing": true}`
   - Canonicalizes the workspace root and performs bounded static inspection.
   - Does not execute commands, modify files, run verifiers, or mutate packs.
-  - Verifier plan candidates are returned with `executes_by_default: false`.
+  - Safe command, verifier plan, risk, guidance, and operator-summary action candidates are non-authorizing candidates only; command/verifier candidates are returned with `executes_by_default: false`, and guidance/action candidates are returned with `applies_by_default: false` where relevant.
 
 - `context.autopsy` — Evaluate a context case with runtime/persisted mounted-pack guidance and optional bounded artifact/input references **(Implemented)**
   - **Request**: small JSON control plane with `context`, optional `packGuidance`, optional `artifactRefs`, and optional `context.input_refs` / `context.inputRefs`.

@@ -4649,7 +4649,7 @@ fn dispatchProjectAutopsy(allocator: std.mem.Allocator, workspace_root: ?[]const
     // Wrap in a "projectAutopsy" result envelope.
     try w.writeAll("{\"projectAutopsy\":");
     try autopsy_result.writeJson(w);
-    try w.writeAll(",\"readOnly\":true,\"commandsExecuted\":false,\"verifiersRegistered\":false,\"non_authorizing\":true}");
+    try w.writeAll(",\"readOnly\":true,\"commandsExecuted\":false,\"verifiersExecuted\":false,\"verifiersRegistered\":false,\"mutatesState\":false,\"non_authorizing\":true}");
 
     // analysis_arena.deinit() is called by defer above; autopsy_result slices are gone.
     // The out buffer (owned by main allocator) contains the serialized output.
@@ -6358,9 +6358,13 @@ test "project.autopsy valid request returns autopsy result" {
     try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
     const json = result.result_json orelse return error.MissingResult;
     try std.testing.expect(std.mem.indexOf(u8, json, "\"projectAutopsy\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"autopsy_schema_version\": \"project_autopsy.v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"operator_summary\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"readOnly\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"commandsExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verifiersExecuted\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"verifiersRegistered\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"mutatesState\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"non_authorizing\":true") != null);
 }
 
@@ -6415,6 +6419,10 @@ test "project.autopsy verifier candidates have executes_by_default false" {
     // (Pretty-printed JSON uses ": " so search for the key without the value suffix.)
     try std.testing.expect(std.mem.indexOf(u8, json, "\"executes_by_default\": true") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"executes_by_default\":true") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"applies_by_default\": true") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"applies_by_default\":true") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"commandsExecuted\":true") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verifiersExecuted\":true") == null);
     // The field "verifier_plan_candidates" must be present (even if empty).
     try std.testing.expect(std.mem.indexOf(u8, json, "\"verifier_plan_candidates\"") != null);
 }
