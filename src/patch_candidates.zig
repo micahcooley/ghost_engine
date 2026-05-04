@@ -5289,7 +5289,36 @@ fn appendPlanSeed(
     try out.append(seed);
 }
 
+pub const CodeInterventionPolicy = struct {
+    file_cost: u32 = 400,
+    hunk_cost: u32 = 120,
+    change_cost: u32 = 40,
+    dependency_cost: u32 = 220,
+    focused_scope_penalty: u32 = 40,
+    expanded_scope_penalty: u32 = 180,
+    max_bounded_cost: u32 = 2000,
+};
+
+/// Neutral default policy for non-code artifacts (e.g. docs, recipes, logs)
+/// Minimality is a domain policy, not an absolute architectural truth.
+/// Non-code tasks often prefer broader structural consistency over localized patches.
+pub const ArtifactInterventionPolicy = struct {
+    file_cost: u32 = 0,
+    hunk_cost: u32 = 10,
+    change_cost: u32 = 10,
+    dependency_cost: u32 = 0,
+    focused_scope_penalty: u32 = 0,
+    expanded_scope_penalty: u32 = 0,
+    max_bounded_cost: u32 = 2000,
+};
+
+pub const DEFAULT_CODE_INTERVENTION_POLICY = CodeInterventionPolicy{};
+
 fn computeMinimalityEvidence(intel: *const code_intel.Result, surfaces: []const SurfaceSeed, seed: PlanSeed) MinimalityEvidence {
+    return computeMinimalityEvidenceWithPolicy(intel, surfaces, seed, DEFAULT_CODE_INTERVENTION_POLICY);
+}
+
+fn computeMinimalityEvidenceWithPolicy(intel: *const code_intel.Result, surfaces: []const SurfaceSeed, seed: PlanSeed, policy: CodeInterventionPolicy) MinimalityEvidence {
     _ = intel;
     _ = surfaces;
     const file_count: u32 = seed.surface_count;
@@ -5297,8 +5326,8 @@ fn computeMinimalityEvidence(intel: *const code_intel.Result, surfaces: []const 
     const change_count: u32 = seed.surface_count * 2;
     const dependency_spread: u32 = if (seed.surface_count > 0) seed.surface_count - 1 else 0;
     const scope_penalty: u32 = switch (seed.scope_mode) {
-        .focused => 40,
-        .expanded => 180,
+        .focused => policy.focused_scope_penalty,
+        .expanded => policy.expanded_scope_penalty,
     };
     return .{
         .file_count = file_count,
@@ -5306,7 +5335,7 @@ fn computeMinimalityEvidence(intel: *const code_intel.Result, surfaces: []const 
         .hunk_count = hunk_count,
         .dependency_spread = dependency_spread,
         .scope_penalty = scope_penalty,
-        .total_cost = file_count * 400 + hunk_count * 120 + change_count * 40 + dependency_spread * 220 + scope_penalty,
+        .total_cost = file_count * policy.file_cost + hunk_count * policy.hunk_cost + change_count * policy.change_cost + dependency_spread * policy.dependency_cost + scope_penalty,
     };
 }
 
@@ -7534,4 +7563,39 @@ test "patch budget exhaustion is surfaced honestly" {
     try std.testing.expectEqual(code_intel.Status.unresolved, result.status);
     try std.testing.expect(result.budget_exhaustion != null);
     try std.testing.expect(std.mem.indexOf(u8, result.unresolved_detail.?, "compute budget exhausted") != null);
+}
+
+test "policy: code intervention penalty applies costs but neutral artifact policy does not" {
+    const surfaces = [_]SurfaceSeed{};
+
+    const seed = PlanSeed{
+        .strategy = .local_guard,
+        .surface_indexes = [_]u8{0} ** 4,
+        .surface_count = 3, // simulate 3 files/hunks
+        .scope_mode = .expanded,
+        .strategy_score = 0,
+        .minimality = .{},
+    };
+
+    const code_cost = computeMinimalityEvidenceWithPolicy(undefined, &surfaces, seed, DEFAULT_CODE_INTERVENTION_POLICY);
+    const neutral_policy = ArtifactInterventionPolicy{};
+    const neutral_cost = computeMinimalityEvidenceWithPolicy(undefined, &surfaces, seed, .{
+        .file_cost = neutral_policy.file_cost,
+        .hunk_cost = neutral_policy.hunk_cost,
+        .change_cost = neutral_policy.change_cost,
+        .dependency_cost = neutral_policy.dependency_cost,
+        .focused_scope_penalty = neutral_policy.focused_scope_penalty,
+        .expanded_scope_penalty = neutral_policy.expanded_scope_penalty,
+        .max_bounded_cost = neutral_policy.max_bounded_cost,
+    });
+
+    // Code policy penalizes heavily
+    try std.testing.expect(code_cost.file_count == 3);
+    try std.testing.expect(code_cost.total_cost > 1000);
+    try std.testing.expect(code_cost.scope_penalty == 180);
+
+    // Neutral policy doesn't inherit code phobias
+    try std.testing.expect(neutral_cost.file_count == 3);
+    try std.testing.expect(neutral_cost.total_cost < 200); // just hunk/change costs
+    try std.testing.expect(neutral_cost.scope_penalty == 0);
 }
