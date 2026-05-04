@@ -11321,3 +11321,80 @@ test "budget exhaustion is surfaced honestly in code intel results" {
     try std.testing.expect(result.budget_exhaustion != null);
     try std.testing.expect(std.mem.indexOf(u8, result.unresolved_detail.?, "compute budget exhausted") != null);
 }
+
+test "artifact family policy: code profile weights code as intended" {
+    const code_quota = quotaForFamily(DEFAULT_CODE_FAMILY_POLICY, .code);
+    try std.testing.expect(code_quota > 0);
+    try std.testing.expectEqual(@as(usize, 3), code_quota);
+
+    // Test others are lower but not necessarily zero in code profile
+    const docs_quota = quotaForFamily(DEFAULT_CODE_FAMILY_POLICY, .docs);
+    try std.testing.expect(code_quota > docs_quota);
+}
+
+test "artifact family policy: documentation/neutral profile does not silently use code-only quotas" {
+    // Neutral profile should have balanced quotas
+    const neutral_code = quotaForFamily(DEFAULT_NEUTRAL_FAMILY_POLICY, .code);
+    const neutral_docs = quotaForFamily(DEFAULT_NEUTRAL_FAMILY_POLICY, .docs);
+    const neutral_config = quotaForFamily(DEFAULT_NEUTRAL_FAMILY_POLICY, .config);
+    try std.testing.expectEqual(neutral_code, neutral_docs);
+    try std.testing.expectEqual(neutral_docs, neutral_config);
+    try std.testing.expectEqual(@as(usize, 2), neutral_code);
+
+    // Docs profile should prioritize docs over code
+    const docs_code = quotaForFamily(DEFAULT_DOCS_FAMILY_POLICY, .code);
+    const docs_docs = quotaForFamily(DEFAULT_DOCS_FAMILY_POLICY, .docs);
+    try std.testing.expect(docs_docs > docs_code);
+    try std.testing.expectEqual(@as(usize, 4), docs_docs);
+}
+
+test "artifact family policy: hypothesis prior policy is configurable and not universal truth" {
+    const allocator = std.testing.allocator;
+
+    // Create custom policy drastically different from default
+    const custom_policy = HypothesisPriorPolicy{
+        .category_weights = .{
+            .structural = 100,
+            .boundary = 100,
+            .relational = 100,
+            .procedural = 100,
+            .state = 100,
+            .invariant = 100,
+        },
+        .tier_weights = .{
+            .pattern = 50,
+            .convention = 50,
+            .logic = 50,
+            .contract = 50,
+        },
+    };
+
+    var refs = std.ArrayList(abstractions.SupportReference).init(allocator);
+    defer refs.deinit();
+
+    try refs.append(.{
+        .concept_id = @constCast("test-concept"),
+        .source_spec = @constCast("src/test.zig"),
+        .staged = false,
+        .tier = .logic,
+        .category = .structural,
+        .owner_kind = .project,
+        .owner_id = @constCast("test-owner"),
+    });
+
+    // We build biases with default policy and custom policy to prove they differ
+    // and aren't silently forcing a universal truth (default policy)
+    const default_biases = buildBranchBiases(.impact, refs.items, DEFAULT_CODE_PRIOR_POLICY);
+    const custom_biases = buildBranchBiases(.impact, refs.items, custom_policy);
+
+    // They should not be equal if configuration works
+    var differences_found = false;
+    for (0..8) |i| {
+        if (default_biases.values[i] != custom_biases.values[i]) {
+            differences_found = true;
+            break;
+        }
+    }
+
+    try std.testing.expect(differences_found);
+}
