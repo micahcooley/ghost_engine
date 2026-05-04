@@ -968,6 +968,19 @@ test "validation limits enforce defaults and safe overrides" {
     try std.testing.expectError(error.GuidanceArrayItemsLimitOutOfRange, too_large.validate());
 }
 
+test "validation limits enforce max_guidance_bytes hard caps via manifest path validation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    var limits = AutopsyGuidanceValidationLimits.default();
+    limits.max_guidance_bytes = AutopsyGuidanceValidationLimits.hard_cap_guidance_bytes + 1;
+
+    try std.testing.expectError(error.GuidanceBytesLimitOutOfRange, validateManifestPathWithLimits(allocator, root, limits));
+}
+
 test "malformed JSON and unsupported shape fail validation without crashing" {
     const allocator = std.testing.allocator;
     var malformed = try validateGuidanceBytes(allocator, "{not-json", "pack-a", "v1");
@@ -989,6 +1002,17 @@ test "missing manifest path returns structured validation report" {
     try std.testing.expectEqualStrings("manifest_file_missing", report.issues[0].code);
 }
 
+test "relative manifest paths are resolved accurately without cwd state leakage" {
+    const allocator = std.testing.allocator;
+
+    var report = try validateManifestPath(allocator, "does-not-exist/manifest.json");
+    defer report.deinit();
+
+    try std.testing.expect(!report.ok());
+    try std.testing.expectEqualStrings("manifest_file_missing", report.issues[0].code);
+    try std.testing.expect(std.fs.path.isAbsolute(report.manifest_path));
+}
+
 test "invalid manifest structure returns structured validation report" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1003,6 +1027,19 @@ test "invalid manifest structure returns structured validation report" {
     defer report.deinit();
     try std.testing.expect(!report.ok());
     try std.testing.expect(hasIssueCode(report.issues, "manifest_invalid_shape"));
+}
+
+test "manifest path pointing to a directory fails validation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    var report = try validateManifestPath(allocator, root);
+    defer report.deinit();
+    try std.testing.expect(!report.ok());
+    try std.testing.expectEqualStrings("manifest_path_not_file", report.issues[0].code);
 }
 
 fn hasIssueCode(issues: []const ValidationIssue, code: []const u8) bool {
@@ -1051,6 +1088,31 @@ test "invalid and unknown match criteria are reported cleanly" {
     try std.testing.expect(!report.ok());
     try std.testing.expect(hasIssueCode(report.issues, "match_field_invalid_item"));
     try std.testing.expect(hasIssueCode(report.issues, "match_field_unknown"));
+}
+
+test "valid manifest but guidance breaches explicit limit returns structured validation report" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("autopsy");
+    try tmp.dir.writeFile(.{ .sub_path = "autopsy/guidance.json", .data = valid_guidance });
+    const manifest_body =
+        \\{"schemaVersion":"ghost_knowledge_pack_v1","packId":"pack-a","packVersion":"v1","domainFamily":"context","trustClass":"project","compatibility":{"engineVersion":"test","linuxFirst":true,"deterministicOnly":true,"mountSchema":"ghost_knowledge_pack_mounts_v1"},"storage":{"corpusManifestRelPath":"corpus/manifest.json","corpusFilesRelPath":"corpus","abstractionCatalogRelPath":"abstractions/abstractions.gabs","reuseCatalogRelPath":"abstractions/reuse.gabr","lineageStateRelPath":"abstractions/lineage.gabs","influenceManifestRelPath":"influence.json","autopsyGuidanceRelPath":"autopsy/guidance.json"},"provenance":{"packLineageId":"pack:pack-a@v1","sourceKind":"test","sourceId":"test","sourceState":"staged","freshnessState":"active","sourceSummary":"test","sourceLineageSummary":"test"},"content":{"corpusItemCount":0,"conceptCount":0,"corpusHash":0,"abstractionHash":0,"reuseHash":0,"lineageHash":0,"corpusPreview":[],"conceptPreview":[]}}
+    ;
+    try tmp.dir.writeFile(.{ .sub_path = "manifest.json", .data = manifest_body });
+
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const manifest_path = try std.fs.path.join(allocator, &.{ root, "manifest.json" });
+    defer allocator.free(manifest_path);
+
+    var limits = AutopsyGuidanceValidationLimits.default();
+    limits.max_guidance_bytes = 10;
+
+    var report = try validateManifestPathWithLimits(allocator, manifest_path, limits);
+    defer report.deinit();
+    try std.testing.expect(!report.ok());
+    try std.testing.expectEqualStrings("guidance_file_exceeds_byte_limit", report.issues[0].code);
 }
 
 test "missing guidance file declared by manifest fails validation" {
