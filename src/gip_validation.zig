@@ -168,6 +168,22 @@ test "validateVersion rejects wrong version" {
     try std.testing.expect(validateVersion(core.PROTOCOL_VERSION) == null);
 }
 
+test "validateReasoningLevel behavior" {
+    // null should pass
+    try std.testing.expect(validateReasoningLevel(null) == null);
+
+    // valid levels should pass
+    try std.testing.expect(validateReasoningLevel("quick") == null);
+    try std.testing.expect(validateReasoningLevel("balanced") == null);
+    try std.testing.expect(validateReasoningLevel("deep") == null);
+    try std.testing.expect(validateReasoningLevel("max") == null);
+
+    // invalid levels should fail with the correct code
+    const err = validateReasoningLevel("extreme");
+    try std.testing.expect(err != null);
+    try std.testing.expectEqual(core.ErrorCode.invalid_reasoning_level, err.?.code);
+}
+
 test "validatePathContainment rejects traversal" {
     try std.testing.expect(validatePathContainment("/workspace", "../etc/passwd") != null);
     try std.testing.expect(validatePathContainment("/workspace", "/etc/passwd") != null);
