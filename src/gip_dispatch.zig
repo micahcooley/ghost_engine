@@ -11,6 +11,7 @@ const response_engine = @import("response_engine.zig");
 const hypothesis_core = @import("hypothesis_core.zig");
 const verifier_adapter = @import("verifier_adapter.zig");
 const verifier_candidates = @import("verifier_candidates.zig");
+const verifier_candidate_execution = @import("verifier_candidate_execution.zig");
 const knowledge_packs = @import("knowledge_packs.zig");
 const knowledge_pack_store = @import("knowledge_pack_store.zig");
 const autopsy_guidance_validator = @import("autopsy_guidance_validator.zig");
@@ -131,6 +132,7 @@ pub fn dispatch(
         .@"verifier.candidate.propose_from_learning_plan" => dispatchVerifierCandidateProposeFromLearningPlan(allocator, request_body),
         .@"verifier.candidate.list" => dispatchVerifierCandidateList(allocator, request_body),
         .@"verifier.candidate.review" => dispatchVerifierCandidateReview(allocator, request_body),
+        .@"verifier.candidate.execute" => dispatchVerifierCandidateExecute(allocator, workspace_root, request_body),
         .@"correction.list" => dispatchCorrectionList(allocator, workspace_root, request_body),
         .@"correction.get" => dispatchCorrectionGet(allocator, workspace_root, request_body),
         .@"negative_knowledge.candidate.list" => dispatchNegativeKnowledgeCandidateList(allocator, workspace_root, request_body),
@@ -1126,6 +1128,42 @@ fn dispatchVerifierCandidateReview(allocator: std.mem.Allocator, request_body: ?
     gip_state.non_authorization_notice = "verifier.candidate.review appends approval/rejection metadata only; approval permits possible future execution but does not execute or produce evidence";
 
     return .{ .status = .ok, .result_state = gip_state, .result_json = try out.toOwnedSlice(), .allocated_result = true };
+}
+
+fn dispatchVerifierCandidateExecute(allocator: std.mem.Allocator, workspace_root: ?[]const u8, request_body: ?[]const u8) !DispatchResult {
+    const body = request_body orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "request body is required for verifier.candidate.execute" },
+    };
+    var executed = verifier_candidate_execution.executeBody(allocator, body, workspace_root) catch |err| {
+        return verifierCandidateExecutionRequestError(err);
+    };
+    defer executed.deinit();
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try verifier_candidate_execution.writeExecuteResultJson(out.writer(), executed);
+
+    var gip_state = schema.draftResultState();
+    gip_state.permission = .none;
+    gip_state.verification_state = .partial;
+    gip_state.support_minimum_met = false;
+    gip_state.non_authorization_notice = "verifier.candidate.execute runs only approved candidates through the bounded harness and produces verifier execution evidence candidates only; it never grants proof/support or applies correction, negative knowledge, patches, packs, or corpus changes";
+
+    const status: core.ProtocolStatus = if (!executed.executed) .rejected else if (std.mem.eql(u8, executed.status, "passed")) .ok else .failed;
+    return .{ .status = status, .result_state = gip_state, .result_json = try out.toOwnedSlice(), .allocated_result = true };
+}
+
+fn verifierCandidateExecutionRequestError(err: anyerror) DispatchResult {
+    return switch (err) {
+        error.InvalidJson => .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } },
+        error.MissingProjectShard => .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "projectShard is required" } },
+        error.MissingCandidateId => .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "candidateId is required" } },
+        error.MissingWorkspaceRoot => .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "workspaceRoot is required for verifier.candidate.execute" } },
+        error.WorkspaceEscape => .{ .status = .rejected, .err = .{ .code = .path_outside_workspace, .message = "execution cwd is outside workspace root" } },
+        error.InvalidRequest => .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "verifier.candidate.execute request must be a JSON object" } },
+        else => .{ .status = .failed, .err = .{ .code = .internal_error, .message = "verifier.candidate.execute failed", .details = @errorName(err) } },
+    };
 }
 
 fn verifierCandidateRequestError(err: anyerror, fallback: []const u8) DispatchResult {
@@ -6463,7 +6501,7 @@ test "capabilities.describe does not imply unimplemented mutating ops are implem
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"pack.mount\",\"policy\":\"allowed\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"patch.apply\",\"policy\":\"allowed\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"verifier.run\",\"policy\":\"allowed\",\"note\":\"not yet implemented\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"verifier.candidate.execute\",\"policy\":\"denied\",\"mutation\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"verifier.candidate.execute\",\"policy\":\"requires_approval\",\"mutation\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"correction.apply\",\"policy\":\"denied\",\"mutation\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"negative_knowledge.promote\",\"policy\":\"denied\",\"mutation\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"pack.update_from_negative_knowledge\",\"policy\":\"denied\",\"mutation\":true") != null);
@@ -6483,7 +6521,7 @@ test "outputs mark hypotheses and pack influence as non-authorizing" {
     try std.testing.expectEqual(core.ProtocolStatus.ok, pack_result.status);
 }
 
-test "unsupported operations remain unsupported" {
+test "unsupported operations remain unsupported while verifier candidate execute is implemented approval-gated" {
     const allocator = std.testing.allocator;
 
     var r1 = try dispatch(allocator, "verifier.run", core.PROTOCOL_VERSION, null, null, "{}");
@@ -6501,7 +6539,7 @@ test "unsupported operations remain unsupported" {
     var r4 = try dispatch(allocator, "verifier.candidate.execute", core.PROTOCOL_VERSION, null, null, "{}");
     defer r4.deinit(allocator);
     try std.testing.expectEqual(core.ProtocolStatus.rejected, r4.status);
-    try std.testing.expectEqual(core.ErrorCode.capability_denied, r4.err.?.code);
+    try std.testing.expectEqual(core.ErrorCode.missing_required_field, r4.err.?.code);
 
     var r5 = try dispatch(allocator, "correction.apply", core.PROTOCOL_VERSION, null, null, "{}");
     defer r5.deinit(allocator);
@@ -6726,6 +6764,189 @@ test "verifier candidate GIP lifecycle proposes lists approves and rejects witho
     try std.testing.expect(std.mem.indexOf(u8, rejected_list_json, "\"authorityEffect\":\"support\"") == null);
 }
 
+test "verifier.candidate.execute only runs approved confirmed candidates through bounded harness" {
+    const allocator = std.testing.allocator;
+    const shard_id = "verifier-candidate-execute-gip-smoke";
+    const candidate_path = try verifier_candidates.candidatesPath(allocator, shard_id);
+    defer allocator.free(candidate_path);
+    const execution_path = try verifier_candidate_execution.executionsPath(allocator, shard_id);
+    defer allocator.free(execution_path);
+    std.fs.deleteFileAbsolute(candidate_path) catch {};
+    std.fs.deleteFileAbsolute(execution_path) catch {};
+    defer std.fs.deleteFileAbsolute(candidate_path) catch {};
+    defer std.fs.deleteFileAbsolute(execution_path) catch {};
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace_root);
+
+    const propose_body =
+        \\{"projectShard":"verifier-candidate-execute-gip-smoke","learningLoopPlan":{"schema_version":"learning_loop_plan.v1","plan_id":"plan.execute","verifier_candidate_refs":[{"id":"learning.verifier_ref.true","source_command_candidate_id":"true","argv":["true"],"cwd_hint":"","reason":"safe true smoke","evidence_paths":["build.zig"],"requires_approval":true,"executes_by_default":false}]}}
+    ;
+    var proposed = try dispatch(allocator, "verifier.candidate.propose_from_learning_plan", core.PROTOCOL_VERSION, null, null, propose_body);
+    defer proposed.deinit(allocator);
+    const candidate_id = try extractVerifierCandidateIdFromProposal(allocator, proposed.result_json.?);
+    defer allocator.free(candidate_id);
+
+    const execute_proposed_body = try std.fmt.allocPrint(allocator, "{{\"projectShard\":\"{s}\",\"candidateId\":\"{s}\",\"workspaceRoot\":\"{s}\",\"confirmExecute\":true}}", .{ shard_id, candidate_id, workspace_root });
+    defer allocator.free(execute_proposed_body);
+    var proposed_execute = try dispatch(allocator, "verifier.candidate.execute", core.PROTOCOL_VERSION, null, null, execute_proposed_body);
+    defer proposed_execute.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, proposed_execute.status);
+    try std.testing.expect(std.mem.indexOf(u8, proposed_execute.result_json.?, "\"executed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, proposed_execute.result_json.?, "\"candidate_not_approved\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, proposed_execute.result_json.?, "\"producedEvidence\":false") != null);
+
+    const review_body = try std.fmt.allocPrint(allocator, "{{\"projectShard\":\"{s}\",\"candidateId\":\"{s}\",\"decision\":\"approved\",\"reviewedBy\":\"tester\",\"reviewReason\":\"safe bounded execution smoke\"}}", .{ shard_id, candidate_id });
+    defer allocator.free(review_body);
+    var approved = try dispatch(allocator, "verifier.candidate.review", core.PROTOCOL_VERSION, null, null, review_body);
+    defer approved.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, approved.status);
+
+    const execute_no_confirm_body = try std.fmt.allocPrint(allocator, "{{\"projectShard\":\"{s}\",\"candidateId\":\"{s}\",\"workspaceRoot\":\"{s}\",\"confirmExecute\":false}}", .{ shard_id, candidate_id, workspace_root });
+    defer allocator.free(execute_no_confirm_body);
+    var no_confirm = try dispatch(allocator, "verifier.candidate.execute", core.PROTOCOL_VERSION, null, null, execute_no_confirm_body);
+    defer no_confirm.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, no_confirm.status);
+    try std.testing.expect(std.mem.indexOf(u8, no_confirm.result_json.?, "\"confirmation_required\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, no_confirm.result_json.?, "\"commandsExecuted\":false") != null);
+
+    var safe_execute = try dispatch(allocator, "verifier.candidate.execute", core.PROTOCOL_VERSION, null, null, execute_proposed_body);
+    defer safe_execute.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, safe_execute.status);
+    const safe_json = safe_execute.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, safe_json, "\"status\":\"passed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, safe_json, "\"executed\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, safe_json, "\"commandsExecuted\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, safe_json, "\"verifiersExecuted\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, safe_json, "\"evidenceCandidate\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, safe_json, "\"nonAuthorizing\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, safe_json, "\"supportGranted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, safe_json, "\"proofGranted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, safe_json, "\"correctionApplied\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, safe_json, "\"negativeKnowledgePromoted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, safe_json, "\"patchApplied\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, safe_json, "\"mutatesState\":true") != null);
+
+    const persisted = try std.fs.cwd().readFileAlloc(allocator, execution_path, 64 * 1024);
+    defer allocator.free(persisted);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, "\"recordType\":\"verifier_candidate_execution_result\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, "\"supportGranted\":false") != null);
+}
+
+test "verifier.candidate.execute rejects rejected and disallowed candidates without evidence" {
+    const allocator = std.testing.allocator;
+    const shard_id = "verifier-candidate-execute-reject-smoke";
+    const candidate_path = try verifier_candidates.candidatesPath(allocator, shard_id);
+    defer allocator.free(candidate_path);
+    const execution_path = try verifier_candidate_execution.executionsPath(allocator, shard_id);
+    defer allocator.free(execution_path);
+    std.fs.deleteFileAbsolute(candidate_path) catch {};
+    std.fs.deleteFileAbsolute(execution_path) catch {};
+    defer std.fs.deleteFileAbsolute(candidate_path) catch {};
+    defer std.fs.deleteFileAbsolute(execution_path) catch {};
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace_root);
+
+    const propose_body =
+        \\{"projectShard":"verifier-candidate-execute-reject-smoke","learningLoopPlan":{"schema_version":"learning_loop_plan.v1","plan_id":"plan.execute.reject","verifier_candidate_refs":[{"id":"learning.verifier_ref.false","source_command_candidate_id":"false","argv":["false"],"cwd_hint":"","reason":"failing command smoke","evidence_paths":["build.zig"],"requires_approval":true,"executes_by_default":false},{"id":"learning.verifier_ref.bash","source_command_candidate_id":"bash","argv":["bash","-c","echo no"],"cwd_hint":"","reason":"disallowed command smoke","evidence_paths":["build.zig"],"requires_approval":true,"executes_by_default":false}]}}
+    ;
+    var proposed = try dispatch(allocator, "verifier.candidate.propose_from_learning_plan", core.PROTOCOL_VERSION, null, null, propose_body);
+    defer proposed.deinit(allocator);
+    const proposal_json = proposed.result_json.?;
+    const rejected_id = try extractVerifierCandidateIdFromProposal(allocator, proposal_json);
+    defer allocator.free(rejected_id);
+    const disallowed_id = try extractVerifierCandidateIdAt(allocator, proposal_json, 1);
+    defer allocator.free(disallowed_id);
+
+    const reject_body = try std.fmt.allocPrint(allocator, "{{\"projectShard\":\"{s}\",\"candidateId\":\"{s}\",\"decision\":\"rejected\",\"reviewedBy\":\"tester\",\"reviewReason\":\"must not execute rejected\"}}", .{ shard_id, rejected_id });
+    defer allocator.free(reject_body);
+    var rejected_review = try dispatch(allocator, "verifier.candidate.review", core.PROTOCOL_VERSION, null, null, reject_body);
+    defer rejected_review.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, rejected_review.status);
+
+    const execute_rejected_body = try std.fmt.allocPrint(allocator, "{{\"projectShard\":\"{s}\",\"candidateId\":\"{s}\",\"workspaceRoot\":\"{s}\",\"confirmExecute\":true}}", .{ shard_id, rejected_id, workspace_root });
+    defer allocator.free(execute_rejected_body);
+    var rejected_execute = try dispatch(allocator, "verifier.candidate.execute", core.PROTOCOL_VERSION, null, null, execute_rejected_body);
+    defer rejected_execute.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, rejected_execute.status);
+    try std.testing.expect(std.mem.indexOf(u8, rejected_execute.result_json.?, "\"candidate_not_approved\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rejected_execute.result_json.?, "\"producedEvidence\":false") != null);
+
+    const approve_disallowed_body = try std.fmt.allocPrint(allocator, "{{\"projectShard\":\"{s}\",\"candidateId\":\"{s}\",\"decision\":\"approved\",\"reviewedBy\":\"tester\",\"reviewReason\":\"approved metadata but command remains harness-disallowed\"}}", .{ shard_id, disallowed_id });
+    defer allocator.free(approve_disallowed_body);
+    var approved_disallowed = try dispatch(allocator, "verifier.candidate.review", core.PROTOCOL_VERSION, null, null, approve_disallowed_body);
+    defer approved_disallowed.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, approved_disallowed.status);
+
+    const execute_disallowed_body = try std.fmt.allocPrint(allocator, "{{\"projectShard\":\"{s}\",\"candidateId\":\"{s}\",\"workspaceRoot\":\"{s}\",\"confirmExecute\":true}}", .{ shard_id, disallowed_id, workspace_root });
+    defer allocator.free(execute_disallowed_body);
+    var disallowed_execute = try dispatch(allocator, "verifier.candidate.execute", core.PROTOCOL_VERSION, null, null, execute_disallowed_body);
+    defer disallowed_execute.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, disallowed_execute.status);
+    try std.testing.expect(std.mem.indexOf(u8, disallowed_execute.result_json.?, "\"status\":\"disallowed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, disallowed_execute.result_json.?, "\"commandsExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, disallowed_execute.result_json.?, "\"producedEvidence\":false") != null);
+
+    const maybe_file = std.fs.openFileAbsolute(execution_path, .{});
+    try std.testing.expectError(error.FileNotFound, maybe_file);
+}
+
+test "verifier.candidate.execute failed run records evidence candidate without correction or nk" {
+    const allocator = std.testing.allocator;
+    const shard_id = "verifier-candidate-execute-failed-smoke";
+    const candidate_path = try verifier_candidates.candidatesPath(allocator, shard_id);
+    defer allocator.free(candidate_path);
+    const execution_path = try verifier_candidate_execution.executionsPath(allocator, shard_id);
+    defer allocator.free(execution_path);
+    std.fs.deleteFileAbsolute(candidate_path) catch {};
+    std.fs.deleteFileAbsolute(execution_path) catch {};
+    defer std.fs.deleteFileAbsolute(candidate_path) catch {};
+    defer std.fs.deleteFileAbsolute(execution_path) catch {};
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace_root);
+
+    const propose_body =
+        \\{"projectShard":"verifier-candidate-execute-failed-smoke","learningLoopPlan":{"schema_version":"learning_loop_plan.v1","plan_id":"plan.execute.failed","verifier_candidate_refs":[{"id":"learning.verifier_ref.false","source_command_candidate_id":"false","argv":["false"],"cwd_hint":"","reason":"failing command smoke","evidence_paths":["build.zig"],"requires_approval":true,"executes_by_default":false}]}}
+    ;
+    var proposed = try dispatch(allocator, "verifier.candidate.propose_from_learning_plan", core.PROTOCOL_VERSION, null, null, propose_body);
+    defer proposed.deinit(allocator);
+    const candidate_id = try extractVerifierCandidateIdFromProposal(allocator, proposed.result_json.?);
+    defer allocator.free(candidate_id);
+
+    const review_body = try std.fmt.allocPrint(allocator, "{{\"projectShard\":\"{s}\",\"candidateId\":\"{s}\",\"decision\":\"approved\",\"reviewedBy\":\"tester\",\"reviewReason\":\"approved failing verifier smoke\"}}", .{ shard_id, candidate_id });
+    defer allocator.free(review_body);
+    var approved = try dispatch(allocator, "verifier.candidate.review", core.PROTOCOL_VERSION, null, null, review_body);
+    defer approved.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, approved.status);
+
+    const execute_body = try std.fmt.allocPrint(allocator, "{{\"projectShard\":\"{s}\",\"candidateId\":\"{s}\",\"workspaceRoot\":\"{s}\",\"confirmExecute\":true}}", .{ shard_id, candidate_id, workspace_root });
+    defer allocator.free(execute_body);
+    var failed = try dispatch(allocator, "verifier.candidate.execute", core.PROTOCOL_VERSION, null, null, execute_body);
+    defer failed.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.failed, failed.status);
+    const failed_json = failed.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, failed_json, "\"status\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed_json, "\"executed\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed_json, "\"producedEvidence\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed_json, "\"supportGranted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed_json, "\"proofGranted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed_json, "\"correctionApplied\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed_json, "\"negativeKnowledgePromoted\":false") != null);
+
+    const persisted = try std.fs.cwd().readFileAlloc(allocator, execution_path, 64 * 1024);
+    defer allocator.free(persisted);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, "\"status\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, "\"negativeKnowledgePromoted\":false") != null);
+}
+
 test "verifier candidate handoff rejects invalid learning plan refs closed" {
     const allocator = std.testing.allocator;
     const invalid_path = try verifier_candidates.candidatesPath(allocator, "verifier-candidate-invalid-smoke");
@@ -6764,9 +6985,12 @@ test "verifier candidate lifecycle maturity never declares support authority" {
     try std.testing.expectEqual(core.AuthorityEffect.candidate, core.operationAuthorityEffect(.@"verifier.candidate.propose_from_learning_plan"));
     try std.testing.expectEqual(core.AuthorityEffect.candidate, core.operationAuthorityEffect(.@"verifier.candidate.list"));
     try std.testing.expectEqual(core.AuthorityEffect.candidate, core.operationAuthorityEffect(.@"verifier.candidate.review"));
+    try std.testing.expectEqual(core.AuthorityEffect.evidence, core.operationAuthorityEffect(.@"verifier.candidate.execute"));
     try std.testing.expect(core.operationMutatesState(.@"verifier.candidate.propose_from_learning_plan"));
     try std.testing.expect(!core.operationMutatesState(.@"verifier.candidate.list"));
     try std.testing.expect(core.operationMutatesState(.@"verifier.candidate.review"));
+    try std.testing.expect(core.operationMutatesState(.@"verifier.candidate.execute"));
+    try std.testing.expectEqual(core.CapabilityPolicy.requires_approval, core.capabilityPolicyForRequestKind(.@"verifier.candidate.execute"));
 }
 
 test "protocol.describe lists learning.loop.plan as candidate implemented not product ready" {
@@ -6779,12 +7003,16 @@ test "protocol.describe lists learning.loop.plan as candidate implemented not pr
 }
 
 fn extractVerifierCandidateIdFromProposal(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
+    return extractVerifierCandidateIdAt(allocator, json, 0);
+}
+
+fn extractVerifierCandidateIdAt(allocator: std.mem.Allocator, json: []const u8, index: usize) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
     defer parsed.deinit();
     const root = parsed.value.object;
     const proposal = root.get("verifierCandidateProposal").?.object;
     const records = proposal.get("records").?.array;
-    const first = records.items[0].object;
+    const first = records.items[index].object;
     return allocator.dupe(u8, first.get("id").?.string);
 }
 

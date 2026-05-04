@@ -3,13 +3,16 @@
 The first Learning Loop surface is `learning.loop.plan`. It is a read-only,
 candidate-only planning operation:
 
-`project.autopsy` -> `learningLoopPlan` -> `verifierCandidateProposal`
+`project.autopsy` -> `learningLoopPlan` -> `verifierCandidateProposal` ->
+approved `verifier.candidate.execute` -> verifier execution evidence candidate
 
-It does not implement verifier execution, failure ingestion, patching,
-correction application, negative-knowledge review, procedure-pack mutation, or
-learning-state persistence. The verifier-candidate handoff added after the
-first planner surface persists only candidate/review metadata in an append-only
-project-shard JSONL file.
+The planner itself does not execute verifiers, ingest failures, apply patches,
+apply corrections, review negative knowledge, mutate procedure packs, or persist
+learning state. The verifier-candidate handoff persists candidate/review
+metadata in an append-only project-shard JSONL file. A later explicit
+`verifier.candidate.execute` request may run only approved candidates and may
+append verifier execution records; it still does not create proof/support or
+apply follow-on mutations.
 
 ## Safety Contract
 
@@ -42,6 +45,9 @@ handoff is separate:
   latest proposed/approved/rejected status for each candidate.
 - `verifier.candidate.review` appends approval or rejection metadata for an
   existing same-shard candidate.
+- `verifier.candidate.execute` requires an approved same-shard candidate,
+  explicit `confirmExecute:true`, a workspace root, and argv tokens. It reuses
+  the bounded execution harness in `src/execution.zig`.
 
 Candidate records are stored under the project shard at
 `verifier_candidates/verifier_candidates.jsonl`. The file is append-only:
@@ -63,6 +69,22 @@ Every verifier candidate/review surface reports or preserves:
 - `verifiersExecuted: false`
 - `supportGranted: false`
 - `proofDischarged: false`
+
+Approved verifier execution records are stored under the project shard at
+`verifier_executions/verifier_execution_records.jsonl` only after a command is
+actually spawned by the bounded harness. Rejected, unapproved, unconfirmed, or
+disallowed requests return structured non-execution results without evidence.
+Execution records are evidence candidates only:
+
+- `evidenceCandidate: true` only for spawned execution output
+- `nonAuthorizing: true`
+- `supportGranted: false`
+- `proofGranted: false`
+- `correctionApplied: false`
+- `negativeKnowledgePromoted: false`
+- `patchApplied: false`
+- `corpusMutation: false`
+- `packMutation: false`
 
 ## Derivation
 

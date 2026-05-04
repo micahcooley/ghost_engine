@@ -42,6 +42,7 @@ pub const conversation_session = @import("conversation_session.zig");
 pub const verifier_adapter = @import("verifier_adapter.zig");
 pub const verifier_candidates = @import("verifier_candidates.zig");
 pub const verifier_execution = @import("verifier_execution.zig");
+pub const verifier_candidate_execution = @import("verifier_candidate_execution.zig");
 pub const correction_hooks = @import("correction_hooks.zig");
 pub const correction_candidates = @import("correction_candidates.zig");
 pub const correction_review = @import("correction_review.zig");

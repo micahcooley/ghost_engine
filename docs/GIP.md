@@ -132,6 +132,7 @@ results when GIP has no active session or workspace metadata:
 | `verifier.candidate.propose_from_learning_plan` | Converts approval-required `learning.loop.plan` verifier refs into append-only proposed verifier candidate metadata; no command/verifier execution and no evidence/support creation | `append_only_verifier_candidate_metadata_from_learning_loop_no_execution` |
 | `verifier.candidate.list` | Lists same-shard verifier candidate metadata and folded review status; read-only and not proof/evidence | `read_only_verifier_candidate_metadata_inspection_non_authorizing` |
 | `verifier.candidate.review` | Appends approved/rejected review metadata for an existing verifier candidate; approval is for possible future execution only and does not execute | `append_only_verifier_candidate_review_metadata_no_execution` |
+| `verifier.candidate.execute` | Executes only same-shard approved verifier candidate argv tokens through the bounded execution harness after explicit confirmation; appends verifier execution evidence-candidate records, never proof/support | `approved_only_bounded_verifier_execution_evidence_candidate_non_authorizing` |
 | `correction.propose` | Converts a user-disputed output into a review-required correction candidate plus non-authorizing learning candidates; performs no mutation or execution | `candidate_only_review_required_no_mutation` |
 | `correction.review` | Accepts or rejects a correction candidate into an append-only reviewed correction record; performs no corpus, pack, negative-knowledge, command, verifier, or global promotion mutation | `append_only_reviewed_record_no_hidden_mutation` |
 | `correction.reviewed.list` | Lists same-shard reviewed correction records from append-only storage with filters, warnings, and capacity telemetry; read-only and not proof | `read_only_reviewed_correction_inspection_non_authorizing` |
@@ -184,7 +185,7 @@ Denied future mutations remain denied by capability policy.
 | Operation | Status |
 |-----------|--------|
 | `verifier.run` | Not implemented |
-| `verifier.candidate.execute` | Not implemented; denied mutation/future work |
+| `verifier.candidate.execute` | Implemented; explicit approved-candidate execution only, bounded harness, append-only evidence-candidate record |
 | `correction.apply` | Not implemented; denied mutation/future work |
 | `negative_knowledge.promote` | Not implemented; denied mutation/future work |
 | `pack.update_from_negative_knowledge` | Not implemented; denied mutation/future work |
@@ -453,7 +454,15 @@ Denied future mutations remain denied by capability policy.
   - **Response**: Existing execution job/result projection from persisted support-graph state; missing IDs return structured `path_not_found`.
   - Support-graph projections may omit original job/result fields unavailable in persisted graph state.
   - Future populated responses must use bounded stdout/stderr summaries or refs, not unbounded logs.
-- `verifier.candidate.execute` — Execute an approved verifier candidate **(Not implemented; denied mutation/future work)**
+- `verifier.candidate.execute` — Execute an approved verifier candidate **(Implemented; explicit confirmation required)**
+  - **Request**: `{"projectShard": string, "candidateId": string, "workspaceRoot": string, "confirmExecute": true, "timeoutMs": int optional, "maxOutputBytes": int optional}`.
+  - The candidate must already exist in same-shard verifier candidate metadata with folded `status:"approved"`.
+  - The candidate command is replayed as argv tokens through `src/execution.zig`; shell strings, non-allowlisted commands, workspace escapes, and oversized argv are rejected by the bounded harness.
+  - Successful or failed spawned executions append `<project shard>/verifier_executions/verifier_execution_records.jsonl`.
+  - Validation rejections and disallowed commands return structured `executed:false`, `commandsExecuted:false`, `verifiersExecuted:false`, `producedEvidence:false` and do not append evidence.
+  - Passing execution produces a verifier execution evidence candidate only. It does not grant support or proof.
+  - Failing execution produces a verifier execution evidence candidate only. It does not apply corrections, promote negative knowledge, apply patches, mutate packs, or mutate corpus.
+  - **Response**: `{"verifierCandidateExecution":{"status":"passed|failed|timed_out|rejected|disallowed","executionRecord":{...},"executed":bool,"commandsExecuted":bool,"verifiersExecuted":bool,"producedEvidence":bool,"evidenceCandidate":bool,"nonAuthorizing":true,"supportGranted":false,"proofGranted":false,"correctionApplied":false,"negativeKnowledgePromoted":false,"patchApplied":false,"corpusMutation":false,"packMutation":false,"mutatesState":bool,"authorityEffect":"evidence_candidate"}}`
 - `hypothesis.verifier.schedule` — Schedule verifier for hypothesis **(Not implemented yet)**
 
 ### Corrections
@@ -622,7 +631,7 @@ promote global authority.
 | `context.autopsy` | allowed | yes |
 | `command.run` | allowlist | no (not implemented) |
 | `verifier.run` | allowed | no (not implemented) |
-| `verifier.candidate.execute` | denied | no (not implemented) |
+| `verifier.candidate.execute` | requires_approval | yes |
 | `correction.apply` | denied | no (not implemented) |
 | `negative_knowledge.promote` | denied | no (not implemented) |
 | `pack.update_from_negative_knowledge` | denied | no (not implemented) |

@@ -331,7 +331,7 @@ pub fn defaultCapabilities() [64]CapabilityEntry {
         .{ .capability = .@"verifier.candidate.propose_from_learning_plan", .policy = .allowed },
         .{ .capability = .@"verifier.candidate.list", .policy = .allowed },
         .{ .capability = .@"verifier.candidate.review", .policy = .allowed },
-        .{ .capability = .@"verifier.candidate.execute", .policy = .denied },
+        .{ .capability = .@"verifier.candidate.execute", .policy = .requires_approval },
         .{ .capability = .@"hypothesis.list", .policy = .allowed },
         .{ .capability = .@"hypothesis.triage", .policy = .allowed },
         .{ .capability = .@"verifier.list", .policy = .allowed },
@@ -539,6 +539,7 @@ pub fn operationAuthorityEffect(kind: RequestKind) AuthorityEffect {
         .@"corpus.ask",
         .@"verifier.candidate.execution.list",
         .@"verifier.candidate.execution.get",
+        .@"verifier.candidate.execute",
         => .evidence,
         .@"conversation.turn",
         .@"rule.evaluate",
@@ -597,6 +598,7 @@ pub fn operationMaturityLabel(kind: RequestKind) []const u8 {
         .@"artifact.patch.propose" => "candidate_only_patch_proposal_no_apply",
         .@"hypothesis.list", .@"hypothesis.triage" => "stateless_non_authorizing",
         .@"verifier.candidate.execution.list", .@"verifier.candidate.execution.get" => "read_only_state_inspection",
+        .@"verifier.candidate.execute" => "approved_only_bounded_verifier_execution_evidence_candidate_non_authorizing",
         .@"correction.list",
         .@"correction.get",
         .@"negative_knowledge.candidate.list",
@@ -770,6 +772,7 @@ pub const IMPLEMENTED_KINDS = [_]RequestKind{
     .@"verifier.candidate.propose_from_learning_plan",
     .@"verifier.candidate.list",
     .@"verifier.candidate.review",
+    .@"verifier.candidate.execute",
     .@"correction.propose",
     .@"correction.review",
     .@"correction.reviewed.list",
@@ -909,7 +912,6 @@ test "every implemented kind has operation maturity metadata" {
 
 test "maturity preserves denied and approval-required mutation policies" {
     const denied_mutations = [_]RequestKind{
-        .@"verifier.candidate.execute",
         .@"correction.apply",
         .@"negative_knowledge.promote",
         .@"pack.update_from_negative_knowledge",
@@ -925,6 +927,7 @@ test "maturity preserves denied and approval-required mutation policies" {
     const approval_mutations = [_]RequestKind{
         .@"artifact.patch.apply",
         .@"artifact.write.apply",
+        .@"verifier.candidate.execute",
         .@"negative_knowledge.candidate.review",
         .@"negative_knowledge.record.expire",
         .@"negative_knowledge.record.supersede",
