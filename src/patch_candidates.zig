@@ -7590,12 +7590,53 @@ test "policy: code intervention penalty applies costs but neutral artifact polic
     });
 
     // Code policy penalizes heavily
+    try std.testing.expectEqual(DEFAULT_CODE_INTERVENTION_POLICY.file_cost, 400);
+    try std.testing.expectEqual(DEFAULT_CODE_INTERVENTION_POLICY.dependency_cost, 220);
     try std.testing.expect(code_cost.file_count == 3);
     try std.testing.expect(code_cost.total_cost > 1000);
     try std.testing.expect(code_cost.scope_penalty == 180);
 
     // Neutral policy doesn't inherit code phobias
+    try std.testing.expectEqual(neutral_policy.file_cost, 0);
+    try std.testing.expectEqual(neutral_policy.dependency_cost, 0);
     try std.testing.expect(neutral_cost.file_count == 3);
     try std.testing.expect(neutral_cost.total_cost < 200); // just hunk/change costs
     try std.testing.expect(neutral_cost.scope_penalty == 0);
+}
+
+test "policy scoring does not grant proof or support status" {
+    var candidate = Candidate{
+        .id = try std.testing.allocator.dupe(u8, "candidate_scoring"),
+        .source_intent = try std.testing.allocator.dupe(u8, "test"),
+        .action_surface = try std.testing.allocator.dupe(u8, "test"),
+        .summary = try std.testing.allocator.dupe(u8, "test"),
+        .strategy = try std.testing.allocator.dupe(u8, "test"),
+        .scope = try std.testing.allocator.dupe(u8, "test"),
+        .score = 100,
+        .minimality = .{
+            .file_count = 1,
+            .change_count = 1,
+            .hunk_count = 1,
+            .dependency_spread = 0,
+            .scope_penalty = 0,
+            .total_cost = 0, // perfect minimality (0 penalty)
+        },
+        .validation_state = .draft_unvalidated,
+    };
+    defer candidate.deinit(std.testing.allocator);
+
+    const workflow = VerificationWorkflow{
+        .test_available = false,
+        .runtime_available = false,
+        .runtime_oracle = null,
+    };
+
+    const initial_state = candidate.validation_state;
+    const score = proofScore(&candidate, workflow);
+
+    // Scoring is applied.
+    try std.testing.expect(score == 2700);
+
+    // The core requirement: policy scoring MUST NOT mutate or grant proof/support validation state.
+    try std.testing.expectEqual(initial_state, candidate.validation_state);
 }
