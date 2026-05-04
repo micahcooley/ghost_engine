@@ -1321,10 +1321,9 @@ pub fn stageMergeFromCommand(allocator: std.mem.Allocator, paths: *const shards.
     const source_record = findRecordByConcept(source_live.items, request.source_concept_id) orelse return error.AbstractionSourceNotFound;
 
     if (request.mode == .promote) {
-        if (trustRank(default_trust) <= trustRank(source_record.trust_class)) return error.TrustPromotionRequiresHigherDestination;
-        if (source_record.trust_class == .exploratory) return error.ExploratoryContentCannotBePromoted;
+        if (trustRank(default_trust, DEFAULT_TRUST_POLICY) <= trustRank(source_record.trust_class, DEFAULT_TRUST_POLICY)) return error.TrustPromotionRequiresHigherDestination;
         if (source_record.decay_state == .prunable) return error.PrunableContentCannotBePromoted;
-    } else if (trustRank(default_trust) > trustRank(source_record.trust_class)) {
+    } else if (trustRank(default_trust, DEFAULT_TRUST_POLICY) > trustRank(source_record.trust_class, DEFAULT_TRUST_POLICY)) {
         return error.UsePromoteForHigherTrustDestination;
     }
 
@@ -1936,7 +1935,7 @@ pub fn applyReinforcementEvents(
         try mergeUniqueTextInto(&target.?.sources, allocator, event.source_specs);
         try mergeUniqueTextInto(&target.?.tokens, allocator, event.tokens);
         try mergeUniqueTextInto(&target.?.patterns, allocator, event.patterns);
-        applyReinforcementOutcome(target.?, event.outcome);
+        applyReinforcementOutcome(target.?, event.outcome, DEFAULT_TRUST_POLICY);
         refreshReinforcementRecord(target.?);
 
         const extra = try reinforcementExtra(allocator, event);
@@ -2612,7 +2611,7 @@ fn sortSupportReferences(items: []SupportReference) void {
 fn lessSupportReference(a: SupportReference, b: SupportReference) bool {
     if (a.usable != b.usable) return a.usable;
     if (a.decay_state != b.decay_state) return decayRank(a.decay_state) < decayRank(b.decay_state);
-    if (a.trust_class != b.trust_class) return trustRank(a.trust_class) > trustRank(b.trust_class);
+    if (a.trust_class != b.trust_class) return trustRank(a.trust_class, DEFAULT_TRUST_POLICY) > trustRank(b.trust_class, DEFAULT_TRUST_POLICY);
     if (a.lookup_score != b.lookup_score) return a.lookup_score > b.lookup_score;
     if (tierRank(a.tier) != tierRank(b.tier)) return tierRank(a.tier) > tierRank(b.tier);
     if (a.direct_support_count != b.direct_support_count) return a.direct_support_count > b.direct_support_count;
@@ -2637,7 +2636,7 @@ fn sortReverseLinkReferences(items: []ReverseLinkReference) void {
 fn lessReverseLinkReference(a: ReverseLinkReference, b: ReverseLinkReference) bool {
     if (a.usable != b.usable) return a.usable;
     if (a.decay_state != b.decay_state) return decayRank(a.decay_state) < decayRank(b.decay_state);
-    if (a.trust_class != b.trust_class) return trustRank(a.trust_class) > trustRank(b.trust_class);
+    if (a.trust_class != b.trust_class) return trustRank(a.trust_class, DEFAULT_TRUST_POLICY) > trustRank(b.trust_class, DEFAULT_TRUST_POLICY);
     if (a.lookup_score != b.lookup_score) return a.lookup_score > b.lookup_score;
     if (tierRank(a.tier) != tierRank(b.tier)) return tierRank(a.tier) > tierRank(b.tier);
     if (a.direct_support_count != b.direct_support_count) return a.direct_support_count > b.direct_support_count;
@@ -2987,7 +2986,7 @@ fn findHigherTrustConceptCompetitor(items: []const SupportReference, idx: usize)
         if (other_idx == idx) continue;
         if (!std.mem.eql(u8, item.concept_id, needle.concept_id)) continue;
         if (supportReferenceCompatible(item, needle)) continue;
-        if (trustRank(item.trust_class) > trustRank(needle.trust_class)) return item;
+        if (trustRank(item.trust_class, DEFAULT_TRUST_POLICY) > trustRank(needle.trust_class, DEFAULT_TRUST_POLICY)) return item;
     }
     return null;
 }
@@ -3175,7 +3174,7 @@ fn findHigherTrustAnchorCompetitor(items: []const MountedPackCandidate, idx: usi
         if (item_idx == idx) continue;
         if (item.freshness_state != .active) continue;
         if (!candidatesShareAnchor(item, needle)) continue;
-        if (trustRank(item.trust_class) > trustRank(needle.trust_class)) return item;
+        if (trustRank(item.trust_class, DEFAULT_TRUST_POLICY) > trustRank(needle.trust_class, DEFAULT_TRUST_POLICY)) return item;
     }
     return null;
 }
@@ -3185,7 +3184,7 @@ fn findEarlierAnchorPeer(items: []const MountedPackCandidate, idx: usize) ?Mount
     for (items[0..idx]) |item| {
         if (item.freshness_state != .active) continue;
         if (!candidatesShareAnchor(item, needle)) continue;
-        if (trustRank(item.trust_class) < trustRank(needle.trust_class)) continue;
+        if (trustRank(item.trust_class, DEFAULT_TRUST_POLICY) < trustRank(needle.trust_class, DEFAULT_TRUST_POLICY)) continue;
         return item;
     }
     return null;
@@ -3205,7 +3204,7 @@ fn findLaterEqualTrustAnchorPeer(items: []const MountedPackCandidate, idx: usize
     for (items[idx + 1 ..]) |item| {
         if (item.freshness_state != .active) continue;
         if (!candidatesShareAnchor(item, needle)) continue;
-        if (trustRank(item.trust_class) != trustRank(needle.trust_class)) continue;
+        if (trustRank(item.trust_class, DEFAULT_TRUST_POLICY) != trustRank(needle.trust_class, DEFAULT_TRUST_POLICY)) continue;
         return item;
     }
     return null;
@@ -3310,7 +3309,7 @@ fn scoreMountedPack(
         @as(u32, out.symbol_hits) * 1400 +
         @as(u32, out.domain_hits) * 900 +
         @as(u32, out.file_family_hits) * 250 +
-        @as(u32, trustRank(out.trust_class)) * 50;
+        @as(u32, trustRank(out.trust_class, DEFAULT_TRUST_POLICY)) * 50;
     out.reason = "eligible deterministic anchor";
     return out;
 }
@@ -3331,7 +3330,7 @@ fn lessMountedPackCandidate(a: MountedPackCandidate, b: MountedPackCandidate) bo
     if (a.compatible != b.compatible) return a.compatible;
     if (a.eligible != b.eligible) return a.eligible;
     if (a.freshness_state != b.freshness_state) return a.freshness_state == .active;
-    if (a.trust_class != b.trust_class) return trustRank(a.trust_class) > trustRank(b.trust_class);
+    if (a.trust_class != b.trust_class) return trustRank(a.trust_class, DEFAULT_TRUST_POLICY) > trustRank(b.trust_class, DEFAULT_TRUST_POLICY);
     if (a.score != b.score) return a.score > b.score;
     if (a.path_hits != b.path_hits) return a.path_hits > b.path_hits;
     if (a.symbol_hits != b.symbol_hits) return a.symbol_hits > b.symbol_hits;
@@ -5265,12 +5264,23 @@ fn defaultTrustForKind(kind: shards.Kind) TrustClass {
     };
 }
 
-fn trustRank(class: TrustClass) u8 {
+pub const TrustDecayPolicy = struct {
+    exploratory_rank: u8 = 0,
+    project_rank: u8 = 1,
+    promoted_rank: u8 = 2,
+    core_rank: u8 = 3,
+    contradiction_decay_threshold: u8 = 2,
+    core_immune_to_contradiction: bool = false,
+};
+
+pub const DEFAULT_TRUST_POLICY = TrustDecayPolicy{};
+
+pub fn trustRank(class: TrustClass, policy: TrustDecayPolicy) u8 {
     return switch (class) {
-        .exploratory => 0,
-        .project => 1,
-        .promoted => 2,
-        .core => 3,
+        .exploratory => policy.exploratory_rank,
+        .project => policy.project_rank,
+        .promoted => policy.promoted_rank,
+        .core => policy.core_rank,
     };
 }
 
@@ -5527,7 +5537,7 @@ fn reinforcementExtra(allocator: std.mem.Allocator, event: ReinforcementEvent) !
     });
 }
 
-fn applyReinforcementOutcome(record: *Record, outcome: ReinforcementOutcome) void {
+fn applyReinforcementOutcome(record: *Record, outcome: ReinforcementOutcome, policy: TrustDecayPolicy) void {
     switch (outcome) {
         .success => {
             record.success_count +|= 1;
@@ -5536,7 +5546,23 @@ fn applyReinforcementOutcome(record: *Record, outcome: ReinforcementOutcome) voi
         },
         .failure => record.failure_count +|= 1,
         .ambiguous => record.ambiguity_count +|= 1,
-        .contradicted => record.contradiction_count +|= 1,
+        .contradicted => {
+            record.contradiction_count +|= 1;
+            if (record.contradiction_count >= policy.contradiction_decay_threshold) {
+                if (record.trust_class == .core and policy.core_immune_to_contradiction) {
+                    // Immune
+                } else if (record.trust_class == .core) {
+                    record.trust_class = .promoted;
+                    record.decay_state = .stale;
+                } else if (record.trust_class == .promoted) {
+                    record.trust_class = .project;
+                    record.decay_state = .stale;
+                } else if (record.trust_class == .project) {
+                    record.trust_class = .exploratory;
+                    record.decay_state = .prunable;
+                }
+            }
+        },
     }
 }
 
@@ -5715,7 +5741,7 @@ fn mergeCompatibleRecord(
 
 fn provenanceMergeAllowed(current: *const Record, source: *const Record, mode: MergeMode, destination_trust: TrustClass) bool {
     if (current.decay_state == .protected and mode != .promote) return false;
-    if (mode == .promote and trustRank(destination_trust) <= trustRank(source.trust_class)) return false;
+    if (mode == .promote and trustRank(destination_trust, DEFAULT_TRUST_POLICY) <= trustRank(source.trust_class, DEFAULT_TRUST_POLICY)) return false;
     return true;
 }
 
@@ -5746,7 +5772,7 @@ fn findMutableRecord(records: []Record, concept_id: []const u8) ?*Record {
 
 fn pruneCollectEligible(record: *const Record, state: CatalogState, gap: u32, quality: u16, confidence: u16, trust_limit: TrustClass) bool {
     if (record.decay_state == .protected or record.decay_state == .prunable) return false;
-    if (trustRank(record.trust_class) > trustRank(trust_limit)) return false;
+    if (trustRank(record.trust_class, DEFAULT_TRUST_POLICY) > trustRank(trust_limit, DEFAULT_TRUST_POLICY)) return false;
     if (record.quality_score > quality or record.confidence_score > confidence) return false;
     const last_seen = @max(record.last_review_revision, record.last_revision);
     return state.revision >= last_seen + gap;
@@ -5962,4 +5988,49 @@ fn appendStringArrayJson(out: *std.ArrayList(u8), items: []const []const u8) !vo
         try out.append('"');
     }
     try out.append(']');
+}
+
+test "trust decay: contradictions degrade promoted and core knowledge unless immune" {
+    const allocator = std.testing.allocator;
+
+    var core_record: Record = undefined;
+    core_record.concept_id = try allocator.dupe(u8, "test");
+    core_record.category = .syntax;
+    core_record.tier = .pattern;
+    core_record.trust_class = .core;
+    core_record.decay_state = .active;
+    core_record.allocator = allocator;
+    core_record.contradiction_count = 0;
+
+    // Default policy: 2 contradictions decays
+    const policy = TrustDecayPolicy{};
+
+    // First contradiction: count increases, state remains core
+    applyReinforcementOutcome(&core_record, .contradicted, policy);
+    try std.testing.expectEqual(TrustClass.core, core_record.trust_class);
+
+    // Second contradiction: hits threshold (2), decays to promoted/stale
+    applyReinforcementOutcome(&core_record, .contradicted, policy);
+    try std.testing.expectEqual(TrustClass.promoted, core_record.trust_class);
+    try std.testing.expectEqual(DecayState.stale, core_record.decay_state);
+
+    // Test immunity
+    var immune_core: Record = undefined;
+    immune_core.concept_id = try allocator.dupe(u8, "test");
+    immune_core.category = .syntax;
+    immune_core.tier = .pattern;
+    immune_core.trust_class = .core;
+    immune_core.decay_state = .active;
+    immune_core.allocator = allocator;
+    immune_core.contradiction_count = 0;
+
+    var immune_policy = policy;
+    immune_policy.core_immune_to_contradiction = true;
+
+    applyReinforcementOutcome(&immune_core, .contradicted, immune_policy);
+    applyReinforcementOutcome(&immune_core, .contradicted, immune_policy);
+    try std.testing.expectEqual(TrustClass.core, immune_core.trust_class); // Immune
+    
+    allocator.free(core_record.concept_id);
+    allocator.free(immune_core.concept_id);
 }

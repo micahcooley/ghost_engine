@@ -415,7 +415,7 @@ fn lessThanRanked(_: void, lhs: Ranked, rhs: Ranked) bool {
     if (lhs.upper != rhs.upper) return lhs.upper > rhs.upper;
     if (selectedSignalSource(lhs.entry) != selectedSignalSource(rhs.entry)) return signalSourceRank(selectedSignalSource(lhs.entry)) > signalSourceRank(selectedSignalSource(rhs.entry));
     if (lhs.entry.exact_anchor != rhs.entry.exact_anchor) return lhs.entry.exact_anchor;
-    if (lhs.entry.trust_class != rhs.entry.trust_class) return trustRank(lhs.entry.trust_class) > trustRank(rhs.entry.trust_class);
+    if (lhs.entry.trust_class != rhs.entry.trust_class) return trustRank(lhs.entry.trust_class, DEFAULT_TRUST_POLICY) > trustRank(rhs.entry.trust_class, DEFAULT_TRUST_POLICY);
     if (lhs.entry.source_family != rhs.entry.source_family) return @intFromEnum(lhs.entry.source_family) < @intFromEnum(rhs.entry.source_family);
     if (lhs.entry.stable_rank != rhs.entry.stable_rank) return lhs.entry.stable_rank < rhs.entry.stable_rank;
     return std.mem.lessThan(u8, lhs.entry.id, rhs.entry.id);
@@ -449,12 +449,23 @@ fn signalSourceRank(source: SignalSource) u8 {
     };
 }
 
-fn trustRank(trust: TrustClass) u8 {
+pub const TrustDecayPolicy = struct {
+    exploratory_rank: u8 = 0,
+    project_rank: u8 = 1,
+    promoted_rank: u8 = 2,
+    core_rank: u8 = 3,
+    contradiction_decay_threshold: u8 = 2,
+    core_immune_to_contradiction: bool = false,
+};
+
+pub const DEFAULT_TRUST_POLICY = TrustDecayPolicy{};
+
+pub fn trustRank(trust: TrustClass, policy: TrustDecayPolicy) u8 {
     return switch (trust) {
-        .exploratory => 0,
-        .project => 1,
-        .promoted => 2,
-        .core => 3,
+        .exploratory => policy.exploratory_rank,
+        .project => policy.project_rank,
+        .promoted => policy.promoted_rank,
+        .core => policy.core_rank,
     };
 }
 
