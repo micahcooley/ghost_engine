@@ -16,7 +16,6 @@ The current pass demonstrates the shape:
 - Integration with the domain-neutral artifact policy system.
 
 Future passes may add:
-- Filesystem-backed inspection (reading actual doc/config files).
 - Pack-driven non-code autopsy guidance.
 - Additional domains (incident review, config audit, contract review).
 
@@ -143,6 +142,30 @@ checks documentation audit, recipe unused ingredient, recipe missing
 ingredient, missing ingredients section, missing steps section, and path
 traversal rejection. The checks use `jq` when available and fall back to
 literal output matching otherwise.
+
+## Local Verification Checkpoint
+
+For a known-good local artifact autopsy integration check, build and verify the
+engine before testing the CLI wrapper:
+
+```bash
+bash ./compile_shaders.sh
+zig build
+zig build test --summary all
+zig build smoke-artifact-autopsy
+zig build bench-serious-workflows
+zig build test-parity
+git diff --check
+```
+
+`smoke-artifact-autopsy` is an engine smoke for `ghost_gip` and the checked-in
+artifact fixtures. It does not make artifact findings proof, support, or
+product-ready output. Findings remain candidate-only and non-authorizing.
+
+Jules PRs are implementation candidates. Local machine verification is the
+merge-readiness authority. If a remote/Jules environment lacks Zig, Vulkan, or
+shader tooling, report that blocker and do not claim full verification from
+remote checks alone.
 
 ## Policy Integration
 
