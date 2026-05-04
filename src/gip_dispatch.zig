@@ -4876,7 +4876,15 @@ fn dispatchArtifactAutopsyInspect(allocator: std.mem.Allocator, workspace_root: 
 
     try w.writeAll("{\"artifactAutopsyInspect\":");
     try std.json.stringify(result, .{}, w);
-    try w.writeAll(",\"readOnly\":true,\"mutatesState\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false,\"supportGranted\":false,\"proofGranted\":false,\"non_authorizing\":true}");
+    try w.writeAll(",\"readOnly\":true,\"mutatesState\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false,\"supportGranted\":false,\"proofGranted\":false,\"non_authorizing\":true");
+    // v1 contract fields in envelope for consumer discoverability
+    try w.print(",\"autopsy_schema_version\":\"{s}\"", .{result.autopsy_schema_version});
+    try w.print(",\"artifact_autopsy_contract\":\"{s}\"", .{result.artifact_autopsy_contract});
+    try w.print(",\"route_kind\":\"{s}\"", .{result.route_kind});
+    try w.print(",\"fixture_backed\":{}", .{result.fixture_backed});
+    try w.print(",\"file_backed\":{}", .{result.file_backed});
+    try w.print(",\"product_ready\":{}", .{result.product_ready});
+    try w.writeAll("}");
 
     // analysis_arena.deinit() called by defer above; result slices are gone.
     // out buffer (owned by main allocator) contains the serialized output.

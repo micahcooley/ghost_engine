@@ -159,6 +159,44 @@ test "smoke: gip artifact.autopsy.inspect rejects unknown domain" {
     try std.testing.expectEqual(gip.ProtocolStatus.rejected, result.status);
 }
 
+test "smoke: gip artifact.autopsy.inspect fixture fallback includes artifact_autopsy.v1 metadata" {
+    const allocator = std.testing.allocator;
+    // No artifactPaths -> fixture fallback path
+    var result = try gip.dispatch.dispatch(allocator, "artifact.autopsy.inspect", gip.PROTOCOL_VERSION, null, null, null);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(gip.ProtocolStatus.ok, result.status);
+    const json = result.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"autopsy_schema_version\":\"artifact_autopsy.v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"artifact_autopsy_contract\":\"seed.file_bounded.v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"route_kind\":\"artifact.autopsy.inspect\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"fixture_backed\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"file_backed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"product_ready\":false") != null);
+    // Safety flags unchanged
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"readOnly\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"non_authorizing\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"proofGranted\":false") != null);
+}
+
+test "smoke: gip artifact.autopsy.inspect recipe_consistency includes artifact_autopsy.v1 and fixture_backed:true" {
+    const allocator = std.testing.allocator;
+    const req = "{\"domain\":\"recipe_consistency\"}";
+    var result = try gip.dispatch.dispatch(allocator, "artifact.autopsy.inspect", gip.PROTOCOL_VERSION, null, null, req);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(gip.ProtocolStatus.ok, result.status);
+    const json = result.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"autopsy_schema_version\":\"artifact_autopsy.v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"artifact_autopsy_contract\":\"seed.file_bounded.v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"fixture_backed\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"file_backed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"product_ready\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"recipe_consistency\"") != null);
+    // Safety contract preserved
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"non_authorizing\":true") != null);
+}
+
 const TraceCapture = struct {
     event: ?mc.TraceEvent = null,
     event_count: u32 = 0,

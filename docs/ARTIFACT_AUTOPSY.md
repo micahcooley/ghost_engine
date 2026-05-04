@@ -56,6 +56,34 @@ Every `ArtifactAutopsyResult` carries explicit, redundant safety flags:
 These are **compile-time defaults** in the struct definition. Any change
 to these defaults is a visible source change that tests will catch.
 
+## Result Schema (v1 Contract)
+
+The v1 result contract adds explicit schema/version metadata to every
+`ArtifactAutopsyResult`. These fields are **descriptive only**:
+
+| Field | Type | Value | Invariant |
+|-------|------|-------|-----------|
+| `autopsy_schema_version` | `string` | `"artifact_autopsy.v1"` | Never changes within v1 |
+| `artifact_autopsy_contract` | `string` | `"seed.file_bounded.v1"` | Identifies bounded inspection contract |
+| `route_kind` | `string` | `"artifact.autopsy.inspect"` | The GIP kind that produced this result |
+| `fixture_backed` | `bool` | `true` for fixture, `false` for file-backed | Mutually exclusive with `file_backed` |
+| `file_backed` | `bool` | `true` for file reads, `false` for fixtures | Mutually exclusive with `fixture_backed` |
+| `product_ready` | `bool` | `false` always | Schema presence does not imply readiness |
+
+### Authority rules for schema metadata
+
+1. **Schema labels are descriptive, not authorizing.**
+   `autopsy_schema_version:"artifact_autopsy.v1"` does not grant authority.
+2. **`product_ready:false` cannot be overridden by schema presence.**
+   Presence of a schema field does not make a route product-ready.
+3. **Schema metadata does not alter safety contract fields.**
+   `read_only`, `non_authorizing`, `proof_granted`, etc. are unaffected.
+4. **`fixture_backed` and `file_backed` are mutually exclusive.**
+   A result is either a fixture (no filesystem reads) or file-backed (bounded reads).
+5. **No behavior becomes product-ready just because it has a schema.**
+
+
+
 ## Fixture: Documentation Audit
 
 The documentation audit fixture demonstrates:

@@ -430,9 +430,10 @@ Denied future mutations remain denied by capability policy.
 - `artifact.list` — List directory entries **(Implemented)**
 - `artifact.policy.describe` — Inspect active domain policy metadata **(Implemented; read-only)**
 - `artifact.autopsy.inspect` — Seed read-only non-code artifact inspection **(Implemented)**
-  - **Request**: `{"domain": "documentation_audit" | "recipe_consistency"}`
-  - **Response**: `{"artifactAutopsyInspect": {"autopsy_schema_version": "...", "read_only": true, ...}}`
-  - Returns hardcoded fixtures for now to seed the architecture.
+  - **Request**: `{"domain": "documentation_audit" | "recipe_consistency", "artifactPaths": ["README.md"]}` (artifactPaths is optional, falls back to fixture)
+  - **Response**: `{"artifactAutopsyInspect": {"autopsy_schema_version": "artifact_autopsy.v1", "artifact_autopsy_contract": "seed.file_bounded.v1", "route_kind": "artifact.autopsy.inspect", "fixture_backed": bool, "file_backed": bool, "product_ready": false, "read_only": true, ...}, "readOnly": true, "mutatesState": false, "commandsExecuted": false, "verifiersExecuted": false, "supportGranted": false, "proofGranted": false, "non_authorizing": true, "autopsy_schema_version": "artifact_autopsy.v1", "artifact_autopsy_contract": "seed.file_bounded.v1", "route_kind": "artifact.autopsy.inspect", "fixture_backed": bool, "file_backed": bool, "product_ready": false}`
+  - Supports bounded file reads when `artifactPaths` are provided, otherwise falls back to deterministic fixtures.
+  - Schema metadata in response is descriptive only; it does not grant authority.
 - `artifact.search` — Search for patterns in workspace **(Not implemented yet)**
 - `artifact.patch.propose` — Propose edits (non-authorizing). **(Implemented)**
   - **Request**: `{"path": string, "edits": [{"editId": string, "span": {"startLine": int, "startCol": int, "endLine": int, "endCol": int}, "replacement": string, "precondition": {"expectedText": string, "expectedHash": int}}]}`

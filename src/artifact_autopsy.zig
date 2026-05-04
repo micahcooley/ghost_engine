@@ -100,7 +100,33 @@ pub const ArtifactUnknown = struct {
 /// downstream renderers and consumers do not need to infer safety
 /// from the result's provenance or context.
 pub const ArtifactAutopsyResult = struct {
+    // ── Schema/contract metadata ────────────────────────────────────────
+    // These fields describe the shape and provenance of the result.
+    // They are descriptive only. A schema label does not grant authority.
+    // product_ready:false cannot be overridden by schema presence.
+
+    /// Schema version for this result envelope (v1 contract).
     autopsy_schema_version: []const u8 = "artifact_autopsy.v1",
+
+    /// Stable contract label for this route.
+    /// seed.file_bounded.v1 — inspection is bounded: fixture or bounded file read only.
+    artifact_autopsy_contract: []const u8 = "seed.file_bounded.v1",
+
+    /// The GIP kind that produced this result.
+    route_kind: []const u8 = "artifact.autopsy.inspect",
+
+    /// Whether this result came from a hardcoded fixture.
+    /// true  → no filesystem reads; deterministic test fixture
+    /// false → file-backed; bounded reads from provided paths
+    fixture_backed: bool = false,
+
+    /// Whether this result was produced from actual file reads.
+    /// Mutually exclusive with fixture_backed.
+    file_backed: bool = false,
+
+    /// Whether this autopsy route is considered product-ready.
+    /// Always false at seed stage. Schema presence does not imply readiness.
+    product_ready: bool = false,
 
     /// Which non-code domain this autopsy targets
     artifact_domain: ArtifactDomain = .documentation_audit,
@@ -155,6 +181,8 @@ pub const ArtifactAutopsyResult = struct {
 /// It does not read the filesystem; it uses hardcoded fixture data.
 pub fn documentationAuditFixture() ArtifactAutopsyResult {
     return .{
+        .fixture_backed = true,
+        .file_backed = false,
         .artifact_domain = .documentation_audit,
         .artifact_paths = &.{ "README.md", "Makefile" },
         .detected_claims = &.{
@@ -221,6 +249,8 @@ pub fn documentationAuditFixture() ArtifactAutopsyResult {
 /// This is a bounded, deterministic fixture for testing.
 pub fn recipeConsistencyFixture() ArtifactAutopsyResult {
     return .{
+        .fixture_backed = true,
+        .file_backed = false,
         .artifact_domain = .recipe_consistency,
         .artifact_paths = &.{"recipe.md"},
         .detected_claims = &.{
@@ -469,6 +499,8 @@ pub fn documentationAudit(
     }
 
     const result = ArtifactAutopsyResult{
+        .fixture_backed = false,
+        .file_backed = true,
         .artifact_domain = .documentation_audit,
         .active_policy_profile = .documentation,
         .artifact_paths = inspected_paths.items,
@@ -498,6 +530,34 @@ test "artifact autopsy result defaults enforce read-only non-authorizing contrac
     try std.testing.expect(!result.commands_executed);
     try std.testing.expect(!result.verifiers_executed);
     try std.testing.expect(!result.mutates_state);
+    try std.testing.expectEqualStrings("draft", result.state);
+}
+
+// ── 1b. Schema/contract v1 metadata ─────────────────────────────────────
+
+test "artifact autopsy result carries v1 schema version" {
+    const result = ArtifactAutopsyResult{};
+    try std.testing.expectEqualStrings("artifact_autopsy.v1", result.autopsy_schema_version);
+    try std.testing.expectEqualStrings("seed.file_bounded.v1", result.artifact_autopsy_contract);
+    try std.testing.expectEqualStrings("artifact.autopsy.inspect", result.route_kind);
+}
+
+test "artifact autopsy result product_ready is always false" {
+    const result = ArtifactAutopsyResult{};
+    try std.testing.expect(!result.product_ready);
+    // Schema presence does not override product_ready
+    try std.testing.expectEqualStrings("artifact_autopsy.v1", result.autopsy_schema_version);
+    try std.testing.expect(!result.product_ready);
+}
+
+test "schema/contract metadata does not alter safety contract fields" {
+    const result = ArtifactAutopsyResult{};
+    // Verify schema fields do not interfere with safety invariants
+    try std.testing.expectEqualStrings("artifact_autopsy.v1", result.autopsy_schema_version);
+    try std.testing.expect(result.read_only);
+    try std.testing.expect(result.non_authorizing);
+    try std.testing.expect(!result.support_granted);
+    try std.testing.expect(!result.proof_granted);
     try std.testing.expectEqualStrings("draft", result.state);
 }
 
@@ -552,6 +612,21 @@ test "artifact unknowns represent missing evidence, not negative evidence" {
 }
 
 // ── 2. Documentation audit fixture ──────────────────────────────────────
+
+test "documentation audit fixture carries v1 schema metadata" {
+    const result = documentationAuditFixture();
+    try std.testing.expectEqualStrings("artifact_autopsy.v1", result.autopsy_schema_version);
+    try std.testing.expectEqualStrings("seed.file_bounded.v1", result.artifact_autopsy_contract);
+    try std.testing.expectEqualStrings("artifact.autopsy.inspect", result.route_kind);
+    try std.testing.expect(result.fixture_backed);
+    try std.testing.expect(!result.file_backed);
+    try std.testing.expect(!result.product_ready);
+    // Safety contract unchanged by schema metadata
+    try std.testing.expect(result.read_only);
+    try std.testing.expect(result.non_authorizing);
+    try std.testing.expect(!result.proof_granted);
+    try std.testing.expect(!result.support_granted);
+}
 
 test "documentation audit fixture detects candidate inconsistency between README and config" {
     const result = documentationAuditFixture();
@@ -621,6 +696,20 @@ test "documentation audit fixture uses documentation policy, not code policy" {
 }
 
 // ── 3. Recipe consistency fixture ───────────────────────────────────────
+
+test "recipe consistency fixture carries v1 schema metadata" {
+    const result = recipeConsistencyFixture();
+    try std.testing.expectEqualStrings("artifact_autopsy.v1", result.autopsy_schema_version);
+    try std.testing.expectEqualStrings("seed.file_bounded.v1", result.artifact_autopsy_contract);
+    try std.testing.expectEqualStrings("artifact.autopsy.inspect", result.route_kind);
+    try std.testing.expect(result.fixture_backed);
+    try std.testing.expect(!result.file_backed);
+    try std.testing.expect(!result.product_ready);
+    // Safety contract unchanged
+    try std.testing.expect(result.read_only);
+    try std.testing.expect(result.non_authorizing);
+    try std.testing.expect(!result.proof_granted);
+}
 
 test "recipe consistency fixture detects missing ingredient candidate" {
     const result = recipeConsistencyFixture();
@@ -861,4 +950,51 @@ test "documentation audit explicit docs-only reports missing build evidence" {
         if (std.mem.eql(u8, u.name, "missing_build_evidence")) found_missing = true;
     }
     try std.testing.expect(found_missing);
+}
+
+// ── 7. File-backed v1 schema metadata ───────────────────────────────────
+
+test "file-backed documentation audit carries v1 schema metadata with file_backed:true" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "README.md", .data = "Run `zig build`" });
+
+    const ws = try tmp.dir.realpathAlloc(allocator, ".");
+    const paths = [_][]const u8{"README.md"};
+    const result = try documentationAudit(allocator, ws, &paths);
+
+    // v1 schema metadata present
+    try std.testing.expectEqualStrings("artifact_autopsy.v1", result.autopsy_schema_version);
+    try std.testing.expectEqualStrings("seed.file_bounded.v1", result.artifact_autopsy_contract);
+    try std.testing.expectEqualStrings("artifact.autopsy.inspect", result.route_kind);
+    // file-backed, not fixture-backed
+    try std.testing.expect(result.file_backed);
+    try std.testing.expect(!result.fixture_backed);
+    // product_ready always false
+    try std.testing.expect(!result.product_ready);
+    // Safety contract unchanged
+    try std.testing.expect(result.read_only);
+    try std.testing.expect(result.non_authorizing);
+    try std.testing.expect(!result.proof_granted);
+    try std.testing.expect(!result.support_granted);
+    try std.testing.expect(!result.mutates_state);
+}
+
+test "fixture fallback carries v1 schema metadata with fixture_backed:true and file_backed:false" {
+    const result = try documentationAudit(std.testing.allocator, ".", &.{});
+    // Fixture fallback path
+    try std.testing.expectEqualStrings("artifact_autopsy.v1", result.autopsy_schema_version);
+    try std.testing.expectEqualStrings("seed.file_bounded.v1", result.artifact_autopsy_contract);
+    try std.testing.expect(result.fixture_backed);
+    try std.testing.expect(!result.file_backed);
+    try std.testing.expect(!result.product_ready);
+    // Safety contract unchanged
+    try std.testing.expect(result.read_only);
+    try std.testing.expect(result.non_authorizing);
+    try std.testing.expect(!result.proof_granted);
 }
