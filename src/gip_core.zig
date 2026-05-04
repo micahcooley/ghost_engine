@@ -35,6 +35,7 @@ pub const RequestKind = enum {
     @"artifact.list",
     @"artifact.read",
     @"artifact.search",
+    @"artifact.policy.describe",
     @"artifact.patch.propose",
     @"artifact.patch.apply",
     @"artifact.write.propose",
@@ -230,6 +231,7 @@ pub const CapabilityName = enum {
     @"artifact.read",
     @"artifact.list",
     @"artifact.search",
+    @"artifact.policy.describe",
     @"artifact.patch.propose",
     @"artifact.patch.apply",
     @"artifact.write.propose",
@@ -314,11 +316,12 @@ pub const CapabilityEntry = struct {
     policy: CapabilityPolicy,
 };
 
-pub fn defaultCapabilities() [64]CapabilityEntry {
+pub fn defaultCapabilities() [65]CapabilityEntry {
     return .{
         .{ .capability = .@"artifact.read", .policy = .allowed },
         .{ .capability = .@"artifact.list", .policy = .allowed },
         .{ .capability = .@"artifact.search", .policy = .allowed },
+        .{ .capability = .@"artifact.policy.describe", .policy = .allowed },
         .{ .capability = .@"artifact.patch.propose", .policy = .allowed },
         .{ .capability = .@"artifact.patch.apply", .policy = .requires_approval },
         .{ .capability = .@"artifact.write.propose", .policy = .allowed },
@@ -388,6 +391,7 @@ pub fn requestCapabilityName(kind: RequestKind) ?CapabilityName {
         .@"artifact.read" => .@"artifact.read",
         .@"artifact.list" => .@"artifact.list",
         .@"artifact.search" => .@"artifact.search",
+        .@"artifact.policy.describe" => .@"artifact.policy.describe",
         .@"corpus.ask" => .@"corpus.ask",
         .@"rule.evaluate" => .@"rule.evaluate",
         .@"sigil.inspect" => .@"sigil.inspect",
@@ -609,6 +613,7 @@ pub fn operationMaturityLabel(kind: RequestKind) []const u8 {
         .@"trust_decay.candidate.list",
         .@"feedback.summary",
         .@"session.get",
+        .@"artifact.policy.describe",
         => "read_only_state_inspection",
         .@"negative_knowledge.review" => "append_only_reviewed_negative_knowledge_no_hidden_mutation",
         .@"negative_knowledge.reviewed.list", .@"negative_knowledge.reviewed.get" => "read_only_reviewed_negative_knowledge_inspection_non_authorizing",
@@ -763,6 +768,7 @@ pub const IMPLEMENTED_KINDS = [_]RequestKind{
     .@"sigil.inspect",
     .@"artifact.read",
     .@"artifact.list",
+    .@"artifact.policy.describe",
     .@"artifact.patch.propose",
     .@"hypothesis.list",
     .@"hypothesis.triage",
@@ -839,9 +845,9 @@ test "default capabilities have safe defaults" {
     // artifact.read should be allowed
     try std.testing.expectEqual(CapabilityPolicy.allowed, caps[0].policy);
     // artifact.patch.apply should require approval
-    try std.testing.expectEqual(CapabilityPolicy.requires_approval, caps[4].policy);
+    try std.testing.expectEqual(CapabilityPolicy.requires_approval, caps[5].policy);
     // command.run should be allowlisted
-    try std.testing.expectEqual(CapabilityPolicy.allowlist, caps[7].policy);
+    try std.testing.expectEqual(CapabilityPolicy.allowlist, caps[8].policy);
     // network.access should be denied
     try std.testing.expectEqual(CapabilityPolicy.denied, capabilityPolicy(&caps, .@"network.access").?);
     // corpus.ask should be allowed (read-only/non-authorizing)

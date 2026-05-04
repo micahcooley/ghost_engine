@@ -85,7 +85,8 @@ Controls how knowledge is promoted or demoted based on contradiction evidence.
 ## Policy Metadata Inspection (`src/artifact_policy.zig`)
 
 The `PolicySummary` struct provides a read-only, serializable view of the
-active policy configuration. It exposes:
+active policy configuration. This metadata is exposed to clients via the
+GIP `artifact.policy.describe` read-only endpoint. It exposes:
 
 - `active_profile` — which domain profile is active (code / documentation / neutral / custom)
 - `domain_scope` — artifact/domain scope description

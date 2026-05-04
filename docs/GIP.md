@@ -427,6 +427,7 @@ Denied future mutations remain denied by capability policy.
 ### Artifacts
 - `artifact.read` — Read file content (workspace-bounded) **(Implemented)**
 - `artifact.list` — List directory entries **(Implemented)**
+- `artifact.policy.describe` — Inspect active domain policy metadata **(Implemented; read-only)**
 - `artifact.search` — Search for patterns in workspace **(Not implemented yet)**
 - `artifact.patch.propose` — Propose edits (non-authorizing). **(Implemented)**
   - **Request**: `{"path": string, "edits": [{"editId": string, "span": {"startLine": int, "startCol": int, "endLine": int, "endCol": int}, "replacement": string, "precondition": {"expectedText": string, "expectedHash": int}}]}`
@@ -628,6 +629,7 @@ promote global authority.
 | `session.get` | allowed | yes |
 | `project.autopsy` | allowed | yes |
 | `context.autopsy` | allowed | yes |
+| `artifact.policy.describe` | allowed | yes |
 | `command.run` | allowlist | no (not implemented) |
 | `verifier.run` | allowed | no (not implemented) |
 | `verifier.candidate.execute` | requires_approval | yes |

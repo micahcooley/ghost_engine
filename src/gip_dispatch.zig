@@ -32,6 +32,7 @@ const negative_knowledge_review = @import("negative_knowledge_review.zig");
 const learning_status = @import("learning_status.zig");
 const procedure_pack_candidates = @import("procedure_pack_candidates.zig");
 const sigil_core = @import("sigil_core.zig");
+const artifact_policy = @import("artifact_policy.zig");
 
 pub const DispatchResult = struct {
     status: core.ProtocolStatus,
@@ -123,6 +124,7 @@ pub fn dispatch(
         .@"procedure_pack.candidate.reviewed.get" => dispatchProcedurePackCandidateReviewedGet(allocator, request_body),
         .@"artifact.read" => dispatchArtifactRead(allocator, workspace_root, request_path),
         .@"artifact.list" => dispatchArtifactList(allocator, workspace_root, request_path),
+        .@"artifact.policy.describe" => dispatchArtifactPolicyDescribe(allocator),
         .@"artifact.patch.propose" => dispatchArtifactPatchPropose(allocator, workspace_root, request_body),
         .@"hypothesis.list" => dispatchHypothesisList(allocator, request_body),
         .@"hypothesis.triage" => dispatchHypothesisTriage(allocator, request_body),
@@ -2003,6 +2005,40 @@ fn dispatchArtifactList(allocator: std.mem.Allocator, workspace_root: ?[]const u
 
     return .{
         .status = .ok,
+        .result_json = try out.toOwnedSlice(),
+        .allocated_result = true,
+    };
+}
+
+fn dispatchArtifactPolicyDescribe(allocator: std.mem.Allocator) !DispatchResult {
+    const summary = artifact_policy.codeProfileSummary();
+    const inner_json = try summary.toJson(allocator);
+    defer allocator.free(inner_json);
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+
+    try w.writeAll("{\"artifactPolicy\":");
+    if (inner_json.len > 0 and inner_json[inner_json.len - 1] == '}') {
+        try w.writeAll(inner_json[0 .. inner_json.len - 1]);
+    } else {
+        try w.writeAll(inner_json);
+    }
+
+    try w.writeAll(", \"schema_version\": \"1.0\", \"read_only\": true, \"mutates_state\": false, \"commands_executed\": false, \"verifiers_executed\": false}}");
+
+    var gip_state = schema.draftResultState();
+    gip_state.permission = .none;
+    gip_state.verification_state = .unverified;
+    gip_state.support_minimum_met = false;
+    gip_state.stop_reason = .none;
+    gip_state.unresolved_reason = null;
+    gip_state.non_authorization_notice = "artifact.policy.describe is a read-only metadata inspection operation; it does not grant proof or support";
+
+    return .{
+        .status = .ok,
+        .result_state = gip_state,
         .result_json = try out.toOwnedSlice(),
         .allocated_result = true,
     };

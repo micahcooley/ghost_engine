@@ -91,6 +91,23 @@ test "smoke: correction proposal remains candidate-only and non-mutating" {
     try std.testing.expect(!proposal.mutation_flags.verifiers_executed);
 }
 
+test "smoke: gip artifact.policy.describe returns read-only policy metadata" {
+    const allocator = std.testing.allocator;
+    var result = try gip.dispatch.dispatch(allocator, "artifact.policy.describe", gip.PROTOCOL_VERSION, null, null, null);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(gip.ProtocolStatus.ok, result.status);
+    try std.testing.expect(result.result_state != null);
+    try std.testing.expect(result.result_state.?.is_draft);
+
+    const json = result.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"read_only\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"mutates_state\": false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"commands_executed\": false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"non_authorizing\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"proof_granted\": false") != null);
+}
+
 const TraceCapture = struct {
     event: ?mc.TraceEvent = null,
     event_count: u32 = 0,

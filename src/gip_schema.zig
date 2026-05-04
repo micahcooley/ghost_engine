@@ -636,6 +636,7 @@ fn writeCapabilityDetails(w: anytype, capability: core.CapabilityName, policy: c
         .@"session.get",
         .@"project.autopsy",
         .@"context.autopsy",
+        .@"artifact.policy.describe",
         => try writeBool(w, "read_only", true, false),
         else => {},
     }
