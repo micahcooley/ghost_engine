@@ -156,7 +156,7 @@ pub fn dispatch(
         .@"session.get" => dispatchSessionGet(allocator, request_body),
         .@"project.autopsy" => dispatchProjectAutopsy(allocator, workspace_root, request_body),
         .@"context.autopsy" => dispatchContextAutopsy(allocator, workspace_root, request_body),
-        .@"artifact.autopsy.inspect" => dispatchArtifactAutopsyInspect(allocator, request_body),
+        .@"artifact.autopsy.inspect" => dispatchArtifactAutopsyInspect(allocator, workspace_root, request_body),
         else => .{
             .status = .unsupported,
             .err = .{
@@ -4791,8 +4791,11 @@ fn writeStringList(w: anytype, values: []const []const u8) !void {
 // Command candidates remain argv arrays with requires_user_confirmation=true.
 // Verifier plan candidates have executes_by_default=false.
 // Missing evidence is expressed as unknown/gap, not negative evidence.
-fn dispatchArtifactAutopsyInspect(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
+fn dispatchArtifactAutopsyInspect(allocator: std.mem.Allocator, workspace_root: ?[]const u8, request_body: ?[]const u8) !DispatchResult {
     var domain: artifact_autopsy.ArtifactDomain = .documentation_audit;
+    var artifact_paths = std.ArrayList([]const u8).init(allocator);
+    defer artifact_paths.deinit();
+
     if (request_body) |body| {
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
             return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } };
@@ -4800,7 +4803,8 @@ fn dispatchArtifactAutopsyInspect(allocator: std.mem.Allocator, request_body: ?[
         defer parsed.deinit();
 
         if (parsed.value == .object) {
-            if (getStr(parsed.value.object, "domain", "domain")) |d| {
+            const obj = parsed.value.object;
+            if (getStr(obj, "domain", "domain")) |d| {
                 if (std.mem.eql(u8, d, "documentation_audit")) {
                     domain = .documentation_audit;
                 } else if (std.mem.eql(u8, d, "recipe_consistency")) {
@@ -4809,16 +4813,46 @@ fn dispatchArtifactAutopsyInspect(allocator: std.mem.Allocator, request_body: ?[
                     return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "unknown domain", .details = d } };
                 }
             }
+
+            if (obj.get("artifactPaths") orelse obj.get("artifact_paths")) |paths_val| {
+                if (paths_val == .array) {
+                    for (paths_val.array.items) |p_val| {
+                        if (p_val == .string) {
+                            try artifact_paths.append(try allocator.dupe(u8, p_val.string));
+                        } else {
+                            return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "artifactPaths must be strings" } };
+                        }
+                    }
+                } else {
+                    return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "artifactPaths must be an array" } };
+                }
+            }
         } else {
             return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "artifact.autopsy.inspect request must be a JSON object" } };
         }
     }
 
-    const result = switch (domain) {
-        .documentation_audit => artifact_autopsy.documentationAuditFixture(),
-        .recipe_consistency => artifact_autopsy.recipeConsistencyFixture(),
-        else => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "unsupported domain for inspection" } },
-    };
+    if (domain == .recipe_consistency and artifact_paths.items.len > 0) {
+        return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "recipe_consistency domain is fixture-only and does not support artifactPaths" } };
+    }
+
+    if (artifact_paths.items.len > 0 and workspace_root == null) {
+        return .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "workspace root is required for bounded file autopsy when artifactPaths are provided" } };
+    }
+
+    const result = if (domain == .recipe_consistency)
+        artifact_autopsy.recipeConsistencyFixture()
+    else
+        artifact_autopsy.documentationAudit(allocator, workspace_root orelse ".", artifact_paths.items) catch |err| switch (err) {
+            error.TooManyFiles => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "too many files provided in artifactPaths" } },
+            error.AbsolutePathRejected => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "absolute paths are rejected for artifact autopsy" } },
+            error.PathTraversalRejected => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "path traversal is rejected for artifact autopsy" } },
+            error.DirectoryRejected => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "directory paths are rejected for artifact autopsy" } },
+            error.FileTooLarge => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "file too large for artifact autopsy" } },
+            error.TotalBytesExceeded => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "total bytes exceeded for artifact autopsy" } },
+            error.WorkspaceNotFound => return .{ .status = .rejected, .err = .{ .code = .path_not_found, .message = "workspace root not found" } },
+            else => return err,
+        };
 
     var out = std.ArrayList(u8).init(allocator);
     errdefer out.deinit();

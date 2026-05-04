@@ -278,6 +278,186 @@ pub fn recipeConsistencyFixture() ArtifactAutopsyResult {
     };
 }
 
+// ── File-Backed Audit Implementation ──────────────────────────────────────
+
+pub const MAX_FILES = 10;
+pub const MAX_FILE_BYTES = 128 * 1024;
+pub const MAX_TOTAL_BYTES = 512 * 1024;
+
+/// Performs a read-only, bounded documentation audit of the provided paths.
+/// Returns the fixture if paths are empty.
+pub fn documentationAudit(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    paths: []const []const u8,
+) !ArtifactAutopsyResult {
+    if (paths.len == 0) return documentationAuditFixture();
+
+    if (paths.len > MAX_FILES) return error.TooManyFiles;
+
+    var claims = std.ArrayList(DetectedClaim).init(allocator);
+    const obligations = std.ArrayList(DetectedObligation).init(allocator);
+    var inconsistencies = std.ArrayList(CandidateInconsistency).init(allocator);
+    var unknowns = std.ArrayList(ArtifactUnknown).init(allocator);
+    var inspected_paths = std.ArrayList([]const u8).init(allocator);
+
+    var total_bytes: usize = 0;
+
+    var ws_dir = std.fs.cwd().openDir(workspace_root, .{}) catch return error.WorkspaceNotFound;
+    defer ws_dir.close();
+
+    var has_config_or_build = false;
+    var has_docs = false;
+    var doc_command_claim: ?[]const u8 = null;
+    var config_command_claim: ?[]const u8 = null;
+
+    for (paths) |p| {
+        if (std.fs.path.isAbsolute(p)) return error.AbsolutePathRejected;
+        if (std.mem.indexOf(u8, p, "..") != null) return error.PathTraversalRejected;
+
+        const stat = ws_dir.statFile(p) catch |err| {
+            try unknowns.append(.{
+                .name = "unreadable_file",
+                .importance = "high",
+                .reason = try std.fmt.allocPrint(allocator, "Could not stat {s}: {s}", .{ p, @errorName(err) }),
+            });
+            continue;
+        };
+
+        if (stat.kind == .directory) return error.DirectoryRejected;
+
+        if (stat.size > MAX_FILE_BYTES) return error.FileTooLarge;
+        total_bytes += stat.size;
+        if (total_bytes > MAX_TOTAL_BYTES) return error.TotalBytesExceeded;
+
+        const file = ws_dir.openFile(p, .{}) catch |err| {
+            try unknowns.append(.{
+                .name = "unopenable_file",
+                .importance = "high",
+                .reason = try std.fmt.allocPrint(allocator, "Could not open {s}: {s}", .{ p, @errorName(err) }),
+            });
+            continue;
+        };
+        defer file.close();
+
+        const content = try file.readToEndAlloc(allocator, MAX_FILE_BYTES);
+
+        try inspected_paths.append(try allocator.dupe(u8, p));
+
+        const is_doc = std.mem.endsWith(u8, p, ".md") or std.mem.endsWith(u8, p, ".txt");
+        const is_config = std.mem.endsWith(u8, p, "Makefile") or std.mem.endsWith(u8, p, "build.zig") or std.mem.endsWith(u8, p, ".json");
+
+        if (is_config) has_config_or_build = true;
+        if (is_doc) has_docs = true;
+
+        if (is_doc) {
+            if (std.mem.indexOf(u8, content, "zig build test") != null) {
+                doc_command_claim = "zig build test";
+                try claims.append(.{
+                    .source_path = try allocator.dupe(u8, p),
+                    .claim_text = "zig build test",
+                    .claim_kind = "test_instruction",
+                    .confidence = "medium",
+                    .reason = "detected explicit command in docs",
+                });
+            } else if (std.mem.indexOf(u8, content, "zig build") != null) {
+                doc_command_claim = "zig build";
+                try claims.append(.{
+                    .source_path = try allocator.dupe(u8, p),
+                    .claim_text = "zig build",
+                    .claim_kind = "build_instruction",
+                    .confidence = "medium",
+                    .reason = "detected explicit command in docs",
+                });
+            } else if (std.mem.indexOf(u8, content, "make test") != null) {
+                doc_command_claim = "make test";
+                try claims.append(.{
+                    .source_path = try allocator.dupe(u8, p),
+                    .claim_text = "make test",
+                    .claim_kind = "test_instruction",
+                    .confidence = "medium",
+                    .reason = "detected explicit command in docs",
+                });
+            } else if (std.mem.indexOf(u8, content, "make build") != null) {
+                doc_command_claim = "make build";
+                try claims.append(.{
+                    .source_path = try allocator.dupe(u8, p),
+                    .claim_text = "make build",
+                    .claim_kind = "build_instruction",
+                    .confidence = "medium",
+                    .reason = "detected explicit command in docs",
+                });
+            } else {
+                try unknowns.append(.{
+                    .name = "ambiguous_commands",
+                    .importance = "medium",
+                    .reason = "docs provided but no recognizable explicit build/test command found",
+                });
+            }
+        } else if (is_config) {
+            if (std.mem.endsWith(u8, p, "Makefile")) {
+                config_command_claim = "Makefile targets";
+                try claims.append(.{
+                    .source_path = try allocator.dupe(u8, p),
+                    .claim_text = "Makefile targets",
+                    .claim_kind = "build_config",
+                    .confidence = "medium",
+                    .reason = "Makefile present, implies make commands",
+                });
+            } else if (std.mem.endsWith(u8, p, "build.zig")) {
+                config_command_claim = "zig build targets";
+                try claims.append(.{
+                    .source_path = try allocator.dupe(u8, p),
+                    .claim_text = "zig build targets",
+                    .claim_kind = "build_config",
+                    .confidence = "high",
+                    .reason = "build.zig present, implies zig commands",
+                });
+            }
+        } else {
+            try unknowns.append(.{
+                .name = "unknown_file_type",
+                .importance = "low",
+                .reason = try std.fmt.allocPrint(allocator, "file {s} is neither recognized doc nor config", .{p}),
+            });
+        }
+    }
+
+    if (has_docs and !has_config_or_build) {
+        try unknowns.append(.{
+            .name = "missing_build_evidence",
+            .importance = "high",
+            .reason = "documentation provided without corresponding configuration or build files to verify against",
+        });
+    }
+
+    if (doc_command_claim != null and config_command_claim != null) {
+        try inconsistencies.append(.{
+            .id = "inconsistency.claim_vs_config_surface",
+            .inconsistency_kind = "claim_vs_config",
+            .description = "documentation claims one command behavior but underlying config may differ; exact execution semantics unknown",
+            .evidence_paths = try allocator.dupe([]const u8, inspected_paths.items),
+            .claim_a = try allocator.dupe(u8, doc_command_claim.?),
+            .claim_b = try allocator.dupe(u8, config_command_claim.?),
+            .confidence = "medium",
+            .reason = "candidate only: static file audit cannot prove command alignment without execution",
+        });
+    }
+
+    const result = ArtifactAutopsyResult{
+        .artifact_domain = .documentation_audit,
+        .active_policy_profile = .documentation,
+        .artifact_paths = inspected_paths.items,
+        .evidence_paths = inspected_paths.items,
+        .detected_claims = claims.items,
+        .detected_obligations = obligations.items,
+        .inconsistencies = inconsistencies.items,
+        .unknowns = unknowns.items,
+    };
+
+    return result;
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════
@@ -490,4 +670,79 @@ test "both fixture domains preserve identical safety contract" {
     // But they use different artifact domains and policy profiles
     try std.testing.expect(doc_result.artifact_domain != recipe_result.artifact_domain);
     try std.testing.expect(doc_result.active_policy_profile != recipe_result.active_policy_profile);
+}
+
+// ── 6. File-backed Documentation Audit ──────────────────────────────────
+
+test "documentation audit with empty paths falls back to fixture" {
+    const result = try documentationAudit(std.testing.allocator, ".", &.{});
+    try std.testing.expectEqual(ArtifactDomain.documentation_audit, result.artifact_domain);
+    try std.testing.expectEqualStrings("README.md", result.evidence_paths[0]);
+}
+
+test "documentation audit rejects path traversal" {
+    const err = documentationAudit(std.testing.allocator, ".", &.{"../outside.md"});
+    try std.testing.expectError(error.PathTraversalRejected, err);
+}
+
+test "documentation audit rejects absolute paths" {
+    const err = documentationAudit(std.testing.allocator, ".", &.{"/etc/passwd"});
+    try std.testing.expectError(error.AbsolutePathRejected, err);
+}
+
+test "documentation audit rejects too many files" {
+    const paths = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k" };
+    const err = documentationAudit(std.testing.allocator, ".", &paths);
+    try std.testing.expectError(error.TooManyFiles, err);
+}
+
+test "documentation audit detects generic config vs doc inconsistency" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "README.md", .data = "Run `make build`" });
+    try tmp.dir.writeFile(.{ .sub_path = "Makefile", .data = "build:\n\tcmake --build build\n" });
+
+    const ws = try tmp.dir.realpathAlloc(allocator, ".");
+
+    const paths = [_][]const u8{ "README.md", "Makefile" };
+    const result = try documentationAudit(allocator, ws, &paths);
+
+    // Check safety invariants
+    try std.testing.expect(result.read_only);
+    try std.testing.expect(result.non_authorizing);
+    try std.testing.expect(result.candidate_only);
+    try std.testing.expect(!result.mutates_state);
+
+    // Found generic inconsistency
+    try std.testing.expectEqual(@as(usize, 1), result.inconsistencies.len);
+    try std.testing.expectEqualStrings("claim_vs_config", result.inconsistencies[0].inconsistency_kind);
+}
+
+test "documentation audit explicit docs-only reports missing build evidence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "README.md", .data = "Some docs without commands." });
+
+    const ws = try tmp.dir.realpathAlloc(allocator, ".");
+
+    const paths = [_][]const u8{"README.md"};
+    const result = try documentationAudit(allocator, ws, &paths);
+
+    // Check missing build evidence
+    try std.testing.expectEqual(@as(usize, 2), result.unknowns.len);
+    var found_missing = false;
+    for (result.unknowns) |u| {
+        if (std.mem.eql(u8, u.name, "missing_build_evidence")) found_missing = true;
+    }
+    try std.testing.expect(found_missing);
 }
