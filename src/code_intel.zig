@@ -25,6 +25,8 @@ pub const Options = struct {
     compute_budget_request: compute_budget.Request = .{},
     effective_budget: compute_budget.Effective = compute_budget.resolve(.{}),
     pack_conflict_policy: abstractions.PackConflictPolicy = .{},
+    family_policy: ?ArtifactFamilyPolicy = null,
+    prior_policy: ?HypothesisPriorPolicy = null,
     query_kind: QueryKind,
     target: []const u8,
     other_target: ?[]const u8 = null,
@@ -81,13 +83,33 @@ const SourceFamily = enum {
     other,
 };
 
-const FamilyQuota = struct {
+pub const ArtifactFamilyPolicy = struct {
     code: usize = 3,
     docs: usize = 2,
     config: usize = 2,
     logs: usize = 1,
     tests: usize = 1,
     other: usize = 1,
+};
+
+pub const DEFAULT_CODE_FAMILY_POLICY = ArtifactFamilyPolicy{};
+
+pub const DEFAULT_DOCS_FAMILY_POLICY = ArtifactFamilyPolicy{
+    .code = 1,
+    .docs = 4,
+    .config = 1,
+    .logs = 1,
+    .tests = 1,
+    .other = 1,
+};
+
+pub const DEFAULT_NEUTRAL_FAMILY_POLICY = ArtifactFamilyPolicy{
+    .code = 2,
+    .docs = 2,
+    .config = 2,
+    .logs = 2,
+    .tests = 2,
+    .other = 2,
 };
 
 const DeclKind = enum {
@@ -1449,6 +1471,25 @@ fn routingTraceHitConsideredBudget(trace: support_routing.Trace) bool {
     return false;
 }
 
+pub const HypothesisPriorPolicy = struct {
+    category_weights: struct {
+        syntax: u32 = 1,
+        interface: u32 = 2,
+        data_flow: u32 = 3,
+        control_flow: u32 = 4,
+        state: u32 = 5,
+        invariant: u32 = 6,
+    } = .{},
+    tier_weights: struct {
+        pattern: u32 = 1,
+        idiom: u32 = 2,
+        mechanism: u32 = 3,
+        contract: u32 = 5,
+    } = .{},
+};
+
+pub const DEFAULT_CODE_PRIOR_POLICY = HypothesisPriorPolicy{};
+
 const BranchBiasMap = struct {
     values: [8]u32 = [_]u32{0} ** 8,
 
@@ -1482,7 +1523,7 @@ fn abstractionBiasMagnitude(reference: abstractions.SupportReference) u32 {
     return @max(@as(u32, reference.lookup_score) / 18, @as(u32, 12));
 }
 
-fn buildBranchBiases(query_kind: QueryKind, refs: []const abstractions.SupportReference) BranchBiasMap {
+fn buildBranchBiases(query_kind: QueryKind, refs: []const abstractions.SupportReference, policy: HypothesisPriorPolicy) BranchBiasMap {
     var biases = BranchBiasMap{};
     for (refs) |reference| {
         if (!reference.usable) continue;
@@ -1490,63 +1531,63 @@ fn buildBranchBiases(query_kind: QueryKind, refs: []const abstractions.SupportRe
         switch (query_kind) {
             .impact => switch (reference.tier) {
                 .pattern => {
-                    biases.add(1, magnitude / 2);
-                    biases.add(2, magnitude);
+                    biases.add(policy.tier_weights.pattern, magnitude / 2);
+                    biases.add(policy.tier_weights.idiom, magnitude);
                 },
                 .idiom => {
-                    biases.add(2, magnitude);
-                    biases.add(5, magnitude / 3);
+                    biases.add(policy.tier_weights.idiom, magnitude);
+                    biases.add(policy.tier_weights.contract, magnitude / 3);
                 },
                 .mechanism => {
-                    biases.add(3, magnitude);
-                    biases.add(5, magnitude / 2);
+                    biases.add(policy.tier_weights.mechanism, magnitude);
+                    biases.add(policy.tier_weights.contract, magnitude / 2);
                 },
                 .contract => {
-                    biases.add(3, magnitude / 2);
-                    biases.add(5, magnitude);
+                    biases.add(policy.tier_weights.mechanism, magnitude / 2);
+                    biases.add(policy.tier_weights.contract, magnitude);
                 },
             },
             .breaks_if => switch (reference.tier) {
                 .pattern => {
-                    biases.add(1, magnitude);
-                    biases.add(2, magnitude / 2);
+                    biases.add(policy.tier_weights.pattern, magnitude);
+                    biases.add(policy.tier_weights.idiom, magnitude / 2);
                 },
                 .idiom => {
-                    biases.add(1, magnitude / 3);
-                    biases.add(2, magnitude);
+                    biases.add(policy.tier_weights.pattern, magnitude / 3);
+                    biases.add(policy.tier_weights.idiom, magnitude);
                 },
                 .mechanism => {
-                    biases.add(2, magnitude / 2);
-                    biases.add(3, magnitude);
+                    biases.add(policy.tier_weights.idiom, magnitude / 2);
+                    biases.add(policy.tier_weights.mechanism, magnitude);
                 },
                 .contract => {
-                    biases.add(2, magnitude / 3);
-                    biases.add(3, magnitude);
+                    biases.add(policy.tier_weights.idiom, magnitude / 3);
+                    biases.add(policy.tier_weights.mechanism, magnitude);
                 },
             },
             .contradicts => switch (reference.category) {
-                .syntax => biases.add(1, magnitude / 2),
-                .interface => biases.add(2, magnitude),
-                .data_flow => biases.add(3, magnitude),
-                .control_flow => biases.add(4, magnitude),
-                .state => biases.add(5, magnitude),
-                .invariant => biases.add(6, magnitude),
+                .syntax => biases.add(policy.category_weights.syntax, magnitude / 2),
+                .interface => biases.add(policy.category_weights.interface, magnitude),
+                .data_flow => biases.add(policy.category_weights.data_flow, magnitude),
+                .control_flow => biases.add(policy.category_weights.control_flow, magnitude),
+                .state => biases.add(policy.category_weights.state, magnitude),
+                .invariant => biases.add(policy.category_weights.invariant, magnitude),
             },
         }
 
         switch (reference.category) {
             .interface => {
                 if (query_kind == .impact) {
-                    biases.add(4, magnitude / 2);
-                    biases.add(5, magnitude / 2);
+                    biases.add(policy.category_weights.control_flow, magnitude / 2);
+                    biases.add(policy.category_weights.state, magnitude / 2);
                 }
             },
-            .data_flow => if (query_kind == .impact) biases.add(3, magnitude / 2),
-            .control_flow => if (query_kind == .breaks_if) biases.add(2, magnitude / 3),
-            .state => if (query_kind == .contradicts) biases.add(5, magnitude / 2),
+            .data_flow => if (query_kind == .impact) biases.add(policy.category_weights.data_flow, magnitude / 2),
+            .control_flow => if (query_kind == .breaks_if) biases.add(policy.category_weights.interface, magnitude / 3),
+            .state => if (query_kind == .contradicts) biases.add(policy.category_weights.state, magnitude / 2),
             .invariant => {
-                if (query_kind == .breaks_if) biases.add(3, magnitude / 2);
-                if (query_kind == .impact) biases.add(5, magnitude / 2);
+                if (query_kind == .breaks_if) biases.add(policy.category_weights.data_flow, magnitude / 2);
+                if (query_kind == .impact) biases.add(policy.category_weights.state, magnitude / 2);
             },
             .syntax => {},
         }
@@ -1765,7 +1806,7 @@ fn lookupSymbolicGrounding(
     defer abstractions.deinitSupportReferences(allocator, grounding_refs);
 
     var outcome = GroundingOutcome{
-        .biases = buildBranchBiases(query_kind, grounding_refs),
+        .biases = buildBranchBiases(query_kind, grounding_refs, DEFAULT_CODE_PRIOR_POLICY),
     };
     errdefer outcome.deinit(allocator);
 
@@ -1932,8 +1973,8 @@ fn lookupReverseSymbolicGrounding(
         for (suppressed.items) |*item| item.deinit(allocator);
         suppressed.deinit();
     }
-    var family_counts = FamilyQuota{ .code = 0, .docs = 0, .config = 0, .logs = 0, .tests = 0, .other = 0 };
-    const family_limits = FamilyQuota{};
+    var family_counts = ArtifactFamilyPolicy{ .code = 0, .docs = 0, .config = 0, .logs = 0, .tests = 0, .other = 0 };
+    const family_limits = ArtifactFamilyPolicy{};
     var seen_consensus = std.AutoHashMap(u64, void).init(allocator);
     defer seen_consensus.deinit();
     const trust_floor = targetTrustClass(index, target);
@@ -3201,7 +3242,7 @@ fn sourceFamilyForPath(index: *const RepoIndex, rel_path: []const u8) SourceFami
     return .other;
 }
 
-fn quotaForFamily(quota: FamilyQuota, family: SourceFamily) usize {
+fn quotaForFamily(quota: ArtifactFamilyPolicy, family: SourceFamily) usize {
     return switch (family) {
         .code => quota.code,
         .docs => quota.docs,
@@ -3212,7 +3253,7 @@ fn quotaForFamily(quota: FamilyQuota, family: SourceFamily) usize {
     };
 }
 
-fn familyCount(quota: FamilyQuota, family: SourceFamily) usize {
+fn familyCount(quota: ArtifactFamilyPolicy, family: SourceFamily) usize {
     return switch (family) {
         .code => quota.code,
         .docs => quota.docs,
@@ -3223,7 +3264,7 @@ fn familyCount(quota: FamilyQuota, family: SourceFamily) usize {
     };
 }
 
-fn incrementFamilyCount(quota: *FamilyQuota, family: SourceFamily) void {
+fn incrementFamilyCount(quota: *ArtifactFamilyPolicy, family: SourceFamily) void {
     switch (family) {
         .code => quota.code += 1,
         .docs => quota.docs += 1,
@@ -4592,7 +4633,7 @@ fn queryImpact(allocator: std.mem.Allocator, index: *const RepoIndex, paths: *co
     defer abstractions.deinitSupportReferences(allocator, abstraction_refs);
     result.abstraction_traces = try buildAbstractionTraces(allocator, abstraction_refs);
     result.pack_routing_traces = try pack_routing.toOwnedSlice();
-    var branch_biases = buildBranchBiases(options.query_kind, abstraction_refs);
+    var branch_biases = buildBranchBiases(options.query_kind, abstraction_refs, options.prior_policy orelse DEFAULT_CODE_PRIOR_POLICY);
     branch_biases.merge(grounding.biases);
 
     if (shouldLeaveSymbolicTargetUnresolved(index, target, direct_refs.items, dependency_surface.items, import_surface.items, contradiction_seeds, abstraction_refs) and grounding.state != .selected) {
@@ -4604,7 +4645,7 @@ fn queryImpact(allocator: std.mem.Allocator, index: *const RepoIndex, paths: *co
 
     if (contradiction_seeds.len > 0) {
         result.contradiction_traces = try buildContradictionTraces(allocator, index, contradiction_seeds, options.max_items);
-        const contradiction_biases = buildBranchBiases(.contradicts, abstraction_refs);
+        const contradiction_biases = buildBranchBiases(.contradicts, abstraction_refs, options.prior_policy orelse DEFAULT_CODE_PRIOR_POLICY);
 
         var contradiction_hypotheses = std.ArrayList(CandidateTrace).init(allocator);
         defer freeCandidateTraceList(allocator, &contradiction_hypotheses);
@@ -4844,7 +4885,7 @@ fn queryBreaksIf(allocator: std.mem.Allocator, index: *const RepoIndex, paths: *
     defer abstractions.deinitSupportReferences(allocator, abstraction_refs);
     result.abstraction_traces = try buildAbstractionTraces(allocator, abstraction_refs);
     result.pack_routing_traces = try pack_routing.toOwnedSlice();
-    var branch_biases = buildBranchBiases(options.query_kind, abstraction_refs);
+    var branch_biases = buildBranchBiases(options.query_kind, abstraction_refs, options.prior_policy orelse DEFAULT_CODE_PRIOR_POLICY);
     branch_biases.merge(grounding.biases);
 
     if (shouldLeaveSymbolicTargetUnresolved(index, target, direct_refs.items, dependency_surface.items, import_surface.items, contradiction_seeds, abstraction_refs) and grounding.state != .selected) {
@@ -4856,7 +4897,7 @@ fn queryBreaksIf(allocator: std.mem.Allocator, index: *const RepoIndex, paths: *
 
     if (contradiction_seeds.len > 0) {
         result.contradiction_traces = try buildContradictionTraces(allocator, index, contradiction_seeds, options.max_items);
-        const contradiction_biases = buildBranchBiases(.contradicts, abstraction_refs);
+        const contradiction_biases = buildBranchBiases(.contradicts, abstraction_refs, options.prior_policy orelse DEFAULT_CODE_PRIOR_POLICY);
 
         var contradiction_hypotheses = std.ArrayList(CandidateTrace).init(allocator);
         defer freeCandidateTraceList(allocator, &contradiction_hypotheses);
@@ -5118,7 +5159,7 @@ fn queryContradicts(allocator: std.mem.Allocator, index: *const RepoIndex, paths
     defer abstractions.deinitSupportReferences(allocator, abstraction_refs);
     result.abstraction_traces = try buildAbstractionTraces(allocator, abstraction_refs);
     result.pack_routing_traces = try pack_routing.toOwnedSlice();
-    var branch_biases = buildBranchBiases(options.query_kind, abstraction_refs);
+    var branch_biases = buildBranchBiases(options.query_kind, abstraction_refs, options.prior_policy orelse DEFAULT_CODE_PRIOR_POLICY);
     branch_biases.merge(left_grounding.biases);
     branch_biases.merge(right_grounding.biases);
 
