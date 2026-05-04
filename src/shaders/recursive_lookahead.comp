@@ -81,11 +81,11 @@ uint collapseChunk(uint base_uint, uint chunk_idx) {
 }
 
 uint findSlot(uint64_t rotor) {
-    uint slot_mask = params.slot_mask;
-    uint slot_count_local = slot_mask + 1u;
+    if (params.slot_count == 0u) return 0xFFFFFFFFu;
+    uint slot_count_local = params.slot_count;
     uint base_slot = uint(rotor % uint64_t(slot_count_local));
     for (uint p = 0; p < 1024u; p++) {
-        uint slot = (base_slot + p) & slot_mask;
+        uint slot = (base_slot + p) % slot_count_local;
         uint64_t occ_hash = matrix_tags.entries[slot];
         if (occ_hash == rotor) return slot;
         if (occ_hash == 0ul) return 0xFFFFFFFFu;

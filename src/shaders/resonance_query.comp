@@ -100,7 +100,7 @@ uint findSlot(uint64_t rotor, bool use_sigil) {
     }
 
     // V32 SUDH: widening multiply + neighborhood-aligned base + odd stride
-    uint slot_mask = params.slot_mask;
+    uint slot_mask = params.slot_count;
     uint slot_count_local = slot_mask + 1u;
     uint lo = uint(rotor & 0xFFFFFFFFul);
     uint64_t wide = uint64_t(lo) * uint64_t(slot_count_local);
