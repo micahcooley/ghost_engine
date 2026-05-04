@@ -10,6 +10,7 @@ const conversation_session = @import("conversation_session.zig");
 const response_engine = @import("response_engine.zig");
 const hypothesis_core = @import("hypothesis_core.zig");
 const verifier_adapter = @import("verifier_adapter.zig");
+const verifier_candidates = @import("verifier_candidates.zig");
 const knowledge_packs = @import("knowledge_packs.zig");
 const knowledge_pack_store = @import("knowledge_pack_store.zig");
 const autopsy_guidance_validator = @import("autopsy_guidance_validator.zig");
@@ -127,6 +128,9 @@ pub fn dispatch(
         .@"verifier.list" => dispatchVerifierList(allocator),
         .@"verifier.candidate.execution.list" => dispatchVerifierCandidateExecutionList(allocator, workspace_root, request_body),
         .@"verifier.candidate.execution.get" => dispatchVerifierCandidateExecutionGet(allocator, workspace_root, request_body),
+        .@"verifier.candidate.propose_from_learning_plan" => dispatchVerifierCandidateProposeFromLearningPlan(allocator, request_body),
+        .@"verifier.candidate.list" => dispatchVerifierCandidateList(allocator, request_body),
+        .@"verifier.candidate.review" => dispatchVerifierCandidateReview(allocator, request_body),
         .@"correction.list" => dispatchCorrectionList(allocator, workspace_root, request_body),
         .@"correction.get" => dispatchCorrectionGet(allocator, workspace_root, request_body),
         .@"negative_knowledge.candidate.list" => dispatchNegativeKnowledgeCandidateList(allocator, workspace_root, request_body),
@@ -1043,6 +1047,98 @@ fn dispatchProcedurePackCandidatePropose(allocator: std.mem.Allocator, request_b
         .result_state = gip_state,
         .result_json = try out.toOwnedSlice(),
         .allocated_result = true,
+    };
+}
+
+fn dispatchVerifierCandidateProposeFromLearningPlan(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
+    const body = request_body orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "request body is required for verifier.candidate.propose_from_learning_plan" },
+    };
+    var proposed = verifier_candidates.proposeFromLearningPlanBody(allocator, body) catch |err| {
+        return verifierCandidateRequestError(err, "verifier.candidate.propose_from_learning_plan rejected invalid learning loop plan or verifier ref");
+    };
+    defer proposed.deinit();
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try verifier_candidates.writeProposeResultJson(out.writer(), proposed);
+
+    var gip_state = schema.draftResultState();
+    gip_state.permission = .none;
+    gip_state.verification_state = .unverified;
+    gip_state.support_minimum_met = false;
+    gip_state.non_authorization_notice = "verifier.candidate.propose_from_learning_plan appends candidate metadata only; it does not execute commands or verifiers and does not create proof or evidence";
+
+    return .{ .status = .ok, .result_state = gip_state, .result_json = try out.toOwnedSlice(), .allocated_result = true };
+}
+
+fn dispatchVerifierCandidateList(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
+    const body = request_body orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "request body is required for verifier.candidate.list" },
+    };
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } };
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "verifier.candidate.list request must be a JSON object" } };
+    }
+    const obj = parsed.value.object;
+    const project_shard = getStr(obj, "project_shard", "projectShard") orelse shards.DEFAULT_PROJECT_ID;
+    const limit = boundedCount(obj, "limit", "limit", verifier_candidates.MAX_CANDIDATES_READ, verifier_candidates.MAX_CANDIDATES_READ);
+
+    var listed = try verifier_candidates.listCandidates(allocator, project_shard, limit);
+    defer listed.deinit();
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try verifier_candidates.writeListResultJson(out.writer(), listed);
+
+    var gip_state = schema.draftResultState();
+    gip_state.permission = .none;
+    gip_state.verification_state = .unverified;
+    gip_state.support_minimum_met = false;
+    gip_state.non_authorization_notice = "verifier.candidate.list is read-only candidate metadata inspection; listing never executes commands or verifiers and never creates evidence";
+
+    return .{ .status = .ok, .result_state = gip_state, .result_json = try out.toOwnedSlice(), .allocated_result = true };
+}
+
+fn dispatchVerifierCandidateReview(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
+    const body = request_body orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "request body is required for verifier.candidate.review" },
+    };
+    var reviewed = verifier_candidates.reviewBody(allocator, body) catch |err| {
+        return verifierCandidateRequestError(err, "verifier.candidate.review rejected invalid review request");
+    };
+    defer reviewed.deinit();
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try verifier_candidates.writeReviewResultJson(out.writer(), reviewed);
+
+    var gip_state = schema.draftResultState();
+    gip_state.permission = .none;
+    gip_state.verification_state = .unverified;
+    gip_state.support_minimum_met = false;
+    gip_state.non_authorization_notice = "verifier.candidate.review appends approval/rejection metadata only; approval permits possible future execution but does not execute or produce evidence";
+
+    return .{ .status = .ok, .result_state = gip_state, .result_json = try out.toOwnedSlice(), .allocated_result = true };
+}
+
+fn verifierCandidateRequestError(err: anyerror, fallback: []const u8) DispatchResult {
+    return switch (err) {
+        error.InvalidJson => .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } },
+        error.MissingProjectShard => .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "projectShard is required" } },
+        error.MissingLearningPlan => .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "learningLoopPlan is required" } },
+        error.MissingCandidateId => .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "candidateId is required" } },
+        error.MissingDecision => .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "decision is required" } },
+        error.CandidateNotFound => .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "candidateId was not found in same-shard verifier candidate metadata" } },
+        error.InvalidDecision => .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "decision must be approved or rejected" } },
+        error.InvalidLearningPlan, error.InvalidVerifierRef, error.InvalidRequest => .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = fallback } },
+        else => .{ .status = .failed, .err = .{ .code = .internal_error, .message = "verifier candidate lifecycle operation failed", .details = @errorName(err) } },
     };
 }
 
@@ -6569,6 +6665,110 @@ test "learning.loop.plan rejects non-object request body" {
     try std.testing.expectEqual(core.ErrorCode.invalid_request, result.err.?.code);
 }
 
+test "verifier candidate GIP lifecycle proposes lists approves and rejects without execution" {
+    const allocator = std.testing.allocator;
+    const shard_id = "verifier-candidate-gip-smoke";
+    const candidate_path = try verifier_candidates.candidatesPath(allocator, shard_id);
+    defer allocator.free(candidate_path);
+    std.fs.deleteFileAbsolute(candidate_path) catch {};
+    defer std.fs.deleteFileAbsolute(candidate_path) catch {};
+
+    const propose_body =
+        \\{"projectShard":"verifier-candidate-gip-smoke","learningLoopPlan":{"schema_version":"learning_loop_plan.v1","plan_id":"plan.gip","verifier_candidate_refs":[{"id":"learning.verifier_ref.zig_build_test","source_command_candidate_id":"zig_build_test","argv":["zig","build","test"],"cwd_hint":"/workspace","reason":"build test candidate from learning loop","evidence_paths":["build.zig"],"requires_approval":true,"executes_by_default":false}]}}
+    ;
+    var proposed = try dispatch(allocator, "verifier.candidate.propose_from_learning_plan", core.PROTOCOL_VERSION, null, null, propose_body);
+    defer proposed.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, proposed.status);
+    const proposed_json = proposed.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, proposed_json, "\"candidateOnly\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, proposed_json, "\"nonAuthorizing\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, proposed_json, "\"executed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, proposed_json, "\"producedEvidence\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, proposed_json, "\"verifiersExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, proposed_json, "\"authorityEffect\":\"support\"") == null);
+
+    const candidate_id = try extractVerifierCandidateIdFromProposal(allocator, proposed_json);
+    defer allocator.free(candidate_id);
+
+    const review_body = try std.fmt.allocPrint(allocator, "{{\"projectShard\":\"{s}\",\"candidateId\":\"{s}\",\"decision\":\"approved\",\"reviewedBy\":\"tester\",\"reviewReason\":\"safe future verifier candidate\"}}", .{ shard_id, candidate_id });
+    defer allocator.free(review_body);
+    var approved = try dispatch(allocator, "verifier.candidate.review", core.PROTOCOL_VERSION, null, null, review_body);
+    defer approved.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, approved.status);
+    const approved_json = approved.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, approved_json, "\"status\":\"approved\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, approved_json, "\"approvalCreatesEvidence\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, approved_json, "\"executed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, approved_json, "\"producedEvidence\":false") != null);
+
+    var listed_after_approval = try dispatch(allocator, "verifier.candidate.list", core.PROTOCOL_VERSION, null, null, "{\"projectShard\":\"verifier-candidate-gip-smoke\"}");
+    defer listed_after_approval.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, listed_after_approval.status);
+    const approved_list_json = listed_after_approval.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, approved_list_json, "\"status\":\"approved\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, approved_list_json, "\"commandsExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, approved_list_json, "\"verifiersExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, approved_list_json, "\"producedEvidence\":false") != null);
+
+    const reject_body = try std.fmt.allocPrint(allocator, "{{\"projectShard\":\"{s}\",\"candidateId\":\"{s}\",\"decision\":\"rejected\",\"reviewedBy\":\"tester\",\"reviewReason\":\"reject to verify folded status\"}}", .{ shard_id, candidate_id });
+    defer allocator.free(reject_body);
+    var rejected = try dispatch(allocator, "verifier.candidate.review", core.PROTOCOL_VERSION, null, null, reject_body);
+    defer rejected.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, rejected.status);
+    const rejected_json = rejected.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, rejected_json, "\"status\":\"rejected\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rejected_json, "\"approvalCreatesEvidence\":false") != null);
+
+    var listed_after_rejection = try dispatch(allocator, "verifier.candidate.list", core.PROTOCOL_VERSION, null, null, "{\"projectShard\":\"verifier-candidate-gip-smoke\"}");
+    defer listed_after_rejection.deinit(allocator);
+    const rejected_list_json = listed_after_rejection.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, rejected_list_json, "\"status\":\"rejected\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rejected_list_json, "\"authorityEffect\":\"support\"") == null);
+}
+
+test "verifier candidate handoff rejects invalid learning plan refs closed" {
+    const allocator = std.testing.allocator;
+    const invalid_path = try verifier_candidates.candidatesPath(allocator, "verifier-candidate-invalid-smoke");
+    defer allocator.free(invalid_path);
+    std.fs.deleteFileAbsolute(invalid_path) catch {};
+
+    var executes_by_default = try dispatch(
+        allocator,
+        "verifier.candidate.propose_from_learning_plan",
+        core.PROTOCOL_VERSION,
+        null,
+        null,
+        "{\"projectShard\":\"verifier-candidate-invalid-smoke\",\"learningLoopPlan\":{\"verifier_candidate_refs\":[{\"id\":\"bad\",\"source_command_candidate_id\":\"bad\",\"argv\":[\"zig\"],\"requires_approval\":true,\"executes_by_default\":true}]}}",
+    );
+    defer executes_by_default.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, executes_by_default.status);
+    try std.testing.expectEqual(core.ErrorCode.invalid_request, executes_by_default.err.?.code);
+
+    var no_approval = try dispatch(
+        allocator,
+        "verifier.candidate.propose_from_learning_plan",
+        core.PROTOCOL_VERSION,
+        null,
+        null,
+        "{\"projectShard\":\"verifier-candidate-invalid-smoke\",\"learningLoopPlan\":{\"verifier_candidate_refs\":[{\"id\":\"bad\",\"source_command_candidate_id\":\"bad\",\"argv\":[\"zig\"],\"requires_approval\":false,\"executes_by_default\":false}]}}",
+    );
+    defer no_approval.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, no_approval.status);
+    try std.testing.expectEqual(core.ErrorCode.invalid_request, no_approval.err.?.code);
+
+    const maybe_file = std.fs.openFileAbsolute(invalid_path, .{});
+    try std.testing.expectError(error.FileNotFound, maybe_file);
+}
+
+test "verifier candidate lifecycle maturity never declares support authority" {
+    try std.testing.expectEqual(core.AuthorityEffect.candidate, core.operationAuthorityEffect(.@"verifier.candidate.propose_from_learning_plan"));
+    try std.testing.expectEqual(core.AuthorityEffect.candidate, core.operationAuthorityEffect(.@"verifier.candidate.list"));
+    try std.testing.expectEqual(core.AuthorityEffect.candidate, core.operationAuthorityEffect(.@"verifier.candidate.review"));
+    try std.testing.expect(core.operationMutatesState(.@"verifier.candidate.propose_from_learning_plan"));
+    try std.testing.expect(!core.operationMutatesState(.@"verifier.candidate.list"));
+    try std.testing.expect(core.operationMutatesState(.@"verifier.candidate.review"));
+}
+
 test "protocol.describe lists learning.loop.plan as candidate implemented not product ready" {
     const allocator = std.testing.allocator;
     var result = try dispatch(allocator, "protocol.describe", core.PROTOCOL_VERSION, null, null, null);
@@ -6576,6 +6776,16 @@ test "protocol.describe lists learning.loop.plan as candidate implemented not pr
     const json = result.result_json.?;
     try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"learning.loop.plan\",\"declared\":true,\"implemented\":true,\"wired\":true,\"mutatesState\":false,\"requiresApproval\":false,\"capabilityPolicy\":\"allowed\",\"authorityEffect\":\"candidate\",\"productReady\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "candidate_only_project_autopsy_learning_loop_plan_no_execution_no_mutation") != null);
+}
+
+fn extractVerifierCandidateIdFromProposal(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    const proposal = root.get("verifierCandidateProposal").?.object;
+    const records = proposal.get("records").?.array;
+    const first = records.items[0].object;
+    return allocator.dupe(u8, first.get("id").?.string);
 }
 
 test "capabilities.describe lists learning.loop.plan as allowed read-only" {

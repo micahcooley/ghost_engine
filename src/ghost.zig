@@ -40,6 +40,7 @@ pub const response_engine = @import("response_engine.zig");
 pub const epistemic_renderer = @import("epistemic_renderer.zig");
 pub const conversation_session = @import("conversation_session.zig");
 pub const verifier_adapter = @import("verifier_adapter.zig");
+pub const verifier_candidates = @import("verifier_candidates.zig");
 pub const verifier_execution = @import("verifier_execution.zig");
 pub const correction_hooks = @import("correction_hooks.zig");
 pub const correction_candidates = @import("correction_candidates.zig");

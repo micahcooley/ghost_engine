@@ -129,6 +129,9 @@ results when GIP has no active session or workspace metadata:
 | `sigil.inspect` | Compiles and validates Sigil source, then returns bytecode disassembly and procedure inspection records without VM execution or mutation | `read_only_sigil_bytecode_inspection_non_authorizing` |
 | `learning.status` | Summarizes same-shard reviewed correction and reviewed negative-knowledge scoreboard diagnostics; read-only and not proof/evidence | `read_only_reviewed_learning_loop_scoreboard_non_authorizing` |
 | `learning.loop.plan` | Runs bounded Project Autopsy and derives a candidate-only learning-loop plan; no execution, verifier run, patch apply, pack mutation, correction application, or negative-knowledge promotion | `candidate_only_project_autopsy_learning_loop_plan_no_execution_no_mutation` |
+| `verifier.candidate.propose_from_learning_plan` | Converts approval-required `learning.loop.plan` verifier refs into append-only proposed verifier candidate metadata; no command/verifier execution and no evidence/support creation | `append_only_verifier_candidate_metadata_from_learning_loop_no_execution` |
+| `verifier.candidate.list` | Lists same-shard verifier candidate metadata and folded review status; read-only and not proof/evidence | `read_only_verifier_candidate_metadata_inspection_non_authorizing` |
+| `verifier.candidate.review` | Appends approved/rejected review metadata for an existing verifier candidate; approval is for possible future execution only and does not execute | `append_only_verifier_candidate_review_metadata_no_execution` |
 | `correction.propose` | Converts a user-disputed output into a review-required correction candidate plus non-authorizing learning candidates; performs no mutation or execution | `candidate_only_review_required_no_mutation` |
 | `correction.review` | Accepts or rejects a correction candidate into an append-only reviewed correction record; performs no corpus, pack, negative-knowledge, command, verifier, or global promotion mutation | `append_only_reviewed_record_no_hidden_mutation` |
 | `correction.reviewed.list` | Lists same-shard reviewed correction records from append-only storage with filters, warnings, and capacity telemetry; read-only and not proof | `read_only_reviewed_correction_inspection_non_authorizing` |
@@ -221,6 +224,24 @@ Denied future mutations remain denied by capability policy.
   - Verifier gaps become missing-evidence steps. Risk surfaces become triage candidates. Guidance candidates become review-required procedure guidance steps. Unknowns become evidence-collection candidates.
   - Failure ingestion, correction, negative-knowledge, and procedure-pack entries are placeholders for later explicit review/execution lifecycles. They are not failures, corrections, accepted negative knowledge, or applied packs.
   - It does not execute commands, run verifiers, apply patches, mutate packs, mutate corpus, apply corrections, promote negative knowledge, mutate trust/snapshot/scratch state, grant support, or discharge proof.
+
+- `verifier.candidate.propose_from_learning_plan` — Persist review-required verifier candidates from a learning-loop plan **(Implemented; append-only metadata only)**
+  - **Request body**: `{"projectShard":"<shard>","learningLoopPlan":{...}}`
+  - **Response**: `{"verifierCandidateProposal":{"candidateCount":1,"records":[...],"reviewRequired":true,"candidateOnly":true,"nonAuthorizing":true,"commandsExecuted":false,"verifiersExecuted":false,"executed":false,"producedEvidence":false,"authorityEffect":"candidate"}}`
+  - Only `learningLoopPlan.verifier_candidate_refs[]` are converted. Invalid refs, empty argv, refs that do not require approval, or refs with `executes_by_default:true` are rejected closed.
+  - The operation appends candidate metadata under `verifier_candidates/verifier_candidates.jsonl`; it does not execute commands or verifiers.
+
+- `verifier.candidate.list` — List same-shard verifier candidate metadata **(Implemented; read-only)**
+  - **Request body**: `{"projectShard":"<shard>","limit":128}`
+  - **Response**: `{"verifierCandidateList":{"candidates":[{"status":"proposed|approved|rejected",...}],"readOnly":true,"candidateOnly":true,"nonAuthorizing":true,"commandsExecuted":false,"verifiersExecuted":false,"executed":false,"producedEvidence":false,"authorityEffect":"candidate"}}`
+  - Listing folds append-only proposal/review records and never executes the candidate.
+  - Candidate metadata and approval state are not evidence, proof, or support.
+
+- `verifier.candidate.review` — Append approval/rejection metadata for a verifier candidate **(Implemented; append-only metadata only)**
+  - **Request body**: `{"projectShard":"<shard>","candidateId":"<id>","decision":"approved|rejected","reviewedBy":"operator","reviewReason":"..." }`
+  - **Response**: `{"verifierCandidateReview":{"status":"approved|rejected","approvalCreatesEvidence":false,"executed":false,"producedEvidence":false,...},"candidateOnly":true,"nonAuthorizing":true,"authorityEffect":"candidate"}`
+  - Approval means approved for possible future execution only.
+  - Review records do not run commands/verifiers, ingest failures, apply patches, mutate packs/corpus/corrections/negative knowledge, or create evidence/support.
 
 - `context.autopsy` — Evaluate a context case with runtime/persisted mounted-pack guidance and optional bounded artifact/input references **(Implemented)**
   - **Request**: small JSON control plane with `context`, optional `packGuidance`, optional `artifactRefs`, and optional `context.input_refs` / `context.inputRefs`.
