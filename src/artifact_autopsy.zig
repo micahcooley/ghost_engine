@@ -310,6 +310,12 @@ pub fn recipeConsistencyFixture() ArtifactAutopsyResult {
 
 // ── File-Backed Audit Implementation ──────────────────────────────────────
 
+const CANDIDATE_INGREDIENTS = [_][]const u8{
+    "flour", "sugar", "butter", "eggs", "milk", "water", "salt", "pepper",
+    "oil", "yeast", "cinnamon", "vanilla", "chocolate", "chips", "baking powder",
+    "baking soda", "honey", "syrup", "cream", "cheese", "garlic", "onion",
+};
+
 pub const MAX_FILES = 10;
 pub const MAX_FILE_BYTES = 128 * 1024;
 pub const MAX_TOTAL_BYTES = 512 * 1024;
@@ -512,6 +518,213 @@ pub fn documentationAudit(
     };
 
     return result;
+}
+
+/// Performs a read-only, bounded recipe consistency audit of the provided paths.
+/// Returns the fixture if paths are empty.
+pub fn recipeConsistency(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    paths: []const []const u8,
+) !ArtifactAutopsyResult {
+    if (paths.len == 0) return recipeConsistencyFixture();
+
+    if (paths.len > MAX_FILES) return error.TooManyFiles;
+
+    var claims = std.ArrayList(DetectedClaim).init(allocator);
+    var obligations = std.ArrayList(DetectedObligation).init(allocator);
+    var inconsistencies = std.ArrayList(CandidateInconsistency).init(allocator);
+    var unknowns = std.ArrayList(ArtifactUnknown).init(allocator);
+    var inspected_paths = std.ArrayList([]const u8).init(allocator);
+
+    var total_bytes: usize = 0;
+
+    var ws_dir = std.fs.cwd().openDir(workspace_root, .{}) catch return error.WorkspaceNotFound;
+    defer ws_dir.close();
+
+    var ingredients = std.StringArrayHashMap(void).init(allocator);
+    var used_ingredients = std.StringArrayHashMap(void).init(allocator);
+    var has_ingredients_section = false;
+    var has_steps_section = false;
+
+    for (paths) |p| {
+        if (p.len == 0) return error.EmptyPathRejected;
+        if (std.fs.path.isAbsolute(p)) return error.AbsolutePathRejected;
+        if (std.mem.indexOf(u8, p, "..") != null) return error.PathTraversalRejected;
+
+        var symlink_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (ws_dir.readLink(p, &symlink_buf)) |_| {
+            return error.SymlinkRejected;
+        } else |err| switch (err) {
+            error.NotLink => {},
+            error.FileNotFound => {
+                try unknowns.append(.{
+                    .name = "unreadable_file",
+                    .importance = "high",
+                    .reason = try std.fmt.allocPrint(allocator, "File not found: {s}", .{p}),
+                });
+                continue;
+            },
+            else => {
+                try unknowns.append(.{
+                    .name = "unreadable_file_link",
+                    .importance = "high",
+                    .reason = try std.fmt.allocPrint(allocator, "Could not check if {s} is a symlink: {s}", .{ p, @errorName(err) }),
+                });
+                continue;
+            },
+        }
+
+        const stat = ws_dir.statFile(p) catch |err| {
+            try unknowns.append(.{
+                .name = "unreadable_file",
+                .importance = "high",
+                .reason = try std.fmt.allocPrint(allocator, "Could not stat {s}: {s}", .{ p, @errorName(err) }),
+            });
+            continue;
+        };
+
+        if (stat.kind == .directory) return error.DirectoryRejected;
+
+        if (stat.size > MAX_FILE_BYTES) return error.FileTooLarge;
+        total_bytes += stat.size;
+        if (total_bytes > MAX_TOTAL_BYTES) return error.TotalBytesExceeded;
+
+        const file = ws_dir.openFile(p, .{}) catch |err| {
+            try unknowns.append(.{
+                .name = "unopenable_file",
+                .importance = "high",
+                .reason = try std.fmt.allocPrint(allocator, "Could not open {s}: {s}", .{ p, @errorName(err) }),
+            });
+            continue;
+        };
+        defer file.close();
+
+        const content = try file.readToEndAlloc(allocator, MAX_FILE_BYTES);
+        try inspected_paths.append(try allocator.dupe(u8, p));
+
+        var lines = std.mem.tokenizeAny(u8, content, "\n\r");
+        var in_ingredients = false;
+        var in_steps = false;
+
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t*-.#");
+            if (trimmed.len == 0) continue;
+
+            const lower_line = try allocator.alloc(u8, line.len);
+            _ = std.ascii.lowerString(lower_line, line);
+
+            if (std.mem.indexOf(u8, lower_line, "ingredient") != null) {
+                in_ingredients = true;
+                in_steps = false;
+                has_ingredients_section = true;
+                continue;
+            }
+            if (std.mem.indexOf(u8, lower_line, "step") != null or
+                std.mem.indexOf(u8, lower_line, "instruction") != null or
+                std.mem.indexOf(u8, lower_line, "direction") != null)
+            {
+                in_ingredients = false;
+                in_steps = true;
+                has_steps_section = true;
+                continue;
+            }
+
+            if (in_ingredients) {
+                try ingredients.put(try allocator.dupe(u8, trimmed), {});
+                try claims.append(.{
+                    .source_path = try allocator.dupe(u8, p),
+                    .claim_text = try allocator.dupe(u8, trimmed),
+                    .claim_kind = "ingredient",
+                    .confidence = "high",
+                    .reason = "line found in ingredients section",
+                });
+            } else if (in_steps) {
+                try claims.append(.{
+                    .source_path = try allocator.dupe(u8, p),
+                    .claim_text = try allocator.dupe(u8, trimmed),
+                    .claim_kind = "step",
+                    .confidence = "high",
+                    .reason = "line found in steps/instructions section",
+                });
+
+                for (ingredients.keys()) |ing| {
+                    if (std.mem.indexOf(u8, lower_line, ing) != null) {
+                        try used_ingredients.put(ing, {});
+                    }
+                }
+
+                for (CANDIDATE_INGREDIENTS) |cand| {
+                    if (std.mem.indexOf(u8, lower_line, cand) != null) {
+                        if (!ingredients.contains(cand)) {
+                            try inconsistencies.append(.{
+                                .id = try std.fmt.allocPrint(allocator, "inconsistency.missing_ingredient.{s}", .{cand}),
+                                .inconsistency_kind = "missing_ingredient",
+                                .description = try std.fmt.allocPrint(allocator, "Step references apparent ingredient '{s}' not listed in ingredients", .{cand}),
+                                .claim_a = "Ingredients list",
+                                .claim_b = try allocator.dupe(u8, trimmed),
+                                .confidence = "medium",
+                                .reason = "apparent ingredient word detected in step but absent from ingredients section",
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (!has_ingredients_section) {
+        try unknowns.append(.{
+            .name = "missing_ingredients_section",
+            .importance = "high",
+            .reason = "no section with 'ingredient' found in inspected files",
+        });
+    }
+    if (!has_steps_section) {
+        try unknowns.append(.{
+            .name = "missing_steps_section",
+            .importance = "high",
+            .reason = "no section with 'step', 'instruction', or 'direction' found in inspected files",
+        });
+    }
+
+    if (has_ingredients_section and has_steps_section) {
+        for (ingredients.keys()) |ing| {
+            if (!used_ingredients.contains(ing)) {
+                try inconsistencies.append(.{
+                    .id = try std.fmt.allocPrint(allocator, "inconsistency.unused_ingredient.{s}", .{ing}),
+                    .inconsistency_kind = "unused_ingredient",
+                    .description = try std.fmt.allocPrint(allocator, "Ingredient '{s}' is listed but never referenced in steps", .{ing}),
+                    .claim_a = try allocator.dupe(u8, ing),
+                    .claim_b = "Steps/instructions",
+                    .confidence = "medium",
+                    .reason = "ingredient name does not appear in any step text",
+                });
+            }
+        }
+
+        try obligations.append(.{
+            .source_path = if (inspected_paths.items.len > 0) inspected_paths.items[0] else "unknown",
+            .obligation_text = "every ingredient referenced in steps should appear in the ingredients list",
+            .obligation_kind = "ingredient_use",
+            .referenced_by = "recipe consistency convention",
+            .confidence = "medium",
+            .reason = "conventional recipe structure implies ingredients list is exhaustive",
+        });
+    }
+
+    return .{
+        .fixture_backed = false,
+        .file_backed = true,
+        .artifact_domain = .recipe_consistency,
+        .active_policy_profile = .neutral,
+        .artifact_paths = inspected_paths.items,
+        .evidence_paths = inspected_paths.items,
+        .detected_claims = claims.items,
+        .detected_obligations = obligations.items,
+        .inconsistencies = inconsistencies.items,
+        .unknowns = unknowns.items,
+    };
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -997,4 +1210,78 @@ test "fixture fallback carries v1 schema metadata with fixture_backed:true and f
     try std.testing.expect(result.read_only);
     try std.testing.expect(result.non_authorizing);
     try std.testing.expect(!result.proof_granted);
+}
+
+test "recipe consistency file-backed detection tests" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const tmp_dir = "temp_recipe_test";
+    std.fs.cwd().makePath(tmp_dir) catch {};
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    // 1. Unused ingredient
+    {
+        const path = try std.fs.path.join(allocator, &.{ tmp_dir, "unused.md" });
+        try std.fs.cwd().writeFile(.{ .sub_path = path, .data = 
+            \\# Recipe
+            \\## Ingredients
+            \\* flour
+            \\* butter
+            \\## Steps
+            \\1. Mix flour.
+        });
+        const result = try recipeConsistency(allocator, ".", &.{path});
+        
+        var found_unused = false;
+        for (result.inconsistencies) |inc| {
+            if (std.mem.eql(u8, inc.inconsistency_kind, "unused_ingredient") and std.mem.indexOf(u8, inc.description, "butter") != null) {
+                found_unused = true;
+            }
+        }
+        try std.testing.expect(found_unused);
+    }
+
+    // 2. Missing ingredient
+    {
+        const path = try std.fs.path.join(allocator, &.{ tmp_dir, "missing.md" });
+        try std.fs.cwd().writeFile(.{ .sub_path = path, .data = 
+            \\# Recipe
+            \\## Ingredients
+            \\* flour
+            \\## Steps
+            \\1. Add sugar.
+        });
+        const result = try recipeConsistency(allocator, ".", &.{path});
+        var found_missing = false;
+        for (result.inconsistencies) |inc| {
+            if (std.mem.eql(u8, inc.inconsistency_kind, "missing_ingredient") and std.mem.indexOf(u8, inc.description, "sugar") != null) {
+                found_missing = true;
+            }
+        }
+        try std.testing.expect(found_missing);
+    }
+
+    // 3. No ingredients section
+    {
+        const path = try std.fs.path.join(allocator, &.{ tmp_dir, "no_ingredients.md" });
+        try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "# Recipe\n## Steps\n1. Mix." });
+        const result = try recipeConsistency(allocator, ".", &.{path});
+        var found_unknown = false;
+        for (result.unknowns) |unk| {
+            if (std.mem.eql(u8, unk.name, "missing_ingredients_section")) {
+                found_unknown = true;
+            }
+        }
+        try std.testing.expect(found_unknown);
+    }
+}
+
+test "recipe consistency path safety applies" {
+    const err = recipeConsistency(std.testing.allocator, ".", &.{"../outside.md"});
+    try std.testing.expectError(error.PathTraversalRejected, err);
+
+    const err_abs = recipeConsistency(std.testing.allocator, ".", &.{"/etc/passwd"});
+    try std.testing.expectError(error.AbsolutePathRejected, err_abs);
 }

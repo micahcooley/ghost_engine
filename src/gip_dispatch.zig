@@ -4839,10 +4839,6 @@ fn dispatchArtifactAutopsyInspect(allocator: std.mem.Allocator, workspace_root: 
         return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "too many files provided in artifactPaths" } };
     }
 
-    if (domain == .recipe_consistency and artifact_paths.items.len > 0) {
-        return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "recipe_consistency domain is fixture-only and does not support artifactPaths" } };
-    }
-
     if (artifact_paths.items.len > 0 and workspace_root == null) {
         return .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "workspace root is required for bounded file autopsy when artifactPaths are provided" } };
     }
@@ -4855,35 +4851,37 @@ fn dispatchArtifactAutopsyInspect(allocator: std.mem.Allocator, workspace_root: 
     const analysis_alloc = analysis_arena.allocator();
 
     const result = if (domain == .recipe_consistency)
-        artifact_autopsy.recipeConsistencyFixture()
+        artifact_autopsy.recipeConsistency(analysis_alloc, workspace_root orelse ".", artifact_paths.items)
     else
-        artifact_autopsy.documentationAudit(analysis_alloc, workspace_root orelse ".", artifact_paths.items) catch |err| switch (err) {
-            error.TooManyFiles => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "too many files provided in artifactPaths" } },
-            error.EmptyPathRejected => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "empty paths are rejected for artifact autopsy" } },
-            error.AbsolutePathRejected => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "absolute paths are rejected for artifact autopsy" } },
-            error.PathTraversalRejected => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "path traversal is rejected for artifact autopsy" } },
-            error.DirectoryRejected => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "directory paths are rejected for artifact autopsy" } },
-            error.SymlinkRejected => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "symlink paths are rejected for artifact autopsy" } },
-            error.FileTooLarge => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "file too large for artifact autopsy" } },
-            error.TotalBytesExceeded => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "total bytes exceeded for artifact autopsy" } },
-            error.WorkspaceNotFound => return .{ .status = .rejected, .err = .{ .code = .path_not_found, .message = "workspace root not found" } },
-            else => return err,
-        };
+        artifact_autopsy.documentationAudit(analysis_alloc, workspace_root orelse ".", artifact_paths.items);
+
+    const autopsy_result = result catch |err| switch (err) {
+        error.TooManyFiles => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "too many files provided in artifactPaths" } },
+        error.EmptyPathRejected => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "empty paths are rejected for artifact autopsy" } },
+        error.AbsolutePathRejected => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "absolute paths are rejected for artifact autopsy" } },
+        error.PathTraversalRejected => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "path traversal is rejected for artifact autopsy" } },
+        error.DirectoryRejected => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "directory paths are rejected for artifact autopsy" } },
+        error.SymlinkRejected => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "symlink paths are rejected for artifact autopsy" } },
+        error.FileTooLarge => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "file too large for artifact autopsy" } },
+        error.TotalBytesExceeded => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "total bytes exceeded for artifact autopsy" } },
+        error.WorkspaceNotFound => return .{ .status = .rejected, .err = .{ .code = .path_not_found, .message = "workspace root not found" } },
+        else => return err,
+    };
 
     var out = std.ArrayList(u8).init(allocator);
     errdefer out.deinit();
     const w = out.writer();
 
     try w.writeAll("{\"artifactAutopsyInspect\":");
-    try std.json.stringify(result, .{}, w);
+    try std.json.stringify(autopsy_result, .{}, w);
     try w.writeAll(",\"readOnly\":true,\"mutatesState\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false,\"supportGranted\":false,\"proofGranted\":false,\"non_authorizing\":true");
     // v1 contract fields in envelope for consumer discoverability
-    try w.print(",\"autopsy_schema_version\":\"{s}\"", .{result.autopsy_schema_version});
-    try w.print(",\"artifact_autopsy_contract\":\"{s}\"", .{result.artifact_autopsy_contract});
-    try w.print(",\"route_kind\":\"{s}\"", .{result.route_kind});
-    try w.print(",\"fixture_backed\":{}", .{result.fixture_backed});
-    try w.print(",\"file_backed\":{}", .{result.file_backed});
-    try w.print(",\"product_ready\":{}", .{result.product_ready});
+    try w.print(",\"autopsy_schema_version\":\"{s}\"", .{autopsy_result.autopsy_schema_version});
+    try w.print(",\"artifact_autopsy_contract\":\"{s}\"", .{autopsy_result.artifact_autopsy_contract});
+    try w.print(",\"route_kind\":\"{s}\"", .{autopsy_result.route_kind});
+    try w.print(",\"fixture_backed\":{}", .{autopsy_result.fixture_backed});
+    try w.print(",\"file_backed\":{}", .{autopsy_result.file_backed});
+    try w.print(",\"product_ready\":{}", .{autopsy_result.product_ready});
     try w.writeAll("}");
 
     // analysis_arena.deinit() called by defer above; result slices are gone.
