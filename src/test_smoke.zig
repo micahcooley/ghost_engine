@@ -1294,10 +1294,12 @@ test "sigil commit applies scratch while discard restores the baseline" {
     defer core_paths.deinit();
 
     try deleteTreeIfExistsAbsolute(core_paths.sigil_root_abs_path);
+    try deleteTreeIfExistsAbsolute(core_paths.abstractions_root_abs_path);
     try deleteFileIfExistsAbsolute(lattice_path);
     try deleteFileIfExistsAbsolute(semantic_path);
     try deleteFileIfExistsAbsolute(tags_path);
     defer deleteTreeIfExistsAbsolute(core_paths.sigil_root_abs_path) catch {};
+    defer deleteTreeIfExistsAbsolute(core_paths.abstractions_root_abs_path) catch {};
     defer deleteFileIfExistsAbsolute(lattice_path) catch {};
     defer deleteFileIfExistsAbsolute(semantic_path) catch {};
     defer deleteFileIfExistsAbsolute(tags_path) catch {};

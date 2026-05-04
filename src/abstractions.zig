@@ -5120,17 +5120,17 @@ fn sanitizeConceptId(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
 
 fn parseTier(text: []const u8) ?Tier {
     if (std.ascii.eqlIgnoreCase(text, "pattern")) return .pattern;
-    if (std.ascii.eqlIgnoreCase(text, "convention")) return .convention;
-    if (std.ascii.eqlIgnoreCase(text, "logic")) return .logic;
+    if (std.ascii.eqlIgnoreCase(text, "convention") or std.ascii.eqlIgnoreCase(text, "idiom")) return .convention;
+    if (std.ascii.eqlIgnoreCase(text, "logic") or std.ascii.eqlIgnoreCase(text, "mechanism")) return .logic;
     if (std.ascii.eqlIgnoreCase(text, "contract")) return .contract;
     return null;
 }
 
 fn parseCategory(text: []const u8) ?Category {
-    if (std.ascii.eqlIgnoreCase(text, "structural")) return .structural;
-    if (std.ascii.eqlIgnoreCase(text, "procedural")) return .procedural;
-    if (std.ascii.eqlIgnoreCase(text, "relational")) return .relational;
-    if (std.ascii.eqlIgnoreCase(text, "boundary")) return .boundary;
+    if (std.ascii.eqlIgnoreCase(text, "structural") or std.ascii.eqlIgnoreCase(text, "syntax")) return .structural;
+    if (std.ascii.eqlIgnoreCase(text, "procedural") or std.ascii.eqlIgnoreCase(text, "control_flow")) return .procedural;
+    if (std.ascii.eqlIgnoreCase(text, "relational") or std.ascii.eqlIgnoreCase(text, "data_flow")) return .relational;
+    if (std.ascii.eqlIgnoreCase(text, "boundary") or std.ascii.eqlIgnoreCase(text, "interface")) return .boundary;
     if (std.ascii.eqlIgnoreCase(text, "state")) return .state;
     if (std.ascii.eqlIgnoreCase(text, "invariant")) return .invariant;
     return null;
@@ -6042,4 +6042,26 @@ test "trust decay: contradictions degrade promoted and core knowledge unless imm
 
     allocator.free(core_record.concept_id);
     allocator.free(immune_core.concept_id);
+}
+
+test "parseTier and parseCategory correctly parse legacy names as aliases" {
+    // Tests for Tier parsing
+    try std.testing.expectEqual(Tier.pattern, parseTier("pattern"));
+    try std.testing.expectEqual(Tier.convention, parseTier("convention"));
+    try std.testing.expectEqual(Tier.convention, parseTier("idiom")); // legacy alias
+    try std.testing.expectEqual(Tier.logic, parseTier("logic"));
+    try std.testing.expectEqual(Tier.logic, parseTier("mechanism")); // legacy alias
+    try std.testing.expectEqual(Tier.contract, parseTier("contract"));
+
+    // Tests for Category parsing
+    try std.testing.expectEqual(Category.structural, parseCategory("structural"));
+    try std.testing.expectEqual(Category.structural, parseCategory("syntax")); // legacy alias
+    try std.testing.expectEqual(Category.procedural, parseCategory("procedural"));
+    try std.testing.expectEqual(Category.procedural, parseCategory("control_flow")); // legacy alias
+    try std.testing.expectEqual(Category.relational, parseCategory("relational"));
+    try std.testing.expectEqual(Category.relational, parseCategory("data_flow")); // legacy alias
+    try std.testing.expectEqual(Category.boundary, parseCategory("boundary"));
+    try std.testing.expectEqual(Category.boundary, parseCategory("interface")); // legacy alias
+    try std.testing.expectEqual(Category.state, parseCategory("state"));
+    try std.testing.expectEqual(Category.invariant, parseCategory("invariant"));
 }
