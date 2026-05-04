@@ -162,6 +162,7 @@ results when GIP has no active session or workspace metadata:
 | `session.get` | Returns session data if session file exists; otherwise `path_not_found` | `requires_existing_session` |
 | `project.autopsy` | Bounded read-only workspace inspection without command execution | `read_only_workspace_inspection` |
 | `context.autopsy` | Runtime and persisted mounted-pack guidance plus bounded workspace artifact/input references for large inputs | `read_only_artifact_and_input_refs_runtime_and_persistent_pack_guidance` |
+| `artifact.autopsy.inspect` | Seed non-code domain read-only artifact autopsy inspection | `read_only_artifact_autopsy_seed_non_authorizing` |
 
 Stateless operations do not fake data. They return structurally valid empty
 outputs that are safe for clients to consume.
@@ -428,6 +429,10 @@ Denied future mutations remain denied by capability policy.
 - `artifact.read` — Read file content (workspace-bounded) **(Implemented)**
 - `artifact.list` — List directory entries **(Implemented)**
 - `artifact.policy.describe` — Inspect active domain policy metadata **(Implemented; read-only)**
+- `artifact.autopsy.inspect` — Seed read-only non-code artifact inspection **(Implemented)**
+  - **Request**: `{"domain": "documentation_audit" | "recipe_consistency"}`
+  - **Response**: `{"artifactAutopsyInspect": {"autopsy_schema_version": "...", "read_only": true, ...}}`
+  - Returns hardcoded fixtures for now to seed the architecture.
 - `artifact.search` — Search for patterns in workspace **(Not implemented yet)**
 - `artifact.patch.propose` — Propose edits (non-authorizing). **(Implemented)**
   - **Request**: `{"path": string, "edits": [{"editId": string, "span": {"startLine": int, "startCol": int, "endLine": int, "endCol": int}, "replacement": string, "precondition": {"expectedText": string, "expectedHash": int}}]}`
@@ -630,6 +635,7 @@ promote global authority.
 | `project.autopsy` | allowed | yes |
 | `context.autopsy` | allowed | yes |
 | `artifact.policy.describe` | allowed | yes |
+| `artifact.autopsy.inspect` | allowed | yes |
 | `command.run` | allowlist | no (not implemented) |
 | `verifier.run` | allowed | no (not implemented) |
 | `verifier.candidate.execute` | requires_approval | yes |
@@ -705,6 +711,7 @@ echo '{"gipVersion":"gip.v0.1","kind":"sigil.inspect","source":"LOOM CPU_ONLY\nS
 echo '{"gipVersion":"gip.v0.1","kind":"correction.review","projectShard":"my-project","correctionCandidateId":"correction:candidate:example","decision":"accepted","reviewerNote":"reviewed by operator","acceptedLearningOutputs":[{"kind":"verifier_check_candidate","status":"candidate"}]}' | ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"project.autopsy"}' | ghost_gip --stdin --workspace /path/to/project
 echo '{"gipVersion":"gip.v0.1","kind":"context.autopsy","context":{"summary":"inspect source context"},"artifactRefs":[{"kind":"directory","path":".","include":["src/**/*.zig"],"exclude":[".git/**","zig-out/**",".zig-cache/**","node_modules/**"],"maxChunkBytes":32768,"maxFiles":64}]}' | ghost_gip --stdin --workspace /path/to/project
+echo '{"gipVersion":"gip.v0.1","kind":"artifact.autopsy.inspect","domain":"recipe_consistency"}' | ghost_gip --stdin
 ```
 
 ## Examples

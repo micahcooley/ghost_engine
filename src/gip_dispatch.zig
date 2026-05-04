@@ -33,6 +33,7 @@ const learning_status = @import("learning_status.zig");
 const procedure_pack_candidates = @import("procedure_pack_candidates.zig");
 const sigil_core = @import("sigil_core.zig");
 const artifact_policy = @import("artifact_policy.zig");
+const artifact_autopsy = @import("artifact_autopsy.zig");
 
 pub const DispatchResult = struct {
     status: core.ProtocolStatus,
@@ -155,6 +156,7 @@ pub fn dispatch(
         .@"session.get" => dispatchSessionGet(allocator, request_body),
         .@"project.autopsy" => dispatchProjectAutopsy(allocator, workspace_root, request_body),
         .@"context.autopsy" => dispatchContextAutopsy(allocator, workspace_root, request_body),
+        .@"artifact.autopsy.inspect" => dispatchArtifactAutopsyInspect(allocator, request_body),
         else => .{
             .status = .unsupported,
             .err = .{
@@ -4789,6 +4791,56 @@ fn writeStringList(w: anytype, values: []const []const u8) !void {
 // Command candidates remain argv arrays with requires_user_confirmation=true.
 // Verifier plan candidates have executes_by_default=false.
 // Missing evidence is expressed as unknown/gap, not negative evidence.
+fn dispatchArtifactAutopsyInspect(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
+    var domain: artifact_autopsy.ArtifactDomain = .documentation_audit;
+    if (request_body) |body| {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+            return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } };
+        };
+        defer parsed.deinit();
+
+        if (parsed.value == .object) {
+            if (getStr(parsed.value.object, "domain", "domain")) |d| {
+                if (std.mem.eql(u8, d, "documentation_audit")) {
+                    domain = .documentation_audit;
+                } else if (std.mem.eql(u8, d, "recipe_consistency")) {
+                    domain = .recipe_consistency;
+                } else {
+                    return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "unknown domain", .details = d } };
+                }
+            }
+        } else {
+            return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "artifact.autopsy.inspect request must be a JSON object" } };
+        }
+    }
+
+    const result = switch (domain) {
+        .documentation_audit => artifact_autopsy.documentationAuditFixture(),
+        .recipe_consistency => artifact_autopsy.recipeConsistencyFixture(),
+        else => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "unsupported domain for inspection" } },
+    };
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+
+    try w.writeAll("{\"artifactAutopsyInspect\":");
+    try std.json.stringify(result, .{}, w);
+    try w.writeAll(",\"readOnly\":true,\"mutatesState\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false,\"non_authorizing\":true}");
+
+    var gip_state = schema.draftResultState();
+    gip_state.permission = .none;
+    gip_state.verification_state = .unverified;
+    gip_state.support_minimum_met = false;
+    gip_state.non_authorization_notice = "artifact.autopsy.inspect output is candidate-only and non-authorizing; no verifier was executed and no proof/support gate was discharged";
+
+    return .{
+        .status = .ok,
+        .result_state = gip_state,
+        .result_json = try out.toOwnedSlice(),
+        .allocated_result = true,
+    };
+}
 
 fn dispatchProjectAutopsy(allocator: std.mem.Allocator, workspace_root: ?[]const u8, request_body: ?[]const u8) !DispatchResult {
     const root = workspace_root orelse return .{

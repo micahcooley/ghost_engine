@@ -40,6 +40,7 @@ pub const RequestKind = enum {
     @"artifact.patch.apply",
     @"artifact.write.propose",
     @"artifact.write.apply",
+    @"artifact.autopsy.inspect",
 
     // Verification
     @"verifier.list",
@@ -236,6 +237,7 @@ pub const CapabilityName = enum {
     @"artifact.patch.apply",
     @"artifact.write.propose",
     @"artifact.write.apply",
+    @"artifact.autopsy.inspect",
     @"command.run",
     @"command.run.allowlist",
     @"verifier.run",
@@ -316,7 +318,7 @@ pub const CapabilityEntry = struct {
     policy: CapabilityPolicy,
 };
 
-pub fn defaultCapabilities() [65]CapabilityEntry {
+pub fn defaultCapabilities() [66]CapabilityEntry {
     return .{
         .{ .capability = .@"artifact.read", .policy = .allowed },
         .{ .capability = .@"artifact.list", .policy = .allowed },
@@ -326,6 +328,7 @@ pub fn defaultCapabilities() [65]CapabilityEntry {
         .{ .capability = .@"artifact.patch.apply", .policy = .requires_approval },
         .{ .capability = .@"artifact.write.propose", .policy = .allowed },
         .{ .capability = .@"artifact.write.apply", .policy = .requires_approval },
+        .{ .capability = .@"artifact.autopsy.inspect", .policy = .allowed },
         .{ .capability = .@"command.run", .policy = .allowlist },
         .{ .capability = .@"command.run.allowlist", .policy = .allowlist },
         .{ .capability = .@"verifier.run", .policy = .allowed },
@@ -401,6 +404,7 @@ pub fn requestCapabilityName(kind: RequestKind) ?CapabilityName {
         .@"artifact.patch.apply" => .@"artifact.patch.apply",
         .@"artifact.write.propose" => .@"artifact.write.propose",
         .@"artifact.write.apply" => .@"artifact.write.apply",
+        .@"artifact.autopsy.inspect" => .@"artifact.autopsy.inspect",
         .@"command.run" => .@"command.run",
         .@"verifier.run" => .@"verifier.run",
         .@"verifier.list" => .@"verifier.list",
@@ -570,6 +574,7 @@ pub fn operationAuthorityEffect(kind: RequestKind) AuthorityEffect {
         .@"trust_decay.candidate.list",
         .@"project.autopsy",
         .@"context.autopsy",
+        .@"artifact.autopsy.inspect",
         .@"learning.loop.plan",
         => .candidate,
         else => .none,
@@ -621,6 +626,7 @@ pub fn operationMaturityLabel(kind: RequestKind) []const u8 {
         .@"negative_knowledge.record.expire", .@"negative_knowledge.record.supersede" => "wired_structured_unsupported_without_persistence",
         .@"project.autopsy" => "read_only_workspace_inspection",
         .@"context.autopsy" => "read_only_artifact_and_input_refs_runtime_and_persistent_pack_guidance",
+        .@"artifact.autopsy.inspect" => "read_only_artifact_autopsy_seed_non_authorizing",
         else => "implemented_not_product_ready",
     };
 }
@@ -769,6 +775,7 @@ pub const IMPLEMENTED_KINDS = [_]RequestKind{
     .@"artifact.read",
     .@"artifact.list",
     .@"artifact.policy.describe",
+    .@"artifact.autopsy.inspect",
     .@"artifact.patch.propose",
     .@"hypothesis.list",
     .@"hypothesis.triage",
@@ -843,11 +850,11 @@ test "parseReasoningLevel recognizes valid levels" {
 test "default capabilities have safe defaults" {
     const caps = defaultCapabilities();
     // artifact.read should be allowed
-    try std.testing.expectEqual(CapabilityPolicy.allowed, caps[0].policy);
+    try std.testing.expectEqual(CapabilityPolicy.allowed, capabilityPolicy(&caps, .@"artifact.read").?);
     // artifact.patch.apply should require approval
-    try std.testing.expectEqual(CapabilityPolicy.requires_approval, caps[5].policy);
+    try std.testing.expectEqual(CapabilityPolicy.requires_approval, capabilityPolicy(&caps, .@"artifact.patch.apply").?);
     // command.run should be allowlisted
-    try std.testing.expectEqual(CapabilityPolicy.allowlist, caps[8].policy);
+    try std.testing.expectEqual(CapabilityPolicy.allowlist, capabilityPolicy(&caps, .@"command.run").?);
     // network.access should be denied
     try std.testing.expectEqual(CapabilityPolicy.denied, capabilityPolicy(&caps, .@"network.access").?);
     // corpus.ask should be allowed (read-only/non-authorizing)

@@ -109,6 +109,33 @@ test "smoke: gip artifact.policy.describe returns read-only policy metadata" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"non_authorizing\":true") != null);
 }
 
+test "smoke: gip artifact.autopsy.inspect returns read-only seed autopsy output" {
+    const allocator = std.testing.allocator;
+    const req = "{\"domain\":\"documentation_audit\"}";
+    var result = try gip.dispatch.dispatch(allocator, "artifact.autopsy.inspect", gip.PROTOCOL_VERSION, null, null, req);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(gip.ProtocolStatus.ok, result.status);
+    try std.testing.expect(result.result_state != null);
+    try std.testing.expect(result.result_state.?.is_draft);
+
+    const json = result.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"readOnly\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"mutatesState\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"commandsExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"non_authorizing\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"documentation_audit\"") != null);
+}
+
+test "smoke: gip artifact.autopsy.inspect rejects unknown domain" {
+    const allocator = std.testing.allocator;
+    const req = "{\"domain\":\"made_up_domain\"}";
+    var result = try gip.dispatch.dispatch(allocator, "artifact.autopsy.inspect", gip.PROTOCOL_VERSION, null, null, req);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(gip.ProtocolStatus.rejected, result.status);
+}
+
 const TraceCapture = struct {
     event: ?mc.TraceEvent = null,
     event_count: u32 = 0,

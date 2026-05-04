@@ -18,8 +18,12 @@ The current pass demonstrates the shape:
 Future passes may add:
 - Filesystem-backed inspection (reading actual doc/config files).
 - Pack-driven non-code autopsy guidance.
-- GIP route (`artifact.autopsy.inspect`).
 - Additional domains (incident review, config audit, contract review).
+
+## GIP Route
+The GIP route `artifact.autopsy.inspect` exposes this read-only structure.
+- **Request**: `{"domain": "documentation_audit"}`
+- **Response**: Bounded fixture result with safety contract intact.
 
 ## Architecture
 
