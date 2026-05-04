@@ -2741,22 +2741,38 @@ fn dispatchVerifierCandidateExecutionGet(allocator: std.mem.Allocator, workspace
     const body = request_body orelse return .{
         .status = .rejected,
         .err = .{ .code = .missing_required_field, .message = "missing request body" },
+        .result_json = try renderVerifierCandidateExecutionGetError(allocator, "rejected", null, null, "missing_request_body", "request body is required"),
+        .allocated_result = true,
     };
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
-        return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON" } };
+        return .{
+            .status = .rejected,
+            .err = .{ .code = .json_contract_error, .message = "invalid JSON" },
+            .result_json = try renderVerifierCandidateExecutionGetError(allocator, "rejected", null, null, "invalid_json", "request body must be valid JSON"),
+            .allocated_result = true,
+        };
     };
     defer parsed.deinit();
 
-    if (parsed.value != .object) return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "verifier.candidate.execution.get request must be a JSON object" } };
+    if (parsed.value != .object) return .{
+        .status = .rejected,
+        .err = .{ .code = .invalid_request, .message = "verifier.candidate.execution.get request must be a JSON object" },
+        .result_json = try renderVerifierCandidateExecutionGetError(allocator, "rejected", null, null, "invalid_request_shape", "request must be a JSON object"),
+        .allocated_result = true,
+    };
     const obj = parsed.value.object;
     const project_shard_raw = getStr(obj, "project_shard", "projectShard") orelse return .{
         .status = .rejected,
         .err = .{ .code = .missing_required_field, .message = "projectShard is required" },
+        .result_json = try renderVerifierCandidateExecutionGetError(allocator, "rejected", null, null, "missing_project_shard", "projectShard is required"),
+        .allocated_result = true,
     };
     const execution_id_raw = getStr(obj, "execution_id", "executionId") orelse return .{
         .status = .rejected,
         .err = .{ .code = .missing_required_field, .message = "execution_id is required" },
+        .result_json = try renderVerifierCandidateExecutionGetError(allocator, "rejected", project_shard_raw, null, "missing_execution_id", "executionId is required"),
+        .allocated_result = true,
     };
     const project_shard = try allocator.dupe(u8, project_shard_raw);
     defer allocator.free(project_shard);
@@ -2792,15 +2808,55 @@ fn dispatchVerifierCandidateExecutionGet(allocator: std.mem.Allocator, workspace
     }
 
     return .{
-        .status = .rejected,
+        .status = .unresolved,
         .err = .{
             .code = .path_not_found,
             .message = "verifier candidate execution not found",
-            .details = execution_id,
             .fix_hint = "list verifier.candidate.execution.list with projectShard to inspect persisted verifier execution records",
         },
         .result_state = schema.unresolvedResultState("verifier candidate execution not found"),
+        .result_json = try renderVerifierCandidateExecutionGetError(allocator, "not_found", project_shard, execution_id, "verifier_execution_not_found", "no same-shard verifier execution record matched executionId"),
+        .allocated_result = true,
     };
+}
+
+fn renderVerifierCandidateExecutionGetError(
+    allocator: std.mem.Allocator,
+    status: []const u8,
+    project_shard: ?[]const u8,
+    execution_id: ?[]const u8,
+    unknown_kind: []const u8,
+    reason: []const u8,
+) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+
+    try w.writeAll("{\"verifierCandidateExecutionGet\":{\"status\":\"");
+    try writeEscaped(w, status);
+    try w.writeAll("\",\"projectShard\":");
+    if (project_shard) |value| {
+        try w.writeAll("\"");
+        try writeEscaped(w, value);
+        try w.writeAll("\"");
+    } else {
+        try w.writeAll("null");
+    }
+    try w.writeAll(",\"executionId\":");
+    if (execution_id) |value| {
+        try w.writeAll("\"");
+        try writeEscaped(w, value);
+        try w.writeAll("\"");
+    } else {
+        try w.writeAll("null");
+    }
+    try w.writeAll(",\"execution\":null,\"unknown\":{\"kind\":\"");
+    try writeEscaped(w, unknown_kind);
+    try w.writeAll("\",\"reason\":\"");
+    try writeEscaped(w, reason);
+    try w.writeAll("\"},\"read_only\":true,\"readOnly\":true,\"non_authorizing\":true,\"nonAuthorizing\":true,\"commands_executed\":false,\"commandsExecuted\":false,\"verifiers_executed\":false,\"verifiersExecuted\":false,\"mutates_state\":false,\"mutatesState\":false,\"proof_granted\":false,\"proofGranted\":false,\"support_granted\":false,\"supportGranted\":false,\"correction_applied\":false,\"correctionApplied\":false,\"negative_knowledge_promoted\":false,\"negativeKnowledgePromoted\":false,\"patch_applied\":false,\"patchApplied\":false,\"corpus_mutation\":false,\"corpusMutation\":false,\"pack_mutation\":false,\"packMutation\":false,\"state_source\":\"verifier_execution_records_jsonl\",\"trace\":{\"summary\":\"inspection only; no verifier candidate execution was scheduled or run\"}}}");
+
+    return out.toOwnedSlice();
 }
 
 // ── Correction Inspection ─────────────────────────────────────────────
@@ -6297,10 +6353,57 @@ test "correction.reviewed.get returns existing and missing records without crash
 
 test "get missing execution returns structured error" {
     const allocator = std.testing.allocator;
+    const shard_id = "verifier-execution-missing-smoke";
+    const execution_path = try verifier_candidate_execution.executionsPath(allocator, shard_id);
+    defer allocator.free(execution_path);
+    std.fs.deleteFileAbsolute(execution_path) catch {};
+    defer std.fs.deleteFileAbsolute(execution_path) catch {};
+
     var result = try dispatch(allocator, "verifier.candidate.execution.get", core.PROTOCOL_VERSION, null, null, "{\"projectShard\":\"verifier-execution-missing-smoke\",\"executionId\":\"missing-exec\"}");
     defer result.deinit(allocator);
-    try std.testing.expectEqual(core.ProtocolStatus.rejected, result.status);
+    try std.testing.expectEqual(core.ProtocolStatus.unresolved, result.status);
     try std.testing.expectEqual(core.ErrorCode.path_not_found, result.err.?.code);
+    const json = result.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":\"not_found\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"verifier_execution_not_found\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"executionId\":\"missing-exec\"") != null);
+    try expectVerifierExecutionInspectionSafeguards(json);
+}
+
+test "verifier execution get missing execution id returns structured rejected response" {
+    const allocator = std.testing.allocator;
+    var result = try dispatch(allocator, "verifier.candidate.execution.get", core.PROTOCOL_VERSION, null, null, "{\"projectShard\":\"verifier-execution-missing-id-smoke\"}");
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, result.status);
+    try std.testing.expectEqual(core.ErrorCode.missing_required_field, result.err.?.code);
+    const json = result.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":\"rejected\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"missing_execution_id\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"executionId\":null") != null);
+    try expectVerifierExecutionInspectionSafeguards(json);
+}
+
+test "verifier execution get missing project shard returns structured rejected response" {
+    const allocator = std.testing.allocator;
+    var result = try dispatch(allocator, "verifier.candidate.execution.get", core.PROTOCOL_VERSION, null, null, "{\"executionId\":\"missing-project-shard\"}");
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, result.status);
+    try std.testing.expectEqual(core.ErrorCode.missing_required_field, result.err.?.code);
+    const json = result.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"missing_project_shard\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"projectShard\":null") != null);
+    try expectVerifierExecutionInspectionSafeguards(json);
+}
+
+test "verifier execution get malformed shape returns structured rejected response" {
+    const allocator = std.testing.allocator;
+    var result = try dispatch(allocator, "verifier.candidate.execution.get", core.PROTOCOL_VERSION, null, null, "[]");
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, result.status);
+    try std.testing.expectEqual(core.ErrorCode.invalid_request, result.err.?.code);
+    const json = result.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"invalid_request_shape\"") != null);
+    try expectVerifierExecutionInspectionSafeguards(json);
 }
 
 test "get missing correction returns structured error" {
@@ -7701,6 +7804,23 @@ fn expectReviewedCorrectionSafeguards(json: []const u8) !void {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"verifiersExecuted\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"nonAuthorizing\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"treatedAsProof\":false") != null);
+}
+
+fn expectVerifierExecutionInspectionSafeguards(json: []const u8) !void {
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"read_only\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"readOnly\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"non_authorizing\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"nonAuthorizing\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"commands_executed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"commandsExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verifiers_executed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verifiersExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"mutates_state\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"mutatesState\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"support_granted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"supportGranted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"proof_granted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"proofGranted\":false") != null);
 }
 
 test "protocol.describe lists context.autopsy as implemented" {
