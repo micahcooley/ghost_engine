@@ -186,6 +186,11 @@ const FamilyCounts = struct {
     other: usize = 0,
 };
 
+/// Calculates the maximum possible support priority a candidate could theoretically reach.
+/// This strictly serves as an optimistic routing/triage limit.
+/// Do NOT use this to authorize real support boundaries. Candidate, evidence, and policy
+/// findings evaluated here do NOT grant support. Actual support is exclusively
+/// granted via explicit support gates during verifier execution.
 pub fn supportPotentialUpperBound(entry: Entry) u16 {
     if (entry.conflict) return 0;
     var score: u16 = 0;
@@ -255,6 +260,8 @@ pub fn select(allocator: std.mem.Allocator, entries: []const Entry, caps: Caps) 
             status = .skipped;
             skip = .stale_or_low_trust;
         } else if (item.upper < 220) {
+            // Triage limit only. Passing this limit does not grant support authority;
+            // it merely allows the candidate to be considered by the proof gates.
             status = .skipped;
             skip = .low_support_potential;
         } else if (familyCount(counts, item.entry.source_family) >= familyLimit(caps, item.entry.source_family)) {
@@ -339,6 +346,8 @@ pub fn selectWithNegativeKnowledge(
             status = .skipped;
             skip = .stale_or_low_trust;
         } else if (item.upper < 220) {
+            // Triage limit only. Passing this limit does not grant support authority;
+            // it merely allows the candidate to be considered by the proof gates.
             status = .skipped;
             skip = .low_support_potential;
         } else if (familyCount(counts, item.entry.source_family) >= familyLimit(caps, item.entry.source_family)) {
