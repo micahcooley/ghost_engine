@@ -132,11 +132,12 @@ The fixture set covers:
 Run the repeatable developer smoke after building `ghost_gip`:
 
 ```bash
-zig build
-bash tools/smoke_artifact_autopsy.sh
+zig build smoke-artifact-autopsy
 ```
 
-The smoke script invokes `./zig-out/bin/ghost_gip` explicitly, writes only
+The build step installs `ghost_gip` and then invokes
+`bash tools/smoke_artifact_autopsy.sh` from the repository root. The smoke
+script invokes `./zig-out/bin/ghost_gip` explicitly, writes only
 temporary output under `${TMPDIR:-/tmp}`, and removes that output on exit. It
 checks documentation audit, recipe unused ingredient, recipe missing
 ingredient, missing ingredients section, missing steps section, and path

@@ -218,6 +218,16 @@ pub fn build(b: *std.Build) void {
     const hygiene_step = b.step("repo-hygiene", "Print repository status after ignoring generated Ghost state");
     hygiene_step.dependOn(&hygiene_cmd.step);
 
+    const artifact_autopsy_smoke_cmd = b.addSystemCommand(&.{
+        "bash",
+        "tools/smoke_artifact_autopsy.sh",
+    });
+    artifact_autopsy_smoke_cmd.setCwd(b.path("."));
+    artifact_autopsy_smoke_cmd.has_side_effects = true;
+    artifact_autopsy_smoke_cmd.step.dependOn(b.getInstallStep());
+    const artifact_autopsy_smoke_step = b.step("smoke-artifact-autopsy", "Run artifact autopsy smoke fixtures");
+    artifact_autopsy_smoke_step.dependOn(&artifact_autopsy_smoke_cmd.step);
+
     // ── 9. Unit & Integration Tests ──
     const main_tests = b.addTest(.{
         .root_module = b.createModule(.{
