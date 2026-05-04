@@ -5566,6 +5566,15 @@ fn applyReinforcementOutcome(record: *Record, outcome: ReinforcementOutcome, pol
     }
 }
 
+/// Public wrapper for cross-module policy tests.
+/// The underlying applyReinforcementOutcome is intentionally private since
+/// it is an internal detail of the reinforcement loop. This wrapper exists
+/// solely so artifact_policy tests can verify trust decay behavior without
+/// duplicating logic.
+pub fn applyReinforcementOutcomePublic(record: *Record, outcome: ReinforcementOutcome, policy: TrustDecayPolicy) void {
+    applyReinforcementOutcome(record, outcome, policy);
+}
+
 fn reinforcementCaseSeen(record: *const Record, case_id: []const u8, outcome: ReinforcementOutcome) bool {
     var needle_buf = std.ArrayList(u8).init(record.allocator);
     defer needle_buf.deinit();

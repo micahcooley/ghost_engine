@@ -50,6 +50,7 @@ const context_autopsy = @import("context_autopsy.zig");
 const context_autopsy_engine = @import("context_autopsy_engine.zig");
 const context_inputs = @import("context_inputs.zig");
 const gip = @import("gip.zig");
+const artifact_policy = @import("artifact_policy.zig");
 
 comptime {
     _ = context_autopsy;
@@ -69,6 +70,7 @@ comptime {
     _ = learning_loop;
     _ = negative_knowledge;
     _ = support_routing;
+    _ = artifact_policy;
 }
 
 test "smoke: correction proposal remains candidate-only and non-mutating" {
