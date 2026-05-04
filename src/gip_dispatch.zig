@@ -2020,13 +2020,8 @@ fn dispatchArtifactPolicyDescribe(allocator: std.mem.Allocator) !DispatchResult 
     const w = out.writer();
 
     try w.writeAll("{\"artifactPolicy\":");
-    if (inner_json.len > 0 and inner_json[inner_json.len - 1] == '}') {
-        try w.writeAll(inner_json[0 .. inner_json.len - 1]);
-    } else {
-        try w.writeAll(inner_json);
-    }
-
-    try w.writeAll(", \"schema_version\": \"1.0\", \"read_only\": true, \"mutates_state\": false, \"commands_executed\": false, \"verifiers_executed\": false}}");
+    try w.writeAll(inner_json);
+    try w.writeAll(",\"readOnly\":true,\"mutatesState\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false,\"non_authorizing\":true}");
 
     var gip_state = schema.draftResultState();
     gip_state.permission = .none;

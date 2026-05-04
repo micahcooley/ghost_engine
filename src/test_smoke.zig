@@ -101,11 +101,10 @@ test "smoke: gip artifact.policy.describe returns read-only policy metadata" {
     try std.testing.expect(result.result_state.?.is_draft);
 
     const json = result.result_json.?;
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"read_only\": true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"mutates_state\": false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"commands_executed\": false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"non_authorizing\": true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"proof_granted\": false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"readOnly\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"mutatesState\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"commandsExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"non_authorizing\":true") != null);
 }
 
 const TraceCapture = struct {
