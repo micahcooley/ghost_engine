@@ -4826,7 +4826,7 @@ fn dispatchArtifactAutopsyInspect(allocator: std.mem.Allocator, request_body: ?[
 
     try w.writeAll("{\"artifactAutopsyInspect\":");
     try std.json.stringify(result, .{}, w);
-    try w.writeAll(",\"readOnly\":true,\"mutatesState\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false,\"non_authorizing\":true}");
+    try w.writeAll(",\"readOnly\":true,\"mutatesState\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false,\"supportGranted\":false,\"proofGranted\":false,\"non_authorizing\":true}");
 
     var gip_state = schema.draftResultState();
     gip_state.permission = .none;

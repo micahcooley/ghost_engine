@@ -123,8 +123,31 @@ test "smoke: gip artifact.autopsy.inspect returns read-only seed autopsy output"
     try std.testing.expect(std.mem.indexOf(u8, json, "\"readOnly\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"mutatesState\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"commandsExecuted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"supportGranted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"proofGranted\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"non_authorizing\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"documentation_audit\"") != null);
+}
+
+test "smoke: gip artifact.autopsy.inspect returns default documentation_audit on empty body" {
+    const allocator = std.testing.allocator;
+    var result = try gip.dispatch.dispatch(allocator, "artifact.autopsy.inspect", gip.PROTOCOL_VERSION, null, null, null);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(gip.ProtocolStatus.ok, result.status);
+    const json = result.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"documentation_audit\"") != null);
+}
+
+test "smoke: gip artifact.autopsy.inspect supports recipe_consistency domain" {
+    const allocator = std.testing.allocator;
+    const req = "{\"domain\":\"recipe_consistency\"}";
+    var result = try gip.dispatch.dispatch(allocator, "artifact.autopsy.inspect", gip.PROTOCOL_VERSION, null, null, req);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(gip.ProtocolStatus.ok, result.status);
+    const json = result.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"recipe_consistency\"") != null);
 }
 
 test "smoke: gip artifact.autopsy.inspect rejects unknown domain" {
