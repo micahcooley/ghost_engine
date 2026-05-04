@@ -113,6 +113,36 @@ The recipe consistency fixture demonstrates:
 The inconsistency is a **candidate**, not proof. Chocolate chips may be
 an intentional optional addition. The autopsy reports what it observes.
 
+## Golden Smoke Fixtures
+
+Reusable local smoke fixtures live under `fixtures/artifact_autopsy/`.
+They are test/smoke artifacts only. They do not grant proof, support, or
+authority, and they are not product-ready examples. They exist so local
+verification can use stable file-backed inputs instead of ad hoc scratch files.
+
+The fixture set covers:
+
+- `fixtures/artifact_autopsy/documentation/README.md`
+- `fixtures/artifact_autopsy/documentation/Makefile`
+- `fixtures/artifact_autopsy/recipes/recipe_unused.md`
+- `fixtures/artifact_autopsy/recipes/recipe_missing.md`
+- `fixtures/artifact_autopsy/recipes/recipe_no_ingredients.md`
+- `fixtures/artifact_autopsy/recipes/recipe_no_steps.md`
+
+Run the repeatable developer smoke after building `ghost_gip`:
+
+```bash
+zig build
+bash tools/smoke_artifact_autopsy.sh
+```
+
+The smoke script invokes `./zig-out/bin/ghost_gip` explicitly, writes only
+temporary output under `${TMPDIR:-/tmp}`, and removes that output on exit. It
+checks documentation audit, recipe unused ingredient, recipe missing
+ingredient, missing ingredients section, missing steps section, and path
+traversal rejection. The checks use `jq` when available and fall back to
+literal output matching otherwise.
+
 ## Policy Integration
 
 Artifact autopsy results carry an `active_policy_profile` field that
