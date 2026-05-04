@@ -597,7 +597,7 @@ pub fn operationMaturityLabel(kind: RequestKind) []const u8 {
         .@"artifact.read", .@"artifact.list", .@"pack.list", .@"pack.inspect", .@"verifier.list" => "read_only_inspection",
         .@"artifact.patch.propose" => "candidate_only_patch_proposal_no_apply",
         .@"hypothesis.list", .@"hypothesis.triage" => "stateless_non_authorizing",
-        .@"verifier.candidate.execution.list", .@"verifier.candidate.execution.get" => "read_only_state_inspection",
+        .@"verifier.candidate.execution.list", .@"verifier.candidate.execution.get" => "read_only_verifier_execution_record_inspection_non_authorizing",
         .@"verifier.candidate.execute" => "approved_only_bounded_verifier_execution_evidence_candidate_non_authorizing",
         .@"correction.list",
         .@"correction.get",

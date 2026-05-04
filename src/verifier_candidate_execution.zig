@@ -10,6 +10,62 @@ pub const MAX_EXECUTION_RECORDS_READ: usize = 128;
 pub const MAX_EXECUTION_RECORDS_BYTES: usize = 256 * 1024;
 const MAX_SNIPPET_BYTES: usize = 1024;
 
+pub const RecordSummary = struct {
+    allocator: std.mem.Allocator,
+    raw_json: []u8,
+    id: []u8,
+    candidate_id: []u8,
+    status: []u8,
+
+    pub fn deinit(self: *RecordSummary) void {
+        self.allocator.free(self.raw_json);
+        self.allocator.free(self.id);
+        self.allocator.free(self.candidate_id);
+        self.allocator.free(self.status);
+        self.* = undefined;
+    }
+};
+
+pub const ListRecordsResult = struct {
+    allocator: std.mem.Allocator,
+    records: []RecordSummary,
+    storage_path: []u8,
+    total: usize,
+    emitted: usize,
+    passed: usize,
+    failed: usize,
+    timed_out: usize,
+    disallowed: usize,
+    rejected: usize,
+    unknown: usize,
+    limit: usize,
+    malformed_lines: usize,
+    bytes_read: usize,
+    truncated: bool,
+
+    pub fn deinit(self: *ListRecordsResult) void {
+        for (self.records) |*record| record.deinit();
+        self.allocator.free(self.records);
+        self.allocator.free(self.storage_path);
+        self.* = undefined;
+    }
+};
+
+pub const GetRecordResult = struct {
+    allocator: std.mem.Allocator,
+    record: ?RecordSummary,
+    storage_path: []u8,
+    malformed_lines: usize,
+    bytes_read: usize,
+    truncated: bool,
+
+    pub fn deinit(self: *GetRecordResult) void {
+        if (self.record) |*record| record.deinit();
+        self.allocator.free(self.storage_path);
+        self.* = undefined;
+    }
+};
+
 pub const ExecuteResult = struct {
     allocator: std.mem.Allocator,
     record_json: []u8,
@@ -34,6 +90,173 @@ pub fn executionsPath(allocator: std.mem.Allocator, project_shard: []const u8) !
     var paths = try shards.resolvePaths(allocator, metadata.metadata);
     defer paths.deinit();
     return std.fs.path.join(allocator, &.{ paths.root_abs_path, EXECUTIONS_REL_DIR, EXECUTIONS_FILE_NAME });
+}
+
+pub fn listExecutionRecords(
+    allocator: std.mem.Allocator,
+    project_shard: []const u8,
+    candidate_filter: ?[]const u8,
+    status_filter: ?[]const u8,
+    limit: usize,
+) !ListRecordsResult {
+    const path = try executionsPath(allocator, project_shard);
+    errdefer allocator.free(path);
+
+    var records = std.ArrayList(RecordSummary).init(allocator);
+    errdefer {
+        for (records.items) |*record| record.deinit();
+        records.deinit();
+    }
+
+    var malformed_lines: usize = 0;
+    var bytes_read: usize = 0;
+    var truncated = false;
+    var total: usize = 0;
+    var passed: usize = 0;
+    var failed: usize = 0;
+    var timed_out: usize = 0;
+    var disallowed: usize = 0;
+    var rejected: usize = 0;
+    var unknown: usize = 0;
+
+    var file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return .{
+            .allocator = allocator,
+            .records = try records.toOwnedSlice(),
+            .storage_path = path,
+            .total = 0,
+            .emitted = 0,
+            .passed = 0,
+            .failed = 0,
+            .timed_out = 0,
+            .disallowed = 0,
+            .rejected = 0,
+            .unknown = 0,
+            .limit = limit,
+            .malformed_lines = 0,
+            .bytes_read = 0,
+            .truncated = false,
+        },
+        else => return err,
+    };
+    defer file.close();
+
+    const stat = try file.stat();
+    const read_len: usize = @intCast(@min(stat.size, MAX_EXECUTION_RECORDS_BYTES));
+    if (stat.size > MAX_EXECUTION_RECORDS_BYTES) truncated = true;
+    const bytes = try file.readToEndAlloc(allocator, read_len);
+    defer allocator.free(bytes);
+    bytes_read = bytes.len;
+
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0) continue;
+        var summary = parseRecordSummary(allocator, line) catch {
+            malformed_lines += 1;
+            continue;
+        };
+        errdefer summary.deinit();
+        if (candidate_filter) |filter| {
+            if (!std.mem.eql(u8, summary.candidate_id, filter)) {
+                summary.deinit();
+                continue;
+            }
+        }
+        if (status_filter) |filter| {
+            if (!std.mem.eql(u8, summary.status, filter)) {
+                summary.deinit();
+                continue;
+            }
+        }
+        total += 1;
+        countStatus(summary.status, &passed, &failed, &timed_out, &disallowed, &rejected, &unknown);
+        if (records.items.len < limit) {
+            try records.append(summary);
+        } else {
+            summary.deinit();
+        }
+    }
+
+    const emitted = records.items.len;
+    if (total > emitted) truncated = true;
+    return .{
+        .allocator = allocator,
+        .records = try records.toOwnedSlice(),
+        .storage_path = path,
+        .total = total,
+        .emitted = emitted,
+        .passed = passed,
+        .failed = failed,
+        .timed_out = timed_out,
+        .disallowed = disallowed,
+        .rejected = rejected,
+        .unknown = unknown,
+        .limit = limit,
+        .malformed_lines = malformed_lines,
+        .bytes_read = bytes_read,
+        .truncated = truncated,
+    };
+}
+
+pub fn getExecutionRecord(allocator: std.mem.Allocator, project_shard: []const u8, execution_id: []const u8) !GetRecordResult {
+    const path = try executionsPath(allocator, project_shard);
+    errdefer allocator.free(path);
+
+    var malformed_lines: usize = 0;
+    var bytes_read: usize = 0;
+    var truncated = false;
+
+    var file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return .{
+            .allocator = allocator,
+            .record = null,
+            .storage_path = path,
+            .malformed_lines = 0,
+            .bytes_read = 0,
+            .truncated = false,
+        },
+        else => return err,
+    };
+    defer file.close();
+
+    const stat = try file.stat();
+    const read_len: usize = @intCast(@min(stat.size, MAX_EXECUTION_RECORDS_BYTES));
+    if (stat.size > MAX_EXECUTION_RECORDS_BYTES) truncated = true;
+    const bytes = try file.readToEndAlloc(allocator, read_len);
+    defer allocator.free(bytes);
+    bytes_read = bytes.len;
+
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0) continue;
+        var summary = parseRecordSummary(allocator, line) catch {
+            malformed_lines += 1;
+            continue;
+        };
+        errdefer summary.deinit();
+        if (std.mem.eql(u8, summary.id, execution_id)) {
+            return .{
+                .allocator = allocator,
+                .record = summary,
+                .storage_path = path,
+                .malformed_lines = malformed_lines,
+                .bytes_read = bytes_read,
+                .truncated = truncated,
+            };
+        }
+        summary.deinit();
+    }
+
+    return .{
+        .allocator = allocator,
+        .record = null,
+        .storage_path = path,
+        .malformed_lines = malformed_lines,
+        .bytes_read = bytes_read,
+        .truncated = truncated,
+    };
 }
 
 pub fn executeBody(allocator: std.mem.Allocator, body: []const u8, dispatch_workspace_root: ?[]const u8) !ExecuteResult {
@@ -189,6 +412,55 @@ pub fn writeExecuteResultJson(writer: anytype, result: ExecuteResult) !void {
     try writer.writeAll(",\"nonAuthorizing\":true,\"supportGranted\":false,\"proofGranted\":false,\"correctionApplied\":false,\"negativeKnowledgePromoted\":false,\"patchApplied\":false,\"corpusMutation\":false,\"packMutation\":false,\"mutatesState\":");
     try writer.writeAll(if (result.mutates_state) "true" else "false");
     try writer.writeAll(",\"authorityEffect\":\"evidence_candidate\"}}");
+}
+
+fn parseRecordSummary(allocator: std.mem.Allocator, line: []const u8) !RecordSummary {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRecord;
+    const obj = parsed.value.object;
+    const id = getStrAny(obj, &.{"id"}) orelse return error.InvalidRecord;
+    const candidate_id = getStrAny(obj, &.{ "candidateId", "candidate_id" }) orelse return error.InvalidRecord;
+    const status = getStrAny(obj, &.{"status"}) orelse "unknown";
+    const raw_json = try allocator.dupe(u8, line);
+    errdefer allocator.free(raw_json);
+    const id_copy = try allocator.dupe(u8, id);
+    errdefer allocator.free(id_copy);
+    const candidate_id_copy = try allocator.dupe(u8, candidate_id);
+    errdefer allocator.free(candidate_id_copy);
+    const status_copy = try allocator.dupe(u8, status);
+    errdefer allocator.free(status_copy);
+    return .{
+        .allocator = allocator,
+        .raw_json = raw_json,
+        .id = id_copy,
+        .candidate_id = candidate_id_copy,
+        .status = status_copy,
+    };
+}
+
+fn countStatus(
+    status: []const u8,
+    passed: *usize,
+    failed: *usize,
+    timed_out: *usize,
+    disallowed: *usize,
+    rejected: *usize,
+    unknown: *usize,
+) void {
+    if (std.mem.eql(u8, status, "passed")) {
+        passed.* += 1;
+    } else if (std.mem.eql(u8, status, "failed")) {
+        failed.* += 1;
+    } else if (std.mem.eql(u8, status, "timed_out")) {
+        timed_out.* += 1;
+    } else if (std.mem.eql(u8, status, "disallowed")) {
+        disallowed.* += 1;
+    } else if (std.mem.eql(u8, status, "rejected")) {
+        rejected.* += 1;
+    } else {
+        unknown.* += 1;
+    }
 }
 
 fn rejectedResult(allocator: std.mem.Allocator, project_shard: []const u8, candidate_id: []const u8, status: []const u8, reason_code: []const u8, reason: []const u8) !ExecuteResult {

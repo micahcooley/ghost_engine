@@ -74,6 +74,11 @@ Approved verifier execution records are stored under the project shard at
 `verifier_executions/verifier_execution_records.jsonl` only after a command is
 actually spawned by the bounded harness. Rejected, unapproved, unconfirmed, or
 disallowed requests return structured non-execution results without evidence.
+`verifier.candidate.execution.list` and `verifier.candidate.execution.get`
+inspect that JSONL store directly by `projectShard`; inspection is read-only and
+does not schedule, retry, or execute verifiers. Empty inspection means no
+persisted execution records were visible. Unknown is not false, and no evidence
+is not negative evidence.
 Execution records are evidence candidates only:
 
 - `evidenceCandidate: true` only for spawned execution output

@@ -142,8 +142,8 @@ results when GIP has no active session or workspace metadata:
 | `procedure_pack.candidate.review` | Appends an accepted/rejected procedure pack candidate review record only; does not mutate packs or promote candidates | `append_only_reviewed_procedure_pack_candidate_no_pack_mutation` |
 | `procedure_pack.candidate.reviewed.list` | Lists same-shard reviewed procedure pack candidate records from append-only storage; read-only and not proof/evidence | `read_only_reviewed_procedure_pack_candidate_inspection_non_authorizing` |
 | `procedure_pack.candidate.reviewed.get` | Retrieves one same-shard reviewed procedure pack candidate record by id; read-only and not proof/evidence | `read_only_reviewed_procedure_pack_candidate_inspection_non_authorizing` |
-| `verifier.candidate.execution.list` | Reads existing task/result support-graph state; returns empty when no state is visible | `read_only_state_inspection` |
-| `verifier.candidate.execution.get` | Reads one existing execution job/result projection; missing IDs return `path_not_found` | `read_only_state_inspection` |
+| `verifier.candidate.execution.list` | Lists persisted verifier execution evidence-candidate records from same-shard JSONL storage; read-only and never proof/support | `read_only_verifier_execution_record_inspection_non_authorizing` |
+| `verifier.candidate.execution.get` | Retrieves one persisted same-shard verifier execution evidence-candidate record by ID; read-only and never proof/support | `read_only_verifier_execution_record_inspection_non_authorizing` |
 | `correction.list` | Reads existing correction-event state; returns empty when no state is visible | `read_only_state_inspection` |
 | `correction.get` | Reads one existing correction event projection; missing IDs return `path_not_found` | `read_only_state_inspection` |
 | `negative_knowledge.candidate.list` | Reads existing proposed negative-knowledge candidate state; returns empty when no state is visible | `read_only_state_inspection` |
@@ -445,15 +445,14 @@ Denied future mutations remain denied by capability policy.
   - `external: true` indicates the adapter requires build/test/runtime execution harness.
 - `verifier.run` — Run a specific verifier **(Not implemented yet)**
 - `verifier.candidate.execution.list` — Inspect verifier candidate execution jobs **(Implemented — inspection only)**
-  - **Request**: `{"sessionId": string (optional), "candidateId": string (optional), "hypothesisId": string (optional), "statusFilter": string (optional), "maxItems": int (optional, default 128, max 128)}`
-  - **Response**: `{"executions": [], "counts": {"total": 0, "pending": 0, "scheduled": 0, "running": 0, "completed": 0, "failed": 0, "blocked": 0, "skipped": 0, "budget_exhausted": 0, "timeout": 0}, "max_items": int, "read_only": true, "non_authorizing_input": true, "state_source": "no_state_found" | "support_graph", "trace": {...}}`
-  - Read-only. Does not schedule, run, approve, or retry verifiers.
-  - Reads existing state via `sessionId`/`projectShard` task-session result paths, or an explicit workspace-contained `statePath` JSON result file. Empty output means no visible state exists.
+  - **Request**: `{"projectShard": string, "candidateId": string (optional), "statusFilter": string (optional), "maxItems": int (optional, default 128, max 128)}`
+  - **Response**: `{"executions": [<verifier_execution_record>], "counts": {"total": int, "emitted": int, "passed": int, "failed": int, "timed_out": int, "disallowed": int, "rejected": int, "unknown": int}, "projectShard": string, "max_items": int, "read_only": true, "non_authorizing": true, "commands_executed": false, "verifiers_executed": false, "mutates_state": false, "support_granted": false, "proof_granted": false, "state_source": "verifier_execution_records_jsonl", "telemetry": {...}, "trace": {...}}`
+  - Read-only. Does not schedule, run, approve, retry, or execute verifiers.
+  - Reads existing same-shard records from `<project shard>/verifier_executions/verifier_execution_records.jsonl`. Empty output means no persisted execution records were visible; no evidence is not negative evidence.
 - `verifier.candidate.execution.get` — Inspect one execution job/result by ID **(Implemented — inspection only)**
-  - **Request**: `{"executionId": string}`
-  - **Response**: Existing execution job/result projection from persisted support-graph state; missing IDs return structured `path_not_found`.
-  - Support-graph projections may omit original job/result fields unavailable in persisted graph state.
-  - Future populated responses must use bounded stdout/stderr summaries or refs, not unbounded logs.
+  - **Request**: `{"projectShard": string, "executionId": string}`
+  - **Response**: `{"execution": <verifier_execution_record>, "projectShard": string, "executionId": string, "read_only": true, "non_authorizing": true, "commands_executed": false, "verifiers_executed": false, "mutates_state": false, "support_granted": false, "proof_granted": false, "state_source": "verifier_execution_records_jsonl", "telemetry": {...}, "trace": {...}}`; missing IDs return structured `path_not_found`.
+  - Stored records contain bounded stdout/stderr snippets captured at execution time. Inspection does not read unbounded logs and does not treat pass/fail as support, proof, correction, negative knowledge, patch, pack, corpus, trust, snapshot, or scratch authority.
 - `verifier.candidate.execute` — Execute an approved verifier candidate **(Implemented; explicit confirmation required)**
   - **Request**: `{"projectShard": string, "candidateId": string, "workspaceRoot": string, "confirmExecute": true, "timeoutMs": int optional, "maxOutputBytes": int optional}`.
   - The candidate must already exist in same-shard verifier candidate metadata with folded `status:"approved"`.
@@ -692,7 +691,7 @@ echo '{"gipVersion":"gip.v0.1","kind":"verifier.list"}' | ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"pack.list"}' | ghost_gip --stdin --workspace /path/to/project
 echo '{"gipVersion":"gip.v0.1","kind":"hypothesis.list"}' | ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"hypothesis.triage","maxItems":16}' | ghost_gip --stdin
-echo '{"gipVersion":"gip.v0.1","kind":"verifier.candidate.execution.list"}' | ghost_gip --stdin
+echo '{"gipVersion":"gip.v0.1","kind":"verifier.candidate.execution.list","projectShard":"default"}' | ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"correction.list"}' | ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"negative_knowledge.candidate.list"}' | ghost_gip --stdin
 echo '{"gipVersion":"gip.v0.1","kind":"pack.inspect","packId":"my-pack"}' | ghost_gip --stdin

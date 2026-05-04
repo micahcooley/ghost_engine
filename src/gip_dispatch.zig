@@ -2645,103 +2645,89 @@ fn writeTrustDecayCandidateProjection(w: anytype, root: std.json.Value, node: st
 }
 
 fn dispatchVerifierCandidateExecutionList(allocator: std.mem.Allocator, workspace_root: ?[]const u8, request_body: ?[]const u8) !DispatchResult {
+    _ = workspace_root;
     var max_items: usize = core.MAX_VERIFIER_EXECUTION_ITEMS;
-    var state_path: ?[]u8 = null;
-    defer if (state_path) |p| allocator.free(p);
     var candidate_filter: ?[]const u8 = null;
-    var hypothesis_filter: ?[]const u8 = null;
+    var candidate_filter_owned: ?[]u8 = null;
+    defer if (candidate_filter_owned) |value| allocator.free(value);
     var status_filter: ?[]const u8 = null;
+    var status_filter_owned: ?[]u8 = null;
+    defer if (status_filter_owned) |value| allocator.free(value);
+    var project_shard: ?[]const u8 = null;
+    var project_shard_owned: ?[]u8 = null;
+    defer if (project_shard_owned) |value| allocator.free(value);
 
     if (request_body) |body| {
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
             return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON" } };
         };
         defer parsed.deinit();
+        if (parsed.value != .object) return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "verifier.candidate.execution.list request must be a JSON object" } };
         const obj = parsed.value.object;
         max_items = boundedMaxItems(obj, core.MAX_VERIFIER_EXECUTION_ITEMS, core.MAX_VERIFIER_EXECUTION_ITEMS);
-        _ = getStr(obj, "session_id", "sessionId");
-        candidate_filter = getStr(obj, "candidate_id", "candidateId");
-        hypothesis_filter = getStr(obj, "hypothesis_id", "hypothesisId");
-        status_filter = getStr(obj, "status_filter", "statusFilter");
-        state_path = resolveInspectionStatePath(allocator, workspace_root, obj) catch |err| {
-            if (err == error.PathRejected) return .{ .status = .rejected, .err = .{ .code = .path_outside_workspace, .message = "state path outside workspace" } };
-            return err;
-        };
+        if (getStr(obj, "project_shard", "projectShard")) |value| {
+            project_shard_owned = try allocator.dupe(u8, value);
+            project_shard = project_shard_owned.?;
+        }
+        if (getStr(obj, "candidate_id", "candidateId")) |value| {
+            candidate_filter_owned = try allocator.dupe(u8, value);
+            candidate_filter = candidate_filter_owned.?;
+        }
+        if (getStr(obj, "status_filter", "statusFilter")) |value| {
+            status_filter_owned = try allocator.dupe(u8, value);
+            status_filter = status_filter_owned.?;
+        }
     }
+    const shard_id = project_shard orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "projectShard is required" },
+    };
+
+    var listed = verifier_candidate_execution.listExecutionRecords(allocator, shard_id, candidate_filter, status_filter, max_items) catch |err| {
+        return switch (err) {
+            else => .{ .status = .failed, .err = .{ .code = .internal_error, .message = "verifier.candidate.execution.list failed", .details = @errorName(err) } },
+        };
+    };
+    defer listed.deinit();
 
     var out = std.ArrayList(u8).init(allocator);
     errdefer out.deinit();
     const w = out.writer();
 
-    var pending: usize = 0;
-    var scheduled: usize = 0;
-    var running: usize = 0;
-    var completed: usize = 0;
-    var failed: usize = 0;
-    var blocked: usize = 0;
-    var skipped: usize = 0;
-    var budget_exhausted: usize = 0;
-    var timeout: usize = 0;
-    var total: usize = 0;
-    var emitted: usize = 0;
-    const source = if (state_path != null) "support_graph" else "no_state_found";
-
-    var parsed_state: ?std.json.Parsed(std.json.Value) = null;
-    defer if (parsed_state) |*p| p.deinit();
-    if (state_path) |path| {
-        parsed_state = loadInspectionState(allocator, path) catch null;
-    }
-
     try w.writeAll("{\"executions\":[");
-    if (parsed_state) |state| {
-        const nodes = supportGraphNodes(state.value);
-        if (nodes) |node_array| {
-            for (node_array.items) |node_val| {
-                const node = valueObject(node_val) orelse continue;
-                const kind = stringField(node, "kind") orelse continue;
-                if (!std.mem.eql(u8, kind, "verifier_execution_job")) continue;
-                const id = stringField(node, "id") orelse continue;
-                const detail = stringField(node, "detail") orelse "";
-                const status = detailValue(detail, "status=") orelse "unknown";
-                const execution_kind = detailValue(detail, "execution_kind=") orelse "unknown";
-                const candidate_id = suffixAfterLast(id, "exec_job:") orelse id;
-                if (candidate_filter) |filter| if (!std.mem.eql(u8, candidate_id, filter) and std.mem.indexOf(u8, id, filter) == null) continue;
-                if (hypothesis_filter != null) continue;
-                if (status_filter) |filter| if (!std.mem.eql(u8, status, filter)) continue;
-                total += 1;
-                if (std.mem.eql(u8, status, "pending")) pending += 1 else if (std.mem.eql(u8, status, "scheduled")) scheduled += 1 else if (std.mem.eql(u8, status, "running")) running += 1 else if (std.mem.eql(u8, status, "completed")) completed += 1 else if (std.mem.eql(u8, status, "failed")) failed += 1 else if (std.mem.eql(u8, status, "blocked")) blocked += 1 else if (std.mem.eql(u8, status, "skipped")) skipped += 1 else if (std.mem.eql(u8, status, "budget_exhausted")) budget_exhausted += 1 else if (std.mem.eql(u8, status, "timeout")) timeout += 1;
-                if (emitted >= max_items) continue;
-                if (emitted != 0) try w.writeByte(',');
-                emitted += 1;
-                try writeExecutionProjection(w, state.value, node, id, candidate_id, status, execution_kind, detail);
-            }
-        }
+    for (listed.records, 0..) |record, i| {
+        if (i != 0) try w.writeByte(',');
+        try w.writeAll(record.raw_json);
     }
     try w.writeAll("],\"counts\":{\"total\":");
-    try w.print("{d}", .{total});
-    try w.writeAll(",\"pending\":");
-    try w.print("{d}", .{pending});
-    try w.writeAll(",\"scheduled\":");
-    try w.print("{d}", .{scheduled});
-    try w.writeAll(",\"running\":");
-    try w.print("{d}", .{running});
-    try w.writeAll(",\"completed\":");
-    try w.print("{d}", .{completed});
+    try w.print("{d}", .{listed.total});
+    try w.writeAll(",\"emitted\":");
+    try w.print("{d}", .{listed.emitted});
+    try w.writeAll(",\"passed\":");
+    try w.print("{d}", .{listed.passed});
     try w.writeAll(",\"failed\":");
-    try w.print("{d}", .{failed});
-    try w.writeAll(",\"blocked\":");
-    try w.print("{d}", .{blocked});
-    try w.writeAll(",\"skipped\":");
-    try w.print("{d}", .{skipped});
-    try w.writeAll(",\"budget_exhausted\":");
-    try w.print("{d}", .{budget_exhausted});
-    try w.writeAll(",\"timeout\":");
-    try w.print("{d}", .{timeout});
-    try w.writeAll("},\"max_items\":");
-    try w.print("{d}", .{max_items});
-    try w.writeAll(",\"read_only\":true,\"non_authorizing_input\":true,\"state_source\":\"");
-    try w.writeAll(source);
-    try w.writeAll("\",\"trace\":{\"summary\":\"inspection only; read existing state without scheduling verifiers\"}}");
+    try w.print("{d}", .{listed.failed});
+    try w.writeAll(",\"timed_out\":");
+    try w.print("{d}", .{listed.timed_out});
+    try w.writeAll(",\"disallowed\":");
+    try w.print("{d}", .{listed.disallowed});
+    try w.writeAll(",\"rejected\":");
+    try w.print("{d}", .{listed.rejected});
+    try w.writeAll(",\"unknown\":");
+    try w.print("{d}", .{listed.unknown});
+    try w.writeAll("},\"projectShard\":\"");
+    try writeEscaped(w, shard_id);
+    try w.writeAll("\",\"max_items\":");
+    try w.print("{d}", .{listed.limit});
+    try w.writeAll(",\"read_only\":true,\"readOnly\":true,\"non_authorizing\":true,\"nonAuthorizing\":true,\"commands_executed\":false,\"commandsExecuted\":false,\"verifiers_executed\":false,\"verifiersExecuted\":false,\"mutates_state\":false,\"mutatesState\":false,\"proof_granted\":false,\"proofGranted\":false,\"support_granted\":false,\"supportGranted\":false,\"correction_applied\":false,\"correctionApplied\":false,\"negative_knowledge_promoted\":false,\"negativeKnowledgePromoted\":false,\"patch_applied\":false,\"patchApplied\":false,\"corpus_mutation\":false,\"corpusMutation\":false,\"pack_mutation\":false,\"packMutation\":false,\"state_source\":\"verifier_execution_records_jsonl\",\"storage_path\":\"");
+    try writeEscaped(w, listed.storage_path);
+    try w.writeAll("\",\"telemetry\":{\"malformed_lines\":");
+    try w.print("{d}", .{listed.malformed_lines});
+    try w.writeAll(",\"bytes_read\":");
+    try w.print("{d}", .{listed.bytes_read});
+    try w.writeAll(",\"truncated\":");
+    try w.writeAll(if (listed.truncated) "true" else "false");
+    try w.writeAll("},\"trace\":{\"summary\":\"inspection only; read existing verifier execution JSONL records without scheduling or running verifiers\"}}");
 
     return .{
         .status = .ok,
@@ -2751,6 +2737,7 @@ fn dispatchVerifierCandidateExecutionList(allocator: std.mem.Allocator, workspac
 }
 
 fn dispatchVerifierCandidateExecutionGet(allocator: std.mem.Allocator, workspace_root: ?[]const u8, request_body: ?[]const u8) !DispatchResult {
+    _ = workspace_root;
     const body = request_body orelse return .{
         .status = .rejected,
         .err = .{ .code = .missing_required_field, .message = "missing request body" },
@@ -2761,58 +2748,56 @@ fn dispatchVerifierCandidateExecutionGet(allocator: std.mem.Allocator, workspace
     };
     defer parsed.deinit();
 
+    if (parsed.value != .object) return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "verifier.candidate.execution.get request must be a JSON object" } };
     const obj = parsed.value.object;
-    const execution_id = getStr(obj, "execution_id", "executionId") orelse return .{
+    const project_shard_raw = getStr(obj, "project_shard", "projectShard") orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "projectShard is required" },
+    };
+    const execution_id_raw = getStr(obj, "execution_id", "executionId") orelse return .{
         .status = .rejected,
         .err = .{ .code = .missing_required_field, .message = "execution_id is required" },
     };
-    const state_path = resolveInspectionStatePath(allocator, workspace_root, obj) catch |err| {
-        if (err == error.PathRejected) return .{ .status = .rejected, .err = .{ .code = .path_outside_workspace, .message = "state path outside workspace" } };
-        return err;
+    const project_shard = try allocator.dupe(u8, project_shard_raw);
+    defer allocator.free(project_shard);
+    const execution_id = try allocator.dupe(u8, execution_id_raw);
+    defer allocator.free(execution_id);
+
+    var inspected = verifier_candidate_execution.getExecutionRecord(allocator, project_shard, execution_id) catch |err| {
+        return switch (err) {
+            else => .{ .status = .failed, .err = .{ .code = .internal_error, .message = "verifier.candidate.execution.get failed", .details = @errorName(err) } },
+        };
     };
-    defer if (state_path) |p| allocator.free(p);
-    if (state_path) |path| {
-        var state = loadInspectionState(allocator, path) catch null;
-        if (state) |*parsed_state| {
-            defer parsed_state.deinit();
-            if (findNode(parsed_state.value, execution_id, "verifier_execution_job")) |node| {
-                const detail = stringField(node, "detail") orelse "";
-                const status = detailValue(detail, "status=") orelse "unknown";
-                const execution_kind = detailValue(detail, "execution_kind=") orelse "unknown";
-                const candidate_id = suffixAfterLast(execution_id, "exec_job:") orelse execution_id;
-                var out = std.ArrayList(u8).init(allocator);
-                errdefer out.deinit();
-                const w = out.writer();
-                try w.writeAll("{\"execution\":");
-                try writeExecutionProjection(w, parsed_state.value, node, execution_id, candidate_id, status, execution_kind, detail);
-                try w.writeAll(",\"result\":");
-                if (linkedEdgeTarget(parsed_state.value, execution_id, "execution_produces_evidence")) |result_id| {
-                    if (findNode(parsed_state.value, result_id, "verifier_execution_result")) |result_node| {
-                        const result_detail = stringField(result_node, "detail") orelse "";
-                        try w.writeAll("{\"id\":\"");
-                        try writeEscaped(w, result_id);
-                        try w.writeAll("\",\"status\":\"");
-                        try writeEscaped(w, detailValue(result_detail, "status=") orelse "unknown");
-                        try w.writeAll("\",\"elapsed_ms\":");
-                        try w.writeAll(detailValue(result_detail, "elapsed_ms=") orelse "null");
-                        try w.writeAll(",\"trace\":{\"summary\":\"");
-                        try writeEscaped(w, result_detail);
-                        try w.writeAll("\",\"source\":\"support_graph\"}}");
-                    } else try w.writeAll("null");
-                } else try w.writeAll("null");
-                try w.writeAll(",\"stdout_ref\":null,\"stderr_ref\":null,\"evidence_refs\":[],\"correction_refs\":[],\"safety_policy\":{\"source\":\"support_graph_projection\"},\"budget_trace\":{\"source\":\"support_graph_projection\"},\"trace\":{\"summary\":\"read existing support graph state\"}}");
-                return .{ .status = .ok, .result_json = try out.toOwnedSlice(), .allocated_result = true };
-            }
-        }
+    defer inspected.deinit();
+    if (inspected.record) |record| {
+        var out = std.ArrayList(u8).init(allocator);
+        errdefer out.deinit();
+        const w = out.writer();
+        try w.writeAll("{\"execution\":");
+        try w.writeAll(record.raw_json);
+        try w.writeAll(",\"projectShard\":\"");
+        try writeEscaped(w, project_shard);
+        try w.writeAll("\",\"executionId\":\"");
+        try writeEscaped(w, execution_id);
+        try w.writeAll("\",\"read_only\":true,\"readOnly\":true,\"non_authorizing\":true,\"nonAuthorizing\":true,\"commands_executed\":false,\"commandsExecuted\":false,\"verifiers_executed\":false,\"verifiersExecuted\":false,\"mutates_state\":false,\"mutatesState\":false,\"proof_granted\":false,\"proofGranted\":false,\"support_granted\":false,\"supportGranted\":false,\"correction_applied\":false,\"correctionApplied\":false,\"negative_knowledge_promoted\":false,\"negativeKnowledgePromoted\":false,\"patch_applied\":false,\"patchApplied\":false,\"corpus_mutation\":false,\"corpusMutation\":false,\"pack_mutation\":false,\"packMutation\":false,\"state_source\":\"verifier_execution_records_jsonl\",\"storage_path\":\"");
+        try writeEscaped(w, inspected.storage_path);
+        try w.writeAll("\",\"telemetry\":{\"malformed_lines\":");
+        try w.print("{d}", .{inspected.malformed_lines});
+        try w.writeAll(",\"bytes_read\":");
+        try w.print("{d}", .{inspected.bytes_read});
+        try w.writeAll(",\"truncated\":");
+        try w.writeAll(if (inspected.truncated) "true" else "false");
+        try w.writeAll("},\"trace\":{\"summary\":\"inspection only; read existing verifier execution JSONL record without scheduling or running verifiers\"}}");
+        return .{ .status = .ok, .result_json = try out.toOwnedSlice(), .allocated_result = true };
     }
 
     return .{
-        .status = .failed,
+        .status = .rejected,
         .err = .{
             .code = .path_not_found,
             .message = "verifier candidate execution not found",
             .details = execution_id,
-            .fix_hint = "list verifier.candidate.execution.list to inspect visible execution jobs",
+            .fix_hint = "list verifier.candidate.execution.list with projectShard to inspect persisted verifier execution records",
         },
         .result_state = schema.unresolvedResultState("verifier candidate execution not found"),
     };
@@ -5432,17 +5417,29 @@ test "verifier.list adapters include required fields" {
 
 test "verifier.candidate.execution.list returns empty list safely" {
     const allocator = std.testing.allocator;
-    var result = try dispatch(allocator, "verifier.candidate.execution.list", core.PROTOCOL_VERSION, null, null, "{}");
+    const shard_id = "verifier-execution-empty-list-smoke";
+    const execution_path = try verifier_candidate_execution.executionsPath(allocator, shard_id);
+    defer allocator.free(execution_path);
+    std.fs.deleteFileAbsolute(execution_path) catch {};
+    defer std.fs.deleteFileAbsolute(execution_path) catch {};
+
+    var result = try dispatch(allocator, "verifier.candidate.execution.list", core.PROTOCOL_VERSION, null, null, "{\"projectShard\":\"verifier-execution-empty-list-smoke\"}");
     defer result.deinit(allocator);
     try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
     const json = result.result_json.?;
     try std.testing.expect(std.mem.indexOf(u8, json, "\"executions\":[]") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"total\":0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"non_authorizing_input\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"read_only\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"non_authorizing\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"commands_executed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verifiers_executed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"support_granted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"proof_granted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"state_source\":\"verifier_execution_records_jsonl\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "engine_state_not_wired") == null);
 }
 
-test "inspection APIs read existing support graph state" {
+test "legacy correction and negative knowledge inspection reads support graph state" {
     const allocator = std.testing.allocator;
     var ws = try PatchTestWorkspace.init(allocator);
     defer ws.deinit();
@@ -5467,13 +5464,6 @@ test "inspection APIs read existing support graph state" {
     file.close();
 
     const exec_body = "{\"statePath\":\"state.json\"}";
-    var exec_result = try dispatch(allocator, "verifier.candidate.execution.list", core.PROTOCOL_VERSION, ws.workspace_root, null, exec_body);
-    defer exec_result.deinit(allocator);
-    try std.testing.expectEqual(core.ProtocolStatus.ok, exec_result.status);
-    try std.testing.expect(std.mem.indexOf(u8, exec_result.result_json.?, "\"state_source\":\"support_graph\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, exec_result.result_json.?, "\"candidate_id\":\"cand-real\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, exec_result.result_json.?, "\"completed\":1") != null);
-
     var correction_result = try dispatch(allocator, "correction.list", core.PROTOCOL_VERSION, ws.workspace_root, null, exec_body);
     defer correction_result.deinit(allocator);
     try std.testing.expectEqual(core.ProtocolStatus.ok, correction_result.status);
@@ -5487,7 +5477,7 @@ test "inspection APIs read existing support graph state" {
     try std.testing.expect(std.mem.indexOf(u8, nk_result.result_json.?, "\"failed_hypothesis\":1") != null);
 }
 
-test "inspection get APIs read existing support graph state" {
+test "legacy correction and negative knowledge get APIs read support graph state" {
     const allocator = std.testing.allocator;
     var ws = try PatchTestWorkspace.init(allocator);
     defer ws.deinit();
@@ -5509,12 +5499,6 @@ test "inspection get APIs read existing support graph state" {
         \\]}}
     );
     file.close();
-
-    var exec_get = try dispatch(allocator, "verifier.candidate.execution.get", core.PROTOCOL_VERSION, ws.workspace_root, null, "{\"statePath\":\"state.json\",\"executionId\":\"out:exec_job:exec_job:cand-real\"}");
-    defer exec_get.deinit(allocator);
-    try std.testing.expectEqual(core.ProtocolStatus.ok, exec_get.status);
-    try std.testing.expect(std.mem.indexOf(u8, exec_get.result_json.?, "\"execution\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, exec_get.result_json.?, "\"result\"") != null);
 
     var correction_get = try dispatch(allocator, "correction.get", core.PROTOCOL_VERSION, ws.workspace_root, null, "{\"statePath\":\"state.json\",\"correctionId\":\"out:correction:correction:1:cand-real\"}");
     defer correction_get.deinit(allocator);
@@ -6313,9 +6297,9 @@ test "correction.reviewed.get returns existing and missing records without crash
 
 test "get missing execution returns structured error" {
     const allocator = std.testing.allocator;
-    var result = try dispatch(allocator, "verifier.candidate.execution.get", core.PROTOCOL_VERSION, null, null, "{\"executionId\":\"missing-exec\"}");
+    var result = try dispatch(allocator, "verifier.candidate.execution.get", core.PROTOCOL_VERSION, null, null, "{\"projectShard\":\"verifier-execution-missing-smoke\",\"executionId\":\"missing-exec\"}");
     defer result.deinit(allocator);
-    try std.testing.expectEqual(core.ProtocolStatus.failed, result.status);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, result.status);
     try std.testing.expectEqual(core.ErrorCode.path_not_found, result.err.?.code);
 }
 
@@ -6338,7 +6322,7 @@ test "get missing negative knowledge candidate returns structured error" {
 test "inspection max_items bounded" {
     const allocator = std.testing.allocator;
 
-    var execution_result = try dispatch(allocator, "verifier.candidate.execution.list", core.PROTOCOL_VERSION, null, null, "{\"maxItems\":999999}");
+    var execution_result = try dispatch(allocator, "verifier.candidate.execution.list", core.PROTOCOL_VERSION, null, null, "{\"projectShard\":\"verifier-execution-max-smoke\",\"maxItems\":999999}");
     defer execution_result.deinit(allocator);
     const execution_max = try std.fmt.allocPrint(allocator, "\"max_items\":{d}", .{core.MAX_VERIFIER_EXECUTION_ITEMS});
     defer allocator.free(execution_max);
@@ -6379,11 +6363,13 @@ test "inspection outputs mark correction and negative knowledge non-authorizing"
 
 test "inspection operations do not schedule or execute verifiers" {
     const allocator = std.testing.allocator;
-    var result = try dispatch(allocator, "verifier.candidate.execution.list", core.PROTOCOL_VERSION, null, null, "{}");
+    var result = try dispatch(allocator, "verifier.candidate.execution.list", core.PROTOCOL_VERSION, null, null, "{\"projectShard\":\"verifier-execution-no-run-smoke\"}");
     defer result.deinit(allocator);
     try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
     try std.testing.expect(result.stats == null or result.stats.?.verifier_jobs_scheduled == null or result.stats.?.verifier_jobs_scheduled.? == 0);
-    try std.testing.expect(std.mem.indexOf(u8, result.result_json.?, "read existing state without scheduling verifiers") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.result_json.?, "\"commands_executed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.result_json.?, "\"verifiers_executed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.result_json.?, "without scheduling or running verifiers") != null);
 }
 
 test "pack.list returns structured response or safe empty list" {
@@ -6833,6 +6819,43 @@ test "verifier.candidate.execute only runs approved confirmed candidates through
     defer allocator.free(persisted);
     try std.testing.expect(std.mem.indexOf(u8, persisted, "\"recordType\":\"verifier_candidate_execution_result\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, persisted, "\"supportGranted\":false") != null);
+
+    const execution_id = try extractVerifierExecutionIdFromExecuteResult(allocator, safe_json);
+    defer allocator.free(execution_id);
+
+    const list_body = try std.fmt.allocPrint(allocator, "{{\"projectShard\":\"{s}\",\"candidateId\":\"{s}\"}}", .{ shard_id, candidate_id });
+    defer allocator.free(list_body);
+    var inspected_list = try dispatch(allocator, "verifier.candidate.execution.list", core.PROTOCOL_VERSION, null, null, list_body);
+    defer inspected_list.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, inspected_list.status);
+    const list_json = inspected_list.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, list_json, execution_id) != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_json, "\"candidateId\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_json, "\"status\":\"passed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_json, "\"argv\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_json, "\"workspaceRoot\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_json, "\"exitCode\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_json, "\"stdoutSnippet\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_json, "\"stderrSnippet\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_json, "\"evidenceCandidate\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_json, "\"state_source\":\"verifier_execution_records_jsonl\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_json, "\"commands_executed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_json, "\"verifiers_executed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_json, "\"support_granted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_json, "\"proof_granted\":false") != null);
+
+    const get_body = try std.fmt.allocPrint(allocator, "{{\"projectShard\":\"{s}\",\"executionId\":\"{s}\"}}", .{ shard_id, execution_id });
+    defer allocator.free(get_body);
+    var inspected_get = try dispatch(allocator, "verifier.candidate.execution.get", core.PROTOCOL_VERSION, null, null, get_body);
+    defer inspected_get.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, inspected_get.status);
+    const get_json = inspected_get.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, get_json, execution_id) != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_json, "\"execution\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_json, "\"commands_executed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_json, "\"verifiers_executed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_json, "\"support_granted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_json, "\"proof_granted\":false") != null);
 }
 
 test "verifier.candidate.execute rejects rejected and disallowed candidates without evidence" {
@@ -7014,6 +7037,15 @@ fn extractVerifierCandidateIdAt(allocator: std.mem.Allocator, json: []const u8, 
     const records = proposal.get("records").?.array;
     const first = records.items[index].object;
     return allocator.dupe(u8, first.get("id").?.string);
+}
+
+fn extractVerifierExecutionIdFromExecuteResult(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    const execution_result = root.get("verifierCandidateExecution").?.object;
+    const record = execution_result.get("executionRecord").?.object;
+    return allocator.dupe(u8, record.get("id").?.string);
 }
 
 test "capabilities.describe lists learning.loop.plan as allowed read-only" {
