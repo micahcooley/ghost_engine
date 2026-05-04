@@ -311,9 +311,9 @@ pub fn recipeConsistencyFixture() ArtifactAutopsyResult {
 // ── File-Backed Audit Implementation ──────────────────────────────────────
 
 const CANDIDATE_INGREDIENTS = [_][]const u8{
-    "flour", "sugar", "butter", "eggs", "milk", "water", "salt", "pepper",
-    "oil", "yeast", "cinnamon", "vanilla", "chocolate", "chips", "baking powder",
-    "baking soda", "honey", "syrup", "cream", "cheese", "garlic", "onion",
+    "flour", "sugar", "butter",   "eggs",    "milk",      "water", "salt",          "pepper",
+    "oil",   "yeast", "cinnamon", "vanilla", "chocolate", "chips", "baking powder", "baking soda",
+    "honey", "syrup", "cream",    "cheese",  "garlic",    "onion",
 };
 
 pub const MAX_FILES = 10;
@@ -522,6 +522,14 @@ pub fn documentationAudit(
 
 /// Performs a read-only, bounded recipe consistency audit of the provided paths.
 /// Returns the fixture if paths are empty.
+///
+/// Heuristic Limitations:
+/// - Missing-ingredient detection is candidate-only. It identifies apparent
+///   ingredients referenced in steps that are absent from the ingredients list
+///   using a curated candidate list.
+/// - This logic does not claim complete ingredient extraction, semantic cooking
+///   understanding, or correctness regarding nutrition, safety, allergens, or
+///   cooking techniques.
 pub fn recipeConsistency(
     allocator: std.mem.Allocator,
     workspace_root: []const u8,
@@ -664,7 +672,7 @@ pub fn recipeConsistency(
                                 .claim_a = "Ingredients list",
                                 .claim_b = try allocator.dupe(u8, trimmed),
                                 .confidence = "medium",
-                                .reason = "apparent ingredient word detected in step but absent from ingredients section",
+                                .reason = "apparent ingredient word from heuristic candidate list detected in step but absent from ingredients section",
                             });
                         }
                     }
@@ -1233,7 +1241,7 @@ test "recipe consistency file-backed detection tests" {
             \\1. Mix flour.
         });
         const result = try recipeConsistency(allocator, ".", &.{path});
-        
+
         var found_unused = false;
         for (result.inconsistencies) |inc| {
             if (std.mem.eql(u8, inc.inconsistency_kind, "unused_ingredient") and std.mem.indexOf(u8, inc.description, "butter") != null) {
