@@ -4794,7 +4794,10 @@ fn writeStringList(w: anytype, values: []const []const u8) !void {
 fn dispatchArtifactAutopsyInspect(allocator: std.mem.Allocator, workspace_root: ?[]const u8, request_body: ?[]const u8) !DispatchResult {
     var domain: artifact_autopsy.ArtifactDomain = .documentation_audit;
     var artifact_paths = std.ArrayList([]const u8).init(allocator);
-    defer artifact_paths.deinit();
+    defer {
+        for (artifact_paths.items) |p| allocator.free(p);
+        artifact_paths.deinit();
+    }
 
     if (request_body) |body| {
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
@@ -4832,6 +4835,10 @@ fn dispatchArtifactAutopsyInspect(allocator: std.mem.Allocator, workspace_root: 
         }
     }
 
+    if (artifact_paths.items.len > artifact_autopsy.MAX_FILES) {
+        return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "too many files provided in artifactPaths" } };
+    }
+
     if (domain == .recipe_consistency and artifact_paths.items.len > 0) {
         return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "recipe_consistency domain is fixture-only and does not support artifactPaths" } };
     }
@@ -4840,14 +4847,23 @@ fn dispatchArtifactAutopsyInspect(allocator: std.mem.Allocator, workspace_root: 
         return .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "workspace root is required for bounded file autopsy when artifactPaths are provided" } };
     }
 
+    // Run file-backed analysis in a sub-arena so all analysis allocations
+    // (file content, duped paths, ArrayLists) are freed together after
+    // stringification into the main allocator output buffer.
+    var analysis_arena = std.heap.ArenaAllocator.init(allocator);
+    defer analysis_arena.deinit();
+    const analysis_alloc = analysis_arena.allocator();
+
     const result = if (domain == .recipe_consistency)
         artifact_autopsy.recipeConsistencyFixture()
     else
-        artifact_autopsy.documentationAudit(allocator, workspace_root orelse ".", artifact_paths.items) catch |err| switch (err) {
+        artifact_autopsy.documentationAudit(analysis_alloc, workspace_root orelse ".", artifact_paths.items) catch |err| switch (err) {
             error.TooManyFiles => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "too many files provided in artifactPaths" } },
+            error.EmptyPathRejected => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "empty paths are rejected for artifact autopsy" } },
             error.AbsolutePathRejected => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "absolute paths are rejected for artifact autopsy" } },
             error.PathTraversalRejected => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "path traversal is rejected for artifact autopsy" } },
             error.DirectoryRejected => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "directory paths are rejected for artifact autopsy" } },
+            error.SymlinkRejected => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "symlink paths are rejected for artifact autopsy" } },
             error.FileTooLarge => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "file too large for artifact autopsy" } },
             error.TotalBytesExceeded => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "total bytes exceeded for artifact autopsy" } },
             error.WorkspaceNotFound => return .{ .status = .rejected, .err = .{ .code = .path_not_found, .message = "workspace root not found" } },
@@ -4861,6 +4877,9 @@ fn dispatchArtifactAutopsyInspect(allocator: std.mem.Allocator, workspace_root: 
     try w.writeAll("{\"artifactAutopsyInspect\":");
     try std.json.stringify(result, .{}, w);
     try w.writeAll(",\"readOnly\":true,\"mutatesState\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false,\"supportGranted\":false,\"proofGranted\":false,\"non_authorizing\":true}");
+
+    // analysis_arena.deinit() called by defer above; result slices are gone.
+    // out buffer (owned by main allocator) contains the serialized output.
 
     var gip_state = schema.draftResultState();
     gip_state.permission = .none;

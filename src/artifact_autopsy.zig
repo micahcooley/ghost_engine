@@ -312,8 +312,32 @@ pub fn documentationAudit(
     var config_command_claim: ?[]const u8 = null;
 
     for (paths) |p| {
+        if (p.len == 0) return error.EmptyPathRejected;
         if (std.fs.path.isAbsolute(p)) return error.AbsolutePathRejected;
         if (std.mem.indexOf(u8, p, "..") != null) return error.PathTraversalRejected;
+
+        var symlink_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (ws_dir.readLink(p, &symlink_buf)) |_| {
+            return error.SymlinkRejected;
+        } else |err| switch (err) {
+            error.NotLink => {}, // normal file, proceed
+            error.FileNotFound => {
+                try unknowns.append(.{
+                    .name = "unreadable_file",
+                    .importance = "high",
+                    .reason = try std.fmt.allocPrint(allocator, "File not found: {s}", .{p}),
+                });
+                continue;
+            },
+            else => {
+                try unknowns.append(.{
+                    .name = "unreadable_file_link",
+                    .importance = "high",
+                    .reason = try std.fmt.allocPrint(allocator, "Could not check if {s} is a symlink: {s}", .{ p, @errorName(err) }),
+                });
+                continue;
+            },
+        }
 
         const stat = ws_dir.statFile(p) catch |err| {
             try unknowns.append(.{
@@ -690,10 +714,102 @@ test "documentation audit rejects absolute paths" {
     try std.testing.expectError(error.AbsolutePathRejected, err);
 }
 
+test "documentation audit rejects empty paths" {
+    const err = documentationAudit(std.testing.allocator, ".", &.{""});
+    try std.testing.expectError(error.EmptyPathRejected, err);
+}
+
+test "documentation audit rejects symlinks" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "target.txt", .data = "hello" });
+    try tmp.dir.symLink("target.txt", "link.txt", .{});
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const ws = try tmp.dir.realpathAlloc(allocator, ".");
+
+    const err = documentationAudit(allocator, ws, &.{"link.txt"});
+    try std.testing.expectError(error.SymlinkRejected, err);
+}
+
 test "documentation audit rejects too many files" {
     const paths = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k" };
     const err = documentationAudit(std.testing.allocator, ".", &paths);
     try std.testing.expectError(error.TooManyFiles, err);
+}
+
+test "documentation audit rejects directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("some_dir");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const ws = try tmp.dir.realpathAlloc(allocator, ".");
+
+    const err = documentationAudit(allocator, ws, &.{"some_dir"});
+    try std.testing.expectError(error.DirectoryRejected, err);
+}
+
+test "documentation audit rejects file too large" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("large.txt", .{});
+    defer file.close();
+    try file.seekTo(MAX_FILE_BYTES + 1);
+    try file.writeAll("x");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const ws = try tmp.dir.realpathAlloc(allocator, ".");
+
+    const err = documentationAudit(allocator, ws, &.{"large.txt"});
+    try std.testing.expectError(error.FileTooLarge, err);
+}
+
+test "documentation audit rejects total bytes exceeded" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file1 = try tmp.dir.createFile("file1.txt", .{});
+    defer file1.close();
+    try file1.seekTo(MAX_FILE_BYTES - 1);
+    try file1.writeAll("x");
+
+    const file2 = try tmp.dir.createFile("file2.txt", .{});
+    defer file2.close();
+    try file2.seekTo(MAX_FILE_BYTES - 1);
+    try file2.writeAll("x");
+
+    const file3 = try tmp.dir.createFile("file3.txt", .{});
+    defer file3.close();
+    try file3.seekTo(MAX_FILE_BYTES - 1);
+    try file3.writeAll("x");
+
+    const file4 = try tmp.dir.createFile("file4.txt", .{});
+    defer file4.close();
+    try file4.seekTo(MAX_FILE_BYTES - 1);
+    try file4.writeAll("x");
+
+    const file5 = try tmp.dir.createFile("file5.txt", .{});
+    defer file5.close();
+    try file5.seekTo(MAX_FILE_BYTES - 1);
+    try file5.writeAll("x");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const ws = try tmp.dir.realpathAlloc(allocator, ".");
+
+    const err = documentationAudit(allocator, ws, &.{ "file1.txt", "file2.txt", "file3.txt", "file4.txt", "file5.txt" });
+    try std.testing.expectError(error.TotalBytesExceeded, err);
 }
 
 test "documentation audit detects generic config vs doc inconsistency" {
