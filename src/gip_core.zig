@@ -27,6 +27,7 @@ pub const RequestKind = enum {
     @"rule.evaluate",
     @"sigil.inspect",
     @"learning.status",
+    @"learning.loop.plan",
     @"intent.ground",
     @"response.evaluate",
 
@@ -245,6 +246,7 @@ pub const CapabilityName = enum {
     @"correction.reviewed.get",
     @"correction.influence.status",
     @"learning.status",
+    @"learning.loop.plan",
     @"correction.list",
     @"correction.get",
     @"correction.apply",
@@ -306,7 +308,7 @@ pub const CapabilityEntry = struct {
     policy: CapabilityPolicy,
 };
 
-pub fn defaultCapabilities() [60]CapabilityEntry {
+pub fn defaultCapabilities() [61]CapabilityEntry {
     return .{
         .{ .capability = .@"artifact.read", .policy = .allowed },
         .{ .capability = .@"artifact.list", .policy = .allowed },
@@ -330,6 +332,7 @@ pub fn defaultCapabilities() [60]CapabilityEntry {
         .{ .capability = .@"correction.reviewed.get", .policy = .allowed },
         .{ .capability = .@"correction.influence.status", .policy = .allowed },
         .{ .capability = .@"learning.status", .policy = .allowed },
+        .{ .capability = .@"learning.loop.plan", .policy = .allowed },
         .{ .capability = .@"correction.list", .policy = .allowed },
         .{ .capability = .@"correction.get", .policy = .allowed },
         .{ .capability = .@"correction.apply", .policy = .denied },
@@ -380,6 +383,7 @@ pub fn requestCapabilityName(kind: RequestKind) ?CapabilityName {
         .@"rule.evaluate" => .@"rule.evaluate",
         .@"sigil.inspect" => .@"sigil.inspect",
         .@"learning.status" => .@"learning.status",
+        .@"learning.loop.plan" => .@"learning.loop.plan",
         .@"artifact.patch.propose" => .@"artifact.patch.propose",
         .@"artifact.patch.apply" => .@"artifact.patch.apply",
         .@"artifact.write.propose" => .@"artifact.write.propose",
@@ -544,6 +548,7 @@ pub fn operationAuthorityEffect(kind: RequestKind) AuthorityEffect {
         .@"trust_decay.candidate.list",
         .@"project.autopsy",
         .@"context.autopsy",
+        .@"learning.loop.plan",
         => .candidate,
         else => .none,
     };
@@ -560,6 +565,7 @@ pub fn operationMaturityLabel(kind: RequestKind) []const u8 {
         .@"rule.evaluate" => "bounded_deterministic_non_authorizing_candidates",
         .@"sigil.inspect" => "read_only_sigil_bytecode_inspection_non_authorizing",
         .@"learning.status" => "read_only_reviewed_learning_loop_scoreboard_non_authorizing",
+        .@"learning.loop.plan" => "candidate_only_project_autopsy_learning_loop_plan_no_execution_no_mutation",
         .@"correction.propose" => "candidate_only_review_required_no_mutation",
         .@"correction.review" => "append_only_reviewed_record_no_hidden_mutation",
         .@"correction.reviewed.list", .@"correction.reviewed.get" => "read_only_reviewed_correction_inspection_non_authorizing",
@@ -747,6 +753,7 @@ pub const IMPLEMENTED_KINDS = [_]RequestKind{
     .@"correction.reviewed.get",
     .@"correction.influence.status",
     .@"learning.status",
+    .@"learning.loop.plan",
     .@"procedure_pack.candidate.propose",
     .@"procedure_pack.candidate.review",
     .@"procedure_pack.candidate.reviewed.list",

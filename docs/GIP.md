@@ -128,6 +128,7 @@ results when GIP has no active session or workspace metadata:
 | `rule.evaluate` | Evaluates bounded deterministic rules over request facts and emits candidate-only outputs with explanation traces and capacity telemetry | `bounded_deterministic_non_authorizing_candidates` |
 | `sigil.inspect` | Compiles and validates Sigil source, then returns bytecode disassembly and procedure inspection records without VM execution or mutation | `read_only_sigil_bytecode_inspection_non_authorizing` |
 | `learning.status` | Summarizes same-shard reviewed correction and reviewed negative-knowledge scoreboard diagnostics; read-only and not proof/evidence | `read_only_reviewed_learning_loop_scoreboard_non_authorizing` |
+| `learning.loop.plan` | Runs bounded Project Autopsy and derives a candidate-only learning-loop plan; no execution, verifier run, patch apply, pack mutation, correction application, or negative-knowledge promotion | `candidate_only_project_autopsy_learning_loop_plan_no_execution_no_mutation` |
 | `correction.propose` | Converts a user-disputed output into a review-required correction candidate plus non-authorizing learning candidates; performs no mutation or execution | `candidate_only_review_required_no_mutation` |
 | `correction.review` | Accepts or rejects a correction candidate into an append-only reviewed correction record; performs no corpus, pack, negative-knowledge, command, verifier, or global promotion mutation | `append_only_reviewed_record_no_hidden_mutation` |
 | `correction.reviewed.list` | Lists same-shard reviewed correction records from append-only storage with filters, warnings, and capacity telemetry; read-only and not proof | `read_only_reviewed_correction_inspection_non_authorizing` |
@@ -212,6 +213,14 @@ Denied future mutations remain denied by capability policy.
   - Canonicalizes the workspace root and performs bounded static inspection.
   - Does not execute commands, modify files, run verifiers, or mutate packs.
   - Safe command, verifier plan, risk, guidance, and operator-summary action candidates are non-authorizing candidates only; command/verifier candidates are returned with `executes_by_default: false`, and guidance/action candidates are returned with `applies_by_default: false` where relevant.
+
+- `learning.loop.plan` — Derive a candidate-only learning-loop plan from Project Autopsy output **(Implemented)**
+  - **Request**: optional JSON object with `planId` / `plan_id`, `maxEntries` / `max_entries`, and `maxDepth` / `max_depth`; workspace still comes from the GIP workspace boundary.
+  - **Response**: `{"learningLoopPlan": {"schema_version": "learning_loop_plan.v1", "source": "project_autopsy", "candidate_only": true, "non_authorizing": true, "read_only": true, "mutates_state": false, "commands_executed": false, "verifiers_executed": false, "patches_applied": false, "packs_mutated": false, "corrections_applied": false, "negative_knowledge_promoted": false, "next_steps": [...], "verifier_candidate_refs": [...], "failure_ingestion_candidates": [...], "correction_candidate_placeholders": [...], "negative_knowledge_candidate_placeholders": [...], "procedure_pack_candidate_placeholders": [...], "unknowns": [...]}, "readOnly": true, "candidateOnly": true, "authorityEffect": "candidate"}`
+  - Safe command candidates become approval-required verifier candidate references with `executes_by_default:false`.
+  - Verifier gaps become missing-evidence steps. Risk surfaces become triage candidates. Guidance candidates become review-required procedure guidance steps. Unknowns become evidence-collection candidates.
+  - Failure ingestion, correction, negative-knowledge, and procedure-pack entries are placeholders for later explicit review/execution lifecycles. They are not failures, corrections, accepted negative knowledge, or applied packs.
+  - It does not execute commands, run verifiers, apply patches, mutate packs, mutate corpus, apply corrections, promote negative knowledge, mutate trust/snapshot/scratch state, grant support, or discharge proof.
 
 - `context.autopsy` — Evaluate a context case with runtime/persisted mounted-pack guidance and optional bounded artifact/input references **(Implemented)**
   - **Request**: small JSON control plane with `context`, optional `packGuidance`, optional `artifactRefs`, and optional `context.input_refs` / `context.inputRefs`.

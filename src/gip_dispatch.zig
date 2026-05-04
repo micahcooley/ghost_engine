@@ -17,6 +17,7 @@ const feedback = @import("feedback.zig");
 const shards = @import("shards.zig");
 const task_sessions = @import("task_sessions.zig");
 const project_autopsy = @import("project_autopsy.zig");
+const learning_loop = @import("learning_loop.zig");
 const context_autopsy = @import("context_autopsy.zig");
 const context_autopsy_engine = @import("context_autopsy_engine.zig");
 const context_artifacts = @import("context_artifacts.zig");
@@ -108,6 +109,7 @@ pub fn dispatch(
         .@"rule.evaluate" => dispatchRuleEvaluate(allocator, request_body),
         .@"sigil.inspect" => dispatchSigilInspect(allocator, request_body),
         .@"learning.status" => dispatchLearningStatus(allocator, request_body),
+        .@"learning.loop.plan" => dispatchLearningLoopPlan(allocator, workspace_root, request_body),
         .@"correction.propose" => dispatchCorrectionPropose(allocator, request_body),
         .@"correction.review" => dispatchCorrectionReview(allocator, request_body),
         .@"correction.reviewed.list" => dispatchCorrectionReviewedList(allocator, request_body),
@@ -4669,6 +4671,84 @@ fn dispatchProjectAutopsy(allocator: std.mem.Allocator, workspace_root: ?[]const
     };
 }
 
+fn dispatchLearningLoopPlan(allocator: std.mem.Allocator, workspace_root: ?[]const u8, request_body: ?[]const u8) !DispatchResult {
+    const root = workspace_root orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "workspace root is required for learning.loop.plan" },
+    };
+
+    var max_entries: usize = project_autopsy.DEFAULT_MAX_ENTRIES;
+    var max_depth: usize = project_autopsy.DEFAULT_MAX_DEPTH;
+    var plan_id: ?[]u8 = null;
+    defer if (plan_id) |owned| allocator.free(owned);
+
+    if (request_body) |body| {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+            return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } };
+        };
+        defer parsed.deinit();
+        if (parsed.value != .object) {
+            return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "learning.loop.plan request must be a JSON object" } };
+        }
+        const obj = parsed.value.object;
+        if (getInt(obj, "max_entries", "maxEntries")) |v| {
+            if (v > 0) max_entries = @min(@as(usize, @intCast(v)), project_autopsy.DEFAULT_MAX_ENTRIES);
+        }
+        if (getInt(obj, "max_depth", "maxDepth")) |v| {
+            if (v > 0) max_depth = @min(@as(usize, @intCast(v)), project_autopsy.DEFAULT_MAX_DEPTH);
+        }
+        if (getStr(obj, "plan_id", "planId")) |value| {
+            plan_id = try allocator.dupe(u8, value);
+        }
+    }
+
+    var analysis_arena = std.heap.ArenaAllocator.init(allocator);
+    defer analysis_arena.deinit();
+    const analysis_alloc = analysis_arena.allocator();
+
+    const autopsy_result = project_autopsy.analyze(analysis_alloc, root, .{
+        .max_entries = max_entries,
+        .max_depth = max_depth,
+    }) catch |err| {
+        if (err == error.FileNotFound) {
+            return .{
+                .status = .rejected,
+                .err = .{ .code = .path_not_found, .message = "workspace root does not exist" },
+            };
+        }
+        return .{
+            .status = .failed,
+            .err = .{
+                .code = .internal_error,
+                .message = "learning loop project autopsy analysis failed",
+                .details = @errorName(err),
+            },
+        };
+    };
+
+    const plan = try learning_loop.planFromAutopsy(analysis_alloc, autopsy_result, .{ .plan_id = plan_id });
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+
+    try w.writeAll("{\"learningLoopPlan\":");
+    try plan.writeJson(w);
+    try w.writeAll(",\"readOnly\":true,\"candidateOnly\":true,\"commandsExecuted\":false,\"verifiersExecuted\":false,\"patchesApplied\":false,\"packsMutated\":false,\"correctionsApplied\":false,\"negativeKnowledgePromoted\":false,\"mutatesState\":false,\"authorityEffect\":\"candidate\",\"non_authorizing\":true}");
+
+    var gip_state = schema.draftResultState();
+    gip_state.stop_reason = .none;
+    gip_state.unresolved_reason = null;
+    gip_state.non_authorization_notice = "learning.loop.plan is read-only and candidate-only; it does not execute commands, run verifiers, apply patches, mutate packs, apply corrections, promote negative knowledge, or grant support";
+
+    return .{
+        .status = .ok,
+        .result_state = gip_state,
+        .result_json = try out.toOwnedSlice(),
+        .allocated_result = true,
+    };
+}
+
 fn parseSigilValidationScope(text: []const u8) ?sigil_core.ValidationScope {
     if (std.ascii.eqlIgnoreCase(text, "boot_control")) return .boot_control;
     if (std.ascii.eqlIgnoreCase(text, "scratch_session")) return .scratch_session;
@@ -6451,6 +6531,59 @@ test "capabilities.describe lists project.autopsy as allowed read-only" {
     defer result.deinit(allocator);
     const json = result.result_json.?;
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"project.autopsy\",\"policy\":\"allowed\",\"read_only\":true") != null);
+}
+
+// ── learning.loop.plan tests ──────────────────────────────────────────
+
+test "learning.loop.plan returns candidate-only read-only plan" {
+    const allocator = std.testing.allocator;
+    var result = try dispatch(allocator, "learning.loop.plan", core.PROTOCOL_VERSION, "/tmp", null, "{\"planId\":\"test-plan\"}");
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
+    const json = result.result_json orelse return error.MissingResult;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"learningLoopPlan\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema_version\": \"learning_loop_plan.v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"plan_id\": \"test-plan\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"candidate_only\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"read_only\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"mutates_state\": false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"commands_executed\": false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verifiers_executed\": false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"patches_applied\": false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"packs_mutated\": false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"corrections_applied\": false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"negative_knowledge_promoted\": false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"support_granted\": false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"proof_discharged\": false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"readOnly\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"authorityEffect\":\"candidate\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"commandsExecuted\":true") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verifiersExecuted\":true") == null);
+}
+
+test "learning.loop.plan rejects non-object request body" {
+    const allocator = std.testing.allocator;
+    var result = try dispatch(allocator, "learning.loop.plan", core.PROTOCOL_VERSION, "/tmp", null, "[]");
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(core.ProtocolStatus.rejected, result.status);
+    try std.testing.expectEqual(core.ErrorCode.invalid_request, result.err.?.code);
+}
+
+test "protocol.describe lists learning.loop.plan as candidate implemented not product ready" {
+    const allocator = std.testing.allocator;
+    var result = try dispatch(allocator, "protocol.describe", core.PROTOCOL_VERSION, null, null, null);
+    defer result.deinit(allocator);
+    const json = result.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"learning.loop.plan\",\"declared\":true,\"implemented\":true,\"wired\":true,\"mutatesState\":false,\"requiresApproval\":false,\"capabilityPolicy\":\"allowed\",\"authorityEffect\":\"candidate\",\"productReady\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "candidate_only_project_autopsy_learning_loop_plan_no_execution_no_mutation") != null);
+}
+
+test "capabilities.describe lists learning.loop.plan as allowed read-only" {
+    const allocator = std.testing.allocator;
+    var result = try dispatch(allocator, "capabilities.describe", core.PROTOCOL_VERSION, null, null, null);
+    defer result.deinit(allocator);
+    const json = result.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"capability\":\"learning.loop.plan\",\"policy\":\"allowed\",\"read_only\":true") != null);
 }
 
 // ── context.autopsy tests ─────────────────────────────────────────────

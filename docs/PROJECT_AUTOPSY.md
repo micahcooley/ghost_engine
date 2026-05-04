@@ -33,6 +33,12 @@ guidance candidates derived from detected structure, risks, and verifier gaps.
 These are proposals only; Autopsy does not approve, register, schedule, execute,
 mount, import, update, promote, or apply them.
 
+`learning.loop.plan` can consume this Autopsy output and derive a separate
+candidate-only loop plan. That downstream plan is still read-only and
+non-authorizing; it does not execute command candidates, run verifiers, ingest
+failures, apply corrections, promote negative knowledge, mutate packs, or
+write learning state.
+
 ## Operator Summary
 
 The top-level `operator_summary` is rendering/explanation data only. It gives

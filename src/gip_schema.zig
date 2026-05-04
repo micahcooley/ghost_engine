@@ -612,6 +612,7 @@ fn writeCapabilityDetails(w: anytype, capability: core.CapabilityName, policy: c
         .@"rule.evaluate",
         .@"sigil.inspect",
         .@"learning.status",
+        .@"learning.loop.plan",
         .@"correction.propose",
         .@"correction.reviewed.list",
         .@"correction.reviewed.get",

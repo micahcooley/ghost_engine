@@ -41,6 +41,7 @@ const correction_review = @import("correction_review.zig");
 const negative_knowledge = @import("negative_knowledge.zig");
 const negative_knowledge_review = @import("negative_knowledge_review.zig");
 const learning_status = @import("learning_status.zig");
+const learning_loop = @import("learning_loop.zig");
 const support_routing = @import("support_routing.zig");
 const repo_hygiene = @import("repo_hygiene.zig");
 const hypothesis_core = @import("hypothesis_core.zig");
@@ -65,6 +66,7 @@ comptime {
     _ = correction_candidates;
     _ = correction_review;
     _ = learning_status;
+    _ = learning_loop;
     _ = negative_knowledge;
     _ = support_routing;
 }
