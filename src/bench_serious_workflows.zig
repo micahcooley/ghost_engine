@@ -579,8 +579,8 @@ const ABSTRACTION_CATALOG =
 const WORKER_SYNC_ABSTRACTION_CATALOG =
     \\GABS1
     \\concept runtime_worker_sync
-    \\tier mechanism
-    \\category data_flow
+    \\tier logic
+    \\category relational
     \\examples 3
     \\threshold 2
     \\retained_tokens 2
@@ -601,8 +601,8 @@ const WORKER_SYNC_ABSTRACTION_CATALOG =
     \\pattern worker_sync
     \\end
     \\concept ui_worker_sync
-    \\tier mechanism
-    \\category data_flow
+    \\tier logic
+    \\category relational
     \\examples 3
     \\threshold 2
     \\retained_tokens 2
@@ -3330,8 +3330,8 @@ fn applyReinforcementScenario(allocator: std.mem.Allocator, project_shard: []con
                 "src/runtime/worker.zig",
             };
             const events = [_]abstractions.ReinforcementEvent{
-                .{ .family = .grounding_schema, .key = "heading:runtime_contracts@1", .case_id = "tank-runtime-ground-a", .tier = .idiom, .category = .interface, .outcome = .success, .source_specs = &sources, .patterns = &patterns },
-                .{ .family = .grounding_schema, .key = "heading:runtime_contracts@1", .case_id = "tank-runtime-ground-b", .tier = .idiom, .category = .interface, .outcome = .success, .source_specs = &sources, .patterns = &patterns },
+                .{ .family = .grounding_schema, .key = "heading:runtime_contracts@1", .case_id = "tank-runtime-ground-a", .tier = .convention, .category = .boundary, .outcome = .success, .source_specs = &sources, .patterns = &patterns },
+                .{ .family = .grounding_schema, .key = "heading:runtime_contracts@1", .case_id = "tank-runtime-ground-b", .tier = .convention, .category = .boundary, .outcome = .success, .source_specs = &sources, .patterns = &patterns },
             };
             _ = try abstractions.applyReinforcementEvents(allocator, &paths, &events, .{ .max_events = events.len, .max_new_records = events.len });
         },
@@ -3351,10 +3351,10 @@ fn applyReinforcementScenario(allocator: std.mem.Allocator, project_shard: []con
                 "src/ui/worker.zig",
             };
             const events = [_]abstractions.ReinforcementEvent{
-                .{ .family = .grounding_schema, .key = "heading:patch_rationale@1/runtime_worker", .case_id = "tank-ambiguous-ground-a", .tier = .idiom, .category = .interface, .outcome = .success, .source_specs = &runtime_sources, .patterns = &runtime_patterns },
-                .{ .family = .grounding_schema, .key = "heading:patch_rationale@1/runtime_worker", .case_id = "tank-ambiguous-ground-b", .tier = .idiom, .category = .interface, .outcome = .success, .source_specs = &runtime_sources, .patterns = &runtime_patterns },
-                .{ .family = .grounding_schema, .key = "heading:patch_rationale@1/ui_worker", .case_id = "tank-ambiguous-ground-c", .tier = .idiom, .category = .interface, .outcome = .success, .source_specs = &ui_sources, .patterns = &ui_patterns },
-                .{ .family = .grounding_schema, .key = "heading:patch_rationale@1/ui_worker", .case_id = "tank-ambiguous-ground-d", .tier = .idiom, .category = .interface, .outcome = .success, .source_specs = &ui_sources, .patterns = &ui_patterns },
+                .{ .family = .grounding_schema, .key = "heading:patch_rationale@1/runtime_worker", .case_id = "tank-ambiguous-ground-a", .tier = .convention, .category = .boundary, .outcome = .success, .source_specs = &runtime_sources, .patterns = &runtime_patterns },
+                .{ .family = .grounding_schema, .key = "heading:patch_rationale@1/runtime_worker", .case_id = "tank-ambiguous-ground-b", .tier = .convention, .category = .boundary, .outcome = .success, .source_specs = &runtime_sources, .patterns = &runtime_patterns },
+                .{ .family = .grounding_schema, .key = "heading:patch_rationale@1/ui_worker", .case_id = "tank-ambiguous-ground-c", .tier = .convention, .category = .boundary, .outcome = .success, .source_specs = &ui_sources, .patterns = &ui_patterns },
+                .{ .family = .grounding_schema, .key = "heading:patch_rationale@1/ui_worker", .case_id = "tank-ambiguous-ground-d", .tier = .convention, .category = .boundary, .outcome = .success, .source_specs = &ui_sources, .patterns = &ui_patterns },
             };
             _ = try abstractions.applyReinforcementEvents(allocator, &paths, &events, .{ .max_events = events.len, .max_new_records = events.len });
         },

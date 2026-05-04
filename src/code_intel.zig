@@ -1473,17 +1473,17 @@ fn routingTraceHitConsideredBudget(trace: support_routing.Trace) bool {
 
 pub const HypothesisPriorPolicy = struct {
     category_weights: struct {
-        syntax: u32 = 1,
-        interface: u32 = 2,
-        data_flow: u32 = 3,
-        control_flow: u32 = 4,
+        structural: u32 = 1,
+        boundary: u32 = 2,
+        relational: u32 = 3,
+        procedural: u32 = 4,
         state: u32 = 5,
         invariant: u32 = 6,
     } = .{},
     tier_weights: struct {
         pattern: u32 = 1,
-        idiom: u32 = 2,
-        mechanism: u32 = 3,
+        convention: u32 = 2,
+        logic: u32 = 3,
         contract: u32 = 5,
     } = .{},
 };
@@ -1513,8 +1513,8 @@ const BranchBiasMap = struct {
 
 fn abstractionCategoryHint(query_kind: QueryKind) abstractions.Category {
     return switch (query_kind) {
-        .impact => .data_flow,
-        .breaks_if => .control_flow,
+        .impact => .relational,
+        .breaks_if => .procedural,
         .contradicts => .invariant,
     };
 }
@@ -1532,64 +1532,64 @@ fn buildBranchBiases(query_kind: QueryKind, refs: []const abstractions.SupportRe
             .impact => switch (reference.tier) {
                 .pattern => {
                     biases.add(policy.tier_weights.pattern, magnitude / 2);
-                    biases.add(policy.tier_weights.idiom, magnitude);
+                    biases.add(policy.tier_weights.convention, magnitude);
                 },
-                .idiom => {
-                    biases.add(policy.tier_weights.idiom, magnitude);
+                .convention => {
+                    biases.add(policy.tier_weights.convention, magnitude);
                     biases.add(policy.tier_weights.contract, magnitude / 3);
                 },
-                .mechanism => {
-                    biases.add(policy.tier_weights.mechanism, magnitude);
+                .logic => {
+                    biases.add(policy.tier_weights.logic, magnitude);
                     biases.add(policy.tier_weights.contract, magnitude / 2);
                 },
                 .contract => {
-                    biases.add(policy.tier_weights.mechanism, magnitude / 2);
+                    biases.add(policy.tier_weights.logic, magnitude / 2);
                     biases.add(policy.tier_weights.contract, magnitude);
                 },
             },
             .breaks_if => switch (reference.tier) {
                 .pattern => {
                     biases.add(policy.tier_weights.pattern, magnitude);
-                    biases.add(policy.tier_weights.idiom, magnitude / 2);
+                    biases.add(policy.tier_weights.convention, magnitude / 2);
                 },
-                .idiom => {
+                .convention => {
                     biases.add(policy.tier_weights.pattern, magnitude / 3);
-                    biases.add(policy.tier_weights.idiom, magnitude);
+                    biases.add(policy.tier_weights.convention, magnitude);
                 },
-                .mechanism => {
-                    biases.add(policy.tier_weights.idiom, magnitude / 2);
-                    biases.add(policy.tier_weights.mechanism, magnitude);
+                .logic => {
+                    biases.add(policy.tier_weights.convention, magnitude / 2);
+                    biases.add(policy.tier_weights.logic, magnitude);
                 },
                 .contract => {
-                    biases.add(policy.tier_weights.idiom, magnitude / 3);
-                    biases.add(policy.tier_weights.mechanism, magnitude);
+                    biases.add(policy.tier_weights.convention, magnitude / 3);
+                    biases.add(policy.tier_weights.logic, magnitude);
                 },
             },
             .contradicts => switch (reference.category) {
-                .syntax => biases.add(policy.category_weights.syntax, magnitude / 2),
-                .interface => biases.add(policy.category_weights.interface, magnitude),
-                .data_flow => biases.add(policy.category_weights.data_flow, magnitude),
-                .control_flow => biases.add(policy.category_weights.control_flow, magnitude),
+                .structural => biases.add(policy.category_weights.structural, magnitude / 2),
+                .boundary => biases.add(policy.category_weights.boundary, magnitude),
+                .relational => biases.add(policy.category_weights.relational, magnitude),
+                .procedural => biases.add(policy.category_weights.procedural, magnitude),
                 .state => biases.add(policy.category_weights.state, magnitude),
                 .invariant => biases.add(policy.category_weights.invariant, magnitude),
             },
         }
 
         switch (reference.category) {
-            .interface => {
+            .boundary => {
                 if (query_kind == .impact) {
-                    biases.add(policy.category_weights.control_flow, magnitude / 2);
+                    biases.add(policy.category_weights.procedural, magnitude / 2);
                     biases.add(policy.category_weights.state, magnitude / 2);
                 }
             },
-            .data_flow => if (query_kind == .impact) biases.add(policy.category_weights.data_flow, magnitude / 2),
-            .control_flow => if (query_kind == .breaks_if) biases.add(policy.category_weights.interface, magnitude / 3),
+            .relational => if (query_kind == .impact) biases.add(policy.category_weights.relational, magnitude / 2),
+            .procedural => if (query_kind == .breaks_if) biases.add(policy.category_weights.boundary, magnitude / 3),
             .state => if (query_kind == .contradicts) biases.add(policy.category_weights.state, magnitude / 2),
             .invariant => {
-                if (query_kind == .breaks_if) biases.add(policy.category_weights.data_flow, magnitude / 2);
+                if (query_kind == .breaks_if) biases.add(policy.category_weights.relational, magnitude / 2);
                 if (query_kind == .impact) biases.add(policy.category_weights.state, magnitude / 2);
             },
-            .syntax => {},
+            .structural => {},
         }
     }
     return biases;
@@ -2944,7 +2944,7 @@ fn collectParserSketchEvents(
             .key = trace.target_label.?,
             .case_id = rel_path,
             .tier = .pattern,
-            .category = .syntax,
+            .category = .structural,
             .outcome = .success,
             .source_specs = &sources,
             .patterns = &patterns,
@@ -2969,8 +2969,8 @@ fn collectGroundingSchemaEvents(
             .family = .grounding_schema,
             .key = trace.concept,
             .case_id = trace.surface,
-            .tier = .idiom,
-            .category = .interface,
+            .tier = .convention,
+            .category = .boundary,
             .outcome = .success,
             .source_specs = &sources,
             .patterns = &patterns,
@@ -2991,8 +2991,8 @@ fn collectGroundingSchemaEvents(
             .family = .grounding_schema,
             .key = trace.concept,
             .case_id = trace.surface,
-            .tier = .idiom,
-            .category = .interface,
+            .tier = .convention,
+            .category = .boundary,
             .outcome = .success,
             .source_specs = &sources,
             .patterns = &patterns,
@@ -3025,7 +3025,7 @@ fn collectRouteSuppressorEvents(
             .key = item.reason,
             .case_id = rel_path,
             .tier = .pattern,
-            .category = .control_flow,
+            .category = .procedural,
             .outcome = if (std.mem.indexOf(u8, item.reason, "ambiguous") != null) .ambiguous else .success,
             .source_specs = &sources,
             .patterns = &patterns,
@@ -11149,9 +11149,9 @@ test "repeated weak-structure parser sketch becomes reusable" {
     const tokens = [_][]const u8{"heading_fragment"};
     const patterns = [_][]const u8{ "class:technical_text", "ext:.md", "stage:robust_structured", "heading_fragment:runtime_contract" };
     const events = [_]abstractions.ReinforcementEvent{
-        .{ .family = .parser_sketch, .key = "heading_fragment:runtime_contract", .case_id = "case-a", .category = .syntax, .outcome = .success, .source_specs = &sources, .tokens = &tokens, .patterns = &patterns },
-        .{ .family = .parser_sketch, .key = "heading_fragment:runtime_contract", .case_id = "case-b", .category = .syntax, .outcome = .success, .source_specs = &sources, .tokens = &tokens, .patterns = &patterns },
-        .{ .family = .parser_sketch, .key = "heading_fragment:runtime_contract", .case_id = "case-c", .category = .syntax, .outcome = .success, .source_specs = &sources, .tokens = &tokens, .patterns = &patterns },
+        .{ .family = .parser_sketch, .key = "heading_fragment:runtime_contract", .case_id = "case-a", .category = .structural, .outcome = .success, .source_specs = &sources, .tokens = &tokens, .patterns = &patterns },
+        .{ .family = .parser_sketch, .key = "heading_fragment:runtime_contract", .case_id = "case-b", .category = .structural, .outcome = .success, .source_specs = &sources, .tokens = &tokens, .patterns = &patterns },
+        .{ .family = .parser_sketch, .key = "heading_fragment:runtime_contract", .case_id = "case-c", .category = .structural, .outcome = .success, .source_specs = &sources, .tokens = &tokens, .patterns = &patterns },
     };
     _ = try abstractions.applyReinforcementEvents(allocator, &shard_paths, &events, .{ .max_events = 3, .max_new_records = 1 });
 
@@ -11169,8 +11169,8 @@ test "repeated noisy route pattern becomes suppressible" {
     const patterns = [_][]const u8{ "candidate_family:docs", "target_family:docs", "anchor:targeted" };
     const sources = [_][]const u8{"@corpus/docs/guide-noise.md"};
     const events = [_]abstractions.ReinforcementEvent{
-        .{ .family = .route_suppressor, .key = "suppressed floating evidence", .case_id = "route-a", .category = .control_flow, .outcome = .success, .source_specs = &sources, .patterns = &patterns },
-        .{ .family = .route_suppressor, .key = "suppressed floating evidence", .case_id = "route-b", .category = .control_flow, .outcome = .success, .source_specs = &sources, .patterns = &patterns },
+        .{ .family = .route_suppressor, .key = "suppressed floating evidence", .case_id = "route-a", .category = .procedural, .outcome = .success, .source_specs = &sources, .patterns = &patterns },
+        .{ .family = .route_suppressor, .key = "suppressed floating evidence", .case_id = "route-b", .category = .procedural, .outcome = .success, .source_specs = &sources, .patterns = &patterns },
     };
     _ = try abstractions.applyReinforcementEvents(allocator, &shard_paths, &events, .{ .max_events = 2, .max_new_records = 1 });
 
@@ -11215,9 +11215,9 @@ test "contradicted grounding reinforcement is demoted and blocked" {
     const patterns = [_][]const u8{ "heading:runtime_contracts@1", "direction:symbolic_to_code", "target_kind:declaration", "src/runtime/worker.zig" };
     const sources = [_][]const u8{"region:@corpus/docs/runbook.md:1-3"};
     const events = [_]abstractions.ReinforcementEvent{
-        .{ .family = .grounding_schema, .key = "heading:runtime_contracts@1", .case_id = "ground-a", .tier = .idiom, .category = .interface, .outcome = .success, .source_specs = &sources, .patterns = &patterns },
-        .{ .family = .grounding_schema, .key = "heading:runtime_contracts@1", .case_id = "ground-b", .tier = .idiom, .category = .interface, .outcome = .success, .source_specs = &sources, .patterns = &patterns },
-        .{ .family = .grounding_schema, .key = "heading:runtime_contracts@1", .case_id = "ground-c", .tier = .idiom, .category = .interface, .outcome = .contradicted, .source_specs = &sources, .patterns = &patterns },
+        .{ .family = .grounding_schema, .key = "heading:runtime_contracts@1", .case_id = "ground-a", .tier = .convention, .category = .boundary, .outcome = .success, .source_specs = &sources, .patterns = &patterns },
+        .{ .family = .grounding_schema, .key = "heading:runtime_contracts@1", .case_id = "ground-b", .tier = .convention, .category = .boundary, .outcome = .success, .source_specs = &sources, .patterns = &patterns },
+        .{ .family = .grounding_schema, .key = "heading:runtime_contracts@1", .case_id = "ground-c", .tier = .convention, .category = .boundary, .outcome = .contradicted, .source_specs = &sources, .patterns = &patterns },
     };
     _ = try abstractions.applyReinforcementEvents(allocator, &shard_paths, &events, .{ .max_events = 3, .max_new_records = 1 });
 
@@ -11245,8 +11245,8 @@ test "reinforced abstractions never authorize supported output directly" {
         .label = try allocator.dupe(u8, "grounding_schema:runtime_contracts"),
         .family = .grounding_schema,
         .source_spec = try allocator.dupe(u8, "region:@corpus/docs/runbook.md:1-3"),
-        .tier = .idiom,
-        .category = .interface,
+        .tier = .convention,
+        .category = .boundary,
         .selection_mode = .promoted,
         .staged = false,
         .owner_kind = .project,

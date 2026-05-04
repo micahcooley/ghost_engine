@@ -599,7 +599,7 @@ pub const MesoLattice = struct {
 };
 
 pub const GhostSoul = struct {
-    syntax: vsa.HyperVector,
+    structural: vsa.HyperVector,
     phrase: vsa.HyperVector,
     concept: vsa.HyperVector,
     global: vsa.HyperVector,
@@ -632,7 +632,7 @@ pub const GhostSoul = struct {
 
     pub fn init(allocator: std.mem.Allocator) !GhostSoul {
         return .{
-            .syntax = @splat(0),
+            .structural = @splat(0),
             .phrase = @splat(0),
             .concept = @splat(0),
             .global = @splat(0),
@@ -683,7 +683,7 @@ pub const GhostSoul = struct {
         self.lexical_rotor = std.math.rotl(u64, self.lexical_rotor, 13) *% FNV_PRIME;
 
         // Fractal evolution: Bundle the new rune into the current lobes
-        self.syntax = vsa.bundle(self.syntax, rune_vec, vsa.generate(self.lexical_rotor));
+        self.structural = vsa.bundle(self.structural, rune_vec, vsa.generate(self.lexical_rotor));
         self.phrase = vsa.bundle(vsa.rotate(self.phrase, 1), rune_vec, vsa.generate(self.phrase_rotor));
 
         // ── Cascade Etching: Multi-Scale Context Hierarchy ──
@@ -695,7 +695,7 @@ pub const GhostSoul = struct {
                 // Word boundary (space-like): fold lexical state into phrase level
                 self.phrase_rotor ^= self.lexical_rotor;
                 self.phrase_rotor = std.math.rotl(u64, self.phrase_rotor, 13) *% FNV_PRIME;
-                self.phrase = vsa.bundle(self.phrase, self.syntax, vsa.generate(self.phrase_rotor));
+                self.phrase = vsa.bundle(self.phrase, self.structural, vsa.generate(self.phrase_rotor));
             },
             .phrase => {
                 // Phrase boundary (punctuation): fold phrase into concept level

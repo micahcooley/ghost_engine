@@ -310,7 +310,7 @@ test "contradiction blocks distillation eligibility" {
         .family = .action_surface,
         .key = "candidate:local_guard",
         .case_id = "verifier:contradicted:case-c",
-        .category = .control_flow,
+        .category = .procedural,
         .outcome = .contradicted,
         .source_specs = &.{"deep_path:c"},
         .patterns = &.{"feedback:contradicted"},

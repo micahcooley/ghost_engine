@@ -171,7 +171,7 @@ fn appendReinforcementEvents(
             .key = event.related_intent,
             .case_id = event.id,
             .tier = .pattern,
-            .category = .interface,
+            .category = .boundary,
             .outcome = outcome,
             .source_specs = try sourceSlice(allocator, event.related_artifact),
             .patterns = try patternSlice(allocator, &.{
@@ -188,7 +188,7 @@ fn appendReinforcementEvents(
             .key = event.related_candidate,
             .case_id = event.id,
             .tier = .pattern,
-            .category = .control_flow,
+            .category = .procedural,
             .outcome = outcome,
             .source_specs = try sourceSlice(allocator, event.related_artifact),
             .patterns = try patternSlice(allocator, &.{

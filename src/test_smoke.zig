@@ -1715,12 +1715,12 @@ test "abstraction distillation preserves explicit hierarchy metadata" {
     var record = try abstractions.stageFromCommand(
         allocator,
         &core_paths,
-        "/commit_abstractions sigil_command_guard tier:mechanism category:control_flow parent:sigil_request_contract region:src/shell_shared.zig:464-472 region:src/shell_windows.zig:823-831",
+        "/commit_abstractions sigil_command_guard tier:logic category:procedural parent:sigil_request_contract region:src/shell_shared.zig:464-472 region:src/shell_windows.zig:823-831",
     );
     defer record.deinit();
 
-    try std.testing.expectEqual(abstractions.Tier.mechanism, record.tier);
-    try std.testing.expectEqual(abstractions.Category.control_flow, record.category);
+    try std.testing.expectEqual(abstractions.Tier.logic, record.tier);
+    try std.testing.expectEqual(abstractions.Category.procedural, record.category);
     try std.testing.expect(record.parent_concept_id != null);
     try std.testing.expectEqualStrings("sigil_request_contract", record.parent_concept_id.?);
     try std.testing.expect(record.quality_score > 0);
@@ -1743,7 +1743,7 @@ test "abstraction lookup promotes bounded higher tiers and falls back when suppo
         \\GABS1
         \\concept compute_guard
         \\tier pattern
-        \\category control_flow
+        \\category procedural
         \\parent compute_mechanism
         \\examples 2
         \\threshold 2
@@ -1764,7 +1764,7 @@ test "abstraction lookup promotes bounded higher tiers and falls back when suppo
         \\pattern return id
         \\end
         \\concept compute_mechanism
-        \\tier mechanism
+        \\tier logic
         \\category invariant
         \\parent compute_contract
         \\examples 3
@@ -1816,7 +1816,7 @@ test "abstraction lookup promotes bounded higher tiers and falls back when suppo
         .max_items = 3,
         .include_staged = false,
         .prefer_higher_tiers = true,
-        .category_hint = .control_flow,
+        .category_hint = .procedural,
     });
     defer abstractions.deinitSupportReferences(allocator, refs);
 
@@ -1883,7 +1883,7 @@ test "project abstraction lookup imports trusted core provenance without copying
         .max_items = 4,
         .include_staged = false,
         .prefer_higher_tiers = true,
-        .category_hint = .control_flow,
+        .category_hint = .procedural,
     });
     defer abstractions.deinitSupportReferences(allocator, refs);
 
@@ -1950,7 +1950,7 @@ test "cross-shard reject keeps provenance explicit and blocks imported reuse" {
         .max_items = 4,
         .include_staged = false,
         .prefer_higher_tiers = true,
-        .category_hint = .control_flow,
+        .category_hint = .procedural,
     });
     defer abstractions.deinitSupportReferences(allocator, refs);
 
@@ -2041,7 +2041,7 @@ test "cross-shard conflict refuses incompatible import and promote pins local ov
             .max_items = 4,
             .include_staged = false,
             .prefer_higher_tiers = true,
-            .category_hint = .control_flow,
+            .category_hint = .procedural,
         });
         defer abstractions.deinitSupportReferences(allocator, refs);
 
@@ -2063,7 +2063,7 @@ test "cross-shard conflict refuses incompatible import and promote pins local ov
         .max_items = 4,
         .include_staged = false,
         .prefer_higher_tiers = true,
-        .category_hint = .control_flow,
+        .category_hint = .procedural,
     });
     defer abstractions.deinitSupportReferences(allocator, promoted_refs);
 
@@ -3265,8 +3265,8 @@ test "task operator preserves unresolved support stops for ambiguous grounding" 
     const catalog_body =
         \\GABS1
         \\concept runtime_worker_sync
-        \\tier mechanism
-        \\category data_flow
+        \\tier logic
+        \\category relational
         \\examples 3
         \\threshold 2
         \\retained_tokens 2
@@ -3287,8 +3287,8 @@ test "task operator preserves unresolved support stops for ambiguous grounding" 
         \\pattern worker_sync
         \\end
         \\concept ui_worker_sync
-        \\tier mechanism
-        \\category data_flow
+        \\tier logic
+        \\category relational
         \\examples 3
         \\threshold 2
         \\retained_tokens 2
@@ -3423,8 +3423,8 @@ test "task operator keeps conflicting external evidence unresolved" {
     const catalog_body =
         \\GABS1
         \\concept runtime_worker_sync
-        \\tier mechanism
-        \\category data_flow
+        \\tier logic
+        \\category relational
         \\examples 3
         \\threshold 2
         \\retained_tokens 2
@@ -3445,8 +3445,8 @@ test "task operator keeps conflicting external evidence unresolved" {
         \\pattern worker_sync
         \\end
         \\concept ui_worker_sync
-        \\tier mechanism
-        \\category data_flow
+        \\tier logic
+        \\category relational
         \\examples 3
         \\threshold 2
         \\retained_tokens 2
@@ -3743,7 +3743,7 @@ test "code intel layer2b reuses shard-local abstractions deterministically" {
         \\GABS1
         \\concept compute_guard
         \\tier pattern
-        \\category control_flow
+        \\category procedural
         \\parent compute_mechanism
         \\examples 2
         \\threshold 2
@@ -3764,7 +3764,7 @@ test "code intel layer2b reuses shard-local abstractions deterministically" {
         \\pattern return id
         \\end
         \\concept compute_mechanism
-        \\tier mechanism
+        \\tier logic
         \\category invariant
         \\examples 3
         \\threshold 2
@@ -5293,8 +5293,8 @@ test "code intel grounds symbolic runbook and config surfaces to runtime concept
     const catalog_body =
         \\GABS1
         \\concept runtime_worker_sync
-        \\tier mechanism
-        \\category data_flow
+        \\tier logic
+        \\category relational
         \\examples 3
         \\threshold 2
         \\retained_tokens 4
@@ -5384,8 +5384,8 @@ test "code intel refuses ambiguous symbolic grounding ties" {
     const catalog_body =
         \\GABS1
         \\concept runtime_worker_sync
-        \\tier mechanism
-        \\category data_flow
+        \\tier logic
+        \\category relational
         \\examples 3
         \\threshold 2
         \\retained_tokens 2
@@ -5406,8 +5406,8 @@ test "code intel refuses ambiguous symbolic grounding ties" {
         \\pattern worker_sync
         \\end
         \\concept ui_worker_sync
-        \\tier mechanism
-        \\category data_flow
+        \\tier logic
+        \\category relational
         \\examples 3
         \\threshold 2
         \\retained_tokens 2

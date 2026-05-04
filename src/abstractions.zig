@@ -35,16 +35,16 @@ pub const PRUNE_COMMAND_NAME = "/prune_abstractions";
 
 pub const Tier = enum(u8) {
     pattern,
-    idiom,
-    mechanism,
+    convention,
+    logic,
     contract,
 };
 
 pub const Category = enum(u8) {
-    syntax,
-    control_flow,
-    data_flow,
-    interface,
+    structural,
+    procedural,
+    relational,
+    boundary,
     state,
     invariant,
 };
@@ -352,7 +352,7 @@ pub const Record = struct {
     concept_id: []u8,
     family: Family = .distilled,
     tier: Tier = .pattern,
-    category: Category = .syntax,
+    category: Category = .structural,
     parent_concept_id: ?[]u8 = null,
     example_count: u32,
     threshold_examples: u32,
@@ -820,18 +820,18 @@ pub fn isCommand(script: []const u8) bool {
 pub fn tierName(tier: Tier) []const u8 {
     return switch (tier) {
         .pattern => "pattern",
-        .idiom => "idiom",
-        .mechanism => "mechanism",
+        .convention => "convention",
+        .logic => "logic",
         .contract => "contract",
     };
 }
 
 pub fn categoryName(category: Category) []const u8 {
     return switch (category) {
-        .syntax => "syntax",
-        .control_flow => "control_flow",
-        .data_flow => "data_flow",
-        .interface => "interface",
+        .structural => "structural",
+        .procedural => "procedural",
+        .relational => "relational",
+        .boundary => "boundary",
         .state => "state",
         .invariant => "invariant",
     };
@@ -3570,7 +3570,7 @@ fn parseCommand(allocator: std.mem.Allocator, script: []const u8) !struct {
         specs.deinit();
     }
     var tier: Tier = .pattern;
-    var category: Category = .syntax;
+    var category: Category = .structural;
     var parent_concept_id: ?[]u8 = null;
     errdefer if (parent_concept_id) |parent| allocator.free(parent);
 
@@ -4511,7 +4511,7 @@ const RecordBuilder = struct {
     concept_id: ?[]u8 = null,
     family: Family = .distilled,
     tier: Tier = .pattern,
-    category: Category = .syntax,
+    category: Category = .structural,
     parent_concept_id: ?[]u8 = null,
     example_count: u32 = 0,
     threshold_examples: u32 = 0,
@@ -5120,17 +5120,17 @@ fn sanitizeConceptId(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
 
 fn parseTier(text: []const u8) ?Tier {
     if (std.ascii.eqlIgnoreCase(text, "pattern")) return .pattern;
-    if (std.ascii.eqlIgnoreCase(text, "idiom")) return .idiom;
-    if (std.ascii.eqlIgnoreCase(text, "mechanism")) return .mechanism;
+    if (std.ascii.eqlIgnoreCase(text, "convention")) return .convention;
+    if (std.ascii.eqlIgnoreCase(text, "logic")) return .logic;
     if (std.ascii.eqlIgnoreCase(text, "contract")) return .contract;
     return null;
 }
 
 fn parseCategory(text: []const u8) ?Category {
-    if (std.ascii.eqlIgnoreCase(text, "syntax")) return .syntax;
-    if (std.ascii.eqlIgnoreCase(text, "control_flow")) return .control_flow;
-    if (std.ascii.eqlIgnoreCase(text, "data_flow")) return .data_flow;
-    if (std.ascii.eqlIgnoreCase(text, "interface")) return .interface;
+    if (std.ascii.eqlIgnoreCase(text, "structural")) return .structural;
+    if (std.ascii.eqlIgnoreCase(text, "procedural")) return .procedural;
+    if (std.ascii.eqlIgnoreCase(text, "relational")) return .relational;
+    if (std.ascii.eqlIgnoreCase(text, "boundary")) return .boundary;
     if (std.ascii.eqlIgnoreCase(text, "state")) return .state;
     if (std.ascii.eqlIgnoreCase(text, "invariant")) return .invariant;
     return null;
@@ -5151,8 +5151,8 @@ fn parseFamily(text: []const u8) ?Family {
 fn tierRank(tier: Tier) u16 {
     return switch (tier) {
         .pattern => 0,
-        .idiom => 1,
-        .mechanism => 2,
+        .convention => 1,
+        .logic => 2,
         .contract => 3,
     };
 }
@@ -5160,8 +5160,8 @@ fn tierRank(tier: Tier) u16 {
 fn tierQualityFloor(tier: Tier) u16 {
     return switch (tier) {
         .pattern => 560,
-        .idiom => 620,
-        .mechanism => 690,
+        .convention => 620,
+        .logic => 690,
         .contract => 760,
     };
 }
@@ -5169,8 +5169,8 @@ fn tierQualityFloor(tier: Tier) u16 {
 fn tierConfidenceFloor(tier: Tier) u16 {
     return switch (tier) {
         .pattern => 560,
-        .idiom => 630,
-        .mechanism => 700,
+        .convention => 630,
+        .logic => 700,
         .contract => 780,
     };
 }
@@ -5178,8 +5178,8 @@ fn tierConfidenceFloor(tier: Tier) u16 {
 fn tierPromotionSupportFloor(tier: Tier) u16 {
     return switch (tier) {
         .pattern => 1,
-        .idiom => 1,
-        .mechanism => 1,
+        .convention => 1,
+        .logic => 1,
         .contract => 2,
     };
 }
@@ -6004,7 +6004,7 @@ test "trust decay: contradictions degrade promoted and core knowledge unless imm
 
     var core_record: Record = undefined;
     core_record.concept_id = try allocator.dupe(u8, "test");
-    core_record.category = .syntax;
+    core_record.category = .structural;
     core_record.tier = .pattern;
     core_record.trust_class = .core;
     core_record.decay_state = .active;
@@ -6026,7 +6026,7 @@ test "trust decay: contradictions degrade promoted and core knowledge unless imm
     // Test immunity
     var immune_core: Record = undefined;
     immune_core.concept_id = try allocator.dupe(u8, "test");
-    immune_core.category = .syntax;
+    immune_core.category = .structural;
     immune_core.tier = .pattern;
     immune_core.trust_class = .core;
     immune_core.decay_state = .active;
@@ -6039,7 +6039,7 @@ test "trust decay: contradictions degrade promoted and core knowledge unless imm
     applyReinforcementOutcome(&immune_core, .contradicted, immune_policy);
     applyReinforcementOutcome(&immune_core, .contradicted, immune_policy);
     try std.testing.expectEqual(TrustClass.core, immune_core.trust_class); // Immune
-    
+
     allocator.free(core_record.concept_id);
     allocator.free(immune_core.concept_id);
 }

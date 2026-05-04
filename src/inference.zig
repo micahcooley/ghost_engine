@@ -399,7 +399,7 @@ pub const ReasoningContext = struct {
 
         var step_score: u32 = candidate.base_score;
         step_score += @as(u32, @intCast(vsa.calculateResonance(soul.concept, self.root_soul.concept)));
-        step_score += @as(u32, @intCast(vsa.calculateResonance(soul.syntax, self.root_soul.syntax))) / 2;
+        step_score += @as(u32, @intCast(vsa.calculateResonance(soul.structural, self.root_soul.structural))) / 2;
         step_score += @as(u32, @intCast(@min(@as(u64, drift.manager_drift) / 4, 64)));
         step_score += reasoningSaturationBonus(self.meaning, &soul);
         step_score = applySignedDelta(step_score, self.codeReasoningDelta(previous, last_char));

@@ -1310,21 +1310,21 @@ fn mentionsTarget(lower_source: []const u8, synthetic_rel_path: []const u8, sour
 
 fn conceptTierForClass(class: ItemClass) abstractions.Tier {
     return switch (class) {
-        .docs => .idiom,
+        .docs => .convention,
         .specs => .contract,
-        .configs => .mechanism,
-        .symbolic => .mechanism,
-        .code => .mechanism,
+        .configs => .logic,
+        .symbolic => .logic,
+        .code => .logic,
     };
 }
 
 fn conceptCategoryForClass(class: ItemClass) abstractions.Category {
     return switch (class) {
-        .docs => .interface,
+        .docs => .boundary,
         .specs => .invariant,
         .configs => .state,
-        .symbolic => .control_flow,
-        .code => .data_flow,
+        .symbolic => .procedural,
+        .code => .relational,
     };
 }
 
@@ -1883,17 +1883,17 @@ fn parseRejectReason(text: []const u8) ?RejectReason {
 
 fn parseTier(text: []const u8) ?abstractions.Tier {
     if (std.mem.eql(u8, text, "pattern")) return .pattern;
-    if (std.mem.eql(u8, text, "idiom")) return .idiom;
-    if (std.mem.eql(u8, text, "mechanism")) return .mechanism;
+    if (std.mem.eql(u8, text, "convention")) return .convention;
+    if (std.mem.eql(u8, text, "logic")) return .logic;
     if (std.mem.eql(u8, text, "contract")) return .contract;
     return null;
 }
 
 fn parseCategory(text: []const u8) ?abstractions.Category {
-    if (std.mem.eql(u8, text, "syntax")) return .syntax;
-    if (std.mem.eql(u8, text, "control_flow")) return .control_flow;
-    if (std.mem.eql(u8, text, "data_flow")) return .data_flow;
-    if (std.mem.eql(u8, text, "interface")) return .interface;
+    if (std.mem.eql(u8, text, "structural")) return .structural;
+    if (std.mem.eql(u8, text, "procedural")) return .procedural;
+    if (std.mem.eql(u8, text, "relational")) return .relational;
+    if (std.mem.eql(u8, text, "boundary")) return .boundary;
     if (std.mem.eql(u8, text, "state")) return .state;
     if (std.mem.eql(u8, text, "invariant")) return .invariant;
     return null;

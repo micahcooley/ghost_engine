@@ -53,7 +53,7 @@ pub fn isAllowed(cp: u32) bool {
 }
 
 pub const SoulSnapshot = struct {
-    syntax: vsa.HyperVector,
+    structural: vsa.HyperVector,
     phrase: vsa.HyperVector,
     concept: vsa.HyperVector,
     global: vsa.HyperVector,
@@ -69,7 +69,7 @@ pub const SoulSnapshot = struct {
 
 pub fn saveSoul(soul: *const ghost_state.GhostSoul) SoulSnapshot {
     return .{
-        .syntax = soul.syntax,
+        .structural = soul.structural,
         .phrase = soul.phrase,
         .concept = soul.concept,
         .global = soul.global,
@@ -85,7 +85,7 @@ pub fn saveSoul(soul: *const ghost_state.GhostSoul) SoulSnapshot {
 }
 
 pub fn restoreSoul(soul: *ghost_state.GhostSoul, snap: SoulSnapshot) void {
-    soul.syntax = snap.syntax;
+    soul.structural = snap.structural;
     soul.phrase = snap.phrase;
     soul.concept = snap.concept;
     soul.global = snap.global;
