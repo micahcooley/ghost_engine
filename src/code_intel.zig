@@ -11351,21 +11351,22 @@ test "artifact family policy: documentation/neutral profile does not silently us
 test "artifact family policy: hypothesis prior policy is configurable and not universal truth" {
     const allocator = std.testing.allocator;
 
-    // Create custom policy drastically different from default
+    // Use valid branch IDs (1..7) so this exercises configurability instead of
+    // silently dropping invalid bias destinations.
     const custom_policy = HypothesisPriorPolicy{
         .category_weights = .{
-            .structural = 100,
-            .boundary = 100,
-            .relational = 100,
-            .procedural = 100,
-            .state = 100,
-            .invariant = 100,
+            .structural = 2,
+            .boundary = 3,
+            .relational = 4,
+            .procedural = 5,
+            .state = 6,
+            .invariant = 7,
         },
         .tier_weights = .{
-            .pattern = 50,
-            .convention = 50,
-            .logic = 50,
-            .contract = 50,
+            .pattern = 2,
+            .convention = 4,
+            .logic = 4,
+            .contract = 6,
         },
     };
 
@@ -11387,14 +11388,8 @@ test "artifact family policy: hypothesis prior policy is configurable and not un
     const default_biases = buildBranchBiases(.impact, refs.items, DEFAULT_CODE_PRIOR_POLICY);
     const custom_biases = buildBranchBiases(.impact, refs.items, custom_policy);
 
-    // They should not be equal if configuration works
-    var differences_found = false;
-    for (0..8) |i| {
-        if (default_biases.values[i] != custom_biases.values[i]) {
-            differences_found = true;
-            break;
-        }
-    }
-
-    try std.testing.expect(differences_found);
+    try std.testing.expect(default_biases.get(3) > 0);
+    try std.testing.expectEqual(@as(u32, 0), custom_biases.get(3));
+    try std.testing.expect(custom_biases.get(4) > 0);
+    try std.testing.expect(custom_biases.get(6) > 0);
 }

@@ -664,14 +664,15 @@ fn writeJsonString(w: anytype, value: []const u8) !void {
     try w.writeByte('"');
 }
 
-
-
 fn setupTestShard(allocator: std.mem.Allocator, project_shard: []const u8) !void {
     var meta = try shards.resolveProjectMetadata(allocator, project_shard);
     defer meta.deinit();
     var paths = try shards.resolvePaths(allocator, meta.metadata);
     defer paths.deinit();
-    std.fs.deleteTreeAbsolute(paths.root_abs_path) catch {};
+    std.fs.deleteTreeAbsolute(paths.root_abs_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
     const candidates_dir = try std.fs.path.join(allocator, &.{ paths.root_abs_path, verifier_candidates.CANDIDATES_REL_DIR });
     defer allocator.free(candidates_dir);
     try std.fs.cwd().makePath(candidates_dir);
