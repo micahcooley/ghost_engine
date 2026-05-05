@@ -236,7 +236,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_text_generation_lab_tests = b.addRunArtifact(text_generation_lab_tests);
-    const text_generation_lab_smoke_step = b.step("smoke-text-generation-lab", "Run experimental text generation lab tests");
+    const text_generation_lab_smoke_step = b.step("smoke-text-generation-lab", "Run experimental text generation lab tests and fixture corpus smoke");
     text_generation_lab_smoke_step.dependOn(&run_text_generation_lab_tests.step);
 
     // ── 9. Unit & Integration Tests ──
