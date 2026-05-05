@@ -269,6 +269,11 @@ fn blockedResult(
     };
 }
 
+// Execution Safety Boundaries:
+// - argv-token execution only: Commands are strictly executed as discrete argv arrays, not through a shell.
+// - no arbitrary shell strings: Raw strings cannot be passed for shell evaluation, mitigating injection risks.
+// - workspace confinement expectations: Execution paths and arguments must resolve strictly within the designated workspace root to prevent escapes.
+// - caller approval requirement: It is expected that the caller has already enforced any necessary permission or approval before invoking execution steps.
 fn validateStep(allocator: std.mem.Allocator, options: Options, step: Step) !Validation {
     if (step.argv.len == 0 or step.argv.len > MAX_ARG_COUNT) return error.InvalidExecutionStep;
     const workspace_root = try normalizePath(allocator, options.workspace_root);
@@ -658,6 +663,28 @@ fn isSimpleToken(text: []const u8) bool {
         }
     }
     return text.len > 0;
+}
+
+test "isSimpleToken limits shell-like inputs" {
+    const testing = std.testing;
+
+    // Allowed patterns
+    try testing.expect(isSimpleToken("valid-token"));
+    try testing.expect(isSimpleToken("valid_token_123"));
+    try testing.expect(isSimpleToken("path/to/file.zig"));
+    try testing.expect(isSimpleToken("user@domain.com"));
+    try testing.expect(isSimpleToken("+val:123"));
+
+    // Disallowed shell operators and spaces
+    try testing.expect(!isSimpleToken("invalid token"));
+    try testing.expect(!isSimpleToken("token;"));
+    try testing.expect(!isSimpleToken("token|grep"));
+    try testing.expect(!isSimpleToken("token&"));
+    try testing.expect(!isSimpleToken("\"token\""));
+    try testing.expect(!isSimpleToken("'token'"));
+    try testing.expect(!isSimpleToken("`token`"));
+    try testing.expect(!isSimpleToken("$(token)"));
+    try testing.expect(!isSimpleToken(""));
 }
 
 fn joinTokensOwned(allocator: std.mem.Allocator, tokens: []const []const u8) ![]u8 {
