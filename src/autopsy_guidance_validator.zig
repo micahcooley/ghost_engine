@@ -1132,29 +1132,28 @@ test "validator does not mutate manifest or guidance files" {
     try std.testing.expectEqualStrings(before_manifest, after_manifest);
     try std.testing.expectEqualStrings(before_guidance, after_guidance);
 }
+const test_manifest_body =
+    \\{"schemaVersion":"ghost_knowledge_pack_v1","packId":"test_valid_pack","packVersion":"v1","domainFamily":"context","trustClass":"project","compatibility":{"engineVersion":"test","linuxFirst":true,"deterministicOnly":true,"mountSchema":"ghost_knowledge_pack_mounts_v1"},"storage":{"corpusManifestRelPath":"corpus/manifest.json","corpusFilesRelPath":"corpus","abstractionCatalogRelPath":"abstractions/abstractions.gabs","reuseCatalogRelPath":"abstractions/reuse.gabr","lineageStateRelPath":"abstractions/lineage.gabs","influenceManifestRelPath":"influence.json","autopsyGuidanceRelPath":"guidance.json"},"provenance":{"packLineageId":"pack:test_pack@v1","sourceKind":"test","sourceId":"test","sourceState":"staged","freshnessState":"active","sourceSummary":"test","sourceLineageSummary":"test"},"content":{"corpusItemCount":0,"conceptCount":0,"corpusHash":0,"abstractionHash":0,"reuseHash":0,"lineageHash":0,"corpusPreview":[],"conceptPreview":[]}}
+;
+
 test "validateInstalledPack happy path" {
     const allocator = std.testing.allocator;
     const pack_id = "test_valid_pack";
     const pack_version = "v1";
 
-    // Setup global state path for knowledge packs
     const pack_root = try store.packRootAbsPath(allocator, pack_id, pack_version);
     defer allocator.free(pack_root);
 
-    // Clean before and after just in case
     std.fs.deleteTreeAbsolute(pack_root) catch {};
-    try std.fs.cwd().makePath(pack_root);
+    try std.fs.makeDirAbsolute(pack_root);
     defer std.fs.deleteTreeAbsolute(pack_root) catch {};
 
     const manifest_path = try std.fs.path.join(allocator, &.{ pack_root, "manifest.json" });
     defer allocator.free(manifest_path);
 
-    const manifest_data =
-        \\{"schemaVersion":"ghost_knowledge_pack_v1","packId":"test_valid_pack","packVersion":"v1","domainFamily":"context","trustClass":"project","compatibility":{"engineVersion":"test","linuxFirst":true,"deterministicOnly":true,"mountSchema":"ghost_knowledge_pack_mounts_v1"},"storage":{"corpusManifestRelPath":"corpus/manifest.json","corpusFilesRelPath":"corpus","abstractionCatalogRelPath":"abstractions/abstractions.gabs","reuseCatalogRelPath":"abstractions/reuse.gabr","lineageStateRelPath":"abstractions/lineage.gabs","influenceManifestRelPath":"influence.json","autopsyGuidanceRelPath":"guidance.json"},"provenance":{"packLineageId":"pack:test_valid_pack@v1","sourceKind":"test","sourceId":"test","sourceState":"staged","freshnessState":"active","sourceSummary":"test","sourceLineageSummary":"test"},"content":{"corpusItemCount":0,"conceptCount":0,"corpusHash":0,"abstractionHash":0,"reuseHash":0,"lineageHash":0,"corpusPreview":[],"conceptPreview":[]}}
-    ;
     var f1 = try std.fs.createFileAbsolute(manifest_path, .{});
     defer f1.close();
-    try f1.writeAll(manifest_data);
+    try f1.writeAll(test_manifest_body);
 
     const guidance_path = try std.fs.path.join(allocator, &.{ pack_root, "guidance.json" });
     defer allocator.free(guidance_path);
@@ -1176,19 +1175,16 @@ test "validateInstalledPack missing manifest returns error report" {
     const pack_id = "test_missing_manifest";
     const pack_version = "v1";
 
-    // Setup global state path for knowledge packs
     const pack_root = try store.packRootAbsPath(allocator, pack_id, pack_version);
     defer allocator.free(pack_root);
 
-    // Clean before and after
     std.fs.deleteTreeAbsolute(pack_root) catch {};
-    try std.fs.cwd().makePath(pack_root);
+    try std.fs.makeDirAbsolute(pack_root);
     defer std.fs.deleteTreeAbsolute(pack_root) catch {};
 
     // Do NOT create manifest.json
 
     const report = validateInstalledPack(allocator, pack_id, pack_version);
-    // Should return error from std.fs.openFileAbsolute inside loadManifestFromPath
     try std.testing.expectError(error.FileNotFound, report);
 }
 
@@ -1200,20 +1196,16 @@ test "validateInstalledPack missing guidance file returns structured report" {
     const pack_root = try store.packRootAbsPath(allocator, pack_id, pack_version);
     defer allocator.free(pack_root);
 
-    // Clean before and after
     std.fs.deleteTreeAbsolute(pack_root) catch {};
-    try std.fs.cwd().makePath(pack_root);
+    try std.fs.makeDirAbsolute(pack_root);
     defer std.fs.deleteTreeAbsolute(pack_root) catch {};
 
     const manifest_path = try std.fs.path.join(allocator, &.{ pack_root, "manifest.json" });
     defer allocator.free(manifest_path);
 
-    const manifest_data =
-        \\{"schemaVersion":"ghost_knowledge_pack_v1","packId":"test_missing_guidance","packVersion":"v1","domainFamily":"context","trustClass":"project","compatibility":{"engineVersion":"test","linuxFirst":true,"deterministicOnly":true,"mountSchema":"ghost_knowledge_pack_mounts_v1"},"storage":{"corpusManifestRelPath":"corpus/manifest.json","corpusFilesRelPath":"corpus","abstractionCatalogRelPath":"abstractions/abstractions.gabs","reuseCatalogRelPath":"abstractions/reuse.gabr","lineageStateRelPath":"abstractions/lineage.gabs","influenceManifestRelPath":"influence.json","autopsyGuidanceRelPath":"guidance.json"},"provenance":{"packLineageId":"pack:test_missing_guidance@v1","sourceKind":"test","sourceId":"test","sourceState":"staged","freshnessState":"active","sourceSummary":"test","sourceLineageSummary":"test"},"content":{"corpusItemCount":0,"conceptCount":0,"corpusHash":0,"abstractionHash":0,"reuseHash":0,"lineageHash":0,"corpusPreview":[],"conceptPreview":[]}}
-    ;
     var f1 = try std.fs.createFileAbsolute(manifest_path, .{});
     defer f1.close();
-    try f1.writeAll(manifest_data);
+    try f1.writeAll(test_manifest_body);
 
     // Do NOT create guidance.json
 
