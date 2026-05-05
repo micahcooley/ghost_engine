@@ -154,3 +154,25 @@ test "simhash is stable for identical text and near for small local variation" {
     const unrelated_distance = hammingDistance(base.hash, unrelated.hash);
     try std.testing.expect(near_distance < unrelated_distance);
 }
+
+test "hammingDistance edge cases" {
+    // exact match
+    try std.testing.expectEqual(@as(u7, 0), hammingDistance(0x1234567890ABCDEF, 0x1234567890ABCDEF));
+
+    // zero vs zero
+    try std.testing.expectEqual(@as(u7, 0), hammingDistance(0, 0));
+
+    // maxInt(u64) vs maxInt(u64)
+    try std.testing.expectEqual(@as(u7, 0), hammingDistance(std.math.maxInt(u64), std.math.maxInt(u64)));
+
+    // zero vs maxInt(u64) = 64
+    try std.testing.expectEqual(@as(u7, 64), hammingDistance(0, std.math.maxInt(u64)));
+
+    // one-bit difference = 1
+    try std.testing.expectEqual(@as(u7, 1), hammingDistance(0b0000, 0b0001));
+    try std.testing.expectEqual(@as(u7, 1), hammingDistance(0x8000000000000000, 0));
+
+    // multi-bit difference
+    try std.testing.expectEqual(@as(u7, 2), hammingDistance(0b1001, 0b0000));
+    try std.testing.expectEqual(@as(u7, 4), hammingDistance(0x0F, 0x00));
+}
