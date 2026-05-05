@@ -1376,3 +1376,100 @@ test "rule firing does not produce proof support or mutation flags" {
     try std.testing.expectEqual(false, result.safety_flags.proof_discharged);
     try std.testing.expectEqual(false, result.safety_flags.support_granted);
 }
+
+fn validTestRule() Rule {
+    return .{
+        .id = "rule1",
+        .name = "name1",
+        .all = &.{.{ .subject = "subj", .predicate = "pred" }},
+        .outputs = &.{.{ .kind = .unknown, .id = "out1", .summary = "sum" }},
+    };
+}
+
+test "validateRule accepts minimal all condition rule" {
+    try validateRule(validTestRule());
+}
+
+test "validateRule accepts any-only condition rule" {
+    var rule = validTestRule();
+    rule.all = &.{};
+    rule.any = &.{.{ .subject = "subj", .predicate = "pred" }};
+
+    try validateRule(rule);
+}
+
+test "any-only rule fires only when an any condition matches" {
+    const facts = [_]Fact{.{ .subject = "subj", .predicate = "pred", .object = "obj" }};
+    const valid_outputs = [_]RuleOutput{.{ .kind = .unknown, .id = "out1", .summary = "sum" }};
+    const rules = [_]Rule{.{
+        .id = "rule1",
+        .name = "name1",
+        .any = &.{.{ .subject = "subj", .predicate = "pred" }},
+        .outputs = &valid_outputs,
+    }};
+
+    var result = try evaluate(std.testing.allocator, .{ .facts = &facts, .rules = &rules });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.fired_rules.len);
+    try std.testing.expectEqual(true, result.explanation_trace[0].matched_any);
+    try std.testing.expectEqual(@as(usize, 1), result.explanation_trace[0].required_any);
+}
+
+test "validateRule rejects missing rule identity fields" {
+    var invalid_rule = validTestRule();
+    invalid_rule.id = "";
+    try std.testing.expectError(error.InvalidRule, validateRule(invalid_rule));
+
+    invalid_rule = validTestRule();
+    invalid_rule.name = "";
+    try std.testing.expectError(error.InvalidRule, validateRule(invalid_rule));
+}
+
+test "validateRule rejects missing conditions and outputs" {
+    var invalid_rule = validTestRule();
+    invalid_rule.all = &.{};
+    invalid_rule.any = &.{};
+    try std.testing.expectError(error.InvalidRule, validateRule(invalid_rule));
+
+    invalid_rule = validTestRule();
+    invalid_rule.outputs = &.{};
+    try std.testing.expectError(error.InvalidRule, validateRule(invalid_rule));
+}
+
+test "validateRule rejects invalid all and any conditions" {
+    var invalid_rule = validTestRule();
+    invalid_rule.all = &.{.{ .subject = "", .predicate = "pred" }};
+    try std.testing.expectError(error.InvalidRule, validateRule(invalid_rule));
+
+    invalid_rule = validTestRule();
+    invalid_rule.all = &.{.{ .subject = "subj", .predicate = "" }};
+    try std.testing.expectError(error.InvalidRule, validateRule(invalid_rule));
+
+    invalid_rule = validTestRule();
+    invalid_rule.all = &.{};
+    invalid_rule.any = &.{.{ .subject = "", .predicate = "pred" }};
+    try std.testing.expectError(error.InvalidRule, validateRule(invalid_rule));
+
+    invalid_rule = validTestRule();
+    invalid_rule.all = &.{};
+    invalid_rule.any = &.{.{ .subject = "subj", .predicate = "" }};
+    try std.testing.expectError(error.InvalidRule, validateRule(invalid_rule));
+}
+
+test "validateRule rejects invalid outputs" {
+    const invalid_output_id = [_]RuleOutput{.{ .kind = .unknown, .id = "", .summary = "sum" }};
+    var invalid_rule = validTestRule();
+    invalid_rule.outputs = &invalid_output_id;
+    try std.testing.expectError(error.InvalidRule, validateRule(invalid_rule));
+
+    const invalid_output_summary = [_]RuleOutput{.{ .kind = .unknown, .id = "out1", .summary = "" }};
+    invalid_rule = validTestRule();
+    invalid_rule.outputs = &invalid_output_summary;
+    try std.testing.expectError(error.InvalidRule, validateRule(invalid_rule));
+
+    const invalid_output_fact = [_]RuleOutput{.{ .kind = .fact, .id = "out1", .summary = "sum" }};
+    invalid_rule = validTestRule();
+    invalid_rule.outputs = &invalid_output_fact;
+    try std.testing.expectError(error.InvalidRule, validateRule(invalid_rule));
+}
