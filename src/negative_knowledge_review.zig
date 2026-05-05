@@ -350,35 +350,17 @@ pub fn readAcceptedInfluencesAtPath(allocator: std.mem.Allocator, abs_path: []co
         }
         records_read += 1;
 
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch {
-            malformed_lines += 1;
-            try appendReadWarning(allocator, &warnings, line_number, "malformed reviewed negative knowledge JSONL line ignored");
-            continue;
-        };
-        defer parsed.deinit();
+        var parsed_line = (try parseReviewLineAndValidateShard(
+            allocator,
+            line,
+            line_number,
+            project_shard,
+            &warnings,
+            &malformed_lines,
+        )) orelse continue;
+        defer parsed_line.deinit();
 
-        const obj = valueObject(parsed.value) orelse {
-            malformed_lines += 1;
-            try appendReadWarning(allocator, &warnings, line_number, "reviewed negative knowledge line was not an object");
-            continue;
-        };
-        const record_shard = getStr(obj, "projectShard") orelse getStr(obj, "project_shard") orelse {
-            malformed_lines += 1;
-            try appendReadWarning(allocator, &warnings, line_number, "reviewed negative knowledge missing projectShard");
-            continue;
-        };
-        if (!std.mem.eql(u8, record_shard, project_shard)) continue;
-        const decision_text = getStr(obj, "reviewDecision") orelse {
-            malformed_lines += 1;
-            try appendReadWarning(allocator, &warnings, line_number, "reviewed negative knowledge missing reviewDecision");
-            continue;
-        };
-        const decision = Decision.parse(decision_text) orelse {
-            malformed_lines += 1;
-            try appendReadWarning(allocator, &warnings, line_number, "reviewed negative knowledge had invalid reviewDecision");
-            continue;
-        };
-        switch (decision) {
+        switch (parsed_line.decision) {
             .rejected => {
                 rejected_records += 1;
                 continue;
@@ -387,7 +369,7 @@ pub fn readAcceptedInfluencesAtPath(allocator: std.mem.Allocator, abs_path: []co
         }
 
         const before = influences.items.len;
-        try appendInfluencesFromRecord(allocator, obj, line_number, &influences);
+        try appendInfluencesFromRecord(allocator, parsed_line.obj, line_number, &influences);
         if (influences.items.len == before) {
             try appendReadWarning(allocator, &warnings, line_number, "accepted reviewed negative knowledge did not contain a usable future influence");
         }
@@ -468,35 +450,17 @@ pub fn listReviewedNegativeKnowledgeAtPath(
         }
         total_read += 1;
 
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch {
-            malformed_lines += 1;
-            try appendReadWarning(allocator, &warnings, line_number, "malformed reviewed negative knowledge JSONL line ignored");
-            continue;
-        };
-        defer parsed.deinit();
+        var parsed_line = (try parseReviewLineAndValidateShard(
+            allocator,
+            line,
+            line_number,
+            project_shard,
+            &warnings,
+            &malformed_lines,
+        )) orelse continue;
+        defer parsed_line.deinit();
 
-        const obj = valueObject(parsed.value) orelse {
-            malformed_lines += 1;
-            try appendReadWarning(allocator, &warnings, line_number, "reviewed negative knowledge line was not an object");
-            continue;
-        };
-        const record_shard = getStr(obj, "projectShard") orelse getStr(obj, "project_shard") orelse {
-            malformed_lines += 1;
-            try appendReadWarning(allocator, &warnings, line_number, "reviewed negative knowledge missing projectShard");
-            continue;
-        };
-        if (!std.mem.eql(u8, record_shard, project_shard)) continue;
-        const decision_text = getStr(obj, "reviewDecision") orelse {
-            malformed_lines += 1;
-            try appendReadWarning(allocator, &warnings, line_number, "reviewed negative knowledge missing reviewDecision");
-            continue;
-        };
-        const decision = Decision.parse(decision_text) orelse {
-            malformed_lines += 1;
-            try appendReadWarning(allocator, &warnings, line_number, "reviewed negative knowledge had invalid reviewDecision");
-            continue;
-        };
-        if (!decision_filter.matches(decision)) continue;
+        if (!decision_filter.matches(parsed_line.decision)) continue;
         if (matched_seen < offset) {
             matched_seen += 1;
             continue;
@@ -506,7 +470,7 @@ pub fn listReviewedNegativeKnowledgeAtPath(
             limit_hit = true;
             continue;
         }
-        try records.append(try duplicateReviewedRecord(allocator, obj, line, decision, line_number));
+        try records.append(try duplicateReviewedRecord(allocator, parsed_line.obj, line, parsed_line.decision, line_number));
         emitted += 1;
     }
 
@@ -563,43 +527,26 @@ pub fn getReviewedNegativeKnowledgeAtPath(allocator: std.mem.Allocator, abs_path
         }
         total_read += 1;
 
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch {
-            malformed_lines += 1;
-            try appendReadWarning(allocator, &warnings, line_number, "malformed reviewed negative knowledge JSONL line ignored");
-            continue;
-        };
-        defer parsed.deinit();
+        var parsed_line = (try parseReviewLineAndValidateShard(
+            allocator,
+            line,
+            line_number,
+            project_shard,
+            &warnings,
+            &malformed_lines,
+        )) orelse continue;
+        defer parsed_line.deinit();
 
-        const obj = valueObject(parsed.value) orelse {
-            malformed_lines += 1;
-            try appendReadWarning(allocator, &warnings, line_number, "reviewed negative knowledge line was not an object");
-            continue;
-        };
-        const record_shard = getStr(obj, "projectShard") orelse getStr(obj, "project_shard") orelse {
-            malformed_lines += 1;
-            try appendReadWarning(allocator, &warnings, line_number, "reviewed negative knowledge missing projectShard");
-            continue;
-        };
-        if (!std.mem.eql(u8, record_shard, project_shard)) continue;
-        const record_id = getStr(obj, "id") orelse {
+        const record_id = getStr(parsed_line.obj, "id") orelse {
             malformed_lines += 1;
             try appendReadWarning(allocator, &warnings, line_number, "reviewed negative knowledge missing id");
             continue;
         };
-        const decision_text = getStr(obj, "reviewDecision") orelse {
-            malformed_lines += 1;
-            try appendReadWarning(allocator, &warnings, line_number, "reviewed negative knowledge missing reviewDecision");
-            continue;
-        };
-        const decision = Decision.parse(decision_text) orelse {
-            malformed_lines += 1;
-            try appendReadWarning(allocator, &warnings, line_number, "reviewed negative knowledge had invalid reviewDecision");
-            continue;
-        };
+
         if (std.mem.eql(u8, record_id, id)) {
             return .{
                 .allocator = allocator,
-                .record = try duplicateReviewedRecord(allocator, obj, line, decision, line_number),
+                .record = try duplicateReviewedRecord(allocator, parsed_line.obj, line, parsed_line.decision, line_number),
                 .warnings = try warnings.toOwnedSlice(),
                 .total_read = total_read,
                 .malformed_lines = malformed_lines,
@@ -838,6 +785,63 @@ fn appendReadWarning(allocator: std.mem.Allocator, warnings: *std.ArrayList(Read
         .line_number = line_number,
         .reason = try allocator.dupe(u8, reason),
     });
+}
+
+const ParsedReviewLine = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    obj: std.json.ObjectMap,
+    decision: Decision,
+
+    pub fn deinit(self: *ParsedReviewLine) void {
+        self.parsed.deinit();
+    }
+};
+
+fn parseReviewLineAndValidateShard(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    line_number: usize,
+    project_shard: []const u8,
+    warnings: *std.ArrayList(ReadWarning),
+    malformed_lines: *usize,
+) !?ParsedReviewLine {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch {
+        malformed_lines.* += 1;
+        try appendReadWarning(allocator, warnings, line_number, "malformed reviewed negative knowledge JSONL line ignored");
+        return null;
+    };
+    var success = false;
+    defer if (!success) parsed.deinit();
+
+    const obj = valueObject(parsed.value) orelse {
+        malformed_lines.* += 1;
+        try appendReadWarning(allocator, warnings, line_number, "reviewed negative knowledge line was not an object");
+        return null;
+    };
+    const record_shard = getStr(obj, "projectShard") orelse getStr(obj, "project_shard") orelse {
+        malformed_lines.* += 1;
+        try appendReadWarning(allocator, warnings, line_number, "reviewed negative knowledge missing projectShard");
+        return null;
+    };
+    if (!std.mem.eql(u8, record_shard, project_shard)) return null;
+
+    const decision_text = getStr(obj, "reviewDecision") orelse {
+        malformed_lines.* += 1;
+        try appendReadWarning(allocator, warnings, line_number, "reviewed negative knowledge missing reviewDecision");
+        return null;
+    };
+    const decision = Decision.parse(decision_text) orelse {
+        malformed_lines.* += 1;
+        try appendReadWarning(allocator, warnings, line_number, "reviewed negative knowledge had invalid reviewDecision");
+        return null;
+    };
+
+    success = true;
+    return .{
+        .parsed = parsed,
+        .obj = obj,
+        .decision = decision,
+    };
 }
 
 fn valueObject(value: std.json.Value) ?std.json.ObjectMap {
