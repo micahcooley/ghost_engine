@@ -2656,16 +2656,16 @@ test "project autopsy invariants: missing or ambiguous roots and missing verifie
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Trigger ambiguous source roots
     try makeFile(tmp.dir, "src/main.zig", "pub fn main() void {}");
     try makeFile(tmp.dir, "lib/main.zig", "pub fn main() void {}");
-
-    // Trigger runtime verifier missing gap
     try makeFile(tmp.dir, "Dockerfile", "FROM scratch\n");
 
-    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
-    defer std.heap.page_allocator.free(root);
-    const result = try analyze(std.heap.page_allocator, root, .{});
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const result = try analyze(allocator, root, .{});
 
     try std.testing.expect(containsNamedSignal(result.project_profile.unknowns, "source_root_ambiguous"));
     try std.testing.expect(containsNamedSignal(result.project_profile.unknowns, "test_root_unknown"));
