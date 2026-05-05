@@ -30,6 +30,8 @@ pub const QueryInput = struct {
     max_results: u8 = 2,
 };
 
+/// Note: External evidence records only provide candidate/evidence surfaces.
+/// They do not directly grant proof or support authority to the resulting knowledge.
 pub const RequestInput = struct {
     urls: []const []const u8 = &.{},
     queries: []const QueryInput = &.{},
@@ -834,4 +836,9 @@ fn writeStringArray(writer: anytype, items: []const []const u8) !void {
         try writeJsonString(writer, item);
     }
     try writer.writeAll("]");
+}
+
+test "RequestInput defaults to exploratory trust class limiting safety authority" {
+    const default_input = RequestInput{};
+    try std.testing.expectEqual(abstractions.TrustClass.exploratory, default_input.trust_class);
 }
