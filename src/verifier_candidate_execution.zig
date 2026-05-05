@@ -663,3 +663,183 @@ fn writeJsonString(w: anytype, value: []const u8) !void {
     }
     try w.writeByte('"');
 }
+
+
+
+fn setupTestShard(allocator: std.mem.Allocator, project_shard: []const u8) !void {
+    var meta = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer meta.deinit();
+    var paths = try shards.resolvePaths(allocator, meta.metadata);
+    defer paths.deinit();
+    std.fs.deleteTreeAbsolute(paths.root_abs_path) catch {};
+    const candidates_dir = try std.fs.path.join(allocator, &.{ paths.root_abs_path, verifier_candidates.CANDIDATES_REL_DIR });
+    defer allocator.free(candidates_dir);
+    try std.fs.cwd().makePath(candidates_dir);
+}
+
+fn cleanupTestShard(allocator: std.mem.Allocator, project_shard: []const u8) void {
+    var meta = shards.resolveProjectMetadata(allocator, project_shard) catch return;
+    defer meta.deinit();
+    var paths = shards.resolvePaths(allocator, meta.metadata) catch return;
+    defer paths.deinit();
+    std.fs.deleteTreeAbsolute(paths.root_abs_path) catch {};
+}
+
+test "executeBody: unconfirmed execution does not spawn" {
+    const allocator = std.testing.allocator;
+    const test_project = "test_verifier_exec_unconfirmed_v10";
+
+    try setupTestShard(allocator, test_project);
+    defer cleanupTestShard(allocator, test_project);
+
+    const propose_body = try std.fmt.allocPrint(allocator,
+        \\{{"projectShard":"{s}","learningLoopPlan":{{"schema_version":"learning_loop_plan.v1","plan_id":"plan.unit","verifier_candidate_refs":[{{"id":"cand_123","source_command_candidate_id":"cmd_1","argv":["echo","hello"],"cwd_hint":"/tmp","reason":"testing","requires_approval":true,"executes_by_default":false}}]}}}}
+    , .{test_project});
+    defer allocator.free(propose_body);
+
+    var proposed = try verifier_candidates.proposeFromLearningPlanBody(allocator, propose_body);
+    defer proposed.deinit();
+
+    // Extract the generated candidate ID
+    var parsed_prop = try std.json.parseFromSlice(std.json.Value, allocator, proposed.record_jsons[0], .{});
+    defer parsed_prop.deinit();
+    const candidate_id = getStrAny(parsed_prop.value.object, &.{"id"}) orelse return error.NoId;
+
+    const req_body = try std.fmt.allocPrint(allocator,
+        \\{{"projectShard":"{s}","candidateId":"{s}","confirmExecute":false,"workspaceRoot":"/tmp"}}
+    , .{ test_project, candidate_id });
+    defer allocator.free(req_body);
+
+    var result = try executeBody(allocator, req_body, null);
+    defer result.deinit();
+
+    try std.testing.expectEqual(false, result.executed);
+    try std.testing.expectEqual(false, result.commands_executed);
+    try std.testing.expectEqualStrings("rejected", result.status);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.record_json, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("confirmation_required", obj.get("failureSignal").?.string);
+    try std.testing.expectEqual(false, obj.get("executed").?.bool);
+    try std.testing.expectEqual(false, obj.get("producedEvidence").?.bool);
+    try std.testing.expectEqual(false, obj.get("proofGranted").?.bool);
+    try std.testing.expectEqual(false, obj.get("supportGranted").?.bool);
+}
+
+test "executeBody: rejected candidate does not spawn" {
+    const allocator = std.testing.allocator;
+    const test_project = "test_verifier_exec_rejected_v10";
+
+    try setupTestShard(allocator, test_project);
+    defer cleanupTestShard(allocator, test_project);
+
+    const propose_body = try std.fmt.allocPrint(allocator,
+        \\{{"projectShard":"{s}","learningLoopPlan":{{"schema_version":"learning_loop_plan.v1","plan_id":"plan.unit","verifier_candidate_refs":[{{"id":"cand_rejected","source_command_candidate_id":"cmd_1","argv":["echo","hello"],"cwd_hint":"/tmp","reason":"testing","requires_approval":true,"executes_by_default":false}}]}}}}
+    , .{test_project});
+    defer allocator.free(propose_body);
+
+    var proposed = try verifier_candidates.proposeFromLearningPlanBody(allocator, propose_body);
+    defer proposed.deinit();
+
+    var parsed_prop = try std.json.parseFromSlice(std.json.Value, allocator, proposed.record_jsons[0], .{});
+    defer parsed_prop.deinit();
+    const candidate_id = getStrAny(parsed_prop.value.object, &.{"id"}) orelse return error.NoId;
+
+    const review_body = try std.fmt.allocPrint(allocator,
+        \\{{"projectShard":"{s}","candidateId":"{s}","reviewDecision":"rejected","reason":"test rejection"}}
+    , .{ test_project, candidate_id });
+    defer allocator.free(review_body);
+
+    var review_result = try verifier_candidates.reviewBody(allocator, review_body);
+    review_result.deinit();
+
+    const req_body = try std.fmt.allocPrint(allocator,
+        \\{{"projectShard":"{s}","candidateId":"{s}","confirmExecute":true,"workspaceRoot":"/tmp"}}
+    , .{ test_project, candidate_id });
+    defer allocator.free(req_body);
+
+    var result = try executeBody(allocator, req_body, null);
+    defer result.deinit();
+
+    try std.testing.expectEqual(false, result.executed);
+    try std.testing.expectEqual(false, result.commands_executed);
+    try std.testing.expectEqualStrings("rejected", result.status);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.record_json, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("candidate_not_approved", obj.get("failureSignal").?.string);
+    try std.testing.expectEqual(false, obj.get("executed").?.bool);
+}
+
+test "executeBody: execution record is evidence candidate only and proof flags remain false" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+
+    const test_project = "test_verifier_exec_evidence_v10";
+
+    try setupTestShard(allocator, test_project);
+    defer cleanupTestShard(allocator, test_project);
+
+    const propose_body = try std.fmt.allocPrint(allocator,
+        \\{{"projectShard":"{s}","learningLoopPlan":{{"schema_version":"learning_loop_plan.v1","plan_id":"plan.unit","verifier_candidate_refs":[{{"id":"cand_valid","source_command_candidate_id":"cmd_1","argv":["echo","hello"],"cwd_hint":"/tmp","reason":"testing","requires_approval":true,"executes_by_default":false}}]}}}}
+    , .{test_project});
+    defer allocator.free(propose_body);
+
+    var proposed = try verifier_candidates.proposeFromLearningPlanBody(allocator, propose_body);
+    defer proposed.deinit();
+
+    var parsed_prop = try std.json.parseFromSlice(std.json.Value, allocator, proposed.record_jsons[0], .{});
+    defer parsed_prop.deinit();
+    const candidate_id = getStrAny(parsed_prop.value.object, &.{"id"}) orelse return error.NoId;
+
+    const review_body = try std.fmt.allocPrint(allocator,
+        \\{{"projectShard":"{s}","candidateId":"{s}","reviewDecision":"approved","reason":"test approval"}}
+    , .{ test_project, candidate_id });
+    defer allocator.free(review_body);
+
+    var review_result = try verifier_candidates.reviewBody(allocator, review_body);
+    review_result.deinit();
+
+    const workspace_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace_root);
+
+    const req_body = try std.fmt.allocPrint(allocator,
+        \\{{"projectShard":"{s}","candidateId":"{s}","confirmExecute":true,"workspaceRoot":"{s}"}}
+    , .{ test_project, candidate_id, workspace_root });
+    defer allocator.free(req_body);
+
+    var result = try executeBody(allocator, req_body, null);
+    defer result.deinit();
+
+    try std.testing.expectEqual(true, result.executed);
+    try std.testing.expectEqual(true, result.commands_executed);
+    try std.testing.expectEqual(true, result.produced_evidence);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.record_json, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqual(true, obj.get("executed").?.bool);
+    try std.testing.expectEqual(true, obj.get("producedEvidence").?.bool);
+    try std.testing.expectEqual(true, obj.get("evidenceCandidate").?.bool);
+    try std.testing.expectEqualStrings("evidence_candidate", obj.get("authorityEffect").?.string);
+    try std.testing.expectEqual(false, obj.get("proofGranted").?.bool);
+    try std.testing.expectEqual(false, obj.get("supportGranted").?.bool);
+    try std.testing.expectEqual(true, obj.get("nonAuthorizing").?.bool);
+
+    var out = std.ArrayList(u8).init(allocator);
+    defer out.deinit();
+    try writeExecuteResultJson(out.writer(), result);
+
+    const parsed_wrapper = try std.json.parseFromSlice(std.json.Value, allocator, out.items, .{});
+    defer parsed_wrapper.deinit();
+    const wrapper_obj = parsed_wrapper.value.object.get("verifierCandidateExecution").?.object;
+    try std.testing.expectEqual(true, wrapper_obj.get("producedEvidence").?.bool);
+    try std.testing.expectEqual(true, wrapper_obj.get("evidenceCandidate").?.bool);
+    try std.testing.expectEqualStrings("evidence_candidate", wrapper_obj.get("authorityEffect").?.string);
+    try std.testing.expectEqual(false, wrapper_obj.get("proofGranted").?.bool);
+    try std.testing.expectEqual(false, wrapper_obj.get("supportGranted").?.bool);
+    try std.testing.expectEqual(true, wrapper_obj.get("nonAuthorizing").?.bool);
+}
