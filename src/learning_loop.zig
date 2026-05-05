@@ -385,3 +385,60 @@ test "learning loop plan safety flags are non-execution and non-mutation" {
     try std.testing.expect(!plan.support_granted);
     try std.testing.expect(!plan.proof_discharged);
 }
+
+test "LearningLoopPlan struct invariants: plan is read-only and candidate-only by default" {
+    const plan = LearningLoopPlan{
+        .plan_id = "test",
+        .autopsy_schema_version = "v1",
+    };
+    try std.testing.expect(plan.candidate_only);
+    try std.testing.expect(plan.non_authorizing);
+    try std.testing.expect(plan.read_only);
+}
+
+test "LearningLoopPlan struct invariants: no execution or mutation by default" {
+    const plan = LearningLoopPlan{
+        .plan_id = "test",
+        .autopsy_schema_version = "v1",
+    };
+    try std.testing.expect(!plan.mutates_state);
+    try std.testing.expect(!plan.commands_executed);
+    try std.testing.expect(!plan.verifiers_executed);
+    try std.testing.expect(!plan.patches_applied);
+    try std.testing.expect(!plan.packs_mutated);
+    try std.testing.expect(!plan.corrections_applied);
+    try std.testing.expect(!plan.negative_knowledge_promoted);
+    try std.testing.expect(!plan.corpus_mutated);
+    try std.testing.expect(!plan.trust_state_mutated);
+    try std.testing.expect(!plan.snapshots_mutated);
+    try std.testing.expect(!plan.scratch_state_mutated);
+    try std.testing.expect(!plan.support_granted);
+    try std.testing.expect(!plan.proof_discharged);
+}
+
+test "VerifierCandidateRef struct invariants: approval-required and do not execute by default" {
+    const ref = VerifierCandidateRef{
+        .id = "test_id",
+        .source_command_candidate_id = "test_cmd",
+        .argv = &.{},
+        .cwd_hint = "",
+        .reason = "",
+    };
+    try std.testing.expect(ref.requires_approval);
+    try std.testing.expect(!ref.executes_by_default);
+    try std.testing.expect(ref.non_authorizing);
+}
+
+test "LoopPlaceholderCandidate struct invariants: explicit placeholder and non-mutating by default" {
+    const placeholder = LoopPlaceholderCandidate{
+        .id = "test_id",
+        .kind = "test_kind",
+        .reason = "",
+        .source_next_step_id = "",
+    };
+    try std.testing.expect(placeholder.requires_review);
+    try std.testing.expect(placeholder.candidate_only);
+    try std.testing.expect(placeholder.non_authorizing);
+    try std.testing.expect(!placeholder.mutates_state);
+    try std.testing.expect(!placeholder.applies_by_default);
+}
