@@ -1376,3 +1376,65 @@ test "rule firing does not produce proof support or mutation flags" {
     try std.testing.expectEqual(false, result.safety_flags.proof_discharged);
     try std.testing.expectEqual(false, result.safety_flags.support_granted);
 }
+
+test "validateRule validates required fields and conditions" {
+    const valid_outputs = [_]RuleOutput{.{ .kind = .unknown, .id = "out1", .summary = "sum" }};
+    const valid_rule = Rule{
+        .id = "rule1",
+        .name = "name1",
+        .all = &.{.{ .subject = "subj", .predicate = "pred" }},
+        .outputs = &valid_outputs,
+    };
+
+    // Valid minimal rule passes
+    try validateRule(valid_rule);
+
+    // Empty id rejected
+    var invalid_rule = valid_rule;
+    invalid_rule.id = "";
+    try std.testing.expectError(error.InvalidRule, validateRule(invalid_rule));
+
+    // Empty name rejected
+    invalid_rule = valid_rule;
+    invalid_rule.name = "";
+    try std.testing.expectError(error.InvalidRule, validateRule(invalid_rule));
+
+    // Missing both all/any conditions rejected
+    invalid_rule = valid_rule;
+    invalid_rule.all = &.{};
+    invalid_rule.any = &.{};
+    try std.testing.expectError(error.InvalidRule, validateRule(invalid_rule));
+
+    // Missing outputs rejected
+    invalid_rule = valid_rule;
+    invalid_rule.outputs = &.{};
+    try std.testing.expectError(error.InvalidRule, validateRule(invalid_rule));
+
+    // Empty condition subject rejected
+    invalid_rule = valid_rule;
+    invalid_rule.all = &.{.{ .subject = "", .predicate = "pred" }};
+    try std.testing.expectError(error.InvalidRule, validateRule(invalid_rule));
+
+    // Empty condition predicate rejected
+    invalid_rule = valid_rule;
+    invalid_rule.all = &.{.{ .subject = "subj", .predicate = "" }};
+    try std.testing.expectError(error.InvalidRule, validateRule(invalid_rule));
+
+    // Empty output id rejected
+    const invalid_output_id = [_]RuleOutput{.{ .kind = .unknown, .id = "", .summary = "sum" }};
+    invalid_rule = valid_rule;
+    invalid_rule.outputs = &invalid_output_id;
+    try std.testing.expectError(error.InvalidRule, validateRule(invalid_rule));
+
+    // Empty output summary rejected
+    const invalid_output_summary = [_]RuleOutput{.{ .kind = .unknown, .id = "out1", .summary = "" }};
+    invalid_rule = valid_rule;
+    invalid_rule.outputs = &invalid_output_summary;
+    try std.testing.expectError(error.InvalidRule, validateRule(invalid_rule));
+
+    // Output kind .fact rejected
+    const invalid_output_fact = [_]RuleOutput{.{ .kind = .fact, .id = "out1", .summary = "sum" }};
+    invalid_rule = valid_rule;
+    invalid_rule.outputs = &invalid_output_fact;
+    try std.testing.expectError(error.InvalidRule, validateRule(invalid_rule));
+}
