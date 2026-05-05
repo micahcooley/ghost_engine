@@ -272,7 +272,7 @@ fn blockedResult(
 // Execution Safety Boundaries:
 // - argv-token execution only: Commands are strictly executed as discrete argv arrays, not through a shell.
 // - no arbitrary shell strings: Raw strings cannot be passed for shell evaluation, mitigating injection risks.
-// - workspace confinement expectations: Execution paths and arguments must resolve strictly within the designated workspace root to prevent escapes.
+// - workspace confinement: The working directory must remain under the workspace root. Callers must only approve argv that are safe for that workspace.
 // - caller approval requirement: It is expected that the caller has already enforced any necessary permission or approval before invoking execution steps.
 fn validateStep(allocator: std.mem.Allocator, options: Options, step: Step) !Validation {
     if (step.argv.len == 0 or step.argv.len > MAX_ARG_COUNT) return error.InvalidExecutionStep;

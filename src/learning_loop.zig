@@ -391,9 +391,19 @@ test "LearningLoopPlan struct invariants: plan is read-only and candidate-only b
         .plan_id = "test",
         .autopsy_schema_version = "v1",
     };
+    try std.testing.expectEqualStrings(SCHEMA_VERSION, plan.schema_version);
+    try std.testing.expectEqualStrings("project_autopsy", plan.source);
+    try std.testing.expectEqualStrings("draft", plan.state);
     try std.testing.expect(plan.candidate_only);
     try std.testing.expect(plan.non_authorizing);
     try std.testing.expect(plan.read_only);
+    try std.testing.expectEqual(@as(usize, 0), plan.next_steps.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.verifier_candidate_refs.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.failure_ingestion_candidates.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.correction_candidate_placeholders.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.negative_knowledge_candidate_placeholders.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.procedure_pack_candidate_placeholders.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.unknowns.len);
 }
 
 test "LearningLoopPlan struct invariants: no execution or mutation by default" {
@@ -427,6 +437,7 @@ test "VerifierCandidateRef struct invariants: approval-required and do not execu
     try std.testing.expect(ref.requires_approval);
     try std.testing.expect(!ref.executes_by_default);
     try std.testing.expect(ref.non_authorizing);
+    try std.testing.expectEqual(@as(usize, 0), ref.evidence_paths.len);
 }
 
 test "LoopPlaceholderCandidate struct invariants: explicit placeholder and non-mutating by default" {
@@ -441,4 +452,6 @@ test "LoopPlaceholderCandidate struct invariants: explicit placeholder and non-m
     try std.testing.expect(placeholder.non_authorizing);
     try std.testing.expect(!placeholder.mutates_state);
     try std.testing.expect(!placeholder.applies_by_default);
+    try std.testing.expectEqual(@as(usize, 0), placeholder.related_autopsy_ids.len);
+    try std.testing.expectEqual(@as(usize, 0), placeholder.evidence_paths.len);
 }
