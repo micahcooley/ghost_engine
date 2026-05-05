@@ -6027,6 +6027,72 @@ test "corpus ask applies accepted reviewed correction influence without proof or
     try std.testing.expectEqual(@as(usize, 0), other.correction_influences.len);
 }
 
+test "corpus ask promotes matching reviewed correction above contradictory live evidence" {
+    const allocator = std.testing.allocator;
+    const project_shard = "corpus-ask-sovereign-correction-test";
+    var corpus_fixture = std.testing.tmpDir(.{});
+    defer corpus_fixture.cleanup();
+    const corpus_root = try corpus_fixture.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+    try writeFixtureFile(corpus_fixture.dir, "entity_delta_live.md",
+        \\# Entity Delta Live Sensor
+        \\Entity-Delta is not authorized because sensor reading 800 exceeds limit 750.
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.root_abs_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.root_abs_path) catch {};
+
+    var stage_result = try corpus_ingest.stage(allocator, .{
+        .corpus_path = corpus_root,
+        .project_shard = project_shard,
+        .trust_class = .project,
+        .source_label = "entity-delta-live",
+    });
+    defer stage_result.deinit();
+    try corpus_ingest.applyStaged(allocator, &project_paths);
+
+    var accepted = try correction_review.reviewAndAppend(allocator, .{
+        .project_shard = project_shard,
+        .decision = .accepted,
+        .reviewer_note = "human correction is sovereign for Entity-Delta",
+        .rejected_reason = null,
+        .source_candidate_id = "correction:candidate:entity-delta-authority",
+        .correction_candidate_json =
+        \\{"id":"correction:candidate:entity-delta-authority","originalOperationKind":"corpus.ask","originalRequestSummary":"Is Entity-Delta authorized?","disputedOutput":{"kind":"answerDraft","summary":"Entity-Delta is not authorized because sensor reading 800 exceeds limit 750."},"userCorrection":"Entity-Delta authorized reading 740 within limit 750","correctionType":"wrong_answer"}
+        ,
+        .accepted_learning_outputs_json = "[{\"kind\":\"corpus_update_candidate\",\"status\":\"candidate\"}]",
+    });
+    defer accepted.deinit();
+
+    var result = try corpus_ask.ask(allocator, .{
+        .question = "Is Entity-Delta authorized?",
+        .project_shard = project_shard,
+        .max_snippet_bytes = 128,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(corpus_ask.AskStatus.answered, result.status);
+    try std.testing.expect(result.answer_draft != null);
+    try std.testing.expectEqualStrings("Authorized: Entity-Delta (740) is within limits (750).", result.answer_draft.?);
+    try std.testing.expectEqual(@as(usize, 1), result.evidence_used.len);
+    try std.testing.expectEqual(@as(usize, 0), result.evidence_used[0].rank);
+    try std.testing.expect(std.mem.indexOf(u8, result.evidence_used[0].path, "reviewed_corrections.jsonl") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.evidence_used[0].reason, "authority_rank_0") != null);
+    try std.testing.expectEqual(@as(usize, 1), result.suppressed_evidence.len);
+    try std.testing.expectEqualStrings("suppressed_by_authority", result.suppressed_evidence[0].reason);
+
+    const rendered = try corpus_ask.renderJson(allocator, &result);
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"answerDraft\":\"Authorized: Entity-Delta (740) is within limits (750).\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "reviewed_corrections.jsonl") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "suppressed_by_authority") != null);
+}
+
 test "corpus ingest supports explicit partial batches and live merge" {
     const allocator = std.testing.allocator;
     const project_shard = "corpus-ingest-partial-batch-test";

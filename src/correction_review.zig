@@ -97,6 +97,8 @@ pub const AcceptedCorrectionInfluence = struct {
     operation_kind: []u8,
     correction_type: []u8,
     matched_pattern: []u8,
+    original_request_summary: []u8,
+    user_correction: []u8,
     disputed_output_fingerprint: []u8,
     non_authorizing: bool = true,
     treated_as_proof: bool = false,
@@ -111,6 +113,8 @@ pub const AcceptedCorrectionInfluence = struct {
         allocator.free(self.operation_kind);
         allocator.free(self.correction_type);
         allocator.free(self.matched_pattern);
+        allocator.free(self.original_request_summary);
+        allocator.free(self.user_correction);
         allocator.free(self.disputed_output_fingerprint);
         self.* = undefined;
     }
@@ -977,6 +981,8 @@ fn influenceFromRecord(allocator: std.mem.Allocator, obj: std.json.ObjectMap, li
         .operation_kind = try allocator.dupe(u8, operation_kind),
         .correction_type = try allocator.dupe(u8, correction_type),
         .matched_pattern = try allocator.dupe(u8, pattern),
+        .original_request_summary = try allocator.dupe(u8, original_summary orelse ""),
+        .user_correction = try allocator.dupe(u8, user_correction orelse ""),
         .disputed_output_fingerprint = fingerprint,
     };
 }

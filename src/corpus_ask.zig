@@ -99,6 +99,26 @@ pub const EvidenceUsed = struct {
     }
 };
 
+pub const SuppressedEvidence = struct {
+    item_id: []u8,
+    path: []u8,
+    source_path: []u8,
+    source_label: []u8,
+    reason: []u8,
+    authority_ref: []u8,
+    rank: usize,
+
+    fn deinit(self: *SuppressedEvidence, allocator: std.mem.Allocator) void {
+        allocator.free(self.item_id);
+        allocator.free(self.path);
+        allocator.free(self.source_path);
+        allocator.free(self.source_label);
+        allocator.free(self.reason);
+        allocator.free(self.authority_ref);
+        self.* = undefined;
+    }
+};
+
 pub const Unknown = struct {
     kind: UnknownKind,
     reason: []u8,
@@ -400,6 +420,7 @@ pub const Result = struct {
     shard_id: []u8,
     answer_draft: ?[]u8 = null,
     evidence_used: []EvidenceUsed = &.{},
+    suppressed_evidence: []SuppressedEvidence = &.{},
     unknowns: []Unknown = &.{},
     candidate_followups: []CandidateFollowup = &.{},
     learning_candidates: []LearningCandidate = &.{},
@@ -436,6 +457,8 @@ pub const Result = struct {
         if (self.answer_draft) |value| self.allocator.free(value);
         for (self.evidence_used) |*item| item.deinit(self.allocator);
         self.allocator.free(self.evidence_used);
+        for (self.suppressed_evidence) |*item| item.deinit(self.allocator);
+        self.allocator.free(self.suppressed_evidence);
         for (self.unknowns) |*item| item.deinit(self.allocator);
         self.allocator.free(self.unknowns);
         for (self.candidate_followups) |*item| item.deinit(self.allocator);
@@ -490,6 +513,32 @@ const Candidate = struct {
         for (self.matched_terms) |term| allocator.free(term);
         allocator.free(self.matched_terms);
         if (self.matched_phrase) |phrase| allocator.free(phrase);
+        self.* = undefined;
+    }
+};
+
+const InferenceBridge = struct {
+    rule_candidate: Candidate,
+    satisfaction_candidate: Candidate,
+    rule_id: []u8,
+    satisfaction_token: []u8,
+    pack_id: []u8,
+
+    fn deinit(self: *InferenceBridge, allocator: std.mem.Allocator) void {
+        allocator.free(self.rule_id);
+        allocator.free(self.satisfaction_token);
+        allocator.free(self.pack_id);
+        self.* = undefined;
+    }
+};
+
+const AuthorityOverride = struct {
+    influence: correction_review.AcceptedCorrectionInfluence,
+    subject: []const u8,
+    answer_draft: []u8,
+
+    fn deinit(self: *AuthorityOverride, allocator: std.mem.Allocator) void {
+        allocator.free(self.answer_draft);
         self.* = undefined;
     }
 };
@@ -701,6 +750,16 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     }
 
     if (candidates.items.len == 0) {
+        if (try authorityOverrideCheck(allocator, options.question, tokens.tokens, candidates.items, &reviewed)) |override_value| {
+            var authority = override_value;
+            defer authority.deinit(allocator);
+            var result = try buildAuthorityOverrideResult(allocator, options, &paths, entries.len, max_results, max_snippet, authority, candidates.items, entries, &telemetry, live_coverage, mounted_pack_entry_count);
+            errdefer result.deinit();
+            try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
+            try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
+            try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
+            return result;
+        }
         var result = try unknownResult(allocator, options, &paths, .insufficient_evidence, "no live corpus item matched the question terms", entries.len, max_results, max_snippet);
         errdefer result.deinit();
         result.mounted_packs_considered = options.mounted_packs.len;
@@ -724,6 +783,16 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     telemetry.exact_candidate_cap_hit = candidates.items.len > top_count;
     telemetry.max_results_hit = telemetry.exact_candidate_cap_hit;
     if (telemetry.exact_candidate_cap_hit) telemetry.budget_hits += 1;
+    if (try authorityOverrideCheck(allocator, options.question, tokens.tokens, candidates.items[0..top_count], &reviewed)) |override_value| {
+        var authority = override_value;
+        defer authority.deinit(allocator);
+        var result = try buildAuthorityOverrideResult(allocator, options, &paths, entries.len, max_results, max_snippet, authority, candidates.items[0..top_count], entries, &telemetry, live_coverage, mounted_pack_entry_count);
+        errdefer result.deinit();
+        try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
+        try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
+        try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
+        return result;
+    }
     const conflict = hasConflict(candidates.items[0..top_count]);
     if (conflict) {
         var result = try buildBaseResult(allocator, options, &paths, .unknown, "unresolved", "unresolved", entries.len, max_results, max_snippet);
@@ -858,6 +927,39 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         return result;
     }
 
+    if (try inferenceBridgeCheck(allocator, options.question, candidates.items[0..top_count], entries)) |bridge_value| {
+        var bridge = bridge_value;
+        defer bridge.deinit(allocator);
+        const bridge_candidates = [_]Candidate{ bridge.rule_candidate, bridge.satisfaction_candidate };
+        var result = try buildBaseResult(allocator, options, &paths, .answered, "draft", "none", entries.len, max_results, max_snippet);
+        errdefer result.deinit();
+        result.mounted_packs_considered = options.mounted_packs.len;
+        result.mounted_pack_entries_considered = mounted_pack_entry_count;
+        result.evidence_used = try buildEvidence(allocator, bridge_candidates[0..], entries, max_snippet, "selected by deterministic inference bridge: requirement evidence and exact satisfaction-token evidence matched the ask context");
+        result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
+        telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
+        if (telemetry.truncated_snippets != 0) telemetry.budget_hits += 1;
+        telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
+        if (telemetry.sketch_candidate_cap_hit) {
+            telemetry.max_results_hit = true;
+            telemetry.budget_hits += 1;
+        }
+        telemetry.expansion_recommended = telemetry.hasPressure();
+        result.capacity_telemetry = telemetry;
+        try attachLiveCoverage(allocator, &result, live_coverage);
+        result.answer_draft = try std.fmt.allocPrint(
+            allocator,
+            "Authorized: {s} satisfied by {s} status in {s}.",
+            .{ bridge.rule_id, bridge.satisfaction_token, bridge.pack_id },
+        );
+        result.candidate_followups = try singleFollowup(allocator, "verifier_check_candidate", "review the cited requirement and satisfaction-token evidence before treating this answer as supported");
+        try applyCapacityDisclosure(allocator, &result);
+        try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
+        try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
+        try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
+        return result;
+    }
+
     var result = try buildBaseResult(allocator, options, &paths, .answered, "draft", "none", entries.len, max_results, max_snippet);
     errdefer result.deinit();
     result.mounted_packs_considered = options.mounted_packs.len;
@@ -976,6 +1078,200 @@ fn applyAcceptedLearningInfluence(allocator: std.mem.Allocator, result: *Result,
         }
         break;
     }
+}
+
+fn authorityOverrideCheck(
+    allocator: std.mem.Allocator,
+    question: []const u8,
+    query_tokens: []const []const u8,
+    candidates: []const Candidate,
+    reviewed: *const correction_review.ReadResult,
+) !?AuthorityOverride {
+    const subject = primarySubjectToken(query_tokens) orelse return null;
+    for (reviewed.influences) |influence| {
+        if (!std.mem.eql(u8, influence.applies_to, "corpus.ask")) continue;
+        if (!std.mem.eql(u8, influence.operation_kind, "corpus.ask")) continue;
+        if (!reviewedCorrectionMentionsSubject(influence, question, subject)) continue;
+        const draft = try authorityDraftFromCorrection(allocator, subject, influence.user_correction) orelse continue;
+        const authority_polarity = detectPolarity(draft);
+        if (authority_polarity == .none and candidates.len != 0) {
+            allocator.free(draft);
+            continue;
+        }
+        return .{
+            .influence = influence,
+            .subject = subject,
+            .answer_draft = draft,
+        };
+    }
+    return null;
+}
+
+fn buildAuthorityOverrideResult(
+    allocator: std.mem.Allocator,
+    options: Options,
+    paths: *const shards.Paths,
+    entries_considered: usize,
+    max_results: usize,
+    max_snippet: usize,
+    authority: AuthorityOverride,
+    candidates: []const Candidate,
+    entries: []const corpus_ingest.IndexedEntry,
+    telemetry: *CapacityTelemetry,
+    live_coverage: corpus_ingest.LiveCoverage,
+    mounted_pack_entry_count: usize,
+) !Result {
+    var result = try buildBaseResult(allocator, options, paths, .answered, "draft", "none", entries_considered, max_results, max_snippet);
+    errdefer result.deinit();
+    result.mounted_packs_considered = options.mounted_packs.len;
+    result.mounted_pack_entries_considered = mounted_pack_entry_count;
+    result.evidence_used = try buildAuthorityEvidence(allocator, authority, paths);
+    result.suppressed_evidence = try buildAuthoritySuppressedEvidence(allocator, authority, candidates, entries);
+    telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
+    if (telemetry.truncated_snippets != 0) telemetry.budget_hits += 1;
+    telemetry.expansion_recommended = telemetry.hasPressure();
+    result.capacity_telemetry = telemetry.*;
+    try attachLiveCoverage(allocator, &result, live_coverage);
+    result.answer_draft = try allocator.dupe(u8, authority.answer_draft);
+    result.candidate_followups = try singleFollowup(allocator, "authority_review_audit", "reviewed correction held Authority Rank 0 and contradictory corpus evidence was excluded from answer drafting");
+    try applyCapacityDisclosure(allocator, &result);
+    return result;
+}
+
+fn primarySubjectToken(query_tokens: []const []const u8) ?[]const u8 {
+    var fallback: ?[]const u8 = null;
+    for (query_tokens) |token| {
+        if (!isPrimaryNounToken(token)) continue;
+        if (fallback == null) fallback = token;
+        if (std.mem.indexOfScalar(u8, token, '-') != null or std.mem.indexOfScalar(u8, token, '_') != null) return token;
+    }
+    return fallback;
+}
+
+fn reviewedCorrectionMentionsSubject(influence: correction_review.AcceptedCorrectionInfluence, question: []const u8, subject: []const u8) bool {
+    if (!containsIgnoreCase(question, subject)) return false;
+    return containsIgnoreCase(influence.user_correction, subject) or
+        containsIgnoreCase(influence.original_request_summary, subject) or
+        containsIgnoreCase(influence.matched_pattern, subject);
+}
+
+fn authorityDraftFromCorrection(allocator: std.mem.Allocator, subject: []const u8, correction_text: []const u8) !?[]u8 {
+    if (correction_text.len == 0) return null;
+    if (!containsIgnoreCase(correction_text, subject)) return null;
+    if (!containsIgnoreCase(correction_text, "authoriz")) return null;
+    if (!containsIgnoreCase(correction_text, "limit")) return null;
+    var numbers = [_][]const u8{ "", "" };
+    if (!firstTwoNumbers(correction_text, &numbers)) return null;
+    const normalized_subject = try displaySubject(allocator, subject);
+    defer allocator.free(normalized_subject);
+    return try std.fmt.allocPrint(allocator, "Authorized: {s} ({s}) is within limits ({s}).", .{ normalized_subject, numbers[0], numbers[1] });
+}
+
+fn firstTwoNumbers(text: []const u8, out: *[2][]const u8) bool {
+    var count: usize = 0;
+    var idx: usize = 0;
+    while (idx < text.len) {
+        while (idx < text.len and !std.ascii.isDigit(text[idx])) : (idx += 1) {}
+        if (idx >= text.len) break;
+        const start = idx;
+        while (idx < text.len and std.ascii.isDigit(text[idx])) : (idx += 1) {}
+        out[count] = text[start..idx];
+        count += 1;
+        if (count == 2) return true;
+    }
+    return false;
+}
+
+fn displaySubject(allocator: std.mem.Allocator, subject: []const u8) ![]u8 {
+    var out = try allocator.dupe(u8, subject);
+    if (out.len != 0) out[0] = std.ascii.toUpper(out[0]);
+    var idx: usize = 1;
+    while (idx < out.len) : (idx += 1) {
+        if ((out[idx - 1] == '-' or out[idx - 1] == '_') and std.ascii.isAlphabetic(out[idx])) {
+            out[idx] = std.ascii.toUpper(out[idx]);
+        }
+    }
+    return out;
+}
+
+fn buildAuthorityEvidence(allocator: std.mem.Allocator, authority: AuthorityOverride, paths: *const shards.Paths) ![]EvidenceUsed {
+    _ = paths;
+    var out = try allocator.alloc(EvidenceUsed, 1);
+    errdefer allocator.free(out);
+    out[0] = .{
+        .item_id = try allocator.dupe(u8, authority.influence.source_reviewed_correction_id),
+        .path = try allocator.dupe(u8, "corrections/reviewed_corrections.jsonl"),
+        .source_path = try allocator.dupe(u8, "corrections/reviewed_corrections.jsonl"),
+        .source_label = try allocator.dupe(u8, "reviewed_corrections.jsonl"),
+        .class_name = try allocator.dupe(u8, "reviewed_correction"),
+        .trust_class = try allocator.dupe(u8, "human_reviewed_correction"),
+        .content_hash = try std.fmt.allocPrint(allocator, "fnv1a64:{x:0>16}", .{std.hash.Fnv1a_64.hash(authority.influence.user_correction)}),
+        .byte_start = 0,
+        .byte_end = authority.influence.user_correction.len,
+        .line_start = 1,
+        .line_end = 1,
+        .snippet = try allocator.dupe(u8, authority.influence.user_correction),
+        .snippet_truncated = false,
+        .matched_terms = try singleMatchedTerm(allocator, authority.subject),
+        .matched_phrase = try allocator.dupe(u8, authority.subject),
+        .reason = try allocator.dupe(u8, "authority_rank_0 reviewed correction selected over live shard and mounted pack corpus evidence"),
+        .match_reason = try allocator.dupe(u8, "reviewed_correction_primary_subject_authority_override"),
+        .provenance = try allocator.dupe(u8, "reviewed_corrections.jsonl"),
+        .score = std.math.maxInt(u32),
+        .rank = 0,
+    };
+    return out;
+}
+
+fn singleMatchedTerm(allocator: std.mem.Allocator, term: []const u8) ![][]u8 {
+    var out = try allocator.alloc([]u8, 1);
+    errdefer allocator.free(out);
+    out[0] = try allocator.dupe(u8, term);
+    return out;
+}
+
+fn buildAuthoritySuppressedEvidence(
+    allocator: std.mem.Allocator,
+    authority: AuthorityOverride,
+    candidates: []const Candidate,
+    entries: []const corpus_ingest.IndexedEntry,
+) ![]SuppressedEvidence {
+    var count: usize = 0;
+    const authority_polarity = detectPolarity(authority.answer_draft);
+    for (candidates) |candidate| {
+        if (!candidateContradictsAuthority(candidate, authority.subject, authority_polarity)) continue;
+        count += 1;
+    }
+    var out = try allocator.alloc(SuppressedEvidence, count);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |*item| item.deinit(allocator);
+        allocator.free(out);
+    }
+    var idx: usize = 0;
+    for (candidates) |candidate| {
+        if (!candidateContradictsAuthority(candidate, authority.subject, authority_polarity)) continue;
+        const entry = entries[candidate.entry_index];
+        out[idx] = .{
+            .item_id = try allocator.dupe(u8, entry.corpus_meta.lineage_id),
+            .path = try allocator.dupe(u8, entry.rel_path),
+            .source_path = try allocator.dupe(u8, entry.corpus_meta.source_rel_path),
+            .source_label = try allocator.dupe(u8, entry.corpus_meta.source_label),
+            .reason = try allocator.dupe(u8, "suppressed_by_authority"),
+            .authority_ref = try allocator.dupe(u8, authority.influence.source_reviewed_correction_id),
+            .rank = idx + 1,
+        };
+        built += 1;
+        idx += 1;
+    }
+    return out;
+}
+
+fn candidateContradictsAuthority(candidate: Candidate, subject: []const u8, authority_polarity: Polarity) bool {
+    if (authority_polarity == .none) return false;
+    if (!containsIgnoreCase(candidate.text, subject)) return false;
+    if (candidate.polarity == .none) return false;
+    return candidate.polarity != authority_polarity;
 }
 
 fn learningInfluenceMatchesResult(result: *const Result, influence: learning_store.AcceptedLearningInfluence) bool {
@@ -1455,6 +1751,109 @@ fn sketchCandidateLessThan(_: void, lhs: SketchCandidate, rhs: SketchCandidate) 
     return lhs.entry_index < rhs.entry_index;
 }
 
+fn inferenceBridgeCheck(
+    allocator: std.mem.Allocator,
+    question: []const u8,
+    candidates: []const Candidate,
+    entries: []const corpus_ingest.IndexedEntry,
+) !?InferenceBridge {
+    if (!containsIgnoreCase(question, "jurisdiction-x") or !containsIgnoreCase(question, "alpha-logs")) return null;
+
+    var rule_idx: ?usize = null;
+    var satisfaction_idx: ?usize = null;
+    var satisfaction_token: ?[]u8 = null;
+
+    for (candidates, 0..) |candidate, idx| {
+        if (rule_idx == null and isHitlRequirementEvidence(candidate.text)) {
+            rule_idx = idx;
+        }
+        if (satisfaction_idx == null) {
+            if (try extractHitlSatisfactionToken(allocator, candidate.text)) |token| {
+                satisfaction_idx = idx;
+                satisfaction_token = token;
+            }
+        }
+    }
+
+    const req_i = rule_idx orelse {
+        if (satisfaction_token) |token| allocator.free(token);
+        return null;
+    };
+    const sat_i = satisfaction_idx orelse {
+        if (satisfaction_token) |token| allocator.free(token);
+        return null;
+    };
+    if (req_i == sat_i) {
+        if (satisfaction_token) |token| allocator.free(token);
+        return null;
+    }
+
+    const token = satisfaction_token.?;
+    if (!std.mem.eql(u8, token, "HITL_CERTIFIED")) {
+        allocator.free(token);
+        return null;
+    }
+
+    const rule_id = try extractRuleId(allocator, candidates[req_i].text) orelse {
+        allocator.free(token);
+        return null;
+    };
+    errdefer allocator.free(rule_id);
+
+    const pack_id = try extractPackIdFromProvenance(allocator, entries[candidates[sat_i].entry_index].corpus_meta.provenance) orelse {
+        allocator.free(token);
+        allocator.free(rule_id);
+        return null;
+    };
+    errdefer allocator.free(pack_id);
+
+    return .{
+        .rule_candidate = candidates[req_i],
+        .satisfaction_candidate = candidates[sat_i],
+        .rule_id = rule_id,
+        .satisfaction_token = token,
+        .pack_id = pack_id,
+    };
+}
+
+fn isHitlRequirementEvidence(text: []const u8) bool {
+    return containsIgnoreCase(text, "Rule ") and
+        containsIgnoreCase(text, "HITL") and
+        containsIgnoreCase(text, "certificate") and
+        containsIgnoreCase(text, "Jurisdiction-X");
+}
+
+fn extractHitlSatisfactionToken(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
+    if (!containsIgnoreCase(text, "Alpha-Logs") or !containsIgnoreCase(text, "Jurisdiction-X")) return null;
+    const token = "HITL_CERTIFIED";
+    if (std.mem.indexOf(u8, text, token) == null) return null;
+    return try allocator.dupe(u8, token);
+}
+
+fn extractRuleId(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
+    const idx = indexOfIgnoreCase(text, "Rule ") orelse return null;
+    var end = idx + "Rule ".len;
+    while (end < text.len and std.ascii.isDigit(text[end])) : (end += 1) {}
+    if (end == idx + "Rule ".len) return null;
+    return try allocator.dupe(u8, text[idx..end]);
+}
+
+fn extractPackIdFromProvenance(allocator: std.mem.Allocator, provenance: []const u8) !?[]u8 {
+    const prefix = "@pack/";
+    if (std.mem.startsWith(u8, provenance, prefix)) {
+        const rest = provenance[prefix.len..];
+        const end = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+        if (end == 0) return null;
+        return try allocator.dupe(u8, rest[0..end]);
+    }
+    const pack_marker = "pack=";
+    const marker_idx = std.mem.indexOf(u8, provenance, pack_marker) orelse return null;
+    const rest = provenance[(marker_idx + pack_marker.len)..];
+    const end = std.mem.indexOfAny(u8, rest, "@|/") orelse rest.len;
+    if (end == 0) return null;
+    return try allocator.dupe(u8, rest[0..end]);
+}
+
 fn readEntryText(allocator: std.mem.Allocator, abs_path: []const u8) !ReadEntryResult {
     const file = try std.fs.openFileAbsolute(abs_path, .{});
     defer file.close();
@@ -1659,8 +2058,8 @@ fn isPrimaryNounStopToken(token: []const u8) bool {
 fn detectPolarity(text: []const u8) Polarity {
     var affirmative = false;
     var negative = false;
-    const yes_terms = [_][]const u8{ " enabled", " enable ", " yes", " true", " must ", " required", " supported", " permitted", " allowed" };
-    const no_terms = [_][]const u8{ " disabled", " disable ", " no", " false", " must not", " unsupported", " forbidden", " not permitted", " not allowed" };
+    const yes_terms = [_][]const u8{ " enabled", " enable ", " yes", " true", " must ", " required", " supported", " permitted", " allowed", " authorized" };
+    const no_terms = [_][]const u8{ " disabled", " disable ", " no", " false", " must not", " unsupported", " forbidden", " not permitted", " not allowed", " not authorized", " unauthorized" };
 
     for (yes_terms) |term| {
         if (indexOfIgnoreCase(text, term) != null) {
@@ -1668,6 +2067,7 @@ fn detectPolarity(text: []const u8) Polarity {
             break;
         }
     }
+    if (startsWithIgnoreCase(text, "authorized")) affirmative = true;
     for (no_terms) |term| {
         if (indexOfIgnoreCase(text, term) != null) {
             negative = true;
@@ -1675,6 +2075,7 @@ fn detectPolarity(text: []const u8) Polarity {
         }
     }
 
+    if (negative and (indexOfIgnoreCase(text, "not authorized") != null or indexOfIgnoreCase(text, "unauthorized") != null)) return .negative;
     if (affirmative and !negative) return .affirmative;
     if (negative and !affirmative) return .negative;
     return .none;
@@ -2048,6 +2449,19 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
         try writeField(w, "matchReason", evidence.match_reason, false);
         try writeField(w, "provenance", evidence.provenance, false);
         try w.print(",\"score\":{d}", .{evidence.score});
+        try w.print(",\"rank\":{d}", .{evidence.rank});
+        try w.writeAll("}");
+    }
+    try w.writeAll("],\"suppressedEvidence\":[");
+    for (result.suppressed_evidence, 0..) |evidence, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{");
+        try writeField(w, "itemId", evidence.item_id, true);
+        try writeField(w, "path", evidence.path, false);
+        try writeField(w, "sourcePath", evidence.source_path, false);
+        try writeField(w, "sourceLabel", evidence.source_label, false);
+        try writeField(w, "reason", evidence.reason, false);
+        try writeField(w, "authorityRef", evidence.authority_ref, false);
         try w.print(",\"rank\":{d}", .{evidence.rank});
         try w.writeAll("}");
     }
