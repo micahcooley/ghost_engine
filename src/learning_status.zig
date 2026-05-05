@@ -1,9 +1,10 @@
 const std = @import("std");
 const correction_review = @import("correction_review.zig");
 const negative_knowledge_review = @import("negative_knowledge_review.zig");
+const learning_store = @import("learning_store.zig");
 const shards = @import("shards.zig");
 
-pub const MAX_LEARNING_STATUS_RECORDS: usize = @min(correction_review.MAX_REVIEWED_CORRECTIONS_READ, negative_knowledge_review.MAX_REVIEWED_NEGATIVE_KNOWLEDGE_READ);
+pub const MAX_LEARNING_STATUS_RECORDS: usize = @min(@min(correction_review.MAX_REVIEWED_CORRECTIONS_READ, negative_knowledge_review.MAX_REVIEWED_NEGATIVE_KNOWLEDGE_READ), learning_store.MAX_LEARNED_RECORDS_READ);
 
 pub const Request = struct {
     project_shard: []const u8,
@@ -55,6 +56,7 @@ pub const NegativeKnowledgeSummary = struct {
 pub const WarningSummary = struct {
     malformed_reviewed_correction_lines: usize = 0,
     malformed_reviewed_negative_knowledge_lines: usize = 0,
+    malformed_reviewed_learning_lines: usize = 0,
     capacity_warnings: usize = 0,
     unknown_or_unclassified_records: usize = 0,
     read_caps_hit: bool = false,
@@ -72,6 +74,11 @@ pub const CapacityTelemetry = struct {
     negative_knowledge_read_cap_hit: bool = false,
     negative_knowledge_max_bytes: usize = negative_knowledge_review.MAX_REVIEWED_NEGATIVE_KNOWLEDGE_BYTES,
     negative_knowledge_byte_cap_hit: bool = false,
+    learning_records_read: usize = 0,
+    learning_max_records: usize = learning_store.MAX_LEARNED_RECORDS_READ,
+    learning_read_cap_hit: bool = false,
+    learning_max_bytes: usize = learning_store.MAX_LEARNED_RECORDS_BYTES,
+    learning_byte_cap_hit: bool = false,
     include_records: bool = false,
     limit: usize = 0,
     returned_records: usize = 0,
@@ -81,6 +88,7 @@ pub const CapacityTelemetry = struct {
 pub const StorageSummary = struct {
     correction_missing_file: bool = false,
     negative_knowledge_missing_file: bool = false,
+    learning_missing_file: bool = false,
 };
 
 pub const StatusResult = struct {
@@ -88,6 +96,7 @@ pub const StatusResult = struct {
     project_shard: []u8,
     correction_status: correction_review.InfluenceStatusResult,
     negative_knowledge_summary: NegativeKnowledgeSummary,
+    learning_status: learning_store.StatusResult,
     negative_knowledge_warnings: []negative_knowledge_review.ReadWarning,
     records: []RecordSample,
     warning_summary: WarningSummary,
@@ -98,6 +107,7 @@ pub const StatusResult = struct {
         self.allocator.free(self.project_shard);
         self.correction_status.deinit();
         self.negative_knowledge_summary.deinit(self.allocator);
+        self.learning_status.deinit();
         for (self.negative_knowledge_warnings) |*warning| warning.deinit(self.allocator);
         self.allocator.free(self.negative_knowledge_warnings);
         for (self.records) |*record| record.deinit(self.allocator);
@@ -125,6 +135,8 @@ pub fn readStatus(allocator: std.mem.Allocator, request: Request) !StatusResult 
 
     var nk_status = try readNegativeKnowledgeStatus(allocator, request.project_shard, request.include_records, limit);
     errdefer nk_status.deinit(allocator);
+    var learned_status = try learning_store.status(allocator, request.project_shard, request.include_records, limit, learning_store.MAX_LEARNED_RECORDS_READ);
+    errdefer learned_status.deinit();
 
     var records = std.ArrayList(RecordSample).init(allocator);
     errdefer {
@@ -152,24 +164,38 @@ pub fn readStatus(allocator: std.mem.Allocator, request: Request) !StatusResult 
                 .line_number = record.line_number,
             });
         }
+        for (learned_status.records) |record| {
+            if (records.items.len >= limit) break;
+            try records.append(.{
+                .kind = try allocator.dupe(u8, "reviewed_learning"),
+                .id = try allocator.dupe(u8, record.id),
+                .decision = try allocator.dupe(u8, @tagName(record.decision)),
+                .record_json = try allocator.dupe(u8, record.record_json),
+                .line_number = record.line_number,
+            });
+        }
     }
 
     const correction_read_cap_hit = correction_status.max_records_hit;
     const nk_read_cap_hit = nk_status.max_records_hit;
+    const learning_read_cap_hit = learned_status.max_records_hit;
     const correction_byte_cap_hit = correction_status.truncated;
     const nk_byte_cap_hit = nk_status.truncated;
+    const learning_byte_cap_hit = learned_status.truncated;
     const limit_hit = request.include_records and (correction_status.limit_hit or nk_status.limit_hit or records.items.len >= limit) and
-        (correction_status.summary.total_records + nk_status.summary.reviewed_records > records.items.len);
+        (correction_status.summary.total_records + nk_status.summary.reviewed_records + learned_status.summary.reviewed_records > records.items.len);
 
     const warning_summary = WarningSummary{
         .malformed_reviewed_correction_lines = correction_status.summary.malformed_lines,
         .malformed_reviewed_negative_knowledge_lines = nk_status.summary.malformed_lines,
+        .malformed_reviewed_learning_lines = learned_status.summary.malformed_lines,
         .capacity_warnings = @as(usize, if (correction_read_cap_hit) 1 else 0) + @as(usize, if (nk_read_cap_hit) 1 else 0) +
-            @as(usize, if (correction_byte_cap_hit) 1 else 0) + @as(usize, if (nk_byte_cap_hit) 1 else 0),
+            @as(usize, if (learning_read_cap_hit) 1 else 0) + @as(usize, if (correction_byte_cap_hit) 1 else 0) +
+            @as(usize, if (nk_byte_cap_hit) 1 else 0) + @as(usize, if (learning_byte_cap_hit) 1 else 0),
         .unknown_or_unclassified_records = countEntryValue(correction_status.summary.influence_kind_counts, "unknownInfluenceCandidate") +
             countEntryValue(nk_status.summary.influence_kind_counts, "unknownInfluenceCandidate"),
-        .read_caps_hit = correction_read_cap_hit or nk_read_cap_hit,
-        .byte_caps_hit = correction_byte_cap_hit or nk_byte_cap_hit,
+        .read_caps_hit = correction_read_cap_hit or nk_read_cap_hit or learning_read_cap_hit,
+        .byte_caps_hit = correction_byte_cap_hit or nk_byte_cap_hit or learning_byte_cap_hit,
     };
 
     const returned_records = records.items.len;
@@ -181,6 +207,7 @@ pub fn readStatus(allocator: std.mem.Allocator, request: Request) !StatusResult 
         .project_shard = try allocator.dupe(u8, request.project_shard),
         .correction_status = correction_status,
         .negative_knowledge_summary = nk_status.summary,
+        .learning_status = learned_status,
         .negative_knowledge_warnings = try nk_status.warnings.toOwnedSlice(),
         .records = try records.toOwnedSlice(),
         .warning_summary = warning_summary,
@@ -191,6 +218,9 @@ pub fn readStatus(allocator: std.mem.Allocator, request: Request) !StatusResult 
             .negative_knowledge_records_read = nk_status.records_read,
             .negative_knowledge_read_cap_hit = nk_read_cap_hit,
             .negative_knowledge_byte_cap_hit = nk_byte_cap_hit,
+            .learning_records_read = learned_status.records_read,
+            .learning_read_cap_hit = learning_read_cap_hit,
+            .learning_byte_cap_hit = learning_byte_cap_hit,
             .include_records = request.include_records,
             .limit = limit,
             .returned_records = returned_records,
@@ -199,6 +229,7 @@ pub fn readStatus(allocator: std.mem.Allocator, request: Request) !StatusResult 
         .storage = .{
             .correction_missing_file = correction_status.missing_file,
             .negative_knowledge_missing_file = nk_status.missing_file,
+            .learning_missing_file = learned_status.missing_file,
         },
     };
 }

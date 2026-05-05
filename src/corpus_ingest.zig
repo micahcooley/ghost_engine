@@ -3,6 +3,7 @@ const abstractions = @import("abstractions.zig");
 const config = @import("config.zig");
 const external_evidence = @import("external_evidence.zig");
 const ghost_state = @import("ghost_state.zig");
+const knowledge_pack_store = @import("knowledge_pack_store.zig");
 const shards = @import("shards.zig");
 const vsa = @import("vsa_core.zig");
 
@@ -187,6 +188,11 @@ pub const IndexedEntry = struct {
         self.corpus_meta.deinit();
         self.* = undefined;
     }
+};
+
+pub const MountedPackRef = struct {
+    pack_id: []const u8,
+    pack_version: []const u8 = "v1",
 };
 
 const RootHint = enum {
@@ -484,6 +490,64 @@ pub fn collectLiveScanEntries(allocator: std.mem.Allocator, paths: *const shards
                 .lineage_version = item.lineage_version,
             },
         });
+    }
+
+    return out.toOwnedSlice();
+}
+
+pub fn collectComposedLiveScanEntries(
+    allocator: std.mem.Allocator,
+    paths: *const shards.Paths,
+    mounted_packs: []const MountedPackRef,
+) ![]IndexedEntry {
+    const live_entries = try collectLiveScanEntries(allocator, paths);
+    var live_entries_moved = false;
+    errdefer if (!live_entries_moved) deinitIndexedEntries(allocator, live_entries);
+    if (mounted_packs.len == 0) return live_entries;
+
+    var out = std.ArrayList(IndexedEntry).init(allocator);
+    errdefer {
+        for (out.items) |*item| item.deinit();
+        out.deinit();
+    }
+
+    try out.ensureTotalCapacity(live_entries.len);
+    for (live_entries) |entry| {
+        out.appendAssumeCapacity(entry);
+    }
+    allocator.free(live_entries);
+    live_entries_moved = true;
+
+    for (mounted_packs) |mounted_pack| {
+        const safe_pack_id = try knowledge_pack_store.sanitizePackId(allocator, mounted_pack.pack_id);
+        defer allocator.free(safe_pack_id);
+        const safe_pack_version = try knowledge_pack_store.sanitizeVersion(allocator, mounted_pack.pack_version);
+        defer allocator.free(safe_pack_version);
+
+        var manifest = try knowledge_pack_store.loadManifest(allocator, safe_pack_id, safe_pack_version);
+        defer manifest.deinit();
+        const root_abs_path = try knowledge_pack_store.packRootAbsPath(allocator, safe_pack_id, safe_pack_version);
+        defer allocator.free(root_abs_path);
+        const corpus_manifest_abs_path = try std.fs.path.join(allocator, &.{ root_abs_path, manifest.storage.corpus_manifest_rel_path });
+        defer allocator.free(corpus_manifest_abs_path);
+        const corpus_files_abs_path = try std.fs.path.join(allocator, &.{ root_abs_path, manifest.storage.corpus_files_rel_path });
+        defer allocator.free(corpus_files_abs_path);
+
+        const pack_entries = try collectPackScanEntries(
+            allocator,
+            safe_pack_id,
+            safe_pack_version,
+            corpus_manifest_abs_path,
+            corpus_files_abs_path,
+        );
+        var pack_entries_moved = false;
+        errdefer if (!pack_entries_moved) deinitIndexedEntries(allocator, pack_entries);
+        try out.ensureUnusedCapacity(pack_entries.len);
+        for (pack_entries) |entry| {
+            out.appendAssumeCapacity(entry);
+        }
+        allocator.free(pack_entries);
+        pack_entries_moved = true;
     }
 
     return out.toOwnedSlice();
@@ -1825,9 +1889,9 @@ fn loadManifestFromPath(allocator: std.mem.Allocator, abs_path: []const u8) !str
         try manifest.concepts.append(.{
             .allocator = allocator,
             .concept_id = try allocator.dupe(u8, concept.conceptId),
-            .tier = parseTier(concept.tier) orelse return error.InvalidCorpusManifest,
-            .category = parseCategory(concept.category) orelse return error.InvalidCorpusManifest,
-            .trust_class = abstractions.parseTrustClassName(concept.trustClass) orelse return error.InvalidCorpusManifest,
+            .tier = try parseTier(concept.tier),
+            .category = try parseCategory(concept.category),
+            .trust_class = abstractions.parseTrustClassName(concept.trustClass) orelse return error.InvalidManifestMetadata,
             .lineage_id = try allocator.dupe(u8, concept.lineageId),
             .lineage_version = concept.lineageVersion,
             .source_specs = try cloneStringSlice(allocator, concept.sourceSpecs),
@@ -1881,22 +1945,26 @@ fn parseRejectReason(text: []const u8) ?RejectReason {
     return null;
 }
 
-fn parseTier(text: []const u8) ?abstractions.Tier {
+fn parseTier(text: []const u8) !abstractions.Tier {
     if (std.mem.eql(u8, text, "pattern")) return .pattern;
-    if (std.mem.eql(u8, text, "convention")) return .convention;
+    if (std.mem.eql(u8, text, "convention") or std.mem.eql(u8, text, "idiom")) return .convention;
     if (std.mem.eql(u8, text, "logic")) return .logic;
     if (std.mem.eql(u8, text, "contract")) return .contract;
-    return null;
+
+    std.debug.print("Invalid manifest tier: '{s}'. Supported tiers: pattern, convention, logic, contract. (Hint: 'idiom' is automatically mapped to 'convention')\n", .{text});
+    return error.InvalidManifestMetadata;
 }
 
-fn parseCategory(text: []const u8) ?abstractions.Category {
+fn parseCategory(text: []const u8) !abstractions.Category {
     if (std.mem.eql(u8, text, "structural")) return .structural;
     if (std.mem.eql(u8, text, "procedural")) return .procedural;
     if (std.mem.eql(u8, text, "relational")) return .relational;
-    if (std.mem.eql(u8, text, "boundary")) return .boundary;
+    if (std.mem.eql(u8, text, "boundary") or std.mem.eql(u8, text, "interface")) return .boundary;
     if (std.mem.eql(u8, text, "state")) return .state;
     if (std.mem.eql(u8, text, "invariant")) return .invariant;
-    return null;
+
+    std.debug.print("Invalid manifest category: '{s}'. Supported categories: structural, procedural, relational, boundary, state, invariant. (Hint: 'interface' is automatically mapped to 'boundary')\n", .{text});
+    return error.InvalidManifestMetadata;
 }
 
 fn pathExists(abs_path: []const u8) bool {

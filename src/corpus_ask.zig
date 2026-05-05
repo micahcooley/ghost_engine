@@ -4,6 +4,7 @@ const corpus_ingest = @import("corpus_ingest.zig");
 const corpus_sketch = @import("corpus_sketch.zig");
 const correction_review = @import("correction_review.zig");
 const negative_knowledge_review = @import("negative_knowledge_review.zig");
+const learning_store = @import("learning_store.zig");
 const shards = @import("shards.zig");
 
 pub const DEFAULT_MAX_RESULTS: usize = 3;
@@ -15,6 +16,8 @@ const MAX_QUERY_TOKENS: usize = 16;
 const MIN_TOKEN_LEN: usize = 3;
 const MAX_SKETCH_CANDIDATES: usize = 8;
 const MAX_SIMHASH_DISTANCE: u7 = 24;
+
+pub const MountedPackRef = corpus_ingest.MountedPackRef;
 
 pub const AskStatus = enum {
     answered,
@@ -48,6 +51,7 @@ pub const CorrectionMutationFlags = struct {
 pub const Options = struct {
     question: []const u8,
     project_shard: ?[]const u8 = null,
+    mounted_packs: []const MountedPackRef = &.{},
     max_results: usize = DEFAULT_MAX_RESULTS,
     max_snippet_bytes: usize = DEFAULT_MAX_SNIPPET_BYTES,
     require_citations: bool = true,
@@ -116,18 +120,22 @@ pub const CandidateFollowup = struct {
 };
 
 pub const LearningCandidate = struct {
+    id: []u8,
     candidate_kind: []u8,
     proposed_action: []u8,
     reason: []u8,
+    logic_pattern: []u8,
     candidate_only: bool = true,
     non_authorizing: bool = true,
     treated_as_proof: bool = false,
     persisted: bool = false,
 
     fn deinit(self: *LearningCandidate, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
         allocator.free(self.candidate_kind);
         allocator.free(self.proposed_action);
         allocator.free(self.reason);
+        allocator.free(self.logic_pattern);
         self.* = undefined;
     }
 };
@@ -253,6 +261,33 @@ pub const NegativeKnowledgeInfluence = struct {
     }
 };
 
+pub const LearningInfluence = struct {
+    id: []u8,
+    source_reviewed_learning_id: []u8,
+    learning_candidate_id: []u8,
+    candidate_kind: []u8,
+    logic_pattern: []u8,
+    draft_signal: []u8,
+    reason: []u8,
+    source_store: []u8,
+    non_authorizing: bool = true,
+    treated_as_proof: bool = false,
+    used_as_evidence: bool = false,
+    global_promotion: bool = false,
+
+    fn deinit(self: *LearningInfluence, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.source_reviewed_learning_id);
+        allocator.free(self.learning_candidate_id);
+        allocator.free(self.candidate_kind);
+        allocator.free(self.logic_pattern);
+        allocator.free(self.draft_signal);
+        allocator.free(self.reason);
+        allocator.free(self.source_store);
+        self.* = undefined;
+    }
+};
+
 pub const InfluenceTelemetry = struct {
     reviewed_records_read: usize = 0,
     accepted_records_read: usize = 0,
@@ -278,6 +313,19 @@ pub const NegativeKnowledgeTelemetry = struct {
     mutation_performed: bool = false,
     commands_executed: bool = false,
     verifiers_executed: bool = false,
+};
+
+pub const LearningInfluenceTelemetry = struct {
+    records_read: usize = 0,
+    accepted_records: usize = 0,
+    rejected_records: usize = 0,
+    malformed_lines: usize = 0,
+    warnings: usize = 0,
+    influences_loaded: usize = 0,
+    influences_applied: usize = 0,
+    draft_promoted: bool = false,
+    truncated: bool = false,
+    same_shard_only: bool = true,
 };
 
 pub const CapacityTelemetry = struct {
@@ -333,9 +381,12 @@ pub const Result = struct {
     correction_influences: []CorrectionInfluence = &.{},
     accepted_negative_knowledge_warnings: []AcceptedNegativeKnowledgeWarning = &.{},
     negative_knowledge_influences: []NegativeKnowledgeInfluence = &.{},
+    learning_influences: []LearningInfluence = &.{},
     future_behavior_candidates: []FutureBehaviorCandidate = &.{},
     safety_flags: SafetyFlags = .{},
     corpus_entries_considered: usize = 0,
+    mounted_packs_considered: usize = 0,
+    mounted_pack_entries_considered: usize = 0,
     corpus_coverage_complete: bool = true,
     corpus_coverage_next_cursor: ?[]u8 = null,
     max_results: usize = DEFAULT_MAX_RESULTS,
@@ -344,6 +395,7 @@ pub const Result = struct {
     capacity_telemetry: CapacityTelemetry = .{},
     influence_telemetry: InfluenceTelemetry = .{},
     negative_knowledge_telemetry: NegativeKnowledgeTelemetry = .{},
+    learning_influence_telemetry: LearningInfluenceTelemetry = .{},
 
     pub fn deinit(self: *Result) void {
         self.allocator.free(self.state);
@@ -371,6 +423,8 @@ pub const Result = struct {
         self.allocator.free(self.accepted_negative_knowledge_warnings);
         for (self.negative_knowledge_influences) |*item| item.deinit(self.allocator);
         self.allocator.free(self.negative_knowledge_influences);
+        for (self.learning_influences) |*item| item.deinit(self.allocator);
+        self.allocator.free(self.learning_influences);
         for (self.future_behavior_candidates) |*item| item.deinit(self.allocator);
         self.allocator.free(self.future_behavior_candidates);
         self.* = undefined;
@@ -506,9 +560,16 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     defer reviewed.deinit();
     var reviewed_nk = try negative_knowledge_review.readAcceptedInfluences(allocator, paths.metadata.id);
     defer reviewed_nk.deinit();
+    var reviewed_learning = try learning_store.readAcceptedInfluences(allocator, paths.metadata.id);
+    defer reviewed_learning.deinit();
 
-    const entries = try corpus_ingest.collectLiveScanEntries(allocator, &paths);
+    const live_entries = try corpus_ingest.collectLiveScanEntries(allocator, &paths);
+    const live_entry_count = live_entries.len;
+    corpus_ingest.deinitIndexedEntries(allocator, live_entries);
+
+    const entries = try corpus_ingest.collectComposedLiveScanEntries(allocator, &paths, options.mounted_packs);
     defer corpus_ingest.deinitIndexedEntries(allocator, entries);
+    const mounted_pack_entry_count = entries.len - live_entry_count;
     var live_coverage = try corpus_ingest.liveCoverage(allocator, &paths);
     defer live_coverage.deinit(allocator);
 
@@ -517,19 +578,25 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     const query_intent = classifyQueryIntent(options.question, tokens.tokens);
 
     if (entries.len == 0) {
-        var result = try unknownResult(allocator, options, &paths, .no_corpus_available, "no live shard corpus is available for this ask request", entries.len, max_results, max_snippet);
+        var result = try unknownResult(allocator, options, &paths, .no_corpus_available, "no live shard corpus or explicitly mounted Knowledge Pack corpus is available for this ask request", entries.len, max_results, max_snippet);
         errdefer result.deinit();
+        result.mounted_packs_considered = options.mounted_packs.len;
+        result.mounted_pack_entries_considered = mounted_pack_entry_count;
         try attachLiveCoverage(allocator, &result, live_coverage);
         try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
         try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
+        try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
         return result;
     }
     if (tokens.tokens.len == 0) {
         var result = try unknownResult(allocator, options, &paths, .insufficient_evidence, "question did not contain enough searchable terms", entries.len, max_results, max_snippet);
         errdefer result.deinit();
+        result.mounted_packs_considered = options.mounted_packs.len;
+        result.mounted_pack_entries_considered = mounted_pack_entry_count;
         try attachLiveCoverage(allocator, &result, live_coverage);
         try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
         try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
+        try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
         return result;
     }
 
@@ -607,6 +674,8 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     if (candidates.items.len == 0) {
         var result = try unknownResult(allocator, options, &paths, .insufficient_evidence, "no live corpus item matched the question terms", entries.len, max_results, max_snippet);
         errdefer result.deinit();
+        result.mounted_packs_considered = options.mounted_packs.len;
+        result.mounted_pack_entries_considered = mounted_pack_entry_count;
         result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
         telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
         telemetry.max_results_hit = telemetry.sketch_candidate_cap_hit;
@@ -617,6 +686,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         try applyCapacityDisclosure(allocator, &result);
         try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
         try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
+        try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
         return result;
     }
 
@@ -629,6 +699,8 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     if (conflict) {
         var result = try buildBaseResult(allocator, options, &paths, .unknown, "unresolved", "unresolved", entries.len, max_results, max_snippet);
         errdefer result.deinit();
+        result.mounted_packs_considered = options.mounted_packs.len;
+        result.mounted_pack_entries_considered = mounted_pack_entry_count;
         result.evidence_used = try buildEvidence(allocator, candidates.items[0..top_count], entries, max_snippet, "selected because it matched question terms but conflicts with another selected corpus item");
         result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
         telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
@@ -647,6 +719,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         try applyCapacityDisclosure(allocator, &result);
         try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
         try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
+        try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
         return result;
     }
 
@@ -654,6 +727,8 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     if (top.score < requiredScore(tokens.tokens.len) and top.matched_phrase == null) {
         var result = try unknownResult(allocator, options, &paths, .insufficient_evidence, "matched corpus evidence was too weak to support an answer draft", entries.len, max_results, max_snippet);
         errdefer result.deinit();
+        result.mounted_packs_considered = options.mounted_packs.len;
+        result.mounted_pack_entries_considered = mounted_pack_entry_count;
         result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
         telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
         if (telemetry.sketch_candidate_cap_hit) {
@@ -666,12 +741,15 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         try applyCapacityDisclosure(allocator, &result);
         try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
         try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
+        try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
         return result;
     }
 
     if (query_intent != .general and !top.value_match) {
         var result = try buildBaseResult(allocator, options, &paths, .unknown, "unresolved", "unresolved", entries.len, max_results, max_snippet);
         errdefer result.deinit();
+        result.mounted_packs_considered = options.mounted_packs.len;
+        result.mounted_pack_entries_considered = mounted_pack_entry_count;
         result.evidence_used = try buildEvidence(allocator, candidates.items[0..top_count], entries, max_snippet, "candidate evidence matched topic terms but did not contain the requested value shape");
         result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
         telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
@@ -690,11 +768,14 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         try applyCapacityDisclosure(allocator, &result);
         try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
         try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
+        try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
         return result;
     }
 
     var result = try buildBaseResult(allocator, options, &paths, .answered, "draft", "none", entries.len, max_results, max_snippet);
     errdefer result.deinit();
+    result.mounted_packs_considered = options.mounted_packs.len;
+    result.mounted_pack_entries_considered = mounted_pack_entry_count;
     result.evidence_used = try buildEvidence(allocator, candidates.items[0..top_count], entries, max_snippet, "selected because it matched bounded question terms");
     result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
     telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
@@ -716,6 +797,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     try applyCapacityDisclosure(allocator, &result);
     try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
     try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
+    try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
     return result;
 }
 
@@ -779,6 +861,43 @@ fn applyAcceptedNegativeKnowledgeInfluence(allocator: std.mem.Allocator, result:
             .warning, .penalty => {},
         }
     }
+}
+
+fn applyAcceptedLearningInfluence(allocator: std.mem.Allocator, result: *Result, reviewed: *const learning_store.ReadResult) !void {
+    result.learning_influence_telemetry.records_read = reviewed.records_read;
+    result.learning_influence_telemetry.accepted_records = reviewed.accepted_records;
+    result.learning_influence_telemetry.rejected_records = reviewed.rejected_records;
+    result.learning_influence_telemetry.malformed_lines = reviewed.malformed_lines;
+    result.learning_influence_telemetry.warnings = reviewed.warnings.len;
+    result.learning_influence_telemetry.influences_loaded = reviewed.influences.len;
+    result.learning_influence_telemetry.truncated = reviewed.truncated;
+
+    for (reviewed.influences) |influence| {
+        if (!learningInfluenceMatchesResult(result, influence)) continue;
+        try appendLearningInfluence(allocator, result, influence);
+        result.learning_influence_telemetry.influences_applied += 1;
+        if (result.status == .unknown and result.answer_draft == null) {
+            result.status = .answered;
+            allocator.free(result.state);
+            allocator.free(result.permission);
+            result.state = try allocator.dupe(u8, "draft");
+            result.permission = try allocator.dupe(u8, "none");
+            result.answer_draft = try std.fmt.allocPrint(allocator, "Draft answer from reviewed learning record: {s}", .{influence.draft_signal});
+            for (result.unknowns) |*unknown| unknown.deinit(allocator);
+            allocator.free(result.unknowns);
+            result.unknowns = try allocator.alloc(Unknown, 0);
+            result.learning_influence_telemetry.draft_promoted = true;
+        }
+        break;
+    }
+}
+
+fn learningInfluenceMatchesResult(result: *const Result, influence: learning_store.AcceptedLearningInfluence) bool {
+    for (result.learning_candidates) |candidate| {
+        if (std.mem.eql(u8, candidate.id, influence.learning_candidate_id)) return true;
+        if (std.mem.eql(u8, candidate.logic_pattern, influence.logic_pattern) and std.mem.eql(u8, candidate.candidate_kind, influence.candidate_kind)) return true;
+    }
+    return false;
 }
 
 fn influenceMatchesResult(result: *const Result, influence: correction_review.AcceptedCorrectionInfluence) bool {
@@ -926,6 +1045,24 @@ fn appendNegativeKnowledgeInfluence(allocator: std.mem.Allocator, result: *Resul
     result.negative_knowledge_influences = out;
 }
 
+fn appendLearningInfluence(allocator: std.mem.Allocator, result: *Result, influence: learning_store.AcceptedLearningInfluence) !void {
+    const old = result.learning_influences;
+    var out = try allocator.alloc(LearningInfluence, old.len + 1);
+    @memcpy(out[0..old.len], old);
+    out[old.len] = .{
+        .id = try allocator.dupe(u8, influence.id),
+        .source_reviewed_learning_id = try allocator.dupe(u8, influence.source_reviewed_learning_id),
+        .learning_candidate_id = try allocator.dupe(u8, influence.learning_candidate_id),
+        .candidate_kind = try allocator.dupe(u8, influence.candidate_kind),
+        .logic_pattern = try allocator.dupe(u8, influence.logic_pattern),
+        .draft_signal = try allocator.dupe(u8, influence.draft_signal),
+        .reason = try allocator.dupe(u8, "accepted reviewed learning record matched a current learning candidate; promoted to draft only"),
+        .source_store = try allocator.dupe(u8, learning_store.LEARNED_RECORDS_FILE_NAME),
+    };
+    allocator.free(old);
+    result.learning_influences = out;
+}
+
 fn appendFutureBehaviorCandidate(allocator: std.mem.Allocator, result: *Result, kind: []const u8, reason: []const u8, source_id: []const u8) !void {
     const old = result.future_behavior_candidates;
     var out = try allocator.alloc(FutureBehaviorCandidate, old.len + 1);
@@ -1042,6 +1179,7 @@ fn buildBaseResult(
         .shard_kind = try allocator.dupe(u8, @tagName(paths.metadata.kind)),
         .shard_id = try allocator.dupe(u8, paths.metadata.id),
         .corpus_entries_considered = entries_considered,
+        .mounted_packs_considered = options.mounted_packs.len,
         .max_results = max_results,
         .max_snippet_bytes = max_snippet_bytes,
         .require_citations = options.require_citations,
@@ -1113,10 +1251,13 @@ fn singleLearningCandidate(
     reason: []const u8,
 ) ![]LearningCandidate {
     const items = try allocator.alloc(LearningCandidate, 1);
+    const id_hash = std.hash.Fnv1a_64.hash(candidate_kind) ^ std.hash.Fnv1a_64.hash(proposed_action) ^ std.hash.Fnv1a_64.hash(reason);
     items[0] = .{
+        .id = try std.fmt.allocPrint(allocator, "learning:candidate:{x:0>16}", .{id_hash}),
         .candidate_kind = try allocator.dupe(u8, candidate_kind),
         .proposed_action = try allocator.dupe(u8, proposed_action),
         .reason = try allocator.dupe(u8, reason),
+        .logic_pattern = try allocator.dupe(u8, reason),
     };
     return items;
 }
@@ -1764,6 +1905,24 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
         try writeCorrectionMutationFlags(w, influence.mutation_flags);
         try w.writeAll("}");
     }
+    try w.writeAll("],\"learningInfluences\":[");
+    for (result.learning_influences, 0..) |influence, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{");
+        try writeField(w, "id", influence.id, true);
+        try writeField(w, "sourceReviewedLearningId", influence.source_reviewed_learning_id, false);
+        try writeField(w, "sourceStore", influence.source_store, false);
+        try writeField(w, "learningCandidateId", influence.learning_candidate_id, false);
+        try writeField(w, "candidateKind", influence.candidate_kind, false);
+        try writeField(w, "logicPattern", influence.logic_pattern, false);
+        try writeField(w, "draftSignal", influence.draft_signal, false);
+        try writeField(w, "reason", influence.reason, false);
+        try w.print(",\"nonAuthorizing\":{s}", .{if (influence.non_authorizing) "true" else "false"});
+        try w.print(",\"treatedAsProof\":{s}", .{if (influence.treated_as_proof) "true" else "false"});
+        try w.print(",\"usedAsEvidence\":{s}", .{if (influence.used_as_evidence) "true" else "false"});
+        try w.print(",\"globalPromotion\":{s}", .{if (influence.global_promotion) "true" else "false"});
+        try w.writeAll("}");
+    }
     try w.writeAll("],\"futureBehaviorCandidates\":[");
     for (result.future_behavior_candidates, 0..) |candidate, idx| {
         if (idx != 0) try w.writeByte(',');
@@ -1786,6 +1945,8 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
     try writeInfluenceTelemetry(w, result.influence_telemetry);
     try w.writeAll(",\"negativeKnowledgeTelemetry\":");
     try writeNegativeKnowledgeTelemetry(w, result.negative_knowledge_telemetry);
+    try w.writeAll(",\"learningInfluenceTelemetry\":");
+    try writeLearningInfluenceTelemetry(w, result.learning_influence_telemetry);
     try w.writeAll(",\"unknowns\":[");
     for (result.unknowns, 0..) |unknown, idx| {
         if (idx != 0) try w.writeByte(',');
@@ -1806,9 +1967,11 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
     for (result.learning_candidates, 0..) |candidate, idx| {
         if (idx != 0) try w.writeByte(',');
         try w.writeAll("{");
-        try writeField(w, "candidateKind", candidate.candidate_kind, true);
+        try writeField(w, "id", candidate.id, true);
+        try writeField(w, "candidateKind", candidate.candidate_kind, false);
         try writeField(w, "proposedAction", candidate.proposed_action, false);
         try writeField(w, "reason", candidate.reason, false);
+        try writeField(w, "logicPattern", candidate.logic_pattern, false);
         try w.print(",\"candidateOnly\":{s}", .{if (candidate.candidate_only) "true" else "false"});
         try w.print(",\"nonAuthorizing\":{s}", .{if (candidate.non_authorizing) "true" else "false"});
         try w.print(",\"treatedAsProof\":{s}", .{if (candidate.treated_as_proof) "true" else "false"});
@@ -1823,6 +1986,8 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
     try w.writeAll("}");
     try w.writeAll(",\"trace\":{");
     try w.print("\"corpusEntriesConsidered\":{d}", .{result.corpus_entries_considered});
+    try w.print(",\"mountedPacksConsidered\":{d}", .{result.mounted_packs_considered});
+    try w.print(",\"mountedPackEntriesConsidered\":{d}", .{result.mounted_pack_entries_considered});
     try w.print(",\"maxResults\":{d}", .{result.max_results});
     try w.print(",\"maxSnippetBytes\":{d}", .{result.max_snippet_bytes});
     try w.print(",\"requireCitations\":{s}", .{if (result.require_citations) "true" else "false"});
@@ -1908,6 +2073,27 @@ fn writeNegativeKnowledgeTelemetry(w: anytype, telemetry: NegativeKnowledgeTelem
         if (telemetry.verifiers_executed) "true" else "false",
     });
     try w.writeAll("}");
+}
+
+fn writeLearningInfluenceTelemetry(w: anytype, telemetry: LearningInfluenceTelemetry) !void {
+    try w.writeAll("{");
+    try w.print("\"recordsRead\":{d},\"acceptedRecords\":{d},\"rejectedRecords\":{d}", .{
+        telemetry.records_read,
+        telemetry.accepted_records,
+        telemetry.rejected_records,
+    });
+    try w.print(",\"malformedLines\":{d},\"warnings\":{d},\"influencesLoaded\":{d},\"influencesApplied\":{d}", .{
+        telemetry.malformed_lines,
+        telemetry.warnings,
+        telemetry.influences_loaded,
+        telemetry.influences_applied,
+    });
+    try w.print(",\"draftPromoted\":{s},\"truncated\":{s},\"sameShardOnly\":{s}", .{
+        if (telemetry.draft_promoted) "true" else "false",
+        if (telemetry.truncated) "true" else "false",
+        if (telemetry.same_shard_only) "true" else "false",
+    });
+    try w.writeAll(",\"sourceStore\":\"learned_records.jsonl\"}");
 }
 
 fn writeCorrectionMutationFlags(w: anytype, flags: CorrectionMutationFlags) !void {

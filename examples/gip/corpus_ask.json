@@ -3,6 +3,16 @@
   "kind": "corpus.ask",
   "requestId": "example-corpus-ask-001",
   "projectShard": "my-project",
+  "mountedPacks": [
+    {
+      "packId": "runtime-core",
+      "packVersion": "v1"
+    },
+    {
+      "packId": "manual-hardening",
+      "packVersion": "v1"
+    }
+  ],
   "question": "what does the corpus say about retention?",
   "maxResults": 3,
   "maxSnippetBytes": 320,

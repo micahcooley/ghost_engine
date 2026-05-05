@@ -595,6 +595,7 @@ fn writeCapabilityDetails(w: anytype, capability: core.CapabilityName, policy: c
         .@"command.run",
         => try writeStr(w, "note", "not yet implemented", false),
         .@"correction.review",
+        .@"learning.review",
         .@"procedure_pack.candidate.review",
         .@"negative_knowledge.review",
         => try writeBool(w, "append_only", true, false),

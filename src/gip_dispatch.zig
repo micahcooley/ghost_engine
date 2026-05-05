@@ -29,6 +29,7 @@ const rule_reasoning = @import("rule_reasoning.zig");
 const correction_candidates = @import("correction_candidates.zig");
 const correction_review = @import("correction_review.zig");
 const negative_knowledge_review = @import("negative_knowledge_review.zig");
+const learning_store = @import("learning_store.zig");
 const learning_status = @import("learning_status.zig");
 const procedure_pack_candidates = @import("procedure_pack_candidates.zig");
 const sigil_core = @import("sigil_core.zig");
@@ -113,6 +114,7 @@ pub fn dispatch(
         .@"rule.evaluate" => dispatchRuleEvaluate(allocator, request_body),
         .@"sigil.inspect" => dispatchSigilInspect(allocator, request_body),
         .@"learning.status" => dispatchLearningStatus(allocator, request_body),
+        .@"learning.review" => dispatchLearningReview(allocator, request_body),
         .@"learning.loop.plan" => dispatchLearningLoopPlan(allocator, workspace_root, request_body),
         .@"correction.propose" => dispatchCorrectionPropose(allocator, request_body),
         .@"correction.review" => dispatchCorrectionReview(allocator, request_body),
@@ -334,9 +336,18 @@ fn dispatchCorpusAsk(allocator: std.mem.Allocator, request_body: ?[]const u8) !D
     else
         @min(@as(usize, @intCast(max_snippet_raw)), corpus_ask.MAX_SNIPPET_BYTES);
 
+    const mounted_packs = parseCorpusAskMountedPacks(allocator, obj) catch {
+        return .{
+            .status = .rejected,
+            .err = .{ .code = .invalid_request, .message = "mountedPacks must be an array of strings or objects with packId and optional packVersion/version" },
+        };
+    };
+    defer allocator.free(mounted_packs);
+
     var result = try corpus_ask.ask(allocator, .{
         .question = question,
         .project_shard = getStr(obj, "project_shard", "projectShard"),
+        .mounted_packs = mounted_packs,
         .max_results = max_results,
         .max_snippet_bytes = max_snippet_bytes,
         .require_citations = getBool(obj, "require_citations", "requireCitations") orelse true,
@@ -358,6 +369,42 @@ fn dispatchCorpusAsk(allocator: std.mem.Allocator, request_body: ?[]const u8) !D
         .result_json = rendered,
         .allocated_result = true,
     };
+}
+
+fn parseCorpusAskMountedPacks(
+    allocator: std.mem.Allocator,
+    obj: std.json.ObjectMap,
+) ![]corpus_ask.MountedPackRef {
+    const value = obj.get("mounted_packs") orelse obj.get("mountedPacks") orelse return try allocator.alloc(corpus_ask.MountedPackRef, 0);
+    if (value != .array) return error.InvalidMountedPacks;
+
+    var refs = std.ArrayList(corpus_ask.MountedPackRef).init(allocator);
+    errdefer refs.deinit();
+
+    for (value.array.items) |item| {
+        switch (item) {
+            .string => |text| {
+                const at_index = std.mem.lastIndexOfScalar(u8, text, '@');
+                if (at_index) |idx| {
+                    if (idx == 0 or idx + 1 >= text.len) return error.InvalidMountedPacks;
+                    try refs.append(.{ .pack_id = text[0..idx], .pack_version = text[(idx + 1)..] });
+                } else {
+                    if (std.mem.trim(u8, text, " \r\n\t").len == 0) return error.InvalidMountedPacks;
+                    try refs.append(.{ .pack_id = text, .pack_version = "v1" });
+                }
+            },
+            .object => |pack_obj| {
+                const pack_id = getStr(pack_obj, "pack_id", "packId") orelse getStr(pack_obj, "id", "id") orelse return error.InvalidMountedPacks;
+                if (std.mem.trim(u8, pack_id, " \r\n\t").len == 0) return error.InvalidMountedPacks;
+                const pack_version = getStr(pack_obj, "pack_version", "packVersion") orelse getStr(pack_obj, "version", "version") orelse "v1";
+                if (std.mem.trim(u8, pack_version, " \r\n\t").len == 0) return error.InvalidMountedPacks;
+                try refs.append(.{ .pack_id = pack_id, .pack_version = pack_version });
+            },
+            else => return error.InvalidMountedPacks,
+        }
+    }
+
+    return refs.toOwnedSlice();
 }
 
 fn dispatchRuleEvaluate(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
@@ -1395,6 +1442,110 @@ fn dispatchProcedurePackCandidateReviewedGet(allocator: std.mem.Allocator, reque
     };
 }
 
+fn dispatchLearningReview(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
+    const body = request_body orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "request body is required for learning.review" },
+    };
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } };
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) {
+        return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "learning.review request must be a JSON object" } };
+    }
+    const obj = parsed.value.object;
+    const decision_text = getStr(obj, "decision", "decision") orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "decision is required" },
+    };
+    const decision = learning_store.Decision.parse(decision_text) orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .invalid_request, .message = "decision must be accepted or rejected", .details = decision_text },
+    };
+    const reviewer_note = getStr(obj, "reviewer_note", "reviewerNote") orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "reviewerNote is required" },
+    };
+    const project_shard = getStr(obj, "project_shard", "projectShard") orelse shards.DEFAULT_PROJECT_ID;
+    const candidate_id = getStr(obj, "learning_candidate_id", "learningCandidateId") orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "learningCandidateId is required" },
+    };
+    const learning_candidate_json = if (obj.get("learningCandidate")) |candidate_value| try std.json.stringifyAlloc(allocator, candidate_value, .{}) else null;
+    defer if (learning_candidate_json) |json| allocator.free(json);
+
+    var outcome = try learning_store.reviewAndAppend(allocator, .{
+        .project_shard = project_shard,
+        .learning_candidate_id = candidate_id,
+        .decision = decision,
+        .reviewer_note = reviewer_note,
+        .learning_candidate_json = learning_candidate_json,
+    });
+    defer outcome.deinit();
+
+    if (outcome == .conflict) {
+        const conflict = outcome.conflict;
+        var out = std.ArrayList(u8).init(allocator);
+        errdefer out.deinit();
+        const w = out.writer();
+        try w.writeAll("{\"learningReview\":{\"status\":\"ConflictDetected\",\"appendRefused\":true,\"projectShard\":\"");
+        try writeEscaped(w, project_shard);
+        try w.writeAll("\",\"learningCandidateId\":\"");
+        try writeEscaped(w, candidate_id);
+        try w.writeAll("\",\"conflictsWithRecordIds\":[");
+        for (conflict.established_record_ids, 0..) |id, idx| {
+            if (idx != 0) try w.writeByte(',');
+            try w.writeByte('"');
+            try writeEscaped(w, id);
+            try w.writeByte('"');
+        }
+        try w.writeAll("],\"reason\":\"");
+        try writeEscaped(w, conflict.reason);
+        try w.writeAll("\",\"appendOnly\":{\"storage\":\"jsonl\",\"file\":\"learned_records.jsonl\",\"recordAppended\":false,\"inPlaceRewrite\":false,\"deletion\":false,\"compaction\":false},\"authority\":{\"nonAuthorizing\":true,\"treatedAsProof\":false,\"usedAsEvidence\":false,\"supportGranted\":false,\"proofDischarged\":false,\"globalPromotion\":false}}}");
+        return .{
+            .status = .rejected,
+            .result_state = schema.unresolvedResultState("learning conflict detected"),
+            .result_json = try out.toOwnedSlice(),
+            .err = .{
+                .code = .conflict_detected,
+                .message = "ConflictDetected: accepted learning review contradicts established same-shard learning",
+                .details = "see result.learningReview.conflictsWithRecordIds",
+                .fix_hint = "review the established record before accepting contradictory learning into this shard",
+                .severity = .warning,
+            },
+            .allocated_result = true,
+        };
+    }
+
+    const result = outcome.appended;
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"learningReview\":{\"status\":\"reviewed\",\"reviewedLearningRecord\":");
+    try w.writeAll(result.record_json);
+    try w.writeAll(",\"storage\":{\"path\":\"");
+    try writeEscaped(w, result.storage_path);
+    try w.writeAll("\",\"appendOnly\":true,\"file\":\"learned_records.jsonl\",\"inPlaceRewrite\":false,\"deletion\":false,\"compaction\":false,\"stableOrdering\":\"file_append_order\"}");
+    try w.writeAll(",\"mutationFlags\":{\"corpusMutation\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"correctionMutation\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false}");
+    try w.writeAll(",\"authority\":{\"nonAuthorizing\":true,\"treatedAsProof\":false,\"usedAsEvidence\":false,\"supportGranted\":false,\"proofDischarged\":false,\"globalPromotion\":false}}}");
+
+    var gip_state = schema.draftResultState();
+    gip_state.permission = .none;
+    gip_state.verification_state = .unverified;
+    gip_state.support_minimum_met = false;
+    gip_state.non_authorization_notice = "learning.review persists append-only reviewed learning records only; accepted records may influence draft generation but are non-authorizing and not proof or evidence";
+    return .{
+        .status = .ok,
+        .result_state = gip_state,
+        .result_json = try out.toOwnedSlice(),
+        .allocated_result = true,
+    };
+}
+
 fn dispatchLearningStatus(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
     var parsed: ?std.json.Parsed(std.json.Value) = null;
     defer if (parsed) |*p| p.deinit();
@@ -1466,11 +1617,21 @@ fn dispatchLearningStatus(allocator: std.mem.Allocator, request_body: ?[]const u
         status.negative_knowledge_summary.suppression_candidate_count,
         status.negative_knowledge_summary.future_behavior_candidate_count,
     });
+    try w.writeAll("},\"reviewedLearningSummary\":{");
+    try w.print("\"reviewedLearningRecords\":{d},\"acceptedReviewedLearning\":{d},\"rejectedReviewedLearning\":{d},\"malformedLearningLines\":{d}", .{
+        status.learning_status.summary.reviewed_records,
+        status.learning_status.summary.accepted_records,
+        status.learning_status.summary.rejected_records,
+        status.learning_status.summary.malformed_lines,
+    });
+    try w.writeAll(",\"learningCandidateKindCounts\":");
+    try writeCountEntriesJson(w, status.learning_status.summary.candidate_kind_counts);
     try w.writeAll("},\"influenceSummary\":{");
     const corpus_correction = countNamed(status.correction_status.summary.operation_kind_counts, "corpus.ask") > 0;
     const rule_correction = countNamed(status.correction_status.summary.operation_kind_counts, "rule.evaluate") > 0;
     const corpus_nk = countNamed(status.negative_knowledge_summary.operation_kind_counts, "corpus.ask") > 0;
     const rule_nk = countNamed(status.negative_knowledge_summary.operation_kind_counts, "rule.evaluate") > 0;
+    const reviewed_learning_available = status.learning_status.summary.accepted_records > 0;
     const suppression = status.correction_status.summary.suppression_candidate_count + status.negative_knowledge_summary.suppression_candidate_count;
     const stronger = status.correction_status.summary.stronger_evidence_candidate_count + status.negative_knowledge_summary.stronger_evidence_candidate_count;
     const verifier = status.correction_status.summary.verifier_candidate_count + status.negative_knowledge_summary.verifier_candidate_count;
@@ -1478,11 +1639,12 @@ fn dispatchLearningStatus(allocator: std.mem.Allocator, request_body: ?[]const u
     const corpus = status.correction_status.summary.corpus_update_candidate_count + status.negative_knowledge_summary.corpus_update_candidate_count;
     const rule = status.correction_status.summary.rule_update_candidate_count + status.negative_knowledge_summary.rule_update_candidate_count;
     const future = status.correction_status.summary.future_behavior_candidate_count + status.negative_knowledge_summary.future_behavior_candidate_count;
-    try w.print("\"corpusAskCorrectionInfluenceAvailable\":{},\"ruleEvaluateCorrectionInfluenceAvailable\":{},\"corpusAskNegativeKnowledgeInfluenceAvailable\":{},\"ruleEvaluateNegativeKnowledgeInfluenceAvailable\":{}", .{
+    try w.print("\"corpusAskCorrectionInfluenceAvailable\":{},\"ruleEvaluateCorrectionInfluenceAvailable\":{},\"corpusAskNegativeKnowledgeInfluenceAvailable\":{},\"ruleEvaluateNegativeKnowledgeInfluenceAvailable\":{},\"reviewedLearningInfluenceAvailable\":{}", .{
         corpus_correction,
         rule_correction,
         corpus_nk,
         rule_nk,
+        reviewed_learning_available,
     });
     try w.print(",\"suppressionCapableRecords\":{d},\"strongerEvidenceCandidateCount\":{d},\"verifierCandidateCount\":{d},\"packGuidanceCandidateCount\":{d},\"corpusUpdateCandidateCount\":{d},\"ruleUpdateCandidateCount\":{d},\"futureBehaviorCandidateCount\":{d},\"unappliedCandidateCount\":{d}", .{
         suppression,
@@ -1495,16 +1657,17 @@ fn dispatchLearningStatus(allocator: std.mem.Allocator, request_body: ?[]const u
         future,
     });
     try w.writeAll("},\"warningSummary\":{");
-    try w.print("\"malformedReviewedCorrectionLines\":{d},\"malformedReviewedNegativeKnowledgeLines\":{d},\"capacityWarnings\":{d},\"unknownOrUnclassifiedRecords\":{d},\"readCapsHit\":{},\"byteCapsHit\":{}", .{
+    try w.print("\"malformedReviewedCorrectionLines\":{d},\"malformedReviewedNegativeKnowledgeLines\":{d},\"malformedReviewedLearningLines\":{d},\"capacityWarnings\":{d},\"unknownOrUnclassifiedRecords\":{d},\"readCapsHit\":{},\"byteCapsHit\":{}", .{
         status.warning_summary.malformed_reviewed_correction_lines,
         status.warning_summary.malformed_reviewed_negative_knowledge_lines,
+        status.warning_summary.malformed_reviewed_learning_lines,
         status.warning_summary.capacity_warnings,
         status.warning_summary.unknown_or_unclassified_records,
         status.warning_summary.read_caps_hit,
         status.warning_summary.byte_caps_hit,
     });
     try w.writeAll("},\"capacityTelemetry\":{");
-    try w.print("\"correctionRecordsRead\":{d},\"correctionMaxRecords\":{d},\"correctionReadCapHit\":{},\"correctionMaxBytes\":{d},\"correctionByteCapHit\":{},\"negativeKnowledgeRecordsRead\":{d},\"negativeKnowledgeMaxRecords\":{d},\"negativeKnowledgeReadCapHit\":{},\"negativeKnowledgeMaxBytes\":{d},\"negativeKnowledgeByteCapHit\":{},\"includeRecords\":{},\"limit\":{d},\"returnedRecords\":{d},\"limitHit\":{}", .{
+    try w.print("\"correctionRecordsRead\":{d},\"correctionMaxRecords\":{d},\"correctionReadCapHit\":{},\"correctionMaxBytes\":{d},\"correctionByteCapHit\":{},\"negativeKnowledgeRecordsRead\":{d},\"negativeKnowledgeMaxRecords\":{d},\"negativeKnowledgeReadCapHit\":{},\"negativeKnowledgeMaxBytes\":{d},\"negativeKnowledgeByteCapHit\":{},\"learningRecordsRead\":{d},\"learningMaxRecords\":{d},\"learningReadCapHit\":{},\"learningMaxBytes\":{d},\"learningByteCapHit\":{},\"includeRecords\":{},\"limit\":{d},\"returnedRecords\":{d},\"limitHit\":{}", .{
         status.capacity_telemetry.correction_records_read,
         status.capacity_telemetry.correction_max_records,
         status.capacity_telemetry.correction_read_cap_hit,
@@ -1515,6 +1678,11 @@ fn dispatchLearningStatus(allocator: std.mem.Allocator, request_body: ?[]const u
         status.capacity_telemetry.negative_knowledge_read_cap_hit,
         status.capacity_telemetry.negative_knowledge_max_bytes,
         status.capacity_telemetry.negative_knowledge_byte_cap_hit,
+        status.capacity_telemetry.learning_records_read,
+        status.capacity_telemetry.learning_max_records,
+        status.capacity_telemetry.learning_read_cap_hit,
+        status.capacity_telemetry.learning_max_bytes,
+        status.capacity_telemetry.learning_byte_cap_hit,
         status.capacity_telemetry.include_records,
         status.capacity_telemetry.limit,
         status.capacity_telemetry.returned_records,
@@ -1524,6 +1692,8 @@ fn dispatchLearningStatus(allocator: std.mem.Allocator, request_body: ?[]const u
     try w.print("{}", .{status.storage.correction_missing_file});
     try w.writeAll(",\"negativeKnowledgeMissingFile\":");
     try w.print("{}", .{status.storage.negative_knowledge_missing_file});
+    try w.writeAll(",\"learningMissingFile\":");
+    try w.print("{}", .{status.storage.learning_missing_file});
     try w.writeAll(",\"sameShardOnly\":true,\"readOnly\":true,\"inPlaceRewrite\":false,\"deletion\":false,\"compaction\":false,\"stableOrdering\":\"file_append_order\"}");
     if (include_warnings) {
         try w.writeAll(",\"warnings\":{\"corrections\":");

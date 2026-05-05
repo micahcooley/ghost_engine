@@ -6661,6 +6661,101 @@ test "gip corpus ask sees ingested corpus only after explicit staged apply" {
     try std.testing.expect(std.mem.indexOf(u8, answered.result_json.?, "\"verifiersExecuted\":false") != null);
 }
 
+test "gip corpus ask composes explicitly mounted Knowledge Pack corpus evidence" {
+    const allocator = std.testing.allocator;
+    const project_shard = "corpus-ask-mounted-packs-test";
+    const runtime_pack_id = "corpus-ask-runtime-core-pack";
+    const hardening_pack_id = "corpus-ask-manual-hardening-pack";
+    const pack_version = "v1";
+
+    var runtime_corpus = std.testing.tmpDir(.{});
+    defer runtime_corpus.cleanup();
+    const runtime_root = try runtime_corpus.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(runtime_root);
+    try writeFixtureFile(runtime_corpus.dir, "runtime-core.md",
+        \\# Runtime Core
+        \\Universal Logic Contract requires runtime invariant checks before a draft can be trusted.
+        \\
+    );
+
+    var hardening_corpus = std.testing.tmpDir(.{});
+    defer hardening_corpus.cleanup();
+    const hardening_root = try hardening_corpus.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(hardening_root);
+    try writeFixtureFile(hardening_corpus.dir, "manual-hardening.md",
+        \\# Manual Hardening
+        \\Universal Logic Contract requires manual hardening guard review before operator reliance.
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path) catch {};
+
+    var runtime_pack = try knowledge_packs.createPack(allocator, .{
+        .pack_id = runtime_pack_id,
+        .pack_version = pack_version,
+        .domain_family = "runtime",
+        .trust_class = "project",
+        .source_summary = "runtime core shard pack",
+        .source_project_shard = null,
+        .source_state = .staged,
+        .corpus_path = runtime_root,
+        .corpus_label = "runtime-core",
+    });
+    defer runtime_pack.manifest.deinit();
+    defer allocator.free(runtime_pack.root_abs_path);
+    defer knowledge_packs.removePack(allocator, runtime_pack_id, pack_version) catch {};
+
+    var hardening_pack = try knowledge_packs.createPack(allocator, .{
+        .pack_id = hardening_pack_id,
+        .pack_version = pack_version,
+        .domain_family = "manual-hardening",
+        .trust_class = "project",
+        .source_summary = "manual hardening shard pack",
+        .source_project_shard = null,
+        .source_state = .staged,
+        .corpus_path = hardening_root,
+        .corpus_label = "manual-hardening",
+    });
+    defer hardening_pack.manifest.deinit();
+    defer allocator.free(hardening_pack.root_abs_path);
+    defer knowledge_packs.removePack(allocator, hardening_pack_id, pack_version) catch {};
+
+    const request_body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"question\":\"What does the Universal Logic Contract require for runtime invariant and manual hardening guard review?\",\"projectShard\":\"{s}\",\"mountedPacks\":[{{\"packId\":\"{s}\",\"packVersion\":\"{s}\"}},{{\"packId\":\"{s}\",\"packVersion\":\"{s}\"}}],\"maxResults\":4,\"maxSnippetBytes\":160}}",
+        .{ project_shard, runtime_pack_id, pack_version, hardening_pack_id, pack_version },
+    );
+    defer allocator.free(request_body);
+
+    var result = try gip.dispatch.dispatch(
+        allocator,
+        "corpus.ask",
+        gip.core.PROTOCOL_VERSION,
+        null,
+        null,
+        request_body,
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(gip.core.ProtocolStatus.ok, result.status);
+    const json = result.result_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":\"answered\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"no_corpus_available\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"mountedPacksConsidered\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"mountedPackEntriesConsidered\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "@pack/corpus-ask-runtime-core-pack/v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "@pack/corpus-ask-manual-hardening-pack/v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "runtime invariant checks") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "manual hardening guard review") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"packMutation\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"corpusMutation\":false") != null);
+}
+
 test "corpus ask conflicting evidence stays unresolved and learning is candidate-only" {
     const allocator = std.testing.allocator;
     const project_shard = "corpus-ask-conflict-test";
