@@ -228,6 +228,17 @@ pub fn build(b: *std.Build) void {
     const artifact_autopsy_smoke_step = b.step("smoke-artifact-autopsy", "Run artifact autopsy smoke fixtures");
     artifact_autopsy_smoke_step.dependOn(&artifact_autopsy_smoke_cmd.step);
 
+    const text_generation_lab_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/text_generation_lab.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_text_generation_lab_tests = b.addRunArtifact(text_generation_lab_tests);
+    const text_generation_lab_smoke_step = b.step("smoke-text-generation-lab", "Run experimental text generation lab tests");
+    text_generation_lab_smoke_step.dependOn(&run_text_generation_lab_tests.step);
+
     // ── 9. Unit & Integration Tests ──
     const main_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -259,6 +270,7 @@ pub fn build(b: *std.Build) void {
     const run_main_tests = b.addRunArtifact(main_tests);
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_main_tests.step);
+    test_step.dependOn(&run_text_generation_lab_tests.step);
 
     const lifecycle_tests = b.addTest(.{
         .root_module = b.createModule(.{
