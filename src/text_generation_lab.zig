@@ -109,15 +109,15 @@ const CorpusSignalExtraction = struct {
     }
 };
 
-pub const TokenCount = struct {
-    token: []const u8,
+pub const RuneCount = struct {
+    rune: []const u8,
     count: usize,
 };
 
 pub const TrainingLabResult = struct {
     examples_seen: usize,
-    token_count: usize,
-    frequency_table: []const TokenCount,
+    rune_count: usize,
+    frequency_table: []const RuneCount,
     candidate_only: bool = true,
     non_authorizing: bool = true,
     support_granted: bool = false,
@@ -227,18 +227,18 @@ pub fn summarizeTrainingExamples(
     allocator: std.mem.Allocator,
     examples: []const TrainingExample,
 ) !TrainingLabResult {
-    var counts = std.ArrayList(TokenCount).init(allocator);
+    var counts = std.ArrayList(RuneCount).init(allocator);
     errdefer counts.deinit();
-    var token_total: usize = 0;
+    var rune_total: usize = 0;
 
     for (examples) |example| {
-        token_total += try addTokens(&counts, example.input_text);
-        token_total += try addTokens(&counts, example.desired_draft);
+        rune_total += try addRunes(&counts, example.input_text);
+        rune_total += try addRunes(&counts, example.desired_draft);
     }
 
     return .{
         .examples_seen = examples.len,
-        .token_count = token_total,
+        .rune_count = rune_total,
         .frequency_table = try counts.toOwnedSlice(),
     };
 }
@@ -405,24 +405,25 @@ fn writeUnknowns(writer: anytype, unknowns: []const []const u8) !void {
     try writer.writeAll("Unknown handling: unknown is not false; missing evidence is not negative evidence.\n");
 }
 
-fn addTokens(counts: *std.ArrayList(TokenCount), text: []const u8) !usize {
+fn addRunes(counts: *std.ArrayList(RuneCount), text: []const u8) !usize {
+    // Current rune_count is a lab-local simple lexical count, not final Ghost runeization.
     var seen: usize = 0;
-    var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n.,;:!?()[]{}<>\"'");
-    while (tokens.next()) |token| {
-        if (token.len == 0) continue;
+    var runes = std.mem.tokenizeAny(u8, text, " \t\r\n.,;:!?()[]{}<>\"'");
+    while (runes.next()) |rune| {
+        if (rune.len == 0) continue;
         seen += 1;
-        if (findToken(counts.items, token)) |index| {
+        if (findRune(counts.items, rune)) |index| {
             counts.items[index].count += 1;
         } else {
-            try counts.append(.{ .token = token, .count = 1 });
+            try counts.append(.{ .rune = rune, .count = 1 });
         }
     }
     return seen;
 }
 
-fn findToken(counts: []const TokenCount, token: []const u8) ?usize {
+fn findRune(counts: []const RuneCount, rune: []const u8) ?usize {
     for (counts, 0..) |entry, index| {
-        if (std.ascii.eqlIgnoreCase(entry.token, token)) return index;
+        if (std.ascii.eqlIgnoreCase(entry.rune, rune)) return index;
     }
     return null;
 }
@@ -563,14 +564,14 @@ test "training examples are counted without mutating trusted state" {
     defer result.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 2), result.examples_seen);
-    try std.testing.expectEqual(@as(usize, 11), result.token_count);
+    try std.testing.expectEqual(@as(usize, 11), result.rune_count);
     try std.testing.expect(!result.training_applied);
     try std.testing.expect(!result.mutates_state);
     try std.testing.expect(!result.proof_granted);
     try std.testing.expect(!result.support_granted);
     try std.testing.expect(!result.commands_executed);
     try std.testing.expect(!result.verifiers_executed);
-    try std.testing.expect(findToken(result.frequency_table, "unknown") != null);
+    try std.testing.expect(findRune(result.frequency_table, "unknown") != null);
 }
 
 test "empty input produces insufficient signal draft without certainty" {

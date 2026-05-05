@@ -9,7 +9,7 @@ Current behavior is deliberately small:
 - deterministic template/rule-based draft generation
 - short operator summary drafts from supplied claims, obligations, candidate inconsistencies, and unknowns
 - bounded file-backed ingestion from explicit local corpus file paths
-- tiny in-memory training-example summaries, including example counts and token counts
+- tiny in-memory training-example summaries, including example counts and rune counts
 - no persistent training
 - no model, LLM, GPU, Vulkan, Python, dependency, network, shell, verifier, or command execution
 
