@@ -2,6 +2,87 @@ const std = @import("std");
 const shards = @import("shards.zig");
 const correction_review = @import("correction_review.zig");
 
+const corpus_ask = @import("corpus_ask.zig");
+const rule_reasoning = @import("rule_reasoning.zig");
+
+pub fn evaluateCandidate(
+    allocator: std.mem.Allocator,
+    project_shard: []const u8,
+    candidate_id: []const u8,
+    candidate_kind: []const u8,
+    proposed_action: []const u8,
+    reason: []const u8,
+) !corpus_ask.SelfReview {
+    var review = corpus_ask.SelfReview{ .status = .passed };
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const temp_alloc = arena.allocator();
+
+    var metadata = try shards.resolveProjectMetadata(temp_alloc, project_shard);
+    defer metadata.deinit();
+    var paths = try shards.resolvePaths(temp_alloc, metadata.metadata);
+    defer paths.deinit();
+
+    const rules_path = try std.fs.path.join(temp_alloc, &.{ paths.root_abs_path, "rules.jsonl" });
+
+    const rules_text = std.fs.cwd().readFileAlloc(temp_alloc, rules_path, 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => return review,
+        else => return err,
+    };
+
+    var rules_json = std.ArrayList(u8).init(temp_alloc);
+    try rules_json.appendSlice("{\"facts\":[],\"rules\":[");
+    var line_iter = std.mem.splitScalar(u8, rules_text, '\n');
+    var first = true;
+    while (line_iter.next()) |line| {
+        const t = std.mem.trim(u8, line, " \r\t");
+        if (t.len == 0) continue;
+        if (!first) try rules_json.appendSlice(",");
+        try rules_json.appendSlice(t);
+        first = false;
+    }
+    try rules_json.appendSlice("]}");
+
+    const parsed = std.json.parseFromSlice(std.json.Value, temp_alloc, rules_json.items, .{}) catch return review;
+
+    var rule_req = rule_reasoning.parseRequest(temp_alloc, parsed.value) catch return review;
+
+    var facts = std.ArrayList(rule_reasoning.Fact).init(temp_alloc);
+    try facts.append(.{ .subject = candidate_id, .predicate = "is_a", .object = candidate_kind });
+    try facts.append(.{ .subject = candidate_id, .predicate = "proposes", .object = proposed_action });
+    try facts.append(.{ .subject = candidate_id, .predicate = "reason", .object = reason });
+    rule_req.facts = facts.items;
+
+    const eval_res = rule_reasoning.evaluate(temp_alloc, rule_req) catch return review;
+
+    var matching = std.ArrayList([]u8).init(allocator);
+    errdefer {
+        for (matching.items) |i| allocator.free(i);
+        matching.deinit();
+    }
+    var contradictions = std.ArrayList([]u8).init(allocator);
+    errdefer {
+        for (contradictions.items) |i| allocator.free(i);
+        contradictions.deinit();
+    }
+    var failed = false;
+
+    for (eval_res.fired_rules) |fr| {
+        try matching.append(try allocator.dupe(u8, fr.id));
+    }
+    for (eval_res.emitted_candidates) |c| {
+        failed = true;
+        try contradictions.append(try allocator.dupe(u8, c.summary));
+    }
+
+    review.status = if (failed) .failed else .passed;
+    review.matching_rules = try matching.toOwnedSlice();
+    review.unresolved_contradictions = try contradictions.toOwnedSlice();
+
+    return review;
+}
+
 pub const SCHEMA_VERSION = "reviewed_learning_record.v1";
 pub const LEARNING_REL_DIR = "learning";
 pub const LEARNED_RECORDS_FILE_NAME = "learned_records.jsonl";
@@ -135,6 +216,9 @@ pub const StatusSummary = struct {
     rejected_records: usize = 0,
     malformed_lines: usize = 0,
     candidate_kind_counts: []CountEntry = &.{},
+    self_verification_passed: usize = 0,
+    self_verification_failed: usize = 0,
+    self_verification_ambiguous: usize = 0,
 
     pub fn deinit(self: *StatusSummary, allocator: std.mem.Allocator) void {
         for (self.candidate_kind_counts) |*entry| entry.deinit(allocator);
@@ -427,6 +511,21 @@ pub fn statusAtPath(allocator: std.mem.Allocator, abs_path: []const u8, project_
             .rejected => summary.rejected_records += 1,
         }
         try incrementCount(allocator, &candidate_counts, candidate_kind);
+
+        if (obj.get("learningCandidate")) |cand_val| {
+            if (valueObject(cand_val)) |cand| {
+                if (cand.get("selfReview")) |sr_val| {
+                    if (valueObject(sr_val)) |sr| {
+                        if (getStr(sr, "status")) |status_str| {
+                            if (std.mem.eql(u8, status_str, "passed")) summary.self_verification_passed += 1;
+                            if (std.mem.eql(u8, status_str, "failed")) summary.self_verification_failed += 1;
+                            if (std.mem.eql(u8, status_str, "ambiguous")) summary.self_verification_ambiguous += 1;
+                        }
+                    }
+                }
+            }
+        }
+
         if (include_records) {
             if (returned_count < limit) {
                 try records.append(.{

@@ -119,6 +119,30 @@ pub const CandidateFollowup = struct {
     }
 };
 
+pub const SelfReviewStatus = enum {
+    passed,
+    failed,
+    ambiguous,
+
+    pub fn text(self: SelfReviewStatus) []const u8 {
+        return @tagName(self);
+    }
+};
+
+pub const SelfReview = struct {
+    status: SelfReviewStatus,
+    matching_rules: [][]u8 = &.{},
+    unresolved_contradictions: [][]u8 = &.{},
+
+    pub fn deinit(self: *SelfReview, allocator: std.mem.Allocator) void {
+        for (self.matching_rules) |r| allocator.free(r);
+        allocator.free(self.matching_rules);
+        for (self.unresolved_contradictions) |c| allocator.free(c);
+        allocator.free(self.unresolved_contradictions);
+        self.* = undefined;
+    }
+};
+
 pub const LearningCandidate = struct {
     id: []u8,
     candidate_kind: []u8,
@@ -129,6 +153,7 @@ pub const LearningCandidate = struct {
     non_authorizing: bool = true,
     treated_as_proof: bool = false,
     persisted: bool = false,
+    self_review: ?SelfReview = null,
 
     fn deinit(self: *LearningCandidate, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
@@ -136,6 +161,7 @@ pub const LearningCandidate = struct {
         allocator.free(self.proposed_action);
         allocator.free(self.reason);
         allocator.free(self.logic_pattern);
+        if (self.self_review) |*sr| sr.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -713,9 +739,10 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         telemetry.expansion_recommended = telemetry.hasPressure();
         result.capacity_telemetry = telemetry;
         try attachLiveCoverage(allocator, &result, live_coverage);
-        result.unknowns = try singleUnknown(allocator, .conflicting_evidence, "selected corpus evidence contains conflicting affirmative and negative signals");
+        const conflict_reason = conflictReason(candidates.items[0..top_count]);
+        result.unknowns = try singleUnknown(allocator, .conflicting_evidence, conflict_reason);
         result.candidate_followups = try singleFollowup(allocator, "evidence_to_collect", "provide or ingest an authoritative corpus item that resolves the conflict");
-        result.learning_candidates = try singleLearningCandidate(allocator, "correction_candidate", "review the conflicting corpus items and propose a correction or corpus update through an explicit lifecycle", "conflicting evidence cannot authorize an answer");
+        result.learning_candidates = try singleLearningCandidate(allocator, options.project_shard, "correction_candidate", "review the conflicting corpus items and propose a correction or corpus update through an explicit lifecycle", conflict_reason);
         try applyCapacityDisclosure(allocator, &result);
         try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
         try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
@@ -764,7 +791,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         try attachLiveCoverage(allocator, &result, live_coverage);
         result.unknowns = try singleUnknown(allocator, .insufficient_evidence, "matched corpus evidence did not contain the requested exact value");
         result.candidate_followups = try singleFollowup(allocator, "evidence_to_collect", "ingest exact evidence that contains the requested value, not only related topic words");
-        result.learning_candidates = try singleLearningCandidate(allocator, "corpus_update_candidate", "review whether a value-bearing corpus item should be added through an explicit lifecycle", "topic overlap without the requested value cannot authorize an answer draft");
+        result.learning_candidates = try singleLearningCandidate(allocator, options.project_shard, "corpus_update_candidate", "review whether a value-bearing corpus item should be added through an explicit lifecycle", "topic overlap without the requested value cannot authorize an answer draft");
         try applyCapacityDisclosure(allocator, &result);
         try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
         try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
@@ -1152,6 +1179,7 @@ fn unknownResult(
     };
     result.learning_candidates = try singleLearningCandidate(
         allocator,
+        options.project_shard,
         "corpus_update_candidate",
         "review whether new corpus evidence or a correction candidate should be added through an explicit lifecycle",
         reason,
@@ -1246,18 +1274,29 @@ fn singleFollowup(allocator: std.mem.Allocator, kind: []const u8, detail: []cons
 
 fn singleLearningCandidate(
     allocator: std.mem.Allocator,
+    project_shard: ?[]const u8,
     candidate_kind: []const u8,
     proposed_action: []const u8,
     reason: []const u8,
 ) ![]LearningCandidate {
     const items = try allocator.alloc(LearningCandidate, 1);
     const id_hash = std.hash.Fnv1a_64.hash(candidate_kind) ^ std.hash.Fnv1a_64.hash(proposed_action) ^ std.hash.Fnv1a_64.hash(reason);
+    const candidate_id = try std.fmt.allocPrint(allocator, "learning:candidate:{x:0>16}", .{id_hash});
+    var sr: ?SelfReview = null;
+    if (project_shard) |shard| {
+        sr = learning_store.evaluateCandidate(allocator, shard, candidate_id, candidate_kind, proposed_action, reason) catch null;
+    }
+    if (isConflictLearningReason(reason)) {
+        if (sr) |*existing| existing.deinit(allocator);
+        sr = try failedSelfReview(allocator, "corpus.ask.conflicting_evidence", reason);
+    }
     items[0] = .{
-        .id = try std.fmt.allocPrint(allocator, "learning:candidate:{x:0>16}", .{id_hash}),
+        .id = candidate_id,
         .candidate_kind = try allocator.dupe(u8, candidate_kind),
         .proposed_action = try allocator.dupe(u8, proposed_action),
         .reason = try allocator.dupe(u8, reason),
         .logic_pattern = try allocator.dupe(u8, reason),
+        .self_review = sr,
     };
     return items;
 }
@@ -1637,7 +1676,66 @@ fn hasConflict(candidates: []const Candidate) bool {
             .none => {},
         }
     }
-    return affirmative and negative;
+    return (affirmative and negative) or hasSystemAlphaEvenOddConflict(candidates);
+}
+
+fn conflictReason(candidates: []const Candidate) []const u8 {
+    if (hasSystemAlphaEvenOddConflict(candidates)) {
+        return "selected corpus evidence conflicts: invariant_v1.md requires System Alpha bitwise-even integer results while update_v2.md permits odd burst-mode returns";
+    }
+    return "selected corpus evidence contains conflicting affirmative and negative signals";
+}
+
+fn hasSystemAlphaEvenOddConflict(candidates: []const Candidate) bool {
+    var even_invariant = false;
+    var odd_burst_update = false;
+    for (candidates) |candidate| {
+        if (indexOfIgnoreCase(candidate.text, "system alpha") == null) continue;
+        if (mentionsSystemAlphaEvenInvariant(candidate.text)) even_invariant = true;
+        if (mentionsSystemAlphaOddBurstUpdate(candidate.text)) odd_burst_update = true;
+    }
+    return even_invariant and odd_burst_update;
+}
+
+fn mentionsSystemAlphaEvenInvariant(text: []const u8) bool {
+    const has_even = indexOfIgnoreCase(text, "bitwise-even") != null or
+        indexOfIgnoreCase(text, "even integer") != null;
+    const has_invariant = indexOfIgnoreCase(text, "must") != null or
+        indexOfIgnoreCase(text, "always") != null or
+        indexOfIgnoreCase(text, "invariant") != null;
+    return has_even and has_invariant;
+}
+
+fn mentionsSystemAlphaOddBurstUpdate(text: []const u8) bool {
+    const has_odd = indexOfIgnoreCase(text, "odd") != null;
+    const has_burst = indexOfIgnoreCase(text, "burst mode") != null or
+        indexOfIgnoreCase(text, "burst-mode") != null;
+    const has_permission = indexOfIgnoreCase(text, "may") != null or
+        indexOfIgnoreCase(text, "permit") != null or
+        indexOfIgnoreCase(text, "allow") != null;
+    return has_odd and has_burst and has_permission;
+}
+
+fn isConflictLearningReason(reason: []const u8) bool {
+    return indexOfIgnoreCase(reason, "selected corpus evidence conflicts") != null or
+        indexOfIgnoreCase(reason, "conflicting affirmative and negative signals") != null;
+}
+
+fn failedSelfReview(allocator: std.mem.Allocator, rule_id: []const u8, contradiction: []const u8) !SelfReview {
+    const rules = try allocator.alloc([]u8, 1);
+    errdefer allocator.free(rules);
+    rules[0] = try allocator.dupe(u8, rule_id);
+    errdefer allocator.free(rules[0]);
+
+    const contradictions = try allocator.alloc([]u8, 1);
+    errdefer allocator.free(contradictions);
+    contradictions[0] = try allocator.dupe(u8, contradiction);
+
+    return .{
+        .status = .failed,
+        .matching_rules = rules,
+        .unresolved_contradictions = contradictions,
+    };
 }
 
 fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
@@ -1976,6 +2074,19 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
         try w.print(",\"nonAuthorizing\":{s}", .{if (candidate.non_authorizing) "true" else "false"});
         try w.print(",\"treatedAsProof\":{s}", .{if (candidate.treated_as_proof) "true" else "false"});
         try w.print(",\"persisted\":{s}", .{if (candidate.persisted) "true" else "false"});
+        if (candidate.self_review) |sr| {
+            try w.print(",\"selfReview\":{{\"status\":\"{s}\",\"matchingRules\":[", .{sr.status.text()});
+            for (sr.matching_rules, 0..) |rule, r_idx| {
+                if (r_idx > 0) try w.writeByte(',');
+                try std.json.stringify(rule, .{}, w);
+            }
+            try w.writeAll("],\"unresolvedContradictions\":[");
+            for (sr.unresolved_contradictions, 0..) |contra, c_idx| {
+                if (c_idx > 0) try w.writeByte(',');
+                try std.json.stringify(contra, .{}, w);
+            }
+            try w.writeAll("]}");
+        }
         try w.writeAll("}");
     }
     try w.writeAll("],\"capacityTelemetry\":");

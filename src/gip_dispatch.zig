@@ -1624,6 +1624,12 @@ fn dispatchLearningStatus(allocator: std.mem.Allocator, request_body: ?[]const u
         status.learning_status.summary.rejected_records,
         status.learning_status.summary.malformed_lines,
     });
+    try w.writeAll("},\"selfVerificationScoreboard\":{");
+    try w.print("\"passed\":{d},\"failed\":{d},\"ambiguous\":{d}", .{
+        status.learning_status.summary.self_verification_passed,
+        status.learning_status.summary.self_verification_failed,
+        status.learning_status.summary.self_verification_ambiguous,
+    });
     try w.writeAll(",\"learningCandidateKindCounts\":");
     try writeCountEntriesJson(w, status.learning_status.summary.candidate_kind_counts);
     try w.writeAll("},\"influenceSummary\":{");
