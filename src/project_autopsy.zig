@@ -2651,3 +2651,31 @@ test "project autopsy does not write files" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.access("project_profile.json", .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(".ghost", .{}));
 }
+
+test "project autopsy invariants: missing or ambiguous roots and missing verifiers produce unknowns" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Trigger ambiguous source roots
+    try makeFile(tmp.dir, "src/main.zig", "pub fn main() void {}");
+    try makeFile(tmp.dir, "lib/main.zig", "pub fn main() void {}");
+
+    // Trigger runtime verifier missing gap
+    try makeFile(tmp.dir, "Dockerfile", "FROM scratch\n");
+
+    const root = try tmp.dir.realpathAlloc(std.heap.page_allocator, ".");
+    defer std.heap.page_allocator.free(root);
+    const result = try analyze(std.heap.page_allocator, root, .{});
+
+    try std.testing.expect(containsNamedSignal(result.project_profile.unknowns, "source_root_ambiguous"));
+    try std.testing.expect(containsNamedSignal(result.project_profile.unknowns, "test_root_unknown"));
+
+    try std.testing.expect(findVerifierGap(result.project_gap_report.missing_verifier_adapters, "gap.test_root_verifier_missing") != null);
+    try std.testing.expect(findVerifierGap(result.project_gap_report.missing_verifier_adapters, "gap.runtime_verifier_missing") != null);
+    try std.testing.expect(findVerifierGap(result.project_gap_report.missing_verifier_adapters, "gap.verifier_execution_not_run") != null);
+
+    try std.testing.expect(containsNamedSignal(result.project_profile.verifier_gap_summary.unknown_verifier_status, "verifier_registration_status"));
+
+    try std.testing.expect(result.non_authorizing);
+    try std.testing.expect(result.read_only);
+}
