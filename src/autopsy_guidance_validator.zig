@@ -891,6 +891,111 @@ const valid_guidance =
     \\{"packGuidance":[{"pack_id":"pack-a","match":{"intent_tags_any":["planning"]},"signals":[{"name":"sig","kind":"generic_signal","confidence":"medium","reason":"matched"}],"unknowns":[{"name":"gap","importance":"medium","reason":"missing"}],"risks":[{"risk_kind":"risk","reason":"risk exists","suggested_caution":"check first"}],"candidate_actions":[{"id":"act","summary":"candidate only","action_type":"generic_action"}],"check_candidates":[{"id":"chk","summary":"check only","check_kind":"soft","why_candidate_exists":"needs evidence"}],"evidence_expectations":[{"id":"ev","summary":"evidence required","expectation_kind":"soft","expected_signal":"sig","reason":"before claims"}]}]}
 ;
 
+const minimal_versioned_guidance =
+    \\{"schema":"ghost.autopsy_guidance.v1","packGuidance":[{"pack_id":"pack-a","signals":[{"name":"sig","kind":"generic_signal","confidence":"medium","reason":"matched"}]}]}
+;
+
+const InstalledPackFixture = struct {
+    allocator: std.mem.Allocator,
+    pack_id: []const u8,
+    pack_version: []const u8,
+    root_abs_path: []u8,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        pack_id: []const u8,
+        pack_version: []const u8,
+        guidance_rel_path: ?[]const u8,
+        guidance_body: ?[]const u8,
+    ) !InstalledPackFixture {
+        const root = try store.packRootAbsPath(allocator, pack_id, pack_version);
+        errdefer allocator.free(root);
+        // validateInstalledPack is intentionally tied to the installed-pack
+        // store, so tests isolate writes to one unique pack root and clean it.
+        try deleteTreeIfExistsAbsolute(root);
+        errdefer deleteTreeIfExistsAbsolute(root) catch {};
+
+        var manifest = try testManifest(allocator, pack_id, pack_version, guidance_rel_path);
+        defer manifest.deinit();
+        try store.saveManifest(allocator, root, &manifest);
+
+        if (guidance_body) |body| {
+            const rel_path = guidance_rel_path orelse return error.InvalidKnowledgePackManifest;
+            const guidance_path = try std.fs.path.join(allocator, &.{ root, rel_path });
+            defer allocator.free(guidance_path);
+            try writeFileAbsolute(guidance_path, body);
+        }
+
+        return .{
+            .allocator = allocator,
+            .pack_id = pack_id,
+            .pack_version = pack_version,
+            .root_abs_path = root,
+        };
+    }
+
+    fn deinit(self: *InstalledPackFixture) void {
+        deleteTreeIfExistsAbsolute(self.root_abs_path) catch {};
+        self.allocator.free(self.root_abs_path);
+        self.* = undefined;
+    }
+};
+
+fn testManifest(
+    allocator: std.mem.Allocator,
+    pack_id: []const u8,
+    pack_version: []const u8,
+    guidance_rel_path: ?[]const u8,
+) !store.Manifest {
+    return .{
+        .allocator = allocator,
+        .schema_version = try allocator.dupe(u8, store.PACK_SCHEMA_VERSION),
+        .pack_id = try allocator.dupe(u8, pack_id),
+        .pack_version = try allocator.dupe(u8, pack_version),
+        .domain_family = try allocator.dupe(u8, "context"),
+        .trust_class = try allocator.dupe(u8, "project"),
+        .compatibility = .{
+            .engine_version = try allocator.dupe(u8, "test"),
+            .mount_schema = try allocator.dupe(u8, store.MOUNT_SCHEMA_VERSION),
+        },
+        .storage = .{
+            .corpus_manifest_rel_path = try allocator.dupe(u8, "corpus/manifest.json"),
+            .corpus_files_rel_path = try allocator.dupe(u8, "corpus"),
+            .abstraction_catalog_rel_path = try allocator.dupe(u8, "abstractions/abstractions.gabs"),
+            .reuse_catalog_rel_path = try allocator.dupe(u8, "abstractions/reuse.gabr"),
+            .lineage_state_rel_path = try allocator.dupe(u8, "abstractions/lineage.gabs"),
+            .influence_manifest_rel_path = try allocator.dupe(u8, "influence.json"),
+            .autopsy_guidance_rel_path = if (guidance_rel_path) |path| try allocator.dupe(u8, path) else null,
+        },
+        .provenance = .{
+            .pack_lineage_id = try std.fmt.allocPrint(allocator, "pack:{s}@{s}", .{ pack_id, pack_version }),
+            .source_kind = try allocator.dupe(u8, "test"),
+            .source_id = try allocator.dupe(u8, "test"),
+            .source_state = .staged,
+            .freshness_state = .active,
+            .source_summary = try allocator.dupe(u8, "test"),
+            .source_lineage_summary = try allocator.dupe(u8, "test"),
+        },
+        .content = .{},
+    };
+}
+
+fn deleteTreeIfExistsAbsolute(path: []const u8) !void {
+    std.fs.deleteTreeAbsolute(path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+fn writeFileAbsolute(abs_path: []const u8, bytes: []const u8) !void {
+    if (std.fs.path.dirname(abs_path)) |parent| {
+        try std.fs.cwd().makePath(parent);
+    }
+    var file = try std.fs.createFileAbsolute(abs_path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(bytes);
+}
+
 test "valid persisted autopsy guidance passes validation" {
     const allocator = std.testing.allocator;
     var report = try validateGuidanceBytes(allocator, valid_guidance, "pack-a", "v1");
@@ -1193,4 +1298,57 @@ test "validator does not mutate manifest or guidance files" {
     defer allocator.free(after_guidance);
     try std.testing.expectEqualStrings(before_manifest, after_manifest);
     try std.testing.expectEqualStrings(before_guidance, after_guidance);
+}
+
+test "validateInstalledPack validates installed manifest and guidance" {
+    const allocator = std.testing.allocator;
+    var fixture = try InstalledPackFixture.init(
+        allocator,
+        "autopsy_validator_installed_happy_path",
+        "v1",
+        "autopsy/guidance.json",
+        minimal_versioned_guidance,
+    );
+    defer fixture.deinit();
+
+    var report = try validateInstalledPack(allocator, fixture.pack_id, fixture.pack_version);
+    defer report.deinit();
+
+    try std.testing.expect(report.ok());
+    try std.testing.expectEqualStrings(fixture.pack_id, report.pack_id);
+    try std.testing.expectEqualStrings(fixture.pack_version, report.pack_version);
+    try std.testing.expectEqual(@as(usize, 1), report.guidance_count);
+    try std.testing.expectEqual(@as(usize, 0), report.warning_count);
+}
+
+test "validateInstalledPack missing manifest preserves current FileNotFound contract" {
+    const allocator = std.testing.allocator;
+    const pack_id = "autopsy_validator_installed_missing_manifest";
+    const pack_version = "v1";
+    const root = try store.packRootAbsPath(allocator, pack_id, pack_version);
+    defer allocator.free(root);
+
+    try deleteTreeIfExistsAbsolute(root);
+    defer deleteTreeIfExistsAbsolute(root) catch {};
+
+    try std.testing.expectError(error.FileNotFound, validateInstalledPack(allocator, pack_id, pack_version));
+}
+
+test "validateInstalledPack missing guidance file returns structured report" {
+    const allocator = std.testing.allocator;
+    var fixture = try InstalledPackFixture.init(
+        allocator,
+        "autopsy_validator_installed_missing_guidance",
+        "v1",
+        "autopsy/missing.json",
+        null,
+    );
+    defer fixture.deinit();
+
+    var report = try validateInstalledPack(allocator, fixture.pack_id, fixture.pack_version);
+    defer report.deinit();
+
+    try std.testing.expect(!report.ok());
+    try std.testing.expectEqual(@as(usize, 1), report.error_count);
+    try std.testing.expect(hasIssueCode(report.issues, "guidance_file_missing"));
 }
