@@ -51,6 +51,7 @@ pub const TextGenerationDraft = struct {
     proof_granted: bool = false,
     mutates_state: bool = false,
     training_applied: bool = false,
+    lab_memory_applied: bool = false,
     product_ready: bool = false,
     commands_executed: bool = false,
     verifiers_executed: bool = false,
@@ -59,6 +60,56 @@ pub const TextGenerationDraft = struct {
 
     pub fn deinit(self: TextGenerationDraft, allocator: std.mem.Allocator) void {
         allocator.free(self.draft_text);
+    }
+};
+
+pub const LabMemorySignalKind = enum {
+    claim,
+    obligation,
+    unknown,
+};
+
+pub const LabMemoryReviewState = enum {
+    candidate,
+    accepted,
+    rejected,
+};
+
+pub const LabMemoryRecord = struct {
+    id: []const u8,
+    source_path: []const u8,
+    signal_kind: LabMemorySignalKind,
+    text: []const u8,
+    review_state: LabMemoryReviewState = .candidate,
+    candidate_only: bool = true,
+    non_authorizing: bool = true,
+    support_granted: bool = false,
+    proof_granted: bool = false,
+    product_ready: bool = false,
+};
+
+pub const LabMemoryStore = struct {
+    records: std.ArrayList(LabMemoryRecord),
+
+    pub fn init(allocator: std.mem.Allocator) LabMemoryStore {
+        return .{ .records = std.ArrayList(LabMemoryRecord).init(allocator) };
+    }
+
+    pub fn deinit(self: *LabMemoryStore) void {
+        for (self.records.items) |record| {
+            self.records.allocator.free(record.id);
+            self.records.allocator.free(record.source_path);
+            self.records.allocator.free(record.text);
+        }
+        self.records.deinit();
+    }
+
+    pub fn acceptedCount(self: LabMemoryStore) usize {
+        var count: usize = 0;
+        for (self.records.items) |record| {
+            if (record.review_state == .accepted) count += 1;
+        }
+        return count;
     }
 };
 
@@ -142,6 +193,7 @@ pub fn defaultLimitations() []const []const u8 {
         "no model training is applied",
         "no generated text grants proof or support",
         "no trusted state is mutated",
+        "accepted lab memory is reviewed, lab-local, and non-authorizing",
         "unknowns remain unknown rather than negative evidence",
         "not product-ready",
     };
@@ -151,18 +203,34 @@ pub fn generateOperatorSummaryDraft(
     allocator: std.mem.Allocator,
     input: TextGenerationInput,
 ) !TextGenerationDraft {
+    return generateOperatorSummaryDraftInternal(allocator, input, null);
+}
+
+pub fn generateDraftWithLabMemory(
+    allocator: std.mem.Allocator,
+    input: TextGenerationInput,
+    memory_store: LabMemoryStore,
+) !TextGenerationDraft {
+    return generateOperatorSummaryDraftInternal(allocator, input, memory_store);
+}
+
+fn generateOperatorSummaryDraftInternal(
+    allocator: std.mem.Allocator,
+    input: TextGenerationInput,
+    memory_store: ?LabMemoryStore,
+) !TextGenerationDraft {
     var out = std.ArrayList(u8).init(allocator);
     errdefer out.deinit();
     const writer = out.writer();
+    const lab_memory_applied = if (memory_store) |store| store.acceptedCount() > 0 else false;
 
     try writer.writeAll("TEXT GENERATION LAB DRAFT / CANDIDATE ONLY / NON-AUTHORIZING\n");
-    try writer.writeAll("Authority: proof_granted=false, support_granted=false, mutates_state=false, training_applied=false, product_ready=false.\n\n");
+    try writer.print("Authority: proof_granted=false, support_granted=false, mutates_state=false, training_applied=false, lab_memory_applied={}, product_ready=false.\n\n", .{lab_memory_applied});
 
     if (hasNoSignals(input)) {
         try writer.writeAll("Summary: insufficient inspected signal to draft a substantive operator summary without guessing.\n");
         try writer.writeAll("Unknowns:\n");
         try writer.writeAll("- no claims, obligations, inconsistencies, or explicit unknowns were supplied\n");
-        try writer.writeAll("Boundary: no evidence is not negative evidence, and unknown is not false.\n");
     } else {
         try writer.writeAll("Summary: inspected artifact/corpus-like signals produced a draft for operator review.\n");
         try writeSourceSection(writer, input);
@@ -170,6 +238,11 @@ pub fn generateOperatorSummaryDraft(
         try writeTextSignals(writer, "Detected obligations", input.detected_obligations);
         try writeInconsistencies(writer, input.candidate_inconsistencies);
         try writeUnknowns(writer, input.unknowns);
+    }
+    if (memory_store) |store| try writeLabMemorySection(writer, store);
+    if (hasNoSignals(input)) {
+        try writer.writeAll("Boundary: no evidence is not negative evidence, and unknown is not false.\n");
+    } else {
         try writer.writeAll("Boundary: this draft may guide review, but it is not evidence, proof, support, or verifier output.\n");
     }
 
@@ -178,7 +251,37 @@ pub fn generateOperatorSummaryDraft(
         .source_artifact_ids = input.source_artifact_ids,
         .source_paths = input.source_paths,
         .unknowns = input.unknowns,
+        .lab_memory_applied = lab_memory_applied,
     };
+}
+
+pub fn proposeMemoryFromCorpusSignals(
+    allocator: std.mem.Allocator,
+    store: *LabMemoryStore,
+    input: TextGenerationInput,
+) !usize {
+    var proposed: usize = 0;
+    for (input.detected_claims) |signal| {
+        if (try appendMemoryCandidate(allocator, store, .claim, signal.source_path, signal.text)) proposed += 1;
+    }
+    for (input.detected_obligations) |signal| {
+        if (try appendMemoryCandidate(allocator, store, .obligation, signal.source_path, signal.text)) proposed += 1;
+    }
+    const unknown_source_path = if (input.source_paths.len > 0) input.source_paths[0] else "lab-local-unknown";
+    for (input.unknowns) |unknown| {
+        if (try appendMemoryCandidate(allocator, store, .unknown, unknown_source_path, unknown)) proposed += 1;
+    }
+    return proposed;
+}
+
+pub fn acceptLabMemoryRecord(store: *LabMemoryStore, id: []const u8) !void {
+    const record = findLabMemoryRecord(store, id) orelse return error.LabMemoryRecordNotFound;
+    record.review_state = .accepted;
+}
+
+pub fn rejectLabMemoryRecord(store: *LabMemoryStore, id: []const u8) !void {
+    const record = findLabMemoryRecord(store, id) orelse return error.LabMemoryRecordNotFound;
+    record.review_state = .rejected;
 }
 
 pub fn ingestCorpusAndGenerateDraft(
@@ -358,6 +461,64 @@ fn hasNoSignals(input: TextGenerationInput) bool {
         input.unknowns.len == 0;
 }
 
+fn appendMemoryCandidate(
+    allocator: std.mem.Allocator,
+    store: *LabMemoryStore,
+    kind: LabMemorySignalKind,
+    source_path: []const u8,
+    text: []const u8,
+) !bool {
+    if (containsLabMemoryRecord(store.records.items, kind, source_path, text)) return false;
+
+    const next_index = store.records.items.len + 1;
+    const id = try std.fmt.allocPrint(allocator, "lab-memory-{d}", .{next_index});
+    errdefer allocator.free(id);
+    const owned_source_path = try allocator.dupe(u8, source_path);
+    errdefer allocator.free(owned_source_path);
+    const owned_text = try allocator.dupe(u8, text);
+    errdefer allocator.free(owned_text);
+
+    try store.records.append(.{
+        .id = id,
+        .source_path = owned_source_path,
+        .signal_kind = kind,
+        .text = owned_text,
+    });
+    return true;
+}
+
+fn findLabMemoryRecord(store: *LabMemoryStore, id: []const u8) ?*LabMemoryRecord {
+    for (store.records.items) |*record| {
+        if (std.mem.eql(u8, record.id, id)) return record;
+    }
+    return null;
+}
+
+fn containsLabMemoryRecord(
+    records: []const LabMemoryRecord,
+    kind: LabMemorySignalKind,
+    source_path: []const u8,
+    text: []const u8,
+) bool {
+    for (records) |record| {
+        if (record.signal_kind == kind and
+            std.mem.eql(u8, record.source_path, source_path) and
+            std.mem.eql(u8, record.text, text))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn signalKindName(kind: LabMemorySignalKind) []const u8 {
+    return switch (kind) {
+        .claim => "claim",
+        .obligation => "obligation",
+        .unknown => "unknown",
+    };
+}
+
 fn writeSourceSection(writer: anytype, input: TextGenerationInput) !void {
     if (input.source_artifact_ids.len > 0) {
         try writer.writeAll("\nSource artifact ids:\n");
@@ -403,6 +564,43 @@ fn writeUnknowns(writer: anytype, unknowns: []const []const u8) !void {
         try writer.print("- unknown: {s}\n", .{unknown});
     }
     try writer.writeAll("Unknown handling: unknown is not false; missing evidence is not negative evidence.\n");
+}
+
+fn writeLabMemorySection(writer: anytype, store: LabMemoryStore) !void {
+    if (store.records.items.len == 0) return;
+
+    var accepted_seen = false;
+    for (store.records.items) |record| {
+        if (record.review_state != .accepted) continue;
+        if (!accepted_seen) {
+            try writer.writeAll("\nAccepted lab memory reminders / NON-AUTHORIZING / LAB-LOCAL:\n");
+            accepted_seen = true;
+        }
+        try writer.print("- [{s}] {s}: {s}\n", .{ signalKindName(record.signal_kind), record.source_path, record.text });
+    }
+    if (accepted_seen) {
+        try writer.writeAll("Lab memory boundary: reviewed lab memory can influence this lab draft only; it grants no proof, support, verifier result, trusted memory, or product readiness.\n");
+    }
+
+    var pending_seen = false;
+    for (store.records.items) |record| {
+        if (record.review_state != .candidate) continue;
+        if (!pending_seen) {
+            try writer.writeAll("\nPending lab memory review / NOT APPLIED:\n");
+            pending_seen = true;
+        }
+        try writer.print("- [{s}] {s}: {s}\n", .{ signalKindName(record.signal_kind), record.source_path, record.text });
+    }
+
+    var rejected_seen = false;
+    for (store.records.items) |record| {
+        if (record.review_state != .rejected) continue;
+        if (!rejected_seen) {
+            try writer.writeAll("\nRejected lab memory / NOT APPLIED:\n");
+            rejected_seen = true;
+        }
+        try writer.print("- [{s}] {s}: {s}\n", .{ signalKindName(record.signal_kind), record.source_path, record.text });
+    }
 }
 
 fn addRunes(counts: *std.ArrayList(RuneCount), text: []const u8) !usize {
@@ -628,6 +826,7 @@ test "fixture corpus ingestion produces candidate draft from claims obligations 
             "fixtures/text_generation_lab/corpus/doc_claims.md",
             "fixtures/text_generation_lab/corpus/runbook.md",
             "fixtures/text_generation_lab/corpus/noisy_notes.md",
+            "fixtures/text_generation_lab/corpus/learning_seed.md",
         },
     });
     defer result.deinit(allocator);
@@ -639,7 +838,8 @@ test "fixture corpus ingestion produces candidate draft from claims obligations 
     try std.testing.expect(!result.draft.mutates_state);
     try std.testing.expect(!result.draft.training_applied);
     try std.testing.expect(!result.training_summary.training_applied);
-    try std.testing.expectEqual(@as(usize, 3), result.ingest_summary.files_seen);
+    try std.testing.expect(!result.draft.lab_memory_applied);
+    try std.testing.expectEqual(@as(usize, 4), result.ingest_summary.files_seen);
     try std.testing.expect(result.ingest_summary.claim_count >= 3);
     try std.testing.expect(result.ingest_summary.obligation_count >= 2);
     try std.testing.expect(result.ingest_summary.unknown_count >= 2);
@@ -647,6 +847,168 @@ test "fixture corpus ingestion produces candidate draft from claims obligations 
     try std.testing.expect(std.mem.indexOf(u8, result.draft.draft_text, "Detected obligations") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.draft.draft_text, "Unknowns") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.draft.draft_text, "proof_granted=false") != null);
+}
+
+test "corpus signals can become lab memory candidates" {
+    const allocator = std.testing.allocator;
+    const input = TextGenerationInput{
+        .source_paths = &.{"lab.md"},
+        .detected_claims = &.{
+            .{ .source_path = "lab.md", .kind = "corpus_claim", .text = "claim: lab memory can be proposed" },
+        },
+        .detected_obligations = &.{
+            .{ .source_path = "lab.md", .kind = "corpus_obligation", .text = "obligation: reviewed records must stay lab-local" },
+        },
+        .unknowns = &.{"unknown: whether more review is needed"},
+    };
+    var store = LabMemoryStore.init(allocator);
+    defer store.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), try proposeMemoryFromCorpusSignals(allocator, &store, input));
+    try std.testing.expectEqual(@as(usize, 3), store.records.items.len);
+    for (store.records.items) |record| {
+        try std.testing.expectEqual(LabMemoryReviewState.candidate, record.review_state);
+        try std.testing.expect(record.candidate_only);
+        try std.testing.expect(record.non_authorizing);
+        try std.testing.expect(!record.support_granted);
+        try std.testing.expect(!record.proof_granted);
+        try std.testing.expect(!record.product_ready);
+    }
+}
+
+test "accepted lab memory changes future draft output without training" {
+    const allocator = std.testing.allocator;
+    const input = TextGenerationInput{
+        .source_paths = &.{"learning.md"},
+        .detected_claims = &.{
+            .{ .source_path = "learning.md", .kind = "corpus_claim", .text = "claim: accepted lab memory should be visible later" },
+        },
+    };
+    var store = LabMemoryStore.init(allocator);
+    defer store.deinit();
+    try std.testing.expectEqual(@as(usize, 1), try proposeMemoryFromCorpusSignals(allocator, &store, input));
+
+    const before = try generateDraftWithLabMemory(allocator, .{}, store);
+    defer before.deinit(allocator);
+    try std.testing.expect(!before.lab_memory_applied);
+    try std.testing.expect(std.mem.indexOf(u8, before.draft_text, "Accepted lab memory reminders") == null);
+
+    try acceptLabMemoryRecord(&store, store.records.items[0].id);
+    const after = try generateDraftWithLabMemory(allocator, .{}, store);
+    defer after.deinit(allocator);
+
+    try std.testing.expect(after.lab_memory_applied);
+    try std.testing.expect(!after.training_applied);
+    try std.testing.expect(!after.proof_granted);
+    try std.testing.expect(!after.support_granted);
+    try std.testing.expect(!after.mutates_state);
+    try std.testing.expect(!after.product_ready);
+    try std.testing.expect(std.mem.indexOf(u8, after.draft_text, "Accepted lab memory reminders / NON-AUTHORIZING / LAB-LOCAL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after.draft_text, "accepted lab memory should be visible later") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after.draft_text, "grants no proof, support") != null);
+}
+
+test "rejected lab memory does not influence future draft output" {
+    const allocator = std.testing.allocator;
+    const input = TextGenerationInput{
+        .detected_claims = &.{
+            .{ .source_path = "reject.md", .kind = "corpus_claim", .text = "claim: rejected signal should not become a reminder" },
+        },
+    };
+    var store = LabMemoryStore.init(allocator);
+    defer store.deinit();
+    _ = try proposeMemoryFromCorpusSignals(allocator, &store, input);
+    try rejectLabMemoryRecord(&store, store.records.items[0].id);
+
+    const draft = try generateDraftWithLabMemory(allocator, .{}, store);
+    defer draft.deinit(allocator);
+
+    try std.testing.expect(!draft.lab_memory_applied);
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "Accepted lab memory reminders") == null);
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "Rejected lab memory / NOT APPLIED") != null);
+    try std.testing.expect(!draft.proof_granted);
+    try std.testing.expect(!draft.support_granted);
+}
+
+test "unreviewed lab memory is pending review and not authority" {
+    const allocator = std.testing.allocator;
+    const input = TextGenerationInput{
+        .detected_obligations = &.{
+            .{ .source_path = "candidate.md", .kind = "corpus_obligation", .text = "obligation: candidate records must not apply themselves" },
+        },
+    };
+    var store = LabMemoryStore.init(allocator);
+    defer store.deinit();
+    _ = try proposeMemoryFromCorpusSignals(allocator, &store, input);
+
+    const draft = try generateDraftWithLabMemory(allocator, .{}, store);
+    defer draft.deinit(allocator);
+
+    try std.testing.expect(!draft.lab_memory_applied);
+    try std.testing.expect(!draft.training_applied);
+    try std.testing.expect(!draft.proof_granted);
+    try std.testing.expect(!draft.support_granted);
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "Pending lab memory review / NOT APPLIED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "Accepted lab memory reminders") == null);
+}
+
+test "duplicate lab memory proposals are suppressed before acceptance" {
+    const allocator = std.testing.allocator;
+    const input = TextGenerationInput{
+        .detected_claims = &.{
+            .{ .source_path = "dupe.md", .kind = "corpus_claim", .text = "claim: duplicate lab memory" },
+            .{ .source_path = "dupe.md", .kind = "corpus_claim", .text = "claim: duplicate lab memory" },
+        },
+    };
+    var store = LabMemoryStore.init(allocator);
+    defer store.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), try proposeMemoryFromCorpusSignals(allocator, &store, input));
+    try std.testing.expectEqual(@as(usize, 1), store.records.items.len);
+    try acceptLabMemoryRecord(&store, store.records.items[0].id);
+    try std.testing.expectEqual(@as(usize, 1), store.acceptedCount());
+}
+
+test "no usable signals produce no lab memory records to accept" {
+    const allocator = std.testing.allocator;
+    var store = LabMemoryStore.init(allocator);
+    defer store.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), try proposeMemoryFromCorpusSignals(allocator, &store, .{}));
+    try std.testing.expectEqual(@as(usize, 0), store.records.items.len);
+    try std.testing.expectError(error.LabMemoryRecordNotFound, acceptLabMemoryRecord(&store, "lab-memory-1"));
+}
+
+test "fixture corpus accepted lab memory changes second draft only inside lab" {
+    const allocator = std.testing.allocator;
+    const result = try ingestCorpusAndGenerateDraft(allocator, .{
+        .workspace_root = ".",
+        .corpus_paths = &.{
+            "fixtures/text_generation_lab/corpus/learning_seed.md",
+        },
+    });
+    defer result.deinit(allocator);
+    var store = LabMemoryStore.init(allocator);
+    defer store.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), try proposeMemoryFromCorpusSignals(allocator, &store, result.extraction.input));
+    const first = try generateDraftWithLabMemory(allocator, result.extraction.input, store);
+    defer first.deinit(allocator);
+    try std.testing.expect(!first.lab_memory_applied);
+    try std.testing.expect(std.mem.indexOf(u8, first.draft_text, "Accepted lab memory reminders") == null);
+
+    try acceptLabMemoryRecord(&store, store.records.items[0].id);
+    const second = try generateDraftWithLabMemory(allocator, result.extraction.input, store);
+    defer second.deinit(allocator);
+
+    try std.testing.expect(second.lab_memory_applied);
+    try std.testing.expect(!second.training_applied);
+    try std.testing.expect(!second.mutates_state);
+    try std.testing.expect(!second.proof_granted);
+    try std.testing.expect(!second.support_granted);
+    try std.testing.expect(!second.product_ready);
+    try std.testing.expect(std.mem.indexOf(u8, second.draft_text, "Accepted lab memory reminders") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second.draft_text, "lab memory reminds later drafts") != null);
 }
 
 test "noisy duplicate corpus lines are suppressed and do not become authority" {
