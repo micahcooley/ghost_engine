@@ -16,6 +16,7 @@ const MAX_QUERY_TOKENS: usize = 16;
 const MIN_TOKEN_LEN: usize = 3;
 const MAX_SKETCH_CANDIDATES: usize = 8;
 const MAX_SIMHASH_DISTANCE: u7 = 24;
+const PRIMARY_NOUN_MATCH_THRESHOLD_PERCENT: u8 = 100;
 
 pub const MountedPackRef = corpus_ingest.MountedPackRef;
 
@@ -422,6 +423,8 @@ pub const Result = struct {
     influence_telemetry: InfluenceTelemetry = .{},
     negative_knowledge_telemetry: NegativeKnowledgeTelemetry = .{},
     learning_influence_telemetry: LearningInfluenceTelemetry = .{},
+    parameter_match_failure: bool = false,
+    primary_noun_match_failure: bool = false,
 
     pub fn deinit(self: *Result) void {
         self.allocator.free(self.state);
@@ -765,6 +768,62 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         telemetry.expansion_recommended = telemetry.hasPressure();
         result.capacity_telemetry = telemetry;
         try attachLiveCoverage(allocator, &result, live_coverage);
+        try applyCapacityDisclosure(allocator, &result);
+        try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
+        try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
+        try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
+        return result;
+    }
+
+    if (!candidatesParameterMatchCheck(tokens.tokens, candidates.items[0..top_count])) {
+        var result = try buildBaseResult(allocator, options, &paths, .unknown, "unresolved", "unresolved", entries.len, max_results, max_snippet);
+        errdefer result.deinit();
+        result.parameter_match_failure = true;
+        result.mounted_packs_considered = options.mounted_packs.len;
+        result.mounted_pack_entries_considered = mounted_pack_entry_count;
+        result.evidence_used = try buildEvidence(allocator, candidates.items[0..top_count], entries, max_snippet, "candidate evidence matched topic terms but failed the exact parameter lock");
+        result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
+        telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
+        if (telemetry.truncated_snippets != 0) telemetry.budget_hits += 1;
+        telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
+        if (telemetry.sketch_candidate_cap_hit) {
+            telemetry.max_results_hit = true;
+            telemetry.budget_hits += 1;
+        }
+        telemetry.expansion_recommended = true;
+        result.capacity_telemetry = telemetry;
+        try attachLiveCoverage(allocator, &result, live_coverage);
+        result.unknowns = try singleUnknown(allocator, .insufficient_evidence, "parameter_match_failure: selected evidence did not contain the exact parameter requested by the question");
+        result.candidate_followups = try singleFollowup(allocator, "evidence_to_collect", "ingest exact evidence that contains the requested parameter value");
+        result.learning_candidates = try singleLearningCandidate(allocator, options.project_shard, "corpus_update_candidate", "review whether parameter-bearing corpus evidence should be added through an explicit lifecycle", "parameter_match_failure");
+        try applyCapacityDisclosure(allocator, &result);
+        try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
+        try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
+        try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
+        return result;
+    }
+
+    if (!candidatesPrimaryNounMatchCheck(tokens.tokens, candidates.items[0..top_count])) {
+        var result = try buildBaseResult(allocator, options, &paths, .unknown, "unresolved", "unresolved", entries.len, max_results, max_snippet);
+        errdefer result.deinit();
+        result.primary_noun_match_failure = true;
+        result.mounted_packs_considered = options.mounted_packs.len;
+        result.mounted_pack_entries_considered = mounted_pack_entry_count;
+        result.evidence_used = try buildEvidence(allocator, candidates.items[0..top_count], entries, max_snippet, "candidate evidence fell below the strict exact-token threshold for query primary nouns");
+        result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
+        telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
+        if (telemetry.truncated_snippets != 0) telemetry.budget_hits += 1;
+        telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
+        if (telemetry.sketch_candidate_cap_hit) {
+            telemetry.max_results_hit = true;
+            telemetry.budget_hits += 1;
+        }
+        telemetry.expansion_recommended = true;
+        result.capacity_telemetry = telemetry;
+        try attachLiveCoverage(allocator, &result, live_coverage);
+        result.unknowns = try singleUnknown(allocator, .insufficient_evidence, "primary_noun_similarity_failure: selected evidence did not meet the exact-token threshold for the query primary nouns");
+        result.candidate_followups = try singleFollowup(allocator, "evidence_to_collect", "ingest evidence that exactly names the requested subject, not only adjacent action words");
+        result.learning_candidates = try singleLearningCandidate(allocator, options.project_shard, "corpus_update_candidate", "review whether subject-specific corpus evidence should be added through an explicit lifecycle", "primary_noun_similarity_failure");
         try applyCapacityDisclosure(allocator, &result);
         try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
         try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
@@ -1537,11 +1596,71 @@ fn requiredScore(token_count: usize) u32 {
     return 2;
 }
 
+fn candidatesParameterMatchCheck(query_tokens: []const []const u8, candidates: []const Candidate) bool {
+    for (query_tokens) |token| {
+        if (!isParameterToken(token)) continue;
+        if (!candidatesMatchedTermsContain(candidates, token)) return false;
+    }
+    return true;
+}
+
+fn candidatesPrimaryNounMatchCheck(query_tokens: []const []const u8, candidates: []const Candidate) bool {
+    var primary_count: usize = 0;
+    var matched_count: usize = 0;
+    for (query_tokens) |token| {
+        if (!isPrimaryNounToken(token)) continue;
+        primary_count += 1;
+        if (candidatesMatchedTermsContain(candidates, token)) matched_count += 1;
+    }
+    if (primary_count == 0) return true;
+    return matched_count * 100 >= primary_count * PRIMARY_NOUN_MATCH_THRESHOLD_PERCENT;
+}
+
+fn candidatesMatchedTermsContain(candidates: []const Candidate, needle: []const u8) bool {
+    for (candidates) |candidate| {
+        if (matchedTermsContain(candidate.matched_terms, needle)) return true;
+    }
+    return false;
+}
+
+fn matchedTermsContain(matched_terms: []const []const u8, needle: []const u8) bool {
+    for (matched_terms) |term| {
+        if (std.mem.eql(u8, term, needle)) return true;
+    }
+    return false;
+}
+
+fn isParameterToken(token: []const u8) bool {
+    for (token) |c| {
+        if (std.ascii.isDigit(c)) return true;
+    }
+    return false;
+}
+
+fn isPrimaryNounToken(token: []const u8) bool {
+    if (isParameterToken(token)) return false;
+    if (isPrimaryNounStopToken(token)) return false;
+    return true;
+}
+
+fn isPrimaryNounStopToken(token: []const u8) bool {
+    const words = [_][]const u8{
+        "ask",    "answer",  "corpus",    "draft",    "evidence",  "known",    "learned",  "live",
+        "permit", "permits", "permitted", "allow",    "allows",    "allowed",  "enabled",  "disabled",
+        "enable", "disable", "support",   "supports", "supported", "required", "requires", "require",
+        "must",   "shall",   "should",    "would",    "could",     "does",     "say",
+    };
+    for (words) |word| {
+        if (std.mem.eql(u8, token, word)) return true;
+    }
+    return false;
+}
+
 fn detectPolarity(text: []const u8) Polarity {
     var affirmative = false;
     var negative = false;
-    const yes_terms = [_][]const u8{ " enabled", " enable ", " yes", " true", " must ", " required", " supported" };
-    const no_terms = [_][]const u8{ " disabled", " disable ", " no", " false", " must not", " unsupported", " forbidden" };
+    const yes_terms = [_][]const u8{ " enabled", " enable ", " yes", " true", " must ", " required", " supported", " permitted", " allowed" };
+    const no_terms = [_][]const u8{ " disabled", " disable ", " no", " false", " must not", " unsupported", " forbidden", " not permitted", " not allowed" };
 
     for (yes_terms) |term| {
         if (indexOfIgnoreCase(text, term) != null) {
@@ -2102,6 +2221,10 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
     try w.print(",\"maxResults\":{d}", .{result.max_results});
     try w.print(",\"maxSnippetBytes\":{d}", .{result.max_snippet_bytes});
     try w.print(",\"requireCitations\":{s}", .{if (result.require_citations) "true" else "false"});
+    try w.print(",\"parameterMatchFailure\":{s}", .{if (result.parameter_match_failure) "true" else "false"});
+    if (result.parameter_match_failure) try writeField(w, "parameterMatchFailureReason", "parameter_match_failure", false);
+    try w.print(",\"primaryNounMatchFailure\":{s}", .{if (result.primary_noun_match_failure) "true" else "false"});
+    if (result.primary_noun_match_failure) try writeField(w, "primaryNounMatchFailureReason", "primary_noun_similarity_failure", false);
     try w.print(",\"corpusMutation\":{s}", .{if (result.safety_flags.corpus_mutation) "true" else "false"});
     try w.print(",\"packMutation\":{s}", .{if (result.safety_flags.pack_mutation) "true" else "false"});
     try w.print(",\"negativeKnowledgeMutation\":{s}", .{if (result.safety_flags.negative_knowledge_mutation) "true" else "false"});

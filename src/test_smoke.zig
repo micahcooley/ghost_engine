@@ -6183,6 +6183,63 @@ test "corpus ask requires value-bearing exact evidence for value questions" {
     try std.testing.expect(missing_date.evidence_used.len >= 1);
 }
 
+test "corpus ask parameter lock rejects adjacent bit-width evidence" {
+    const allocator = std.testing.allocator;
+    const project_shard = "corpus-ask-parameter-lock-test";
+    var corpus_fixture = std.testing.tmpDir(.{});
+    defer corpus_fixture.cleanup();
+    const corpus_root = try corpus_fixture.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+    try writeFixtureFile(corpus_fixture.dir, "uid-policy.md",
+        \\# UID Policy
+        \\A 16-bit Beta UID is permitted for legacy import fixtures.
+        \\A 32-bit Alpha UID is permitted for the stable identity path.
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.root_abs_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.root_abs_path) catch {};
+
+    var stage_result = try corpus_ingest.stage(allocator, .{
+        .corpus_path = corpus_root,
+        .project_shard = project_shard,
+        .trust_class = .project,
+        .source_label = "parameter-lock-corpus",
+    });
+    defer stage_result.deinit();
+    try corpus_ingest.applyStaged(allocator, &project_paths);
+
+    var rejected = try corpus_ask.ask(allocator, .{
+        .question = "Is a 64-bit UID permitted?",
+        .project_shard = project_shard,
+    });
+    defer rejected.deinit();
+    try std.testing.expectEqual(corpus_ask.AskStatus.unknown, rejected.status);
+    try std.testing.expect(rejected.answer_draft == null);
+    try std.testing.expect(rejected.parameter_match_failure);
+    try std.testing.expectEqual(corpus_ask.UnknownKind.insufficient_evidence, rejected.unknowns[0].kind);
+    try std.testing.expect(std.mem.indexOf(u8, rejected.unknowns[0].reason, "parameter_match_failure") != null);
+
+    const rejected_json = try corpus_ask.renderJson(allocator, &rejected);
+    defer allocator.free(rejected_json);
+    try std.testing.expect(std.mem.indexOf(u8, rejected_json, "\"answerDraft\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rejected_json, "\"parameterMatchFailure\":true") != null);
+
+    var accepted = try corpus_ask.ask(allocator, .{
+        .question = "Is a 32-bit Alpha UID permitted?",
+        .project_shard = project_shard,
+    });
+    defer accepted.deinit();
+    try std.testing.expectEqual(corpus_ask.AskStatus.answered, accepted.status);
+    try std.testing.expect(accepted.answer_draft != null);
+    try std.testing.expect(!accepted.parameter_match_failure);
+    try std.testing.expect(std.mem.indexOf(u8, accepted.answer_draft.?, "32-bit Alpha UID") != null);
+}
+
 test "corpus ask applies accepted reviewed negative knowledge influence without proof or mutation" {
     const allocator = std.testing.allocator;
     const project_shard = "corpus-ask-accepted-nk-test";
