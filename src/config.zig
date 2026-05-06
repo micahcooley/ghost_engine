@@ -83,7 +83,19 @@ pub const CHECKSUM_RESERVED_BYTES: usize = 1024; // Reserved tail space for hash
 // --- Paths (Environment Agnostic) ---
 pub fn getPath(allocator: std.mem.Allocator, sub_path: []const u8) ![]u8 {
     if (std.fs.path.isAbsolute(sub_path)) return allocator.dupe(u8, sub_path);
-    return std.fs.path.join(allocator, &.{ build_options.project_root, sub_path });
+
+    if (std.posix.getenv("GHOST_ENGINE_ROOT")) |env_path| {
+        return std.fs.path.join(allocator, &.{ env_path, sub_path });
+    }
+
+    const exe_dir = try std.fs.selfExeDirPathAlloc(allocator);
+    defer allocator.free(exe_dir);
+
+    // Assuming the binary is in zig-out/bin/, walk up two directories to find the project root.
+    const p1 = std.fs.path.dirname(exe_dir) orelse exe_dir;
+    const project_root = std.fs.path.dirname(p1) orelse p1;
+
+    return std.fs.path.join(allocator, &.{ project_root, sub_path });
 }
 
 pub const LATTICE_FILE_NAME = "unified_lattice.bin";

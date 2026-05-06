@@ -1,0 +1,4 @@
+# Ghost runtime defaults.
+acceleration = "vulkan"
+# Set to "cpu" if GPU-side crashes occur during Zenith DAW use.
+logical_verification = "cpu"

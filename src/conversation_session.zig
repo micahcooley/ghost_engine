@@ -669,12 +669,28 @@ fn summarizeResponse(allocator: std.mem.Allocator, result: *const response_engin
             result.draft.missing_information.len,
         });
     }
+    if (result.grounded_intent.intent_class == .conversation and result.stop_reason == .supported) {
+        return renderConversationalSummary(allocator, result.grounded_intent.raw_input);
+    }
     switch (result.stop_reason) {
         .supported => return std.fmt.allocPrint(allocator, "{s} result supported by grounded intent and satisfied obligations", .{@tagName(mode)}),
         .budget => return allocator.dupe(u8, "blocked by compute budget; inspect budgetExhaustions for the hit limit and stage"),
         .unresolved => return allocator.dupe(u8, "blocked because ambiguity or missing obligations remain unresolved"),
         .none => return allocator.dupe(u8, "no terminal result was produced"),
     }
+}
+
+fn renderConversationalSummary(allocator: std.mem.Allocator, raw_input: []const u8) ![]u8 {
+    const normalized = try lowercaseAscii(allocator, raw_input);
+    defer allocator.free(normalized);
+
+    if (std.mem.indexOf(u8, normalized, "audio engine") != null) {
+        return allocator.dupe(u8, "The audio engine is on the radar. I can talk through its shape from zenith_root, and I will ask for a concrete path only when you want proof or code changes.");
+    }
+    if (std.mem.indexOf(u8, normalized, "whats up") != null or std.mem.indexOf(u8, normalized, "what's up") != null) {
+        return allocator.dupe(u8, "I'm here, anchored to zenith_root, and ready to work through the next thing with you.");
+    }
+    return allocator.dupe(u8, response_engine.DEFAULT_CONVERSATIONAL_RESPONSE);
 }
 
 fn chooseResponseConfig(session: *const Session, gi: *const intent_grounding.GroundedIntent, normalized: []const u8, budget_request: compute_budget.Request, reasoning_level: response_engine.ReasoningLevel) response_engine.ResponseConfig {

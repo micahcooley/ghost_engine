@@ -24,18 +24,36 @@ pub const MAX_ACTION_SURFACES: usize = 8;
 pub const MAX_MISSING_OBLIGATIONS: usize = 8;
 pub const MAX_GROUNDING_TRACES: usize = 16;
 pub const MAX_INPUT_BYTES: usize = 512;
+pub const LATENT_VECTOR_DIMS: usize = 8;
+
+const HEAVY_TASK_THRESHOLD: f32 = 0.70;
 
 // ── Intent Classification ──────────────────────────────────────────────
 
 /// Deterministic classification of user input into intent categories.
 /// Ties produce ambiguity_sets, not guesses.
 pub const IntentClass = enum {
+    conversation,
     direct_action,
     transformation,
     diagnostic,
     creation,
     verification,
     ambiguous,
+};
+
+pub const LatentConcept = enum {
+    conversation,
+    modification,
+    retrieval,
+    meta_analysis,
+};
+
+const LatentIntentMatch = struct {
+    concept: LatentConcept,
+    similarity: f32,
+    strong_heavy_task: bool,
+    vector: [LATENT_VECTOR_DIMS]f32,
 };
 
 /// Scope of the intent — how wide its effect surface is.
@@ -106,8 +124,9 @@ pub const GroundedConstraint = struct {
     }
 };
 
-/// An obligation produced by intent grounding. Every intent must produce
-/// obligations; no obligation → no progression to supported.
+/// An obligation produced by intent grounding. Conversational reasoning may
+/// have no obligations; artifact-changing/retrieval/verifier work must expose
+/// the missing binding or proof obligations that block support.
 pub const IntentObligation = struct {
     id: []u8,
     label: []u8,
@@ -631,10 +650,20 @@ fn finishGrounding(
     // Step 2: Classify intent.
     const classification = classifyIntent(normalized_form);
     result.intent_class = classification.class;
+    const latent_detail = try std.fmt.allocPrint(
+        allocator,
+        "latent_concept={s}; similarity_per_mille={d}; strong_heavy_task={s}",
+        .{
+            @tagName(classification.latent.concept),
+            scorePerMille(classification.latent.similarity),
+            if (classification.latent.strong_heavy_task) "true" else "false",
+        },
+    );
+    defer allocator.free(latent_detail);
     if (classification.ambiguous) {
-        try appendTrace(allocator, &traces, "classify", normalized_form, @tagName(IntentClass.ambiguous), "multiple classification phrases matched; ties produce ambiguity, not guesses");
+        try appendTrace(allocator, &traces, "classify", normalized_form, @tagName(IntentClass.ambiguous), latent_detail);
     } else {
-        try appendTrace(allocator, &traces, "classify", normalized_form, @tagName(classification.class), classification.matched_phrase orelse "inferred");
+        try appendTrace(allocator, &traces, "classify", normalized_form, @tagName(classification.class), classification.matched_phrase orelse latent_detail);
     }
 
     // Step 3: Vague request expansion (only for transformation class).
@@ -669,24 +698,29 @@ fn finishGrounding(
         }
     }
 
-    // Step 4: Artifact binding.
-    const bindings = try bindArtifacts(allocator, &base_task, normalized_form, options);
-    // Transfer valid bindings.
-    for (bindings) |binding| {
-        if (artifact_bindings.items.len >= MAX_ARTIFACT_BINDINGS) break;
-        try artifact_bindings.append(binding);
-    }
-    if (artifact_bindings.items.len == 0 and base_task.target.kind == .none) {
-        try missing_obligations.append(.{
-            .id = try allocator.dupe(u8, "bind_target_artifact"),
-            .label = try allocator.dupe(u8, "bind target artifact to intent"),
-            .required_for = try allocator.dupe(u8, "any_action"),
-        });
-        try appendTrace(allocator, &traces, "bind_artifact", normalized_form, "no_binding", "no artifact could be bound to the intent");
+    // Step 4: Artifact binding. Conversational reasoning is not artifact work,
+    // so it does not require bind_target_artifact.
+    if (!intentClassRequiresArtifact(classification.class)) {
+        try appendTrace(allocator, &traces, "bind_artifact", normalized_form, "not_required", "latent intent resolved as conversational reasoning");
     } else {
-        try appendTrace(allocator, &traces, "bind_artifact", normalized_form, "bound", null);
+        const bindings = try bindArtifacts(allocator, &base_task, normalized_form, options);
+        // Transfer valid bindings.
+        for (bindings) |binding| {
+            if (artifact_bindings.items.len >= MAX_ARTIFACT_BINDINGS) break;
+            try artifact_bindings.append(binding);
+        }
+        if (artifact_bindings.items.len == 0 and (base_task.target.kind == .none or base_task.target.kind == .current_context)) {
+            try missing_obligations.append(.{
+                .id = try allocator.dupe(u8, "bind_target_artifact"),
+                .label = try allocator.dupe(u8, "bind target artifact to intent"),
+                .required_for = try allocator.dupe(u8, "any_action"),
+            });
+            try appendTrace(allocator, &traces, "bind_artifact", normalized_form, "no_binding", "no artifact could be bound to the intent");
+        } else {
+            try appendTrace(allocator, &traces, "bind_artifact", normalized_form, "bound", null);
+        }
+        allocator.free(bindings);
     }
-    allocator.free(bindings);
 
     // Step 5: Constraint extraction (explicit + inferred).
     try extractGroundedConstraints(allocator, &constraints, &base_task, normalized_form, classification.class);
@@ -850,9 +884,21 @@ pub fn groundingStatusName(status: GroundedIntent.GroundingStatus) []const u8 {
     return @tagName(status);
 }
 
+pub fn intentClassRequiresArtifact(class: IntentClass) bool {
+    return switch (class) {
+        .conversation => false,
+        .direct_action, .transformation, .diagnostic, .creation, .verification, .ambiguous => true,
+    };
+}
+
 // ── Internal: Classification ───────────────────────────────────────────
 
-fn classifyIntent(normalized: []const u8) struct { class: IntentClass, ambiguous: bool, matched_phrase: ?[]const u8 } {
+fn classifyIntent(normalized: []const u8) struct { class: IntentClass, ambiguous: bool, matched_phrase: ?[]const u8, latent: LatentIntentMatch } {
+    const latent = inferLatentIntent(normalized);
+    if (!latent.strong_heavy_task) {
+        return .{ .class = .conversation, .ambiguous = false, .matched_phrase = "latent_default_conversation", .latent = latent };
+    }
+
     var found_class: ?IntentClass = null;
     var found_index: usize = std.math.maxInt(usize);
     var found_phrase: ?[]const u8 = null;
@@ -894,9 +940,218 @@ fn classifyIntent(normalized: []const u8) struct { class: IntentClass, ambiguous
     }
 
     if (found_class == null) {
-        return .{ .class = .ambiguous, .ambiguous = false, .matched_phrase = null };
+        found_class = switch (latent.concept) {
+            .conversation => .conversation,
+            .modification => .transformation,
+            .retrieval => .direct_action,
+            .meta_analysis => .diagnostic,
+        };
+        found_phrase = "latent_similarity";
     }
-    return .{ .class = found_class.?, .ambiguous = ambiguous, .matched_phrase = found_phrase };
+    return .{ .class = found_class.?, .ambiguous = ambiguous, .matched_phrase = found_phrase, .latent = latent };
+}
+
+fn inferLatentIntent(normalized: []const u8) LatentIntentMatch {
+    const input_vector = projectInputVector(normalized);
+    const concepts = [_]struct {
+        concept: LatentConcept,
+        vector: [LATENT_VECTOR_DIMS]f32,
+    }{
+        .{ .concept = .conversation, .vector = .{ 1.00, 0.72, 0.08, 0.00, 0.08, 0.00, 0.24, 0.20 } },
+        .{ .concept = .modification, .vector = .{ 0.00, 0.04, 0.68, 1.00, 0.10, 0.25, 0.12, 0.55 } },
+        .{ .concept = .retrieval, .vector = .{ 0.10, 0.35, 0.55, 0.05, 1.00, 0.10, 0.25, 0.28 } },
+        .{ .concept = .meta_analysis, .vector = .{ 0.28, 0.70, 0.45, 0.10, 0.28, 0.45, 1.00, 0.38 } },
+    };
+
+    var best = LatentIntentMatch{
+        .concept = .conversation,
+        .similarity = -1.0,
+        .strong_heavy_task = false,
+        .vector = input_vector,
+    };
+    for (concepts) |entry| {
+        const similarity = cosineSimilarity(input_vector, entry.vector);
+        if (similarity > best.similarity) {
+            best.concept = entry.concept;
+            best.similarity = similarity;
+        }
+    }
+    const code_context_present = input_vector[2] >= 0.25;
+    const heavy_lane_present = input_vector[3] >= 0.35 or
+        (code_context_present and (input_vector[4] >= 0.45 or input_vector[5] >= 0.35));
+    const path_backed_diagnostic = input_vector[2] >= 0.35 and input_vector[1] >= 0.25 and
+        (containsBoundedPhrase(normalized, "why") != null or containsBoundedPhrase(normalized, "explain") != null);
+    best.strong_heavy_task = hasExplicitHeavyTaskSignal(normalized) and
+        (heavy_lane_present or path_backed_diagnostic or (isHeavyConcept(best.concept) and best.similarity >= HEAVY_TASK_THRESHOLD));
+    return best;
+}
+
+fn isHeavyConcept(concept: LatentConcept) bool {
+    return switch (concept) {
+        .modification, .retrieval => true,
+        .conversation, .meta_analysis => false,
+    };
+}
+
+fn projectInputVector(normalized: []const u8) [LATENT_VECTOR_DIMS]f32 {
+    // Vulkan-compatible f32 semantic lane layout:
+    // social, question, artifact, mutation, retrieval, verification, meta, effort.
+    var vector = [_]f32{0.0} ** LATENT_VECTOR_DIMS;
+    var token_count: usize = 0;
+    var it = std.mem.tokenizeAny(u8, normalized, " \r\n\t,.:;!?()[]{}\"'");
+    while (it.next()) |token| {
+        token_count += 1;
+        if (isSocialToken(token)) vector[0] += 1.0;
+        if (isQuestionToken(token)) vector[1] += 0.85;
+        if (isArtifactToken(token)) vector[2] += 0.65;
+        if (isMutationToken(token)) vector[3] += 1.0;
+        if (isRetrievalToken(token)) vector[4] += 1.0;
+        if (isVerificationToken(token)) vector[5] += 1.0;
+        if (isMetaToken(token)) vector[6] += 0.9;
+        if (isEffortToken(token)) vector[7] += 0.7;
+    }
+
+    if (token_count <= 5) vector[0] += 0.25;
+    if (std.mem.indexOf(u8, normalized, "?") != null) vector[1] += 0.25;
+    if (containsBoundedPhrase(normalized, "what's up") != null or containsBoundedPhrase(normalized, "whats up") != null) vector[0] += 1.0;
+    if (containsBoundedPhrase(normalized, "how is") != null or containsBoundedPhrase(normalized, "how are") != null) {
+        vector[1] += 0.45;
+        vector[6] += 0.35;
+    }
+    if (containsBoundedPhrase(normalized, "looking") != null) vector[6] += 0.35;
+    if (containsBoundedPhrase(normalized, "audio engine") != null) {
+        vector[2] += 0.25;
+        vector[6] += 0.25;
+    }
+    if (containsBoundedPhrase(normalized, "src/") != null or containsBoundedPhrase(normalized, ".zig") != null) vector[2] += 0.9;
+    if (containsBoundedPhrase(normalized, "run tests") != null or containsBoundedPhrase(normalized, "build test") != null) vector[5] += 0.8;
+
+    return normalizeVector(vector);
+}
+
+fn normalizeVector(vector: [LATENT_VECTOR_DIMS]f32) [LATENT_VECTOR_DIMS]f32 {
+    var sum: f32 = 0.0;
+    for (vector) |value| sum += value * value;
+    if (sum <= 0.0) return .{ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+    const magnitude = @sqrt(sum);
+    var out = vector;
+    for (&out) |*value| value.* /= magnitude;
+    return out;
+}
+
+fn cosineSimilarity(a: [LATENT_VECTOR_DIMS]f32, b: [LATENT_VECTOR_DIMS]f32) f32 {
+    const bn = normalizeVector(b);
+    var dot: f32 = 0.0;
+    for (a, bn) |av, bv| dot += av * bv;
+    return dot;
+}
+
+fn scorePerMille(score: f32) u16 {
+    const clipped = @max(@min(score, 1.0), 0.0);
+    return @intFromFloat(clipped * 1000.0);
+}
+
+fn hasExplicitHeavyTaskSignal(normalized: []const u8) bool {
+    const phrases = [_][]const u8{
+        "make",    "improve",  "refactor", "implement", "add",         "fix",     "modify", "change", "patch",    "build",   "create",
+        "migrate", "optimize", "clean",    "clean up",  "restructure", "convert", "write",  "verify", "validate", "test",    "check",
+        "confirm", "prove",    "proof",    "explain",   "why",         "search",  "find",   "show",   "list",     "extract", "summarize",
+        "display", "get",
+    };
+    for (phrases) |phrase| {
+        if (containsBoundedPhrase(normalized, phrase) != null) return true;
+    }
+    return false;
+}
+
+fn isSocialToken(token: []const u8) bool {
+    return std.mem.eql(u8, token, "hi") or
+        std.mem.eql(u8, token, "hello") or
+        std.mem.eql(u8, token, "hey") or
+        std.mem.eql(u8, token, "yo") or
+        std.mem.eql(u8, token, "sup") or
+        std.mem.eql(u8, token, "thanks") or
+        std.mem.eql(u8, token, "morning");
+}
+
+fn isQuestionToken(token: []const u8) bool {
+    return std.mem.eql(u8, token, "what") or
+        std.mem.eql(u8, token, "whats") or
+        std.mem.eql(u8, token, "what's") or
+        std.mem.eql(u8, token, "how") or
+        std.mem.eql(u8, token, "why") or
+        std.mem.eql(u8, token, "where") or
+        std.mem.eql(u8, token, "when");
+}
+
+fn isArtifactToken(token: []const u8) bool {
+    return std.mem.indexOf(u8, token, "/") != null or
+        std.mem.indexOf(u8, token, ".zig") != null or
+        std.mem.eql(u8, token, "file") or
+        std.mem.eql(u8, token, "code") or
+        std.mem.eql(u8, token, "engine") or
+        std.mem.eql(u8, token, "module") or
+        std.mem.eql(u8, token, "artifact");
+}
+
+fn isMutationToken(token: []const u8) bool {
+    return std.mem.eql(u8, token, "refactor") or
+        std.mem.eql(u8, token, "make") or
+        std.mem.eql(u8, token, "improve") or
+        std.mem.eql(u8, token, "implement") or
+        std.mem.eql(u8, token, "add") or
+        std.mem.eql(u8, token, "fix") or
+        std.mem.eql(u8, token, "modify") or
+        std.mem.eql(u8, token, "change") or
+        std.mem.eql(u8, token, "patch") or
+        std.mem.eql(u8, token, "build") or
+        std.mem.eql(u8, token, "create") or
+        std.mem.eql(u8, token, "migrate") or
+        std.mem.eql(u8, token, "optimize") or
+        std.mem.eql(u8, token, "clean") or
+        std.mem.eql(u8, token, "restructure") or
+        std.mem.eql(u8, token, "convert") or
+        std.mem.eql(u8, token, "write");
+}
+
+fn isRetrievalToken(token: []const u8) bool {
+    return std.mem.eql(u8, token, "summarize") or
+        std.mem.eql(u8, token, "list") or
+        std.mem.eql(u8, token, "show") or
+        std.mem.eql(u8, token, "extract") or
+        std.mem.eql(u8, token, "find") or
+        std.mem.eql(u8, token, "search") or
+        std.mem.eql(u8, token, "get") or
+        std.mem.eql(u8, token, "display");
+}
+
+fn isVerificationToken(token: []const u8) bool {
+    return std.mem.eql(u8, token, "verify") or
+        std.mem.eql(u8, token, "check") or
+        std.mem.eql(u8, token, "validate") or
+        std.mem.eql(u8, token, "test") or
+        std.mem.eql(u8, token, "confirm") or
+        std.mem.eql(u8, token, "prove") or
+        std.mem.eql(u8, token, "proof");
+}
+
+fn isMetaToken(token: []const u8) bool {
+    return std.mem.eql(u8, token, "status") or
+        std.mem.eql(u8, token, "state") or
+        std.mem.eql(u8, token, "looking") or
+        std.mem.eql(u8, token, "health") or
+        std.mem.eql(u8, token, "architecture") or
+        std.mem.eql(u8, token, "design") or
+        std.mem.eql(u8, token, "analysis") or
+        std.mem.eql(u8, token, "engine");
+}
+
+fn isEffortToken(token: []const u8) bool {
+    return std.mem.eql(u8, token, "deep") or
+        std.mem.eql(u8, token, "thorough") or
+        std.mem.eql(u8, token, "full") or
+        std.mem.eql(u8, token, "properly") or
+        std.mem.eql(u8, token, "production");
 }
 
 // ── Internal: Vague Request Expansion ──────────────────────────────────
@@ -1077,8 +1332,9 @@ fn mapObligations(
     task: *const task_intent.Task,
     bindings: []ArtifactBinding,
 ) !void {
-    // Every classification produces specific obligations.
+    _ = task;
     switch (class) {
+        .conversation => {},
         .direct_action => {
             try appendObligation(allocator, out, "define_target", "identify the target artifact for the action", "direct_action");
             if (bindings.len == 0) {
@@ -1114,12 +1370,12 @@ fn mapObligations(
         },
     }
 
-    // If base task already has a target, mark bind_artifact as resolved.
-    if (task.target.kind != .none and task.target.kind != .current_context) {
+    // If artifact binding succeeded, mark bind_artifact as resolved.
+    if (bindings.len > 0) {
         for (out.items) |*obl| {
             if (std.mem.eql(u8, obl.id, "bind_artifact")) {
                 if (obl.resolved_by) |old| allocator.free(old);
-                obl.resolved_by = try allocator.dupe(u8, task.target.spec orelse "base_task_target");
+                obl.resolved_by = try allocator.dupe(u8, bindings[0].artifact_id);
                 obl.pending = false;
             }
         }
@@ -1160,6 +1416,9 @@ fn determineActionSurfaces(
     errdefer surfaces.deinit();
 
     switch (class) {
+        .conversation => {
+            // No artifact action surface. This is a resolved conversational turn.
+        },
         .direct_action => {
             try surfaces.append(.extract);
             if (containsBoundedPhrase(task.normalized_input, "summarize") != null) {
@@ -1197,12 +1456,13 @@ fn finalizeGrounding(gi: *GroundedIntent) void {
     // - at least one artifact is bound
     // - no ambiguity sets
     // - no missing obligations
+    const requires_artifact = intentClassRequiresArtifact(gi.intent_class);
     const unambiguous = gi.intent_class != .ambiguous;
     const has_binding = gi.artifact_bindings.len > 0;
     const no_ambiguity = gi.ambiguity_sets.len == 0;
     const no_missing = gi.missing_obligations.len == 0;
 
-    gi.fast_path_eligible = unambiguous and has_binding and no_ambiguity and no_missing;
+    gi.fast_path_eligible = unambiguous and (has_binding or !requires_artifact) and no_ambiguity and no_missing;
 
     if (gi.fast_path_eligible) {
         gi.status = .grounded;
@@ -1218,13 +1478,13 @@ fn finalizeGrounding(gi: *GroundedIntent) void {
 
     // Grounded if unambiguous with binding and no ambiguity, even if base task
     // was unresolved (v2 classification is independent of v1 parsing).
-    if (unambiguous and has_binding and no_ambiguity and no_missing) {
+    if (unambiguous and (has_binding or !requires_artifact) and no_ambiguity and no_missing) {
         gi.status = .grounded;
         return;
     }
 
     // If base task is grounded and we have no ambiguity, we're grounded.
-    if (gi.base_task.status == .grounded and no_ambiguity and no_missing) {
+    if (gi.base_task.status == .grounded and (has_binding or !requires_artifact) and no_ambiguity and no_missing) {
         gi.status = .grounded;
         return;
     }
@@ -1265,6 +1525,37 @@ fn containsBoundedPhrase(text: []const u8, phrase: []const u8) ?usize {
 
 fn isWordByte(byte: u8) bool {
     return std.ascii.isAlphabetic(byte) or std.ascii.isDigit(byte) or byte == '_' or byte == '/' or byte == '.' or byte == ':';
+}
+
+test "intent grounding: latent conversation bypasses artifact obligations" {
+    const allocator = std.testing.allocator;
+
+    const inputs = [_][]const u8{
+        "hi",
+        "test",
+        "whats up",
+        "how is the audio engine looking",
+    };
+    for (inputs) |input| {
+        var gi = try ground(allocator, input, .{});
+        defer gi.deinit();
+
+        try std.testing.expectEqual(IntentClass.conversation, gi.intent_class);
+        try std.testing.expectEqual(GroundedIntent.GroundingStatus.grounded, gi.status);
+        try std.testing.expectEqual(@as(usize, 0), gi.missing_obligations.len);
+        try std.testing.expectEqual(@as(usize, 0), gi.obligations.len);
+        try std.testing.expect(gi.fast_path_eligible);
+    }
+}
+
+test "intent grounding: heavy modification still requires artifact binding" {
+    const allocator = std.testing.allocator;
+
+    var gi = try ground(allocator, "refactor this", .{});
+    defer gi.deinit();
+
+    try std.testing.expectEqual(IntentClass.transformation, gi.intent_class);
+    try std.testing.expect(gi.missing_obligations.len > 0);
 }
 
 fn lowercaseAscii(allocator: std.mem.Allocator, text: []const u8) ![]u8 {

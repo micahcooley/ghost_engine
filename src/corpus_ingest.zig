@@ -1,8 +1,10 @@
 const std = @import("std");
 const abstractions = @import("abstractions.zig");
 const config = @import("config.zig");
+const corpus_sketch = @import("corpus_sketch.zig");
 const external_evidence = @import("external_evidence.zig");
 const ghost_state = @import("ghost_state.zig");
+const hash_acceleration = @import("hash_acceleration.zig");
 const knowledge_pack_store = @import("knowledge_pack_store.zig");
 const shards = @import("shards.zig");
 const vsa = @import("vsa_core.zig");
@@ -14,6 +16,9 @@ pub const DEFAULT_MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
 pub const DEFAULT_MAX_FILES: usize = 512;
 pub const DEFAULT_MAX_CONCEPT_CANDIDATES: usize = 4096;
 pub const DEFAULT_MAX_CONCEPTS: usize = 1024;
+pub const DEFAULT_INGEST_WORKERS: usize = 24;
+pub const DEFAULT_MAX_CONCEPT_SOURCE_BYTES: usize = 64 * 1024;
+const MAX_FILE_READ_INDEX_BYTES: usize = 64 * 1024;
 const MAX_TOKEN_COUNT: usize = 24;
 const MAX_PATTERN_COUNT: usize = 12;
 
@@ -35,6 +40,7 @@ pub const RejectReason = enum {
     unsupported_extension,
     file_too_large,
     contains_nul,
+    invalid_utf8,
     low_structure,
 };
 
@@ -149,6 +155,8 @@ pub const CorpusMeta = struct {
     source_label: []u8,
     provenance: []u8,
     trust_class: abstractions.TrustClass,
+    license_status: []u8,
+    license_authority_level: u8,
     lineage_id: []u8,
     lineage_version: u32,
 
@@ -160,6 +168,8 @@ pub const CorpusMeta = struct {
             .source_label = try allocator.dupe(u8, self.source_label),
             .provenance = try allocator.dupe(u8, self.provenance),
             .trust_class = self.trust_class,
+            .license_status = try allocator.dupe(u8, self.license_status),
+            .license_authority_level = self.license_authority_level,
             .lineage_id = try allocator.dupe(u8, self.lineage_id),
             .lineage_version = self.lineage_version,
         };
@@ -169,6 +179,7 @@ pub const CorpusMeta = struct {
         self.allocator.free(self.source_rel_path);
         self.allocator.free(self.source_label);
         self.allocator.free(self.provenance);
+        self.allocator.free(self.license_status);
         self.allocator.free(self.lineage_id);
         self.* = undefined;
     }
@@ -180,6 +191,9 @@ pub const IndexedEntry = struct {
     abs_path: []u8,
     size_bytes: u64,
     mtime_ns: i128,
+    semantic_hash: u64,
+    search_sketch_hash: u64,
+    search_sketch_features: usize,
     corpus_meta: CorpusMeta,
 
     pub fn deinit(self: *IndexedEntry) void {
@@ -212,10 +226,15 @@ const SourceUnit = struct {
     class: ItemClass,
     trust_class: abstractions.TrustClass,
     source_label: []u8,
+    license_status: []u8,
+    license_authority_level: u8,
     source_mtime_ns: i128,
     size_bytes: u64,
     raw_hash: u64,
     normalized_hash: u64,
+    semantic_hash: u64,
+    search_sketch_hash: u64,
+    search_sketch_features: usize,
     dedup: DedupStatus = .unique,
     canonical_rel_path: ?[]u8 = null,
     lineage_id: []u8,
@@ -232,6 +251,7 @@ const SourceUnit = struct {
         self.allocator.free(self.source_rel_path);
         if (self.source_abs_path) |value| self.allocator.free(value);
         self.allocator.free(self.source_label);
+        self.allocator.free(self.license_status);
         if (self.canonical_rel_path) |value| self.allocator.free(value);
         self.allocator.free(self.lineage_id);
         self.allocator.free(self.provenance);
@@ -288,6 +308,62 @@ const Rejection = struct {
         self.allocator.free(self.source_rel_path);
         self.* = undefined;
     }
+};
+
+const FileCandidate = struct {
+    allocator: std.mem.Allocator,
+    abs_path: []u8,
+    rel_path: []u8,
+
+    fn deinit(self: *FileCandidate) void {
+        self.allocator.free(self.abs_path);
+        self.allocator.free(self.rel_path);
+        self.* = undefined;
+    }
+};
+
+const ScanOutcome = union(enum) {
+    unit: SourceUnit,
+    rejection: Rejection,
+
+    fn deinit(self: *ScanOutcome) void {
+        switch (self.*) {
+            .unit => |*unit| unit.deinit(),
+            .rejection => |*rejection| rejection.deinit(),
+        }
+        self.* = undefined;
+    }
+};
+
+const ScanResult = struct {
+    outcome: ?ScanOutcome = null,
+    err: ?anyerror = null,
+
+    fn deinit(self: *ScanResult) void {
+        if (self.outcome) |*outcome| outcome.deinit();
+        self.* = undefined;
+    }
+};
+
+const ParallelScanContext = struct {
+    candidates: []const FileCandidate,
+    results: []ScanResult,
+    next_index: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    root_hint: RootHint,
+    source_label: []const u8,
+    owner_kind: shards.Kind,
+    owner_id: []const u8,
+    trust_class: abstractions.TrustClass,
+    options: Options,
+    external_meta: *const std.StringHashMap(ExternalMetadata),
+    license_status: []const u8,
+    license_authority_level: u8,
+    acceleration: ?*hash_acceleration.Context,
+};
+
+const RuneParseSummary = struct {
+    rune_count: usize = 0,
+    structural_punctuation_count: usize = 0,
 };
 
 const Manifest = struct {
@@ -365,6 +441,7 @@ fn rejectReasonName(value: RejectReason) []const u8 {
         .unsupported_extension => "unsupported_extension",
         .file_too_large => "file_too_large",
         .contains_nul => "contains_nul",
+        .invalid_utf8 => "invalid_utf8",
         .low_structure => "low_structure",
     };
 }
@@ -479,6 +556,9 @@ pub fn collectLiveScanEntries(allocator: std.mem.Allocator, paths: *const shards
             .abs_path = abs_path,
             .size_bytes = stat.size,
             .mtime_ns = @max(@as(i128, @intCast(stat.mtime)), loaded.mtime_ns),
+            .semantic_hash = item.semantic_hash,
+            .search_sketch_hash = item.search_sketch_hash,
+            .search_sketch_features = item.search_sketch_features,
             .corpus_meta = .{
                 .allocator = allocator,
                 .class = item.class,
@@ -486,6 +566,8 @@ pub fn collectLiveScanEntries(allocator: std.mem.Allocator, paths: *const shards
                 .source_label = try allocator.dupe(u8, item.source_label),
                 .provenance = try allocator.dupe(u8, item.provenance),
                 .trust_class = item.trust_class,
+                .license_status = try allocator.dupe(u8, item.license_status),
+                .license_authority_level = item.license_authority_level,
                 .lineage_id = try allocator.dupe(u8, item.lineage_id),
                 .lineage_version = item.lineage_version,
             },
@@ -604,6 +686,9 @@ pub fn collectPackScanEntries(
             .abs_path = abs_path,
             .size_bytes = stat.size,
             .mtime_ns = @max(@as(i128, @intCast(stat.mtime)), loaded.mtime_ns),
+            .semantic_hash = item.semantic_hash,
+            .search_sketch_hash = item.search_sketch_hash,
+            .search_sketch_features = item.search_sketch_features,
             .corpus_meta = .{
                 .allocator = allocator,
                 .class = item.class,
@@ -611,6 +696,8 @@ pub fn collectPackScanEntries(
                 .source_label = try allocator.dupe(u8, source_label),
                 .provenance = provenance,
                 .trust_class = item.trust_class,
+                .license_status = try allocator.dupe(u8, item.license_status),
+                .license_authority_level = item.license_authority_level,
                 .lineage_id = lineage_id,
                 .lineage_version = item.lineage_version,
             },
@@ -625,7 +712,118 @@ pub fn deinitIndexedEntries(allocator: std.mem.Allocator, entries: []IndexedEntr
     allocator.free(entries);
 }
 
+pub fn readLicenseStatus(allocator: std.mem.Allocator, root_abs_path: []const u8) ![]u8 {
+    var license_path: ?[]u8 = try std.fs.path.join(allocator, &.{ root_abs_path, "license.json" });
+    defer if (license_path) |value| allocator.free(value);
+    const file = std.fs.openFileAbsolute(license_path.?, .{}) catch |err| switch (err) {
+        error.FileNotFound => blk: {
+            allocator.free(license_path.?);
+            license_path = null;
+            license_path = try findTrashedLicensePath(allocator, root_abs_path) orelse return try allocator.dupe(u8, "unspecified");
+            break :blk try std.fs.openFileAbsolute(license_path.?, .{});
+        },
+        else => return err,
+    };
+    defer file.close();
+    const stat = try file.stat();
+    const bytes = try file.readToEndAlloc(allocator, @intCast(@min(stat.size, 16 * 1024)));
+    defer allocator.free(bytes);
+    const parsed = std.json.parseFromSlice(struct {
+        status: ?[]const u8 = null,
+    }, allocator, bytes, .{ .ignore_unknown_fields = true }) catch return try allocator.dupe(u8, "unverified");
+    defer parsed.deinit();
+    const status = std.mem.trim(u8, parsed.value.status orelse return try allocator.dupe(u8, "unverified"), " \r\n\t");
+    if (status.len == 0) return try allocator.dupe(u8, "unverified");
+    var out = try allocator.alloc(u8, status.len);
+    for (status, 0..) |c, idx| out[idx] = std.ascii.toLower(c);
+    return out;
+}
+
+pub fn readLicenseAuthorityLevel(root_abs_path: []const u8) !u8 {
+    const allocator = std.heap.page_allocator;
+    var license_path: ?[]u8 = try std.fs.path.join(allocator, &.{ root_abs_path, "license.json" });
+    defer if (license_path) |value| allocator.free(value);
+    const file = std.fs.openFileAbsolute(license_path.?, .{}) catch |err| switch (err) {
+        error.FileNotFound => blk: {
+            allocator.free(license_path.?);
+            license_path = null;
+            license_path = try findTrashedLicensePath(allocator, root_abs_path) orelse return 2;
+            break :blk try std.fs.openFileAbsolute(license_path.?, .{});
+        },
+        else => return err,
+    };
+    defer file.close();
+    const stat = try file.stat();
+    const bytes = try file.readToEndAlloc(allocator, @intCast(@min(stat.size, 16 * 1024)));
+    defer allocator.free(bytes);
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return 2;
+    defer parsed.deinit();
+    if (parsed.value != .object) return 2;
+    const obj = parsed.value.object;
+    if (jsonAuthorityLevel(obj.get("authority_level"))) |level| return level;
+    if (jsonAuthorityLevel(obj.get("authorityLevel"))) |level| return level;
+    if (jsonAuthorityLevel(obj.get("status"))) |level| return level;
+    return 2;
+}
+
+fn jsonAuthorityLevel(value: ?std.json.Value) ?u8 {
+    const actual = value orelse return null;
+    switch (actual) {
+        .integer => |level| {
+            if (level < 0) return 2;
+            return @min(@as(u8, @intCast(@min(level, 4))), 4);
+        },
+        .float => |level| {
+            if (level <= 0) return 0;
+            if (level >= 4) return 4;
+            return @intFromFloat(level);
+        },
+        .string => |status| {
+            if (std.ascii.eqlIgnoreCase(status, "root")) return 0;
+            if (std.ascii.eqlIgnoreCase(status, "verified")) return 1;
+            if (std.ascii.eqlIgnoreCase(status, "unverified")) return 2;
+            if (std.ascii.eqlIgnoreCase(status, "shadow")) return 3;
+            if (std.ascii.eqlIgnoreCase(status, "trash")) return 4;
+            return null;
+        },
+        else => return null,
+    }
+}
+
+fn findTrashedLicensePath(allocator: std.mem.Allocator, root_abs_path: []const u8) !?[]u8 {
+    const parent = std.fs.path.dirname(root_abs_path) orelse return null;
+    const base_name = std.fs.path.basename(root_abs_path);
+    const trash_root = try std.fs.path.join(allocator, &.{ parent, ".trash" });
+    defer allocator.free(trash_root);
+    var dir = std.fs.openDirAbsolute(trash_root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer dir.close();
+
+    var walker = try dir.walk(allocator);
+    defer walker.deinit();
+    while (try walker.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.eql(u8, entry.basename, "license.json")) continue;
+        const dirname = std.fs.path.dirname(entry.path) orelse continue;
+        const trashed_base = std.fs.path.basename(dirname);
+        if (!std.mem.eql(u8, trashed_base, base_name) and !startsWithTrashCollisionName(trashed_base, base_name)) continue;
+        return try std.fs.path.join(allocator, &.{ trash_root, entry.path });
+    }
+    return null;
+}
+
+fn startsWithTrashCollisionName(name: []const u8, base_name: []const u8) bool {
+    return name.len > base_name.len + 1 and
+        std.mem.startsWith(u8, name, base_name) and
+        name[base_name.len] == '-';
+}
+
 pub fn stage(allocator: std.mem.Allocator, options: Options) !StageResult {
+    var profile_timer: ?std.time.Timer = if (ingestProfileEnabled()) try std.time.Timer.start() else null;
+    var profile_last_ns: u64 = 0;
+
     var shard_metadata = if (options.project_shard) |project_shard|
         try shards.resolveProjectMetadata(allocator, project_shard)
     else
@@ -634,6 +832,7 @@ pub fn stage(allocator: std.mem.Allocator, options: Options) !StageResult {
 
     var paths = try shards.resolvePaths(allocator, shard_metadata.metadata);
     defer paths.deinit();
+    ingestProfileMark(&profile_timer, &profile_last_ns, "resolve_shard");
 
     const corpus_root = try std.fs.cwd().realpathAlloc(allocator, options.corpus_path);
     errdefer allocator.free(corpus_root);
@@ -651,17 +850,25 @@ pub fn stage(allocator: std.mem.Allocator, options: Options) !StageResult {
     defer manifest.deinit();
     var external_meta = try loadExternalMetadata(allocator, corpus_root);
     defer deinitExternalMetadataMap(allocator, &external_meta);
+    var acceleration = hash_acceleration.Context.init(allocator, "corpus ingest hashing");
+    defer acceleration.deinit();
+    ingestProfileMark(&profile_timer, &profile_last_ns, "init_manifest_metadata_acceleration");
 
-    try scanCorpusPath(allocator, corpus_root, detectRootHint(corpus_root), source_label, paths.metadata.kind, paths.metadata.id, trust_class, options, &external_meta, &manifest);
+    try scanCorpusPath(allocator, corpus_root, detectRootHint(corpus_root), source_label, paths.metadata.kind, paths.metadata.id, trust_class, options, &external_meta, &manifest, &acceleration);
+    ingestProfileMark(&profile_timer, &profile_last_ns, "scan_parse_index");
     try buildConceptSpecs(&manifest, paths.metadata.kind, paths.metadata.id, options.max_concept_candidates, options.max_concepts);
+    ingestProfileMark(&profile_timer, &profile_last_ns, "build_concept_specs");
 
     if (options.merge_live and pathExists(paths.corpus_ingest_live_manifest_abs_path)) {
         try mergeLiveManifest(allocator, &paths, &manifest);
+        ingestProfileMark(&profile_timer, &profile_last_ns, "merge_live");
     }
 
     try persistStagedState(allocator, &paths, &manifest, options.max_file_bytes);
+    ingestProfileMark(&profile_timer, &profile_last_ns, "persist_staged_state");
 
     const results = try buildStageItems(allocator, &manifest);
+    ingestProfileMark(&profile_timer, &profile_last_ns, "build_stage_items");
     errdefer {
         for (results) |*item| item.deinit();
         allocator.free(results);
@@ -696,6 +903,24 @@ pub fn stage(allocator: std.mem.Allocator, options: Options) !StageResult {
         .capacity_telemetry = manifest.capacity_telemetry,
         .items = results,
     };
+}
+
+fn ingestProfileEnabled() bool {
+    const raw = std.posix.getenv("GHOST_PROFILE_INGEST") orelse return false;
+    return raw.len != 0 and !std.mem.eql(u8, raw, "0") and !std.ascii.eqlIgnoreCase(raw, "false");
+}
+
+fn ingestProfileMark(timer: *?std.time.Timer, last_ns: *u64, label: []const u8) void {
+    if (timer.*) |*actual| {
+        const now = actual.read();
+        const delta = now - last_ns.*;
+        last_ns.* = now;
+        std.debug.print("[PROFILE][ingest] {s}: delta_ms={d} total_ms={d}\n", .{
+            label,
+            delta / std.time.ns_per_ms,
+            now / std.time.ns_per_ms,
+        });
+    }
 }
 
 pub fn renderJson(allocator: std.mem.Allocator, result: *const StageResult) ![]u8 {
@@ -898,6 +1123,7 @@ fn scanCorpusPath(
     options: Options,
     external_meta: *const std.StringHashMap(ExternalMetadata),
     manifest: *Manifest,
+    acceleration: *hash_acceleration.Context,
 ) !void {
     var maybe_dir = std.fs.openDirAbsolute(corpus_root, .{ .iterate = true }) catch |dir_err| switch (dir_err) {
         error.NotDir, error.FileNotFound => null,
@@ -905,19 +1131,18 @@ fn scanCorpusPath(
     };
     if (maybe_dir) |*dir| {
         dir.close();
-        try scanDirRecursive(allocator, corpus_root, "", root_hint, source_label, owner_kind, owner_id, trust_class, options, external_meta, manifest);
+        try scanDirParallel(allocator, corpus_root, root_hint, source_label, owner_kind, owner_id, trust_class, options, external_meta, manifest, acceleration);
         return;
     }
 
     const rel_path = try allocator.dupe(u8, std.fs.path.basename(corpus_root));
     defer allocator.free(rel_path);
-    try scanOneFile(allocator, corpus_root, rel_path, root_hint, source_label, owner_kind, owner_id, trust_class, options, external_meta, manifest);
+    try scanOneFile(allocator, corpus_root, rel_path, root_hint, source_label, owner_kind, owner_id, trust_class, options, external_meta, manifest, acceleration);
 }
 
-fn scanDirRecursive(
+fn scanDirParallel(
     allocator: std.mem.Allocator,
-    abs_dir: []const u8,
-    rel_dir: []const u8,
+    corpus_root: []const u8,
     root_hint: RootHint,
     source_label: []const u8,
     owner_kind: shards.Kind,
@@ -926,6 +1151,98 @@ fn scanDirRecursive(
     options: Options,
     external_meta: *const std.StringHashMap(ExternalMetadata),
     manifest: *Manifest,
+    acceleration: *hash_acceleration.Context,
+) !void {
+    var candidates = std.ArrayList(FileCandidate).init(allocator);
+    defer {
+        for (candidates.items) |*candidate| candidate.deinit();
+        candidates.deinit();
+    }
+
+    try collectFileCandidates(allocator, corpus_root, "", options, &manifest.capacity_telemetry, &manifest.coverage_complete, &candidates);
+
+    if (candidates.items.len == 0) return;
+
+    const license_status = try readLicenseStatus(allocator, manifest.source_root);
+    defer allocator.free(license_status);
+    const license_authority_level = try readLicenseAuthorityLevel(manifest.source_root);
+
+    const results = try allocator.alloc(ScanResult, candidates.items.len);
+    defer {
+        for (results) |*result| result.deinit();
+        allocator.free(results);
+    }
+    for (results) |*result| result.* = .{};
+
+    var context = ParallelScanContext{
+        .candidates = candidates.items,
+        .results = results,
+        .root_hint = root_hint,
+        .source_label = source_label,
+        .owner_kind = owner_kind,
+        .owner_id = owner_id,
+        .trust_class = trust_class,
+        .options = options,
+        .external_meta = external_meta,
+        .license_status = license_status,
+        .license_authority_level = license_authority_level,
+        .acceleration = acceleration,
+    };
+
+    const worker_count = @min(DEFAULT_INGEST_WORKERS, candidates.items.len);
+    const threads = try allocator.alloc(std.Thread, worker_count);
+    defer allocator.free(threads);
+
+    for (threads, 0..) |*thread, worker_id| {
+        thread.* = try std.Thread.spawn(.{ .allocator = allocator }, scanWorker, .{ &context, worker_id });
+    }
+    for (threads) |thread| thread.join();
+
+    for (results, 0..) |*result, index| {
+        if (result.err) |err| return err;
+        var outcome = result.outcome orelse return error.IncompleteParallelScan;
+        result.outcome = null;
+        errdefer outcome.deinit();
+        switch (outcome) {
+            .unit => |*unit| try appendScannedUnit(manifest, unit),
+            .rejection => |*rejection| try manifest.rejections.append(rejection.*),
+        }
+        if (manifest.next_cursor) |old| allocator.free(old);
+        manifest.next_cursor = try allocator.dupe(u8, candidates.items[index].rel_path);
+    }
+    try applyBatchedSemanticHashes(allocator, manifest, acceleration);
+}
+
+fn applyBatchedSemanticHashes(allocator: std.mem.Allocator, manifest: *Manifest, acceleration: *hash_acceleration.Context) !void {
+    var texts = std.ArrayList([]const u8).init(allocator);
+    defer texts.deinit();
+    var indexes = std.ArrayList(usize).init(allocator);
+    defer indexes.deinit();
+
+    for (manifest.items.items, 0..) |item, idx| {
+        if (item.lower_text) |text| {
+            try texts.append(text[0..@min(text.len, MAX_FILE_READ_INDEX_BYTES)]);
+            try indexes.append(idx);
+        }
+    }
+    if (texts.items.len == 0) return;
+
+    const hashes = try allocator.alloc(u64, texts.items.len);
+    defer allocator.free(hashes);
+    try hash_acceleration.semanticHash64Batch(acceleration, allocator, texts.items, hashes);
+    for (hashes, 0..) |hash, idx| {
+        manifest.items.items[indexes.items[idx]].semantic_hash = hash;
+    }
+}
+
+fn collectFileCandidates(
+    allocator: std.mem.Allocator,
+    abs_dir: []const u8,
+    rel_dir: []const u8,
+    options: Options,
+    capacity: *IngestCapacityTelemetry,
+    coverage_complete: *bool,
+    candidates: *std.ArrayList(FileCandidate),
 ) !void {
     var dir = try std.fs.openDirAbsolute(abs_dir, .{ .iterate = true });
     defer dir.close();
@@ -964,31 +1281,33 @@ fn scanDirRecursive(
                 if (shouldSkipWalkPath(entry.name)) continue;
                 const child_abs = try std.fs.path.join(allocator, &.{ abs_dir, entry.name });
                 defer allocator.free(child_abs);
-                try scanDirRecursive(allocator, child_abs, rel_path, root_hint, source_label, owner_kind, owner_id, trust_class, options, external_meta, manifest);
-                if (!manifest.coverage_complete) return;
+                try collectFileCandidates(allocator, child_abs, rel_path, options, capacity, coverage_complete, candidates);
+                if (!coverage_complete.*) return;
             },
             .file => {
                 if (std.mem.eql(u8, entry.name, external_evidence.EXTERNAL_METADATA_FILE_NAME)) continue;
                 if (options.cursor_after) |cursor| {
                     if (std.mem.order(u8, rel_path, cursor) != .gt) continue;
                 }
-                if (manifest.items.items.len + manifest.rejections.items.len >= options.max_files) {
+                if (candidates.items.len >= options.max_files) {
                     if (!options.allow_partial) {
-                        manifest.capacity_telemetry.too_many_files = true;
-                        manifest.capacity_telemetry.file_cap_hit = true;
-                        manifest.capacity_telemetry.budget_hits += 1;
+                        capacity.too_many_files = true;
+                        capacity.file_cap_hit = true;
+                        capacity.budget_hits += 1;
                         return error.TooManyFiles;
                     }
-                    manifest.coverage_complete = false;
-                    manifest.capacity_telemetry.file_cap_hit = true;
-                    manifest.capacity_telemetry.budget_hits += 1;
+                    coverage_complete.* = false;
+                    capacity.file_cap_hit = true;
+                    capacity.budget_hits += 1;
                     return;
                 }
                 const abs_path = try std.fs.path.join(allocator, &.{ abs_dir, entry.name });
-                defer allocator.free(abs_path);
-                try scanOneFile(allocator, abs_path, rel_path, root_hint, source_label, owner_kind, owner_id, trust_class, options, external_meta, manifest);
-                if (manifest.next_cursor) |old| allocator.free(old);
-                manifest.next_cursor = try allocator.dupe(u8, rel_path);
+                errdefer allocator.free(abs_path);
+                try candidates.append(.{
+                    .allocator = allocator,
+                    .abs_path = abs_path,
+                    .rel_path = try allocator.dupe(u8, rel_path),
+                });
             },
             else => {},
         }
@@ -1007,63 +1326,127 @@ fn scanOneFile(
     options: Options,
     external_meta: *const std.StringHashMap(ExternalMetadata),
     manifest: *Manifest,
+    acceleration: *hash_acceleration.Context,
 ) !void {
+    const license_status = try readLicenseStatus(allocator, manifest.source_root);
+    defer allocator.free(license_status);
+    const license_authority_level = try readLicenseAuthorityLevel(manifest.source_root);
+    var outcome = try parseOneFileForIngest(allocator, abs_path, rel_path, root_hint, source_label, owner_kind, owner_id, trust_class, options, external_meta, license_status, license_authority_level, acceleration);
+    errdefer outcome.deinit();
+    switch (outcome) {
+        .unit => |*unit| try appendScannedUnit(manifest, unit),
+        .rejection => |*rejection| try manifest.rejections.append(rejection.*),
+    }
+    outcome = undefined;
+    try applyBatchedSemanticHashes(allocator, manifest, acceleration);
+}
+
+fn scanWorker(context: *ParallelScanContext, _: usize) void {
+    while (true) {
+        const index = context.next_index.fetchAdd(1, .monotonic);
+        if (index >= context.candidates.len) return;
+        const candidate = context.candidates[index];
+        context.results[index].outcome = parseOneFileForIngest(
+            std.heap.page_allocator,
+            candidate.abs_path,
+            candidate.rel_path,
+            context.root_hint,
+            context.source_label,
+            context.owner_kind,
+            context.owner_id,
+            context.trust_class,
+            context.options,
+            context.external_meta,
+            context.license_status,
+            context.license_authority_level,
+            context.acceleration,
+        ) catch |err| {
+            context.results[index].err = err;
+            return;
+        };
+    }
+}
+
+fn parseOneFileForIngest(
+    allocator: std.mem.Allocator,
+    abs_path: []const u8,
+    rel_path: []const u8,
+    root_hint: RootHint,
+    source_label: []const u8,
+    owner_kind: shards.Kind,
+    owner_id: []const u8,
+    trust_class: abstractions.TrustClass,
+    options: Options,
+    external_meta: *const std.StringHashMap(ExternalMetadata),
+    license_status: []const u8,
+    license_authority_level: u8,
+    acceleration: ?*hash_acceleration.Context,
+) !ScanOutcome {
     const file = try std.fs.openFileAbsolute(abs_path, .{});
     defer file.close();
     const stat = try file.stat();
     if (stat.size > options.max_file_bytes) {
-        try manifest.rejections.append(.{
+        return .{ .rejection = .{
             .allocator = allocator,
             .source_rel_path = try allocator.dupe(u8, rel_path),
             .reason = .file_too_large,
-        });
-        return;
+        } };
     }
 
     const bytes = try file.readToEndAlloc(allocator, options.max_file_bytes);
     defer allocator.free(bytes);
     if (std.mem.indexOfScalar(u8, bytes, 0) != null) {
-        try manifest.rejections.append(.{
+        return .{ .rejection = .{
             .allocator = allocator,
             .source_rel_path = try allocator.dupe(u8, rel_path),
             .reason = .contains_nul,
-        });
-        return;
+        } };
     }
 
     const class = classifyInput(rel_path, root_hint, bytes) orelse {
-        try manifest.rejections.append(.{
+        return .{ .rejection = .{
             .allocator = allocator,
             .source_rel_path = try allocator.dupe(u8, rel_path),
             .reason = .unsupported_extension,
-        });
-        return;
+        } };
     };
 
-    const lower_text = try asciiLowerDup(allocator, bytes);
+    _ = validateRuneBlocks(bytes) catch |err| switch (err) {
+        error.InvalidUtf8 => return .{ .rejection = .{
+            .allocator = allocator,
+            .source_rel_path = try allocator.dupe(u8, rel_path),
+            .reason = .invalid_utf8,
+        } },
+        else => return err,
+    };
+
+    const index_bytes = boundedUtf8Prefix(bytes, MAX_FILE_READ_INDEX_BYTES);
+    const lower_text = try asciiLowerDup(allocator, index_bytes);
     errdefer allocator.free(lower_text);
 
     const tokens = try extractOwnedTokens(allocator, lower_text, MAX_TOKEN_COUNT);
     errdefer freeOwnedStringSlice(allocator, tokens);
-    const patterns = try extractOwnedPatterns(allocator, lower_text, MAX_PATTERN_COUNT);
+    const patterns = try extractOwnedRuneGroups(allocator, lower_text, MAX_PATTERN_COUNT);
     errdefer freeOwnedStringSlice(allocator, patterns);
 
     if (class != .code and tokens.len < 2 and patterns.len == 0) {
         allocator.free(lower_text);
         freeOwnedStringSlice(allocator, tokens);
         freeOwnedStringSlice(allocator, patterns);
-        try manifest.rejections.append(.{
+        return .{ .rejection = .{
             .allocator = allocator,
             .source_rel_path = try allocator.dupe(u8, rel_path),
             .reason = .low_structure,
-        });
-        return;
+        } };
     }
 
     const raw_hash = std.hash.Fnv1a_64.hash(bytes);
     const normalized_bytes = try normalizedDedupBytes(allocator, bytes);
     defer allocator.free(normalized_bytes);
     const normalized_hash = std.hash.Fnv1a_64.hash(normalized_bytes);
+    _ = acceleration;
+    const index_text = lower_text[0..@min(lower_text.len, MAX_FILE_READ_INDEX_BYTES)];
+    const search_sketch = try corpus_sketch.simHash64(allocator, index_text);
     const synthetic_rel_path = try std.fs.path.join(allocator, &.{ CORPUS_REL_PREFIX, className(class), rel_path });
     errdefer allocator.free(synthetic_rel_path);
     const storage_rel_path = try std.fs.path.join(allocator, &.{ config.CORPUS_INGEST_FILES_DIR_NAME, className(class), rel_path });
@@ -1085,10 +1468,15 @@ fn scanOneFile(
         .class = class,
         .trust_class = trust_class,
         .source_label = try allocator.dupe(u8, source_label),
+        .license_status = try allocator.dupe(u8, license_status),
+        .license_authority_level = license_authority_level,
         .source_mtime_ns = stat.mtime,
         .size_bytes = stat.size,
         .raw_hash = raw_hash,
         .normalized_hash = normalized_hash,
+        .semantic_hash = 0,
+        .search_sketch_hash = search_sketch.hash,
+        .search_sketch_features = search_sketch.feature_count,
         .lineage_id = lineage_id,
         .provenance = provenance,
         .lower_text = lower_text,
@@ -1097,20 +1485,24 @@ fn scanOneFile(
     };
     errdefer unit.deinit();
 
+    return .{ .unit = unit };
+}
+
+fn appendScannedUnit(manifest: *Manifest, unit: *SourceUnit) !void {
     for (manifest.items.items) |*existing| {
         if (existing.raw_hash == unit.raw_hash) {
             unit.dedup = .exact_duplicate;
-            unit.canonical_rel_path = try allocator.dupe(u8, existing.synthetic_rel_path);
+            unit.canonical_rel_path = try unit.allocator.dupe(u8, existing.synthetic_rel_path);
             break;
         }
         if (existing.normalized_hash == unit.normalized_hash) {
             unit.dedup = .normalized_duplicate;
-            unit.canonical_rel_path = try allocator.dupe(u8, existing.synthetic_rel_path);
+            unit.canonical_rel_path = try unit.allocator.dupe(u8, existing.synthetic_rel_path);
             break;
         }
     }
 
-    try manifest.items.append(unit);
+    try manifest.items.append(unit.*);
 }
 
 const ConceptTarget = struct {
@@ -1139,7 +1531,8 @@ fn buildConceptSpecs(
 
     for (manifest.items.items, 0..) |*source, source_index| {
         if (source.class == .code or source.dedup != .unique or source.lower_text == null) continue;
-        const source_text = source.lower_text.?;
+        const full_source_text = source.lower_text.?;
+        const source_text = full_source_text[0..@min(full_source_text.len, DEFAULT_MAX_CONCEPT_SOURCE_BYTES)];
         for (targets.items) |target_info| {
             if (manifest.capacity_telemetry.concept_candidates_considered >= max_candidates) {
                 manifest.capacity_telemetry.concept_candidate_cap_hit = true;
@@ -1553,6 +1946,82 @@ fn extractOwnedPatterns(allocator: std.mem.Allocator, lower_text: []const u8, ma
     return list.toOwnedSlice();
 }
 
+fn validateRuneBlocks(text: []const u8) !RuneParseSummary {
+    var view = std.unicode.Utf8View.init(text) catch return error.InvalidUtf8;
+    var iter = view.iterator();
+    var summary = RuneParseSummary{};
+    while (iter.nextCodepoint()) |rune| {
+        summary.rune_count += 1;
+        if (isStructuralRune(rune)) summary.structural_punctuation_count += 1;
+    }
+    return summary;
+}
+
+fn boundedUtf8Prefix(text: []const u8, max_bytes: usize) []const u8 {
+    var end = @min(text.len, max_bytes);
+    while (end > 0) {
+        _ = std.unicode.Utf8View.init(text[0..end]) catch {
+            end -= 1;
+            continue;
+        };
+        break;
+    }
+    return text[0..end];
+}
+
+fn extractOwnedRuneGroups(allocator: std.mem.Allocator, lower_text: []const u8, max_items: usize) ![][]u8 {
+    var list = std.ArrayList([]u8).init(allocator);
+    errdefer {
+        for (list.items) |item| allocator.free(item);
+        list.deinit();
+    }
+
+    var group_start: usize = 0;
+    var index: usize = 0;
+    var view = std.unicode.Utf8View.init(lower_text) catch return error.InvalidUtf8;
+    var iter = view.iterator();
+    while (iter.nextCodepointSlice()) |rune_slice| {
+        const rune = decodeRuneSlice(rune_slice) catch continue;
+        index += rune_slice.len;
+        if (!isStructuralRune(rune)) continue;
+
+        const group = std.mem.trim(u8, lower_text[group_start..index], " \r\n\t-*#`>.,;:!?()[]{}\"'");
+        group_start = index;
+        if (group.len < 4) continue;
+        if (!looksLikeClaimOrObligation(group) and list.items.len + 1 < max_items) continue;
+        if (containsOwned(list.items, group)) continue;
+        try list.append(try allocator.dupe(u8, group));
+        if (list.items.len >= max_items) break;
+    }
+
+    if (list.items.len == 0) {
+        return extractOwnedPatterns(allocator, lower_text, max_items);
+    }
+    return list.toOwnedSlice();
+}
+
+fn decodeRuneSlice(rune_slice: []const u8) !u21 {
+    var view = try std.unicode.Utf8View.init(rune_slice);
+    var iter = view.iterator();
+    return iter.nextCodepoint() orelse error.InvalidUtf8;
+}
+
+fn isStructuralRune(rune: u21) bool {
+    return rune == '.' or rune == ';' or rune == ':' or rune == '!' or rune == '?' or rune == '\n';
+}
+
+fn looksLikeClaimOrObligation(group: []const u8) bool {
+    return std.mem.indexOf(u8, group, " is ") != null or
+        std.mem.indexOf(u8, group, " are ") != null or
+        std.mem.indexOf(u8, group, " was ") != null or
+        std.mem.indexOf(u8, group, " were ") != null or
+        std.mem.indexOf(u8, group, " must ") != null or
+        std.mem.indexOf(u8, group, " shall ") != null or
+        std.mem.indexOf(u8, group, " should ") != null or
+        std.mem.startsWith(u8, group, "claim") or
+        std.mem.startsWith(u8, group, "obligation");
+}
+
 fn containsOwned(items: [][]u8, needle: []const u8) bool {
     for (items) |item| {
         if (std.mem.eql(u8, item, needle)) return true;
@@ -1589,10 +2058,15 @@ fn cloneSourceUnit(allocator: std.mem.Allocator, item: SourceUnit) !SourceUnit {
         .class = item.class,
         .trust_class = item.trust_class,
         .source_label = try allocator.dupe(u8, item.source_label),
+        .license_status = try allocator.dupe(u8, item.license_status),
+        .license_authority_level = item.license_authority_level,
         .source_mtime_ns = item.source_mtime_ns,
         .size_bytes = item.size_bytes,
         .raw_hash = item.raw_hash,
         .normalized_hash = item.normalized_hash,
+        .semantic_hash = item.semantic_hash,
+        .search_sketch_hash = item.search_sketch_hash,
+        .search_sketch_features = item.search_sketch_features,
         .dedup = item.dedup,
         .canonical_rel_path = if (item.canonical_rel_path) |value| try allocator.dupe(u8, value) else null,
         .lineage_id = try allocator.dupe(u8, item.lineage_id),
@@ -1668,6 +2142,16 @@ fn containsWhole(haystack: []const u8, needle: []const u8) bool {
 fn containsWholeLowerNeedle(haystack_lower: []const u8, needle: []const u8) bool {
     if (needle.len == 0 or haystack_lower.len < needle.len) return false;
 
+    if (isAsciiLowerOrNeutral(needle)) {
+        return containsWholeLowerNeedleExact(haystack_lower, needle);
+    }
+
+    var lower_buf: [512]u8 = undefined;
+    if (needle.len <= lower_buf.len) {
+        for (needle, 0..) |c, idx| lower_buf[idx] = std.ascii.toLower(c);
+        return containsWholeLowerNeedleExact(haystack_lower, lower_buf[0..needle.len]);
+    }
+
     var idx: usize = 0;
     while (idx + needle.len <= haystack_lower.len) : (idx += 1) {
         const before_ok = idx == 0 or !isTokenByte(haystack_lower[idx - 1]);
@@ -1686,6 +2170,25 @@ fn containsWholeLowerNeedle(haystack_lower: []const u8, needle: []const u8) bool
         if (matched) return true;
     }
     return false;
+}
+
+fn containsWholeLowerNeedleExact(haystack_lower: []const u8, lower_needle: []const u8) bool {
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack_lower, start, lower_needle)) |idx| {
+        const before_ok = idx == 0 or !isTokenByte(haystack_lower[idx - 1]);
+        const after_pos = idx + lower_needle.len;
+        const after_ok = after_pos >= haystack_lower.len or !isTokenByte(haystack_lower[after_pos]);
+        if (before_ok and after_ok) return true;
+        start = idx + 1;
+    }
+    return false;
+}
+
+fn isAsciiLowerOrNeutral(text: []const u8) bool {
+    for (text) |c| {
+        if (std.ascii.isUpper(c)) return false;
+    }
+    return true;
 }
 
 fn serializeManifest(allocator: std.mem.Allocator, manifest: *Manifest) ![]u8 {
@@ -1717,11 +2220,16 @@ fn serializeManifest(allocator: std.mem.Allocator, manifest: *Manifest) ![]u8 {
         try writeJsonFieldString(writer, "class", className(item.class), false);
         try writeJsonFieldString(writer, "trustClass", abstractions.trustClassName(item.trust_class), false);
         try writeJsonFieldString(writer, "sourceLabel", item.source_label, false);
-        try writer.print(",\"sourceMtimeNs\":{d},\"sizeBytes\":{d},\"rawHash\":{d},\"normalizedHash\":{d}", .{
+        try writeJsonFieldString(writer, "licenseStatus", item.license_status, false);
+        try writer.print(",\"authorityLevel\":{d}", .{item.license_authority_level});
+        try writer.print(",\"sourceMtimeNs\":{d},\"sizeBytes\":{d},\"rawHash\":{d},\"normalizedHash\":{d},\"semanticHash\":{d},\"searchSketchHash\":{d},\"searchSketchFeatures\":{d}", .{
             item.source_mtime_ns,
             item.size_bytes,
             item.raw_hash,
             item.normalized_hash,
+            item.semantic_hash,
+            item.search_sketch_hash,
+            item.search_sketch_features,
         });
         try writeOptionalStringField(writer, "dedup", dedupName(item.dedup));
         if (item.canonical_rel_path) |value| try writeOptionalStringField(writer, "canonicalRelPath", value);
@@ -1785,10 +2293,15 @@ fn loadManifestFromPath(allocator: std.mem.Allocator, abs_path: []const u8) !str
         class: []const u8,
         trustClass: []const u8,
         sourceLabel: []const u8,
+        licenseStatus: ?[]const u8 = null,
+        authorityLevel: ?u8 = null,
         sourceMtimeNs: i128,
         sizeBytes: u64,
         rawHash: u64,
         normalizedHash: u64,
+        semanticHash: ?u64 = null,
+        searchSketchHash: ?u64 = null,
+        searchSketchFeatures: ?usize = null,
         dedup: []const u8,
         canonicalRelPath: ?[]const u8 = null,
         lineageId: []const u8,
@@ -1862,6 +2375,9 @@ fn loadManifestFromPath(allocator: std.mem.Allocator, abs_path: []const u8) !str
         .concepts_emitted = parsed.value.capacityTelemetry.conceptsEmitted,
         .budget_hits = parsed.value.capacityTelemetry.budgetHits,
     };
+    const fallback_license_status = try readLicenseStatus(allocator, parsed.value.sourceRoot);
+    defer allocator.free(fallback_license_status);
+    const fallback_authority_level = try readLicenseAuthorityLevel(parsed.value.sourceRoot);
 
     for (parsed.value.items) |item| {
         try manifest.items.append(.{
@@ -1872,10 +2388,15 @@ fn loadManifestFromPath(allocator: std.mem.Allocator, abs_path: []const u8) !str
             .class = parseClass(item.class) orelse return error.InvalidCorpusManifest,
             .trust_class = abstractions.parseTrustClassName(item.trustClass) orelse return error.InvalidCorpusManifest,
             .source_label = try allocator.dupe(u8, item.sourceLabel),
+            .license_status = try allocator.dupe(u8, if (std.mem.eql(u8, fallback_license_status, "unspecified")) item.licenseStatus orelse fallback_license_status else fallback_license_status),
+            .license_authority_level = if (std.mem.eql(u8, fallback_license_status, "unspecified")) item.authorityLevel orelse fallback_authority_level else fallback_authority_level,
             .source_mtime_ns = item.sourceMtimeNs,
             .size_bytes = item.sizeBytes,
             .raw_hash = item.rawHash,
             .normalized_hash = item.normalizedHash,
+            .semantic_hash = item.semanticHash orelse item.normalizedHash,
+            .search_sketch_hash = item.searchSketchHash orelse 0,
+            .search_sketch_features = item.searchSketchFeatures orelse 0,
             .dedup = parseDedup(item.dedup) orelse return error.InvalidCorpusManifest,
             .canonical_rel_path = if (item.canonicalRelPath) |value| try allocator.dupe(u8, value) else null,
             .lineage_id = try allocator.dupe(u8, item.lineageId),
@@ -1941,6 +2462,7 @@ fn parseRejectReason(text: []const u8) ?RejectReason {
     if (std.mem.eql(u8, text, "unsupported_extension")) return .unsupported_extension;
     if (std.mem.eql(u8, text, "file_too_large")) return .file_too_large;
     if (std.mem.eql(u8, text, "contains_nul")) return .contains_nul;
+    if (std.mem.eql(u8, text, "invalid_utf8")) return .invalid_utf8;
     if (std.mem.eql(u8, text, "low_structure")) return .low_structure;
     return null;
 }

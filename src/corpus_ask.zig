@@ -3,6 +3,7 @@ const abstractions = @import("abstractions.zig");
 const corpus_ingest = @import("corpus_ingest.zig");
 const corpus_sketch = @import("corpus_sketch.zig");
 const correction_review = @import("correction_review.zig");
+const hash_acceleration = @import("hash_acceleration.zig");
 const negative_knowledge_review = @import("negative_knowledge_review.zig");
 const learning_store = @import("learning_store.zig");
 const shards = @import("shards.zig");
@@ -11,23 +12,31 @@ pub const DEFAULT_MAX_RESULTS: usize = 3;
 pub const MAX_RESULTS: usize = 8;
 pub const DEFAULT_MAX_SNIPPET_BYTES: usize = 320;
 pub const MAX_SNIPPET_BYTES: usize = 1024;
-const MAX_FILE_READ_BYTES: usize = 64 * 1024;
+const DEFAULT_MAX_FILE_READ_BYTES: usize = 64 * 1024;
+const SIMPLE_WIKI_MAX_FILE_READ_BYTES: usize = 2 * 1024 * 1024;
 const MAX_QUERY_TOKENS: usize = 16;
 const MIN_TOKEN_LEN: usize = 3;
+const ASK_INDEX_SCAN_LIMIT: usize = 32;
 const MAX_SKETCH_CANDIDATES: usize = 8;
-const MAX_SIMHASH_DISTANCE: u7 = 24;
-const PRIMARY_NOUN_MATCH_THRESHOLD_PERCENT: u8 = 100;
+const MAX_SIMHASH_DISTANCE: u7 = 32;
+const PRIMARY_NOUN_MATCH_THRESHOLD_PERCENT: u8 = 50;
+const PRIMARY_NOUN_SCORE_BONUS: u32 = 12;
+const TITLE_MATCH_SCORE_BONUS: u32 = 80;
+const DEFINITION_MATCH_SCORE_BONUS: u32 = 40;
 
 pub const MountedPackRef = corpus_ingest.MountedPackRef;
 
 pub const AskStatus = enum {
     answered,
     unknown,
+    rejected_falsehood,
 };
 
 pub const UnknownKind = enum {
     no_corpus_available,
     insufficient_evidence,
+    insufficient_high_rank_evidence,
+    rejected_falsehood,
     conflicting_evidence,
     capacity_limited,
     malformed_request,
@@ -65,6 +74,8 @@ pub const EvidenceUsed = struct {
     source_label: []u8,
     class_name: []u8,
     trust_class: []u8,
+    license_status: []u8,
+    authority_level: u8,
     content_hash: []u8,
     byte_start: usize,
     byte_end: usize,
@@ -87,6 +98,7 @@ pub const EvidenceUsed = struct {
         allocator.free(self.source_label);
         allocator.free(self.class_name);
         allocator.free(self.trust_class);
+        allocator.free(self.license_status);
         allocator.free(self.content_hash);
         allocator.free(self.snippet);
         for (self.matched_terms) |term| allocator.free(term);
@@ -106,6 +118,8 @@ pub const SuppressedEvidence = struct {
     source_label: []u8,
     reason: []u8,
     authority_ref: []u8,
+    license_status: []u8,
+    authority_level: u8,
     rank: usize,
 
     fn deinit(self: *SuppressedEvidence, allocator: std.mem.Allocator) void {
@@ -115,6 +129,7 @@ pub const SuppressedEvidence = struct {
         allocator.free(self.source_label);
         allocator.free(self.reason);
         allocator.free(self.authority_ref);
+        allocator.free(self.license_status);
         self.* = undefined;
     }
 };
@@ -496,6 +511,8 @@ const QueryTokens = struct {
 const Candidate = struct {
     entry_index: usize,
     score: u32,
+    similarity_score: u16,
+    hybrid_score: f32,
     first_match: usize,
     byte_start: usize,
     byte_end: usize,
@@ -548,6 +565,25 @@ const SketchCandidate = struct {
     hamming_distance: u7,
     similarity_score: u16,
 };
+
+const IndexScanCandidate = struct {
+    entry_index: usize,
+    hamming_distance: u7,
+    similarity_score: u16,
+};
+
+fn hasSketchCandidate(candidates: []const SketchCandidate, entry_index: usize) bool {
+    for (candidates) |candidate| {
+        if (candidate.entry_index == entry_index) return true;
+    }
+    return false;
+}
+
+fn indexScanCandidateLessThan(_: void, lhs: IndexScanCandidate, rhs: IndexScanCandidate) bool {
+    if (lhs.hamming_distance != rhs.hamming_distance) return lhs.hamming_distance < rhs.hamming_distance;
+    if (lhs.similarity_score != rhs.similarity_score) return lhs.similarity_score > rhs.similarity_score;
+    return lhs.entry_index < rhs.entry_index;
+}
 
 const TextToken = struct {
     lower: []u8,
@@ -616,6 +652,9 @@ const QueryIntent = enum {
 };
 
 pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
+    var profile_timer: ?std.time.Timer = if (askProfileEnabled()) try std.time.Timer.start() else null;
+    var profile_last_ns: u64 = 0;
+
     if (std.mem.trim(u8, options.question, " \r\n\t").len == 0) {
         return malformedResult(allocator, options.question, "question must be non-empty");
     }
@@ -633,12 +672,14 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
 
     var paths = try shards.resolvePaths(allocator, shard_metadata.metadata);
     defer paths.deinit();
+    askProfileMark(&profile_timer, &profile_last_ns, "resolve_shard");
     var reviewed = try correction_review.readAcceptedInfluences(allocator, paths.metadata.id);
     defer reviewed.deinit();
     var reviewed_nk = try negative_knowledge_review.readAcceptedInfluences(allocator, paths.metadata.id);
     defer reviewed_nk.deinit();
     var reviewed_learning = try learning_store.readAcceptedInfluences(allocator, paths.metadata.id);
     defer reviewed_learning.deinit();
+    askProfileMark(&profile_timer, &profile_last_ns, "read_influences");
 
     const live_entries = try corpus_ingest.collectLiveScanEntries(allocator, &paths);
     const live_entry_count = live_entries.len;
@@ -649,10 +690,12 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     const mounted_pack_entry_count = entries.len - live_entry_count;
     var live_coverage = try corpus_ingest.liveCoverage(allocator, &paths);
     defer live_coverage.deinit(allocator);
+    askProfileMark(&profile_timer, &profile_last_ns, "collect_entries_coverage");
 
     var tokens = try tokenizeQuery(allocator, options.question);
     defer tokens.deinit(allocator);
     const query_intent = classifyQueryIntent(options.question, tokens.tokens);
+    askProfileMark(&profile_timer, &profile_last_ns, "tokenize_query");
 
     if (entries.len == 0) {
         var result = try unknownResult(allocator, options, &paths, .no_corpus_available, "no live shard corpus or explicitly mounted Knowledge Pack corpus is available for this ask request", entries.len, max_results, max_snippet);
@@ -685,52 +728,143 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     var sketch_candidates = std.ArrayList(SketchCandidate).init(allocator);
     defer sketch_candidates.deinit();
     const query_sketch = try corpus_sketch.simHash64(allocator, options.question);
+    var acceleration = hash_acceleration.Context.init(allocator, "corpus ask vector search");
+    defer acceleration.deinit();
+    const query_semantic_hash = try hash_acceleration.semanticHash64(&acceleration, allocator, options.question);
     var telemetry = CapacityTelemetry{};
     if (!live_coverage.complete) {
         telemetry.skipped_inputs += 1;
         telemetry.budget_hits += 1;
     }
 
+    var index_scan_candidates = std.ArrayList(IndexScanCandidate).init(allocator);
+    defer index_scan_candidates.deinit();
+    const scan_entries = try allocator.alloc(bool, entries.len);
+    defer allocator.free(scan_entries);
+    @memset(scan_entries, false);
+
     for (entries, 0..) |entry, idx| {
-        const read_result = readEntryText(allocator, entry.abs_path) catch {
-            telemetry.skipped_files += 1;
-            telemetry.skipped_inputs += 1;
-            telemetry.budget_hits += 1;
-            continue;
-        };
-        const file_text = read_result.text;
-        errdefer allocator.free(file_text);
-        if (read_result.truncated) {
-            telemetry.truncated_inputs += 1;
-            telemetry.budget_hits += 1;
-        }
+        var best_distance: ?u7 = null;
         if (query_sketch.valid()) {
-            const entry_sketch = try corpus_sketch.simHash64(allocator, file_text);
-            if (entry_sketch.valid()) {
-                const distance = corpus_sketch.hammingDistance(query_sketch.hash, entry_sketch.hash);
+            if (entry.search_sketch_features != 0) {
+                const distance = corpus_sketch.hammingDistance(query_sketch.hash, entry.search_sketch_hash);
+                best_distance = if (best_distance) |existing| @min(existing, distance) else distance;
                 if (distance <= MAX_SIMHASH_DISTANCE) {
                     try sketch_candidates.append(.{
                         .entry_index = idx,
-                        .sketch_hash = entry_sketch.hash,
+                        .sketch_hash = entry.search_sketch_hash,
                         .hamming_distance = distance,
                         .similarity_score = corpus_sketch.similarityScore(distance),
                     });
                 }
             }
         }
-        const text_tokens = try tokenizeText(allocator, file_text);
-        defer freeTextTokens(allocator, text_tokens);
-        var scored = try scoreText(allocator, text_tokens, tokens.tokens);
-        if (scored.score == 0) {
-            scored.deinit(allocator);
-            allocator.free(file_text);
-            continue;
+        if (entry.semantic_hash != 0) {
+            const semantic_distance = corpus_sketch.hammingDistance(query_semantic_hash, entry.semantic_hash);
+            best_distance = if (best_distance) |existing| @min(existing, semantic_distance) else semantic_distance;
+            if (semantic_distance <= MAX_SIMHASH_DISTANCE and !hasSketchCandidate(sketch_candidates.items, idx)) {
+                try sketch_candidates.append(.{
+                    .entry_index = idx,
+                    .sketch_hash = entry.semantic_hash,
+                    .hamming_distance = semantic_distance,
+                    .similarity_score = corpus_sketch.similarityScore(semantic_distance),
+                });
+            }
         }
+        if (best_distance) |distance| {
+            if (idx == 1 or idx == 2) {
+                std.debug.print("INIT LOOP: Entry {d} best_distance={d} sim_score={d}\n", .{ idx, distance, corpus_sketch.similarityScore(distance) });
+            }
+            try index_scan_candidates.append(.{
+                .entry_index = idx,
+                .hamming_distance = distance,
+                .similarity_score = corpus_sketch.similarityScore(distance),
+            });
+        } else {
+            scan_entries[idx] = true;
+        }
+    }
+
+    std.mem.sort(IndexScanCandidate, index_scan_candidates.items, {}, indexScanCandidateLessThan);
+    const indexed_scan_count = askIndexScanLimit(tokens.tokens.len, index_scan_candidates.items.len);
+    for (index_scan_candidates.items[0..indexed_scan_count]) |candidate| {
+        scan_entries[candidate.entry_index] = true;
+    }
+    if (index_scan_candidates.items.len > indexed_scan_count) {
+        telemetry.skipped_inputs += index_scan_candidates.items.len - indexed_scan_count;
+        telemetry.budget_hits += 1;
+        telemetry.max_results_hit = true;
+    }
+    askProfileMark(&profile_timer, &profile_last_ns, "rank_search_index");
+
+    var profile_read_ns: u64 = 0;
+    const profile_tokenize_ns: u64 = 0;
+    var profile_score_ns: u64 = 0;
+    var profile_intent_hash_ns: u64 = 0;
+    var profile_entries_scanned: usize = 0;
+
+    for (entries, 0..) |entry, idx| {
+        if (!scan_entries[idx]) continue;
+        profile_entries_scanned += 1;
+        const read_start = askProfileNow(&profile_timer);
+        const read_result = readEntryText(allocator, entry.abs_path, maxReadBytesForEntry(entry)) catch {
+            askProfileAccumulate(&profile_timer, read_start, &profile_read_ns);
+            telemetry.skipped_files += 1;
+            telemetry.skipped_inputs += 1;
+            telemetry.budget_hits += 1;
+            continue;
+        };
+        askProfileAccumulate(&profile_timer, read_start, &profile_read_ns);
+        const file_text = read_result.text;
+        errdefer allocator.free(file_text);
+        if (read_result.truncated) {
+            telemetry.truncated_inputs += 1;
+            telemetry.budget_hits += 1;
+        }
+        const score_start = askProfileNow(&profile_timer);
+        var scored = try scoreTextDirect(allocator, file_text, tokens.tokens);
+        askProfileAccumulate(&profile_timer, score_start, &profile_score_ns);
+        // allow zero-keyword matches to pass through for vector scoring!
+
+        const intent_start = askProfileNow(&profile_timer);
         const value_match = evidenceMatchesIntent(file_text, query_intent);
         const value_bonus: u32 = if (query_intent != .general and value_match) 10 else 0;
+        const content_hash = std.hash.Fnv1a_64.hash(file_text);
+        askProfileAccumulate(&profile_timer, intent_start, &profile_intent_hash_ns);
+
+        var best_distance: u7 = 64;
+        if (query_sketch.valid() and entry.search_sketch_features != 0) {
+            best_distance = @min(best_distance, corpus_sketch.hammingDistance(query_sketch.hash, entry.search_sketch_hash));
+        }
+        if (entry.semantic_hash != 0) {
+            best_distance = @min(best_distance, corpus_sketch.hammingDistance(query_semantic_hash, entry.semantic_hash));
+        }
+
+        if (idx == 1 or idx == 2 or idx == 3) {
+            std.debug.print("Entry {d} best_distance={d} sim_score={d}\n", .{ idx, best_distance, corpus_sketch.similarityScore(best_distance) });
+        }
+        const similarity_score = corpus_sketch.similarityScore(best_distance);
+
+        const base_score = scored.score + value_bonus + primaryNounScoreBonus(tokens.tokens, scored.matched_terms);
+        const normalized_score = @as(f32, @floatFromInt(base_score)) / 100.0;
+        const normalized_vector_score = @as(f32, @floatFromInt(similarity_score)) / 300.0;
+
+        var keyword_weight: f32 = 0.5;
+        var vector_weight: f32 = 0.5;
+        if (tokens.tokens.len <= 2) {
+            keyword_weight = 0.8;
+            vector_weight = 0.2;
+        } else if (tokens.tokens.len > 4) {
+            keyword_weight = 0.1;
+            vector_weight = 0.9;
+        }
+        const hybrid_score = (normalized_score * keyword_weight) + (normalized_vector_score * vector_weight);
+
         candidates.append(.{
             .entry_index = idx,
-            .score = scored.score + value_bonus,
+            .score = base_score,
+            .similarity_score = similarity_score,
+            .hybrid_score = hybrid_score,
             .first_match = scored.first_match,
             .byte_start = scored.byte_start,
             .byte_end = scored.byte_end,
@@ -738,7 +872,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
             .line_end = scored.line_end,
             .matched_terms = scored.matched_terms,
             .matched_phrase = scored.matched_phrase,
-            .content_hash = std.hash.Fnv1a_64.hash(file_text),
+            .content_hash = content_hash,
             .polarity = detectPolarity(file_text),
             .value_match = value_match,
             .text = file_text,
@@ -747,6 +881,8 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
             return err;
         };
     }
+    askProfileLoopSummary(&profile_timer, profile_entries_scanned, profile_read_ns, profile_tokenize_ns, profile_score_ns, profile_intent_hash_ns);
+    askProfileMark(&profile_timer, &profile_last_ns, "read_score_indexed_entries");
 
     if (candidates.items.len == 0) {
         if (try authorityOverrideCheck(allocator, options.question, tokens.tokens, candidates.items, &reviewed)) |override_value| {
@@ -778,6 +914,11 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     }
 
     std.mem.sort(Candidate, candidates.items, {}, candidateLessThan);
+    std.debug.print("\n=== TOP 3 CANDIDATES ===\n", .{});
+    for (candidates.items[0..@min(3, candidates.items.len)], 0..) |cand, i| {
+        std.debug.print("#{d}: Entry {d} | hybrid_score: {d:.4} | kw_score: {d} | sim_score: {d}\n", .{i+1, cand.entry_index, cand.hybrid_score, cand.score, cand.similarity_score});
+    }
+    std.debug.print("========================\n\n", .{});
     const top_count = @min(max_results, candidates.items.len);
     telemetry.exact_candidate_cap_hit = candidates.items.len > top_count;
     telemetry.max_results_hit = telemetry.exact_candidate_cap_hit;
@@ -792,13 +933,110 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
         return result;
     }
-    const conflict = hasConflict(candidates.items[0..top_count]);
-    if (conflict) {
+
+    var high_rank_candidates = std.ArrayList(Candidate).init(allocator);
+    defer high_rank_candidates.deinit();
+    var shadow_context_candidates = std.ArrayList(Candidate).init(allocator);
+    defer shadow_context_candidates.deinit();
+    var trash_blocked_candidates = std.ArrayList(Candidate).init(allocator);
+    defer trash_blocked_candidates.deinit();
+    try splitRankedContextCandidates(&high_rank_candidates, &shadow_context_candidates, &trash_blocked_candidates, candidates.items, entries);
+
+    if (high_rank_candidates.items.len == 0) {
+        if (trash_blocked_candidates.items.len != 0) {
+            var result = try buildBaseResult(allocator, options, &paths, .rejected_falsehood, "unresolved", "unresolved", entries.len, max_results, max_snippet);
+            errdefer result.deinit();
+            result.mounted_packs_considered = options.mounted_packs.len;
+            result.mounted_pack_entries_considered = mounted_pack_entry_count;
+            result.suppressed_evidence = try buildTrashSuppressedEvidence(allocator, boundedCandidates(trash_blocked_candidates.items, max_results), entries);
+            result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
+            telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
+            if (telemetry.sketch_candidate_cap_hit) {
+                telemetry.max_results_hit = true;
+                telemetry.budget_hits += 1;
+            }
+            telemetry.expansion_recommended = true;
+            result.capacity_telemetry = telemetry;
+            try attachLiveCoverage(allocator, &result, live_coverage);
+            result.unknowns = try singleUnknown(allocator, .rejected_falsehood, "blacklisted Trash-ranked corpus evidence matched this query; the source was discarded and the falsehood was rejected");
+            result.candidate_followups = try singleFollowup(allocator, "truth_alert", "review the blocked Trash-ranked source only if you intend to reverse its license rank through explicit human audit");
+            try applyCapacityDisclosure(allocator, &result);
+            try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
+            try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
+            try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
+            return result;
+        }
         var result = try buildBaseResult(allocator, options, &paths, .unknown, "unresolved", "unresolved", entries.len, max_results, max_snippet);
         errdefer result.deinit();
         result.mounted_packs_considered = options.mounted_packs.len;
         result.mounted_pack_entries_considered = mounted_pack_entry_count;
-        result.evidence_used = try buildEvidence(allocator, candidates.items[0..top_count], entries, max_snippet, "selected because it matched question terms but conflicts with another selected corpus item");
+        result.evidence_used = try buildEvidence(allocator, candidates.items[0..top_count], entries, max_snippet, "shadow context matched the query but cannot be the sole basis for an answer draft");
+        result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
+        telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
+        if (telemetry.truncated_snippets != 0) telemetry.budget_hits += 1;
+        telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
+        if (telemetry.sketch_candidate_cap_hit) {
+            telemetry.max_results_hit = true;
+            telemetry.budget_hits += 1;
+        }
+        telemetry.expansion_recommended = true;
+        result.capacity_telemetry = telemetry;
+        try attachLiveCoverage(allocator, &result, live_coverage);
+        result.unknowns = try singleUnknown(allocator, .insufficient_high_rank_evidence, "only shadow-ranked corpus evidence matched; shadow context cannot authorize an answer draft");
+        result.candidate_followups = try singleFollowup(allocator, "evidence_to_collect", "promote or ingest root, verified, or unverified evidence before using shadow context as factual support");
+        try applyCapacityDisclosure(allocator, &result);
+        try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
+        try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
+        try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
+        return result;
+    }
+
+    const selected_candidates = boundedCandidates(high_rank_candidates.items, max_results);
+    const shadow_context = boundedCandidates(shadow_context_candidates.items, max_results);
+    const trash_blocked = boundedCandidates(trash_blocked_candidates.items, max_results);
+    const conflict = hasConflict(selected_candidates);
+    if (conflict) {
+        var verified_candidates = std.ArrayList(Candidate).init(allocator);
+        defer verified_candidates.deinit();
+        var unverified_suppressed = std.ArrayList(Candidate).init(allocator);
+        defer unverified_suppressed.deinit();
+        try splitVerifiedDominanceCandidates(&verified_candidates, &unverified_suppressed, selected_candidates, entries);
+        if (verified_candidates.items.len != 0 and unverified_suppressed.items.len != 0) {
+            var result = try buildBaseResult(allocator, options, &paths, .answered, "draft", "none", entries.len, max_results, max_snippet);
+            errdefer result.deinit();
+            result.mounted_packs_considered = options.mounted_packs.len;
+            result.mounted_pack_entries_considered = mounted_pack_entry_count;
+            result.evidence_used = try buildEvidence(allocator, verified_candidates.items, entries, max_snippet, "selected because verified license evidence contradicted unverified evidence");
+            result.suppressed_evidence = try buildCombinedSuppressedEvidence(allocator, unverified_suppressed.items, shadow_context, trash_blocked, entries);
+            result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
+            telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
+            if (telemetry.truncated_snippets != 0) telemetry.budget_hits += 1;
+            telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
+            if (telemetry.sketch_candidate_cap_hit) {
+                telemetry.max_results_hit = true;
+                telemetry.budget_hits += 1;
+            }
+            telemetry.expansion_recommended = telemetry.hasPressure();
+            result.capacity_telemetry = telemetry;
+            try attachLiveCoverage(allocator, &result, live_coverage);
+            result.answer_draft = try std.fmt.allocPrint(
+                allocator,
+                "Draft answer from verified corpus evidence: {s}",
+                .{result.evidence_used[0].snippet},
+            );
+            result.candidate_followups = try singleFollowup(allocator, "license_review_candidate", "unverified contradictory evidence was suppressed; review shard licensing before treating this draft as supported");
+            try applyCapacityDisclosure(allocator, &result);
+            try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
+            try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
+            try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
+            return result;
+        }
+        var result = try buildBaseResult(allocator, options, &paths, .unknown, "unresolved", "unresolved", entries.len, max_results, max_snippet);
+        errdefer result.deinit();
+        result.mounted_packs_considered = options.mounted_packs.len;
+        result.mounted_pack_entries_considered = mounted_pack_entry_count;
+        result.evidence_used = try buildEvidence(allocator, selected_candidates, entries, max_snippet, "selected because it matched question terms but conflicts with another selected corpus item");
+        result.suppressed_evidence = try buildCombinedSuppressedEvidence(allocator, &.{}, shadow_context, trash_blocked, entries);
         result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
         telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
         if (telemetry.truncated_snippets != 0) telemetry.budget_hits += 1;
@@ -810,7 +1048,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         telemetry.expansion_recommended = telemetry.hasPressure();
         result.capacity_telemetry = telemetry;
         try attachLiveCoverage(allocator, &result, live_coverage);
-        const conflict_reason = conflictReason(candidates.items[0..top_count]);
+        const conflict_reason = conflictReason(selected_candidates);
         result.unknowns = try singleUnknown(allocator, .conflicting_evidence, conflict_reason);
         result.candidate_followups = try singleFollowup(allocator, "evidence_to_collect", "provide or ingest an authoritative corpus item that resolves the conflict");
         result.learning_candidates = try singleLearningCandidate(allocator, options.project_shard, "correction_candidate", "review the conflicting corpus items and propose a correction or corpus update through an explicit lifecycle", conflict_reason);
@@ -821,12 +1059,18 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         return result;
     }
 
-    const top = candidates.items[0];
-    if (top.score < requiredScore(tokens.tokens.len) and top.matched_phrase == null) {
+    const top = selected_candidates[0];
+
+    const is_strong_hybrid = top.hybrid_score >= 0.05;
+    const is_perfect_title = top.score >= TITLE_MATCH_SCORE_BONUS;
+    const is_exact_phrase = top.matched_phrase != null;
+
+    if (!is_strong_hybrid and !is_perfect_title and !is_exact_phrase) {
         var result = try unknownResult(allocator, options, &paths, .insufficient_evidence, "matched corpus evidence was too weak to support an answer draft", entries.len, max_results, max_snippet);
         errdefer result.deinit();
         result.mounted_packs_considered = options.mounted_packs.len;
         result.mounted_pack_entries_considered = mounted_pack_entry_count;
+        result.suppressed_evidence = try buildCombinedSuppressedEvidence(allocator, &.{}, shadow_context, trash_blocked, entries);
         result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
         telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
         if (telemetry.sketch_candidate_cap_hit) {
@@ -843,13 +1087,14 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         return result;
     }
 
-    if (!candidatesParameterMatchCheck(tokens.tokens, candidates.items[0..top_count])) {
+    if (!candidatesParameterMatchCheck(tokens.tokens, selected_candidates)) {
         var result = try buildBaseResult(allocator, options, &paths, .unknown, "unresolved", "unresolved", entries.len, max_results, max_snippet);
         errdefer result.deinit();
         result.parameter_match_failure = true;
         result.mounted_packs_considered = options.mounted_packs.len;
         result.mounted_pack_entries_considered = mounted_pack_entry_count;
-        result.evidence_used = try buildEvidence(allocator, candidates.items[0..top_count], entries, max_snippet, "candidate evidence matched topic terms but failed the exact parameter lock");
+        result.evidence_used = try buildEvidence(allocator, selected_candidates, entries, max_snippet, "candidate evidence matched topic terms but failed the exact parameter lock");
+        result.suppressed_evidence = try buildCombinedSuppressedEvidence(allocator, &.{}, shadow_context, trash_blocked, entries);
         result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
         telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
         if (telemetry.truncated_snippets != 0) telemetry.budget_hits += 1;
@@ -871,7 +1116,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         return result;
     }
 
-    if (try inferenceBridgeCheck(allocator, options.question, candidates.items[0..top_count], entries)) |bridge_value| {
+    if (try inferenceBridgeCheck(allocator, options.question, selected_candidates, entries)) |bridge_value| {
         var bridge = bridge_value;
         defer bridge.deinit(allocator);
         const bridge_candidates = [_]Candidate{bridge.candidate};
@@ -880,6 +1125,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         result.mounted_packs_considered = options.mounted_packs.len;
         result.mounted_pack_entries_considered = mounted_pack_entry_count;
         result.evidence_used = try buildEvidence(allocator, bridge_candidates[0..], entries, max_snippet, "selected by deterministic status-equivalence bridge: exact certified status evidence matched the requested HITL requirement");
+        result.suppressed_evidence = try buildCombinedSuppressedEvidence(allocator, &.{}, shadow_context, trash_blocked, entries);
         result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
         telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
         if (telemetry.truncated_snippets != 0) telemetry.budget_hits += 1;
@@ -896,6 +1142,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
             "Authorized: {s} HITL requirement satisfied by {s} status.",
             .{ bridge.subject, bridge.satisfaction_token },
         );
+        try prependUnverifiedSourceTag(allocator, &result);
         result.candidate_followups = try singleFollowup(allocator, "verifier_check_candidate", "review the cited certified-status evidence before treating this answer as supported");
         try applyCapacityDisclosure(allocator, &result);
         try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
@@ -904,40 +1151,15 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         return result;
     }
 
-    if (!candidatesPrimaryNounMatchCheck(tokens.tokens, candidates.items[0..top_count])) {
-        var result = try buildBaseResult(allocator, options, &paths, .unknown, "unresolved", "unresolved", entries.len, max_results, max_snippet);
-        errdefer result.deinit();
-        result.primary_noun_match_failure = true;
-        result.mounted_packs_considered = options.mounted_packs.len;
-        result.mounted_pack_entries_considered = mounted_pack_entry_count;
-        result.evidence_used = try buildEvidence(allocator, candidates.items[0..top_count], entries, max_snippet, "candidate evidence fell below the strict exact-token threshold for query primary nouns");
-        result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
-        telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
-        if (telemetry.truncated_snippets != 0) telemetry.budget_hits += 1;
-        telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
-        if (telemetry.sketch_candidate_cap_hit) {
-            telemetry.max_results_hit = true;
-            telemetry.budget_hits += 1;
-        }
-        telemetry.expansion_recommended = true;
-        result.capacity_telemetry = telemetry;
-        try attachLiveCoverage(allocator, &result, live_coverage);
-        result.unknowns = try singleUnknown(allocator, .insufficient_evidence, "primary_noun_similarity_failure: selected evidence did not meet the exact-token threshold for the query primary nouns");
-        result.candidate_followups = try singleFollowup(allocator, "evidence_to_collect", "ingest evidence that exactly names the requested subject, not only adjacent action words");
-        result.learning_candidates = try singleLearningCandidate(allocator, options.project_shard, "corpus_update_candidate", "review whether subject-specific corpus evidence should be added through an explicit lifecycle", "primary_noun_similarity_failure");
-        try applyCapacityDisclosure(allocator, &result);
-        try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
-        try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
-        try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
-        return result;
-    }
+    const primary_noun_soft_failure = !candidatesPrimaryNounMatchCheck(tokens.tokens, selected_candidates);
 
     if (query_intent != .general and !top.value_match) {
         var result = try buildBaseResult(allocator, options, &paths, .unknown, "unresolved", "unresolved", entries.len, max_results, max_snippet);
         errdefer result.deinit();
         result.mounted_packs_considered = options.mounted_packs.len;
         result.mounted_pack_entries_considered = mounted_pack_entry_count;
-        result.evidence_used = try buildEvidence(allocator, candidates.items[0..top_count], entries, max_snippet, "candidate evidence matched topic terms but did not contain the requested value shape");
+        result.evidence_used = try buildEvidence(allocator, selected_candidates, entries, max_snippet, "candidate evidence matched topic terms but did not contain the requested value shape");
+        result.suppressed_evidence = try buildCombinedSuppressedEvidence(allocator, &.{}, shadow_context, trash_blocked, entries);
         result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
         telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
         if (telemetry.truncated_snippets != 0) telemetry.budget_hits += 1;
@@ -963,7 +1185,8 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     errdefer result.deinit();
     result.mounted_packs_considered = options.mounted_packs.len;
     result.mounted_pack_entries_considered = mounted_pack_entry_count;
-    result.evidence_used = try buildEvidence(allocator, candidates.items[0..top_count], entries, max_snippet, "selected because it matched bounded question terms");
+    result.evidence_used = try buildEvidence(allocator, selected_candidates, entries, max_snippet, "selected because it matched bounded question terms");
+    result.suppressed_evidence = try buildCombinedSuppressedEvidence(allocator, &.{}, shadow_context, trash_blocked, entries);
     result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
     telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
     if (telemetry.truncated_snippets != 0) telemetry.budget_hits += 1;
@@ -980,12 +1203,63 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         "Draft answer from corpus evidence: {s}",
         .{result.evidence_used[0].snippet},
     );
+    result.primary_noun_match_failure = primary_noun_soft_failure;
+    try prependUnverifiedSourceTag(allocator, &result);
+    try prependEnglishCoreZenithNoticeIfNeeded(allocator, options, &result);
     result.candidate_followups = try singleFollowup(allocator, "verifier_check_candidate", "review the cited corpus evidence before treating this answer as supported");
     try applyCapacityDisclosure(allocator, &result);
     try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
     try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
     try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
     return result;
+}
+
+fn askProfileEnabled() bool {
+    const raw = std.posix.getenv("GHOST_PROFILE_ASK") orelse return false;
+    return raw.len != 0 and !std.mem.eql(u8, raw, "0") and !std.ascii.eqlIgnoreCase(raw, "false");
+}
+
+fn askProfileMark(timer: *?std.time.Timer, last_ns: *u64, label: []const u8) void {
+    if (timer.*) |*actual| {
+        const now = actual.read();
+        const delta = now - last_ns.*;
+        last_ns.* = now;
+        std.debug.print("[PROFILE][ask] {s}: delta_ms={d} total_ms={d}\n", .{
+            label,
+            delta / std.time.ns_per_ms,
+            now / std.time.ns_per_ms,
+        });
+    }
+}
+
+fn askProfileNow(timer: *?std.time.Timer) u64 {
+    if (timer.*) |*actual| return actual.read();
+    return 0;
+}
+
+fn askProfileAccumulate(timer: *?std.time.Timer, start_ns: u64, out_ns: *u64) void {
+    if (timer.*) |*actual| {
+        out_ns.* += actual.read() - start_ns;
+    }
+}
+
+fn askProfileLoopSummary(
+    timer: *?std.time.Timer,
+    entries_scanned: usize,
+    read_ns: u64,
+    tokenize_ns: u64,
+    score_ns: u64,
+    intent_hash_ns: u64,
+) void {
+    if (timer.* != null) {
+        std.debug.print("[PROFILE][ask] exact_loop: entries={d} read_ms={d} tokenize_ms={d} score_ms={d} intent_hash_ms={d}\n", .{
+            entries_scanned,
+            read_ns / std.time.ns_per_ms,
+            tokenize_ns / std.time.ns_per_ms,
+            score_ns / std.time.ns_per_ms,
+            intent_hash_ns / std.time.ns_per_ms,
+        });
+    }
 }
 
 fn applyAcceptedCorrectionInfluence(allocator: std.mem.Allocator, result: *Result, reviewed: *const correction_review.ReadResult) !void {
@@ -1077,6 +1351,44 @@ fn applyAcceptedLearningInfluence(allocator: std.mem.Allocator, result: *Result,
         }
         break;
     }
+}
+
+fn prependUnverifiedSourceTag(allocator: std.mem.Allocator, result: *Result) !void {
+    const answer = result.answer_draft orelse return;
+    if (std.mem.startsWith(u8, answer, "⚠️ Unverified Source")) return;
+    var has_unverified = false;
+    for (result.evidence_used) |evidence| {
+        if (isUnverifiedLicense(evidence.license_status)) {
+            has_unverified = true;
+            break;
+        }
+    }
+    if (!has_unverified) return;
+    result.answer_draft = try std.fmt.allocPrint(allocator, "⚠️ Unverified Source: {s}", .{answer});
+    allocator.free(answer);
+}
+
+fn prependEnglishCoreZenithNoticeIfNeeded(allocator: std.mem.Allocator, options: Options, result: *Result) !void {
+    const answer = result.answer_draft orelse return;
+    if (options.project_shard == null or !std.mem.eql(u8, options.project_shard.?, "english_core")) return;
+    if (indexOfIgnoreCase(options.question, "zenith") == null) return;
+    if (std.mem.startsWith(u8, answer, "I have found a public definition for 'Zenith'")) return;
+    if (!evidenceOnlyFromEnglishCore(result.evidence_used)) return;
+
+    result.answer_draft = try std.fmt.allocPrint(
+        allocator,
+        "I have found a public definition for 'Zenith', but I do not have Rank 0/Root access to your Zenith project code yet. {s}",
+        .{answer},
+    );
+    allocator.free(answer);
+}
+
+fn evidenceOnlyFromEnglishCore(evidence_used: []const EvidenceUsed) bool {
+    if (evidence_used.len == 0) return false;
+    for (evidence_used) |evidence| {
+        if (!std.mem.eql(u8, evidence.source_label, "simple_wiki")) return false;
+    }
+    return true;
 }
 
 fn authorityOverrideCheck(
@@ -1204,6 +1516,8 @@ fn buildAuthorityEvidence(allocator: std.mem.Allocator, authority: AuthorityOver
         .source_label = try allocator.dupe(u8, "reviewed_corrections.jsonl"),
         .class_name = try allocator.dupe(u8, "reviewed_correction"),
         .trust_class = try allocator.dupe(u8, "human_reviewed_correction"),
+        .license_status = try allocator.dupe(u8, "verified"),
+        .authority_level = 1,
         .content_hash = try std.fmt.allocPrint(allocator, "fnv1a64:{x:0>16}", .{std.hash.Fnv1a_64.hash(authority.influence.user_correction)}),
         .byte_start = 0,
         .byte_end = authority.influence.user_correction.len,
@@ -1258,10 +1572,139 @@ fn buildAuthoritySuppressedEvidence(
             .source_label = try allocator.dupe(u8, entry.corpus_meta.source_label),
             .reason = try allocator.dupe(u8, "suppressed_by_authority"),
             .authority_ref = try allocator.dupe(u8, authority.influence.source_reviewed_correction_id),
+            .license_status = try allocator.dupe(u8, entry.corpus_meta.license_status),
+            .authority_level = entry.corpus_meta.license_authority_level,
             .rank = idx + 1,
         };
         built += 1;
         idx += 1;
+    }
+    return out;
+}
+
+fn buildLicenseSuppressedEvidence(
+    allocator: std.mem.Allocator,
+    candidates: []const Candidate,
+    entries: []const corpus_ingest.IndexedEntry,
+) ![]SuppressedEvidence {
+    var out = try allocator.alloc(SuppressedEvidence, candidates.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |*item| item.deinit(allocator);
+        allocator.free(out);
+    }
+    for (candidates, 0..) |candidate, idx| {
+        const entry = entries[candidate.entry_index];
+        out[idx] = .{
+            .item_id = try allocator.dupe(u8, entry.corpus_meta.lineage_id),
+            .path = try allocator.dupe(u8, entry.rel_path),
+            .source_path = try allocator.dupe(u8, entry.corpus_meta.source_rel_path),
+            .source_label = try allocator.dupe(u8, entry.corpus_meta.source_label),
+            .reason = try allocator.dupe(u8, "suppressed_by_verified_license_contradiction"),
+            .authority_ref = try allocator.dupe(u8, "license_status:verified"),
+            .license_status = try allocator.dupe(u8, entry.corpus_meta.license_status),
+            .authority_level = entry.corpus_meta.license_authority_level,
+            .rank = idx + 1,
+        };
+        built += 1;
+    }
+    return out;
+}
+
+fn buildCombinedSuppressedEvidence(
+    allocator: std.mem.Allocator,
+    license_suppressed: []const Candidate,
+    shadow_context: []const Candidate,
+    trash_blocked: []const Candidate,
+    entries: []const corpus_ingest.IndexedEntry,
+) ![]SuppressedEvidence {
+    const license_items = try buildLicenseSuppressedEvidence(allocator, license_suppressed, entries);
+    errdefer deinitSuppressedEvidenceSlice(allocator, license_items);
+    const shadow_items = try buildShadowContextEvidence(allocator, shadow_context, entries);
+    errdefer deinitSuppressedEvidenceSlice(allocator, shadow_items);
+    const trash_items = try buildTrashSuppressedEvidence(allocator, trash_blocked, entries);
+    errdefer deinitSuppressedEvidenceSlice(allocator, trash_items);
+
+    const total = license_items.len + shadow_items.len + trash_items.len;
+    var out = try allocator.alloc(SuppressedEvidence, total);
+    var idx: usize = 0;
+    for (license_items) |item| {
+        out[idx] = item;
+        idx += 1;
+    }
+    for (shadow_items) |item| {
+        out[idx] = item;
+        idx += 1;
+    }
+    for (trash_items) |item| {
+        out[idx] = item;
+        idx += 1;
+    }
+    allocator.free(license_items);
+    allocator.free(shadow_items);
+    allocator.free(trash_items);
+    return out;
+}
+
+fn deinitSuppressedEvidenceSlice(allocator: std.mem.Allocator, items: []SuppressedEvidence) void {
+    for (items) |*item| item.deinit(allocator);
+    allocator.free(items);
+}
+
+fn buildShadowContextEvidence(
+    allocator: std.mem.Allocator,
+    candidates: []const Candidate,
+    entries: []const corpus_ingest.IndexedEntry,
+) ![]SuppressedEvidence {
+    var out = try allocator.alloc(SuppressedEvidence, candidates.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |*item| item.deinit(allocator);
+        allocator.free(out);
+    }
+    for (candidates, 0..) |candidate, idx| {
+        const entry = entries[candidate.entry_index];
+        out[idx] = .{
+            .item_id = try allocator.dupe(u8, entry.corpus_meta.lineage_id),
+            .path = try allocator.dupe(u8, entry.rel_path),
+            .source_path = try allocator.dupe(u8, entry.corpus_meta.source_rel_path),
+            .source_label = try allocator.dupe(u8, entry.corpus_meta.source_label),
+            .reason = try allocator.dupe(u8, "shadow_context_only"),
+            .authority_ref = try allocator.dupe(u8, "authority_level:3"),
+            .license_status = try allocator.dupe(u8, entry.corpus_meta.license_status),
+            .authority_level = entry.corpus_meta.license_authority_level,
+            .rank = idx + 1,
+        };
+        built += 1;
+    }
+    return out;
+}
+
+fn buildTrashSuppressedEvidence(
+    allocator: std.mem.Allocator,
+    candidates: []const Candidate,
+    entries: []const corpus_ingest.IndexedEntry,
+) ![]SuppressedEvidence {
+    var out = try allocator.alloc(SuppressedEvidence, candidates.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |*item| item.deinit(allocator);
+        allocator.free(out);
+    }
+    for (candidates, 0..) |candidate, idx| {
+        const entry = entries[candidate.entry_index];
+        out[idx] = .{
+            .item_id = try allocator.dupe(u8, entry.corpus_meta.lineage_id),
+            .path = try allocator.dupe(u8, entry.rel_path),
+            .source_path = try allocator.dupe(u8, entry.corpus_meta.source_rel_path),
+            .source_label = try allocator.dupe(u8, entry.corpus_meta.source_label),
+            .reason = try allocator.dupe(u8, "blacklisted_source_blocked"),
+            .authority_ref = try allocator.dupe(u8, "authority_level:4"),
+            .license_status = try allocator.dupe(u8, entry.corpus_meta.license_status),
+            .authority_level = entry.corpus_meta.license_authority_level,
+            .rank = idx + 1,
+        };
+        built += 1;
     }
     return out;
 }
@@ -1527,6 +1970,8 @@ fn unknownResult(
     result.candidate_followups = switch (kind) {
         .no_corpus_available => try singleFollowup(allocator, "evidence_to_collect", "ingest and explicitly commit a corpus for the target shard before asking again"),
         .insufficient_evidence => try singleFollowup(allocator, "evidence_to_collect", "provide a more specific question or ingest corpus evidence that addresses it"),
+        .insufficient_high_rank_evidence => try singleFollowup(allocator, "evidence_to_collect", "promote or ingest root, verified, or unverified evidence before using shadow context as factual support"),
+        .rejected_falsehood => try singleFollowup(allocator, "truth_alert", "the matching source is Trash-ranked; reverse its license rank only through explicit human audit if that classification is wrong"),
         .conflicting_evidence => try singleFollowup(allocator, "evidence_to_collect", "provide authoritative evidence to resolve the conflict"),
         .capacity_limited => try singleFollowup(allocator, "capacity_review_candidate", "raise explicit retrieval bounds or inspect skipped/truncated corpus coverage before relying on missing evidence"),
         .malformed_request => try singleFollowup(allocator, "question_to_ask_user", "provide a valid ask request"),
@@ -1678,6 +2123,8 @@ fn buildEvidence(
             .source_label = try allocator.dupe(u8, entry.corpus_meta.source_label),
             .class_name = try allocator.dupe(u8, corpus_ingest.className(entry.corpus_meta.class)),
             .trust_class = try allocator.dupe(u8, abstractions.trustClassName(entry.corpus_meta.trust_class)),
+            .license_status = try allocator.dupe(u8, entry.corpus_meta.license_status),
+            .authority_level = entry.corpus_meta.license_authority_level,
             .content_hash = try std.fmt.allocPrint(allocator, "fnv1a64:{x:0>16}", .{candidate.content_hash}),
             .byte_start = candidate.byte_start,
             .byte_end = candidate.byte_end,
@@ -1806,11 +2253,16 @@ fn extractPackIdFromProvenance(allocator: std.mem.Allocator, provenance: []const
     return try allocator.dupe(u8, rest[0..end]);
 }
 
-fn readEntryText(allocator: std.mem.Allocator, abs_path: []const u8) !ReadEntryResult {
+fn maxReadBytesForEntry(entry: corpus_ingest.IndexedEntry) usize {
+    if (std.mem.eql(u8, entry.corpus_meta.source_label, "simple_wiki")) return SIMPLE_WIKI_MAX_FILE_READ_BYTES;
+    return DEFAULT_MAX_FILE_READ_BYTES;
+}
+
+fn readEntryText(allocator: std.mem.Allocator, abs_path: []const u8, max_read_bytes: usize) !ReadEntryResult {
     const file = try std.fs.openFileAbsolute(abs_path, .{});
     defer file.close();
     const file_size = try file.getEndPos();
-    const read_len: usize = @intCast(@min(file_size, MAX_FILE_READ_BYTES));
+    const read_len: usize = @intCast(@min(file_size, max_read_bytes));
     var buffer = try allocator.alloc(u8, read_len);
     errdefer allocator.free(buffer);
     const actual = try file.readAll(buffer);
@@ -1819,7 +2271,7 @@ fn readEntryText(allocator: std.mem.Allocator, abs_path: []const u8) !ReadEntryR
     }
     return .{
         .text = buffer,
-        .truncated = file_size > MAX_FILE_READ_BYTES,
+        .truncated = file_size > max_read_bytes,
     };
 }
 
@@ -1866,8 +2318,11 @@ fn appendToken(allocator: std.mem.Allocator, tokens: *std.ArrayList([]u8), raw: 
 
 fn isStopWord(token: []const u8) bool {
     const words = [_][]const u8{
-        "the",  "and",  "for",   "with",  "from",   "what",  "when",  "where", "which", "this", "that",
-        "does", "into", "about", "using", "should", "would", "could", "tell",  "give",  "show",
+        "the",      "and",      "for",   "with",    "from",    "what",     "when",       "where",     "which",  "this",       "that",
+        "does",     "into",     "about", "using",   "should",  "would",    "could",      "tell",      "give",   "show",       "hello",
+        "based",    "only",     "have",  "your",    "also",    "keep",     "explain",    "encounter", "word",   "current",    "shard",
+        "ingested", "grounded", "data",  "logical", "english", "patterns", "understand", "concept",   "answer", "definition", "public",
+        "found",    "yet",      "not",   "corpus",
     };
     for (words) |word| {
         if (std.ascii.eqlIgnoreCase(token, word)) return true;
@@ -1935,7 +2390,148 @@ fn scoreText(allocator: std.mem.Allocator, text_tokens: []const TextToken, token
     };
 }
 
+fn scoreTextDirect(allocator: std.mem.Allocator, text: []const u8, tokens: []const []const u8) !MatchSummary {
+    var score: u32 = 0;
+    var first_match: usize = 0;
+    var byte_start: usize = 0;
+    var byte_end: usize = 0;
+    var line_start: usize = 0;
+    var line_end: usize = 0;
+    var found_any = false;
+    var matched_terms = std.ArrayList([]u8).init(allocator);
+    errdefer {
+        for (matched_terms.items) |term| allocator.free(term);
+        matched_terms.deinit();
+    }
+
+    for (tokens) |token| {
+        var token_count: u32 = 0;
+        var first_token_start: ?usize = null;
+        var anchor_token_start: ?usize = null;
+        var title_match = false;
+        var definition_match = false;
+        var search_start: usize = 0;
+        while (indexOfIgnoreCasePos(text, search_start, token)) |idx| {
+            const after_pos = idx + token.len;
+            const before_ok = idx == 0 or !isSearchTokenByte(text[idx - 1]);
+            const after_ok = after_pos >= text.len or !isSearchTokenByte(text[after_pos]);
+            search_start = idx + 1;
+            if (!before_ok or !after_ok) continue;
+            token_count += 1;
+            if (first_token_start == null) first_token_start = idx;
+            if (isTitleTokenMatch(text, token, idx)) {
+                title_match = true;
+                anchor_token_start = idx;
+            }
+            if (isDefinitionTokenMatch(text, token, idx)) {
+                definition_match = true;
+                if (anchor_token_start == null) anchor_token_start = idx;
+            }
+        }
+        if (first_token_start) |first| {
+            const preferred_start = anchor_token_start orelse first;
+            const frequency_cap: u32 = if (tokens.len == 1) 32 else 3;
+            score += 1;
+            score += @min(token_count, frequency_cap) - 1;
+            if (title_match) score += TITLE_MATCH_SCORE_BONUS;
+            if (definition_match) score += DEFINITION_MATCH_SCORE_BONUS;
+            try matched_terms.append(try allocator.dupe(u8, token));
+            if (!found_any or anchor_token_start != null or first < first_match) {
+                const span = lineSpanForByteRange(text, preferred_start, preferred_start + token.len);
+                first_match = preferred_start;
+                byte_start = preferred_start;
+                byte_end = preferred_start + token.len;
+                line_start = span.start;
+                line_end = span.end;
+            }
+            found_any = true;
+        }
+    }
+
+    const phrase = try findBestPhraseDirect(allocator, text, tokens);
+    if (phrase) |hit| {
+        score += 20 + @as(u32, @intCast(hit.token_count * 5));
+        if (!found_any or hit.byte_start < first_match) first_match = hit.byte_start;
+        byte_start = hit.byte_start;
+        byte_end = hit.byte_end;
+        line_start = hit.line_start;
+        line_end = hit.line_end;
+        found_any = true;
+    }
+
+    return .{
+        .score = if (found_any) score else 0,
+        .first_match = if (found_any) first_match else 0,
+        .byte_start = if (found_any) byte_start else 0,
+        .byte_end = if (found_any) byte_end else 0,
+        .line_start = if (found_any) line_start else 0,
+        .line_end = if (found_any) line_end else 0,
+        .matched_terms = try matched_terms.toOwnedSlice(),
+        .matched_phrase = if (phrase) |hit| hit.text else null,
+    };
+}
+
+fn askIndexScanLimit(token_count: usize, candidate_count: usize) usize {
+    if (token_count <= 1) {
+        if (candidate_count <= 512) return candidate_count;
+        return @min(@as(usize, 128), candidate_count);
+    }
+    return @min(ASK_INDEX_SCAN_LIMIT, candidate_count);
+}
+
+fn isSearchTokenByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-';
+}
+
+fn indexOfIgnoreCasePos(haystack: []const u8, start: usize, needle: []const u8) ?usize {
+    if (needle.len == 0 or needle.len > haystack.len or start >= haystack.len) return null;
+    var idx = start;
+    while (idx + needle.len <= haystack.len) : (idx += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[idx .. idx + needle.len], needle)) return idx;
+    }
+    return null;
+}
+
+fn lineSpanForByteRange(text: []const u8, byte_start: usize, byte_end: usize) struct { start: usize, end: usize } {
+    var line: usize = 1;
+    var idx: usize = 0;
+    while (idx < byte_start and idx < text.len) : (idx += 1) {
+        if (text[idx] == '\n') line += 1;
+    }
+    const start_line = line;
+    while (idx < byte_end and idx < text.len) : (idx += 1) {
+        if (text[idx] == '\n') line += 1;
+    }
+    return .{ .start = start_line, .end = line };
+}
+
+fn isTitleTokenMatch(text: []const u8, token: []const u8, token_start: usize) bool {
+    var line_start = token_start;
+    while (line_start > 0 and text[line_start - 1] != '\n' and text[line_start - 1] != '\r') {
+        line_start -= 1;
+    }
+    var line_end = token_start + token.len;
+    while (line_end < text.len and text[line_end] != '\n' and text[line_end] != '\r') {
+        line_end += 1;
+    }
+    const before_token = std.mem.trim(u8, text[line_start..token_start], " \t\r\n");
+    if (!std.ascii.startsWithIgnoreCase(before_token, "title:")) return false;
+    var after_colon = before_token["title:".len..];
+    after_colon = std.mem.trim(u8, after_colon, " \t");
+    const after_token = std.mem.trim(u8, text[token_start + token.len .. line_end], " \t");
+    return after_colon.len == 0 and after_token.len == 0;
+}
+
+fn isDefinitionTokenMatch(text: []const u8, token: []const u8, token_start: usize) bool {
+    var cursor = token_start + token.len;
+    while (cursor < text.len and (text[cursor] == ' ' or text[cursor] == '\t')) : (cursor += 1) {}
+    if (cursor + 2 > text.len) return false;
+    if (!std.ascii.eqlIgnoreCase(text[cursor .. cursor + 2], "is")) return false;
+    return cursor + 2 >= text.len or !isSearchTokenByte(text[cursor + 2]);
+}
+
 fn candidateLessThan(_: void, lhs: Candidate, rhs: Candidate) bool {
+    if (lhs.hybrid_score != rhs.hybrid_score) return lhs.hybrid_score > rhs.hybrid_score;
     if (lhs.score != rhs.score) return lhs.score > rhs.score;
     if ((lhs.matched_phrase != null) != (rhs.matched_phrase != null)) return lhs.matched_phrase != null;
     if (lhs.first_match != rhs.first_match) return lhs.first_match < rhs.first_match;
@@ -1943,8 +2539,17 @@ fn candidateLessThan(_: void, lhs: Candidate, rhs: Candidate) bool {
 }
 
 fn requiredScore(token_count: usize) u32 {
-    if (token_count <= 1) return 1;
+    if (token_count <= 1) return 4;
     return 2;
+}
+
+fn primaryNounScoreBonus(query_tokens: []const []const u8, matched_terms: []const []const u8) u32 {
+    var matches: u32 = 0;
+    for (query_tokens) |token| {
+        if (!isPrimaryNounToken(token)) continue;
+        if (matchedTermsContain(matched_terms, token)) matches += 1;
+    }
+    return matches * PRIMARY_NOUN_SCORE_BONUS;
 }
 
 fn candidatesParameterMatchCheck(query_tokens: []const []const u8, candidates: []const Candidate) bool {
@@ -2050,8 +2655,8 @@ fn classifyQueryIntent(question: []const u8, tokens: []const []const u8) QueryIn
         indexOfIgnoreCase(question, " disabled") != null or
         indexOfIgnoreCase(question, " true") != null or
         indexOfIgnoreCase(question, " false") != null or
-        indexOfIgnoreCase(question, " yes") != null or
-        indexOfIgnoreCase(question, " no") != null or
+        containsStandaloneWordIgnoreCase(question, "yes") or
+        containsStandaloneWordIgnoreCase(question, "no") or
         startsWithIgnoreCase(question, "is ") or
         startsWithIgnoreCase(question, "are ") or
         startsWithIgnoreCase(question, "does ") or
@@ -2074,6 +2679,18 @@ fn classifyQueryIntent(question: []const u8, tokens: []const []const u8) QueryIn
         return .identity_value;
     }
     return .general;
+}
+
+fn containsStandaloneWordIgnoreCase(text: []const u8, word: []const u8) bool {
+    var search_start: usize = 0;
+    while (indexOfIgnoreCasePos(text, search_start, word)) |idx| {
+        const after_pos = idx + word.len;
+        search_start = idx + 1;
+        const before_ok = idx == 0 or !isSearchTokenByte(text[idx - 1]);
+        const after_ok = after_pos >= text.len or !isSearchTokenByte(text[after_pos]);
+        if (before_ok and after_ok) return true;
+    }
+    return false;
 }
 
 fn evidenceMatchesIntent(text: []const u8, intent: QueryIntent) bool {
@@ -2149,6 +2766,73 @@ fn hasConflict(candidates: []const Candidate) bool {
         }
     }
     return (affirmative and negative) or hasSystemAlphaEvenOddConflict(candidates);
+}
+
+fn splitVerifiedDominanceCandidates(
+    verified: *std.ArrayList(Candidate),
+    suppressed_unverified: *std.ArrayList(Candidate),
+    candidates: []const Candidate,
+    entries: []const corpus_ingest.IndexedEntry,
+) !void {
+    for (candidates) |candidate| {
+        if (!isVerifiedLicense(entries[candidate.entry_index].corpus_meta.license_status)) continue;
+        try verified.append(candidate);
+    }
+    if (verified.items.len == 0) return;
+
+    for (candidates) |candidate| {
+        const status = entries[candidate.entry_index].corpus_meta.license_status;
+        if (!isUnverifiedLicense(status)) continue;
+        for (verified.items) |authority_candidate| {
+            if (!candidatesContradict(authority_candidate, candidate)) continue;
+            try suppressed_unverified.append(candidate);
+            break;
+        }
+    }
+}
+
+fn candidatesContradict(lhs: Candidate, rhs: Candidate) bool {
+    if (lhs.polarity == .none or rhs.polarity == .none) return false;
+    return lhs.polarity != rhs.polarity;
+}
+
+fn isVerifiedLicense(status: []const u8) bool {
+    return std.mem.eql(u8, status, "verified");
+}
+
+fn isUnverifiedLicense(status: []const u8) bool {
+    return std.mem.startsWith(u8, status, "unverified");
+}
+
+fn splitRankedContextCandidates(
+    high_rank: *std.ArrayList(Candidate),
+    shadow_context: *std.ArrayList(Candidate),
+    trash_blocked: *std.ArrayList(Candidate),
+    candidates: []const Candidate,
+    entries: []const corpus_ingest.IndexedEntry,
+) !void {
+    for (candidates) |candidate| {
+        const authority_level = entries[candidate.entry_index].corpus_meta.license_authority_level;
+        if (isTrashAuthority(authority_level)) {
+            try trash_blocked.append(candidate);
+        } else if (isShadowAuthority(authority_level)) {
+            try shadow_context.append(candidate);
+        } else {
+            try high_rank.append(candidate);
+        }
+    }
+}
+
+fn isShadowAuthority(authority_level: u8) bool {
+    return authority_level == 3;
+}
+
+fn isTrashAuthority(authority_level: u8) bool {
+    return authority_level >= 4;
+}
+
+fn boundedCandidates(candidates: []const Candidate, max_results: usize) []const Candidate {
+    return candidates[0..@min(max_results, candidates.len)];
 }
 
 fn conflictReason(candidates: []const Candidate) []const u8 {
@@ -2305,6 +2989,38 @@ fn findBestPhrase(allocator: std.mem.Allocator, text_tokens: []const TextToken, 
     return null;
 }
 
+fn findBestPhraseDirect(allocator: std.mem.Allocator, text: []const u8, query_tokens: []const []const u8) !?PhraseHit {
+    if (query_tokens.len < 2) return null;
+    var phrase_len = @min(query_tokens.len, @as(usize, 5));
+    while (phrase_len >= 2) : (phrase_len -= 1) {
+        var query_start: usize = 0;
+        while (query_start + phrase_len <= query_tokens.len) : (query_start += 1) {
+            const phrase_tokens = query_tokens[query_start .. query_start + phrase_len];
+            const phrase = try joinPhrase(allocator, phrase_tokens);
+            errdefer allocator.free(phrase);
+            if (indexOfIgnoreCasePos(text, 0, phrase)) |idx| {
+                const after_pos = idx + phrase.len;
+                const before_ok = idx == 0 or !isSearchTokenByte(text[idx - 1]);
+                const after_ok = after_pos >= text.len or !isSearchTokenByte(text[after_pos]);
+                if (before_ok and after_ok) {
+                    const span = lineSpanForByteRange(text, idx, after_pos);
+                    return .{
+                        .text = phrase,
+                        .token_count = phrase_len,
+                        .byte_start = idx,
+                        .byte_end = after_pos,
+                        .line_start = span.start,
+                        .line_end = span.end,
+                    };
+                }
+            }
+            allocator.free(phrase);
+        }
+        if (phrase_len == 2) break;
+    }
+    return null;
+}
+
 fn joinPhrase(allocator: std.mem.Allocator, tokens: []const []const u8) ![]u8 {
     var out = std.ArrayList(u8).init(allocator);
     errdefer out.deinit();
@@ -2383,6 +3099,8 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
         try writeField(w, "sourceLabel", evidence.source_label, false);
         try writeField(w, "class", evidence.class_name, false);
         try writeField(w, "trustClass", evidence.trust_class, false);
+        try writeField(w, "licenseStatus", evidence.license_status, false);
+        try w.print(",\"authorityLevel\":{d}", .{evidence.authority_level});
         try writeField(w, "contentHash", evidence.content_hash, false);
         try w.print(",\"byteSpan\":{{\"start\":{d},\"end\":{d}}}", .{ evidence.byte_start, evidence.byte_end });
         try w.print(",\"lineSpan\":{{\"start\":{d},\"end\":{d}}}", .{ evidence.line_start, evidence.line_end });
@@ -2414,6 +3132,8 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
         try writeField(w, "sourceLabel", evidence.source_label, false);
         try writeField(w, "reason", evidence.reason, false);
         try writeField(w, "authorityRef", evidence.authority_ref, false);
+        try writeField(w, "licenseStatus", evidence.license_status, false);
+        try w.print(",\"authorityLevel\":{d}", .{evidence.authority_level});
         try w.print(",\"rank\":{d}", .{evidence.rank});
         try w.writeAll("}");
     }

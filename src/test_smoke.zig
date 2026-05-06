@@ -5926,6 +5926,218 @@ test "corpus ask returns draft answer with bounded evidence and weak matches sta
     try std.testing.expect(weak.answer_draft == null);
 }
 
+test "corpus ask reads past large indexed prefixes and answers communication" {
+    const allocator = std.testing.allocator;
+    const project_shard = "corpus-ask-large-prefix-communication-test";
+    var corpus_fixture = std.testing.tmpDir(.{});
+    defer corpus_fixture.cleanup();
+    const corpus_root = try corpus_fixture.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+
+    var large_doc = std.ArrayList(u8).init(allocator);
+    defer large_doc.deinit();
+    for (0..8192) |_| try large_doc.appendSlice("alpha beta ");
+    try large_doc.appendSlice(
+        \\
+        \\TITLE: Communication
+        \\Communication is when information is passed from a sender to a recipient using a medium.
+        \\
+    );
+    try writeFixtureFile(corpus_fixture.dir, "large_communication.md", large_doc.items);
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.corpus_ingest_root_abs_path) catch {};
+
+    var stage_result = try corpus_ingest.stage(allocator, .{
+        .corpus_path = corpus_root,
+        .project_shard = project_shard,
+        .trust_class = .project,
+        .source_label = "simple_wiki",
+    });
+    defer stage_result.deinit();
+    try corpus_ingest.applyStaged(allocator, &project_paths);
+
+    var answered = try corpus_ask.ask(allocator, .{
+        .question = "Explain communication.",
+        .project_shard = project_shard,
+        .max_snippet_bytes = 160,
+    });
+    defer answered.deinit();
+
+    try std.testing.expectEqual(corpus_ask.AskStatus.answered, answered.status);
+    try std.testing.expect(answered.answer_draft != null);
+    try std.testing.expect(std.mem.indexOf(u8, answered.answer_draft.?, "Communication is when information is passed") != null);
+    try std.testing.expect(!answered.primary_noun_match_failure);
+}
+
+test "corpus ask reflects promoted license rank on next ask" {
+    const allocator = std.testing.allocator;
+    const project_shard = "corpus-ask-license-promotion-test";
+    var corpus_fixture = std.testing.tmpDir(.{});
+    defer corpus_fixture.cleanup();
+    const corpus_root = try corpus_fixture.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+    try writeFixtureFile(corpus_fixture.dir, "license.json",
+        \\{"status":"unverified","authority_level":2,"audit_log":[]}
+    );
+    try writeFixtureFile(corpus_fixture.dir, "runtime.md",
+        \\# Runtime Retention
+        \\Retention policy is enabled for event audit logs.
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.root_abs_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.root_abs_path) catch {};
+
+    var stage_result = try corpus_ingest.stage(allocator, .{
+        .corpus_path = corpus_root,
+        .project_shard = project_shard,
+        .trust_class = .project,
+        .source_label = "license-promotion-corpus",
+    });
+    defer stage_result.deinit();
+    try corpus_ingest.applyStaged(allocator, &project_paths);
+
+    var unverified = try corpus_ask.ask(allocator, .{
+        .question = "is retention policy enabled",
+        .project_shard = project_shard,
+    });
+    defer unverified.deinit();
+    try std.testing.expectEqual(corpus_ask.AskStatus.answered, unverified.status);
+    try std.testing.expect(unverified.answer_draft != null);
+    try std.testing.expect(std.mem.startsWith(u8, unverified.answer_draft.?, "⚠️ Unverified Source"));
+    try std.testing.expectEqualStrings("unverified", unverified.evidence_used[0].license_status);
+    try std.testing.expectEqual(@as(u8, 2), unverified.evidence_used[0].authority_level);
+
+    try writeFixtureFile(corpus_fixture.dir, "license.json",
+        \\{"status":"verified","authority_level":1,"audit_log":[{"action":"promoted","by":"human","timestamp":"test"}]}
+    );
+
+    var verified = try corpus_ask.ask(allocator, .{
+        .question = "is retention policy enabled",
+        .project_shard = project_shard,
+    });
+    defer verified.deinit();
+    try std.testing.expectEqual(corpus_ask.AskStatus.answered, verified.status);
+    try std.testing.expect(verified.answer_draft != null);
+    try std.testing.expect(!std.mem.startsWith(u8, verified.answer_draft.?, "⚠️ Unverified Source"));
+    try std.testing.expectEqualStrings("verified", verified.evidence_used[0].license_status);
+    try std.testing.expectEqual(@as(u8, 1), verified.evidence_used[0].authority_level);
+}
+
+test "corpus ask refuses shadow-only evidence as answer basis" {
+    const allocator = std.testing.allocator;
+    const project_shard = "corpus-ask-shadow-only-test";
+    var corpus_fixture = std.testing.tmpDir(.{});
+    defer corpus_fixture.cleanup();
+    const corpus_root = try corpus_fixture.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+    try writeFixtureFile(corpus_fixture.dir, "license.json",
+        \\{"status":"shadow","authority_level":3,"audit_log":[]}
+    );
+    try writeFixtureFile(corpus_fixture.dir, "moon.md",
+        \\# Moon Notes
+        \\The moon is made of blue cheese according to noisy folklore.
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.root_abs_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.root_abs_path) catch {};
+
+    var stage_result = try corpus_ingest.stage(allocator, .{
+        .corpus_path = corpus_root,
+        .project_shard = project_shard,
+        .trust_class = .project,
+        .source_label = "shadow-moon-corpus",
+    });
+    defer stage_result.deinit();
+    try corpus_ingest.applyStaged(allocator, &project_paths);
+
+    var result = try corpus_ask.ask(allocator, .{
+        .question = "Is the moon made of blue cheese?",
+        .project_shard = project_shard,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(corpus_ask.AskStatus.unknown, result.status);
+    try std.testing.expect(result.answer_draft == null);
+    try std.testing.expectEqual(corpus_ask.UnknownKind.insufficient_high_rank_evidence, result.unknowns[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), result.evidence_used.len);
+    try std.testing.expectEqualStrings("shadow", result.evidence_used[0].license_status);
+    try std.testing.expectEqual(@as(u8, 3), result.evidence_used[0].authority_level);
+
+    const rendered = try corpus_ask.renderJson(allocator, &result);
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"answerDraft\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "insufficient_high_rank_evidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"authorityLevel\":3") != null);
+}
+
+test "corpus ask rejects trash-only falsehood and blocks source" {
+    const allocator = std.testing.allocator;
+    const project_shard = "corpus-ask-trash-only-test";
+    var corpus_fixture = std.testing.tmpDir(.{});
+    defer corpus_fixture.cleanup();
+    const corpus_root = try corpus_fixture.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(corpus_root);
+    try writeFixtureFile(corpus_fixture.dir, "license.json",
+        \\{"status":"trash","authority_level":4,"audit_log":[]}
+    );
+    try writeFixtureFile(corpus_fixture.dir, "moon.md",
+        \\# Moon Notes
+        \\The moon is made of blue cheese according to blacklisted noise.
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.root_abs_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.root_abs_path) catch {};
+
+    var stage_result = try corpus_ingest.stage(allocator, .{
+        .corpus_path = corpus_root,
+        .project_shard = project_shard,
+        .trust_class = .project,
+        .source_label = "trash-moon-corpus",
+    });
+    defer stage_result.deinit();
+    try corpus_ingest.applyStaged(allocator, &project_paths);
+
+    var result = try corpus_ask.ask(allocator, .{
+        .question = "Is the moon made of blue cheese?",
+        .project_shard = project_shard,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(corpus_ask.AskStatus.rejected_falsehood, result.status);
+    try std.testing.expect(result.answer_draft == null);
+    try std.testing.expectEqual(corpus_ask.UnknownKind.rejected_falsehood, result.unknowns[0].kind);
+    try std.testing.expectEqual(@as(usize, 0), result.evidence_used.len);
+    try std.testing.expectEqual(@as(usize, 1), result.suppressed_evidence.len);
+    try std.testing.expectEqualStrings("trash", result.suppressed_evidence[0].license_status);
+    try std.testing.expectEqual(@as(u8, 4), result.suppressed_evidence[0].authority_level);
+    try std.testing.expectEqualStrings("blacklisted_source_blocked", result.suppressed_evidence[0].reason);
+
+    const rendered = try corpus_ask.renderJson(allocator, &result);
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"status\":\"rejected_falsehood\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"answerDraft\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "blacklisted_source_blocked") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"authorityLevel\":4") != null);
+}
+
 test "corpus ask applies accepted reviewed correction influence without proof or mutation" {
     const allocator = std.testing.allocator;
     const project_shard = "corpus-ask-accepted-correction-test";
@@ -10671,18 +10883,19 @@ test "intent grounding: transformation produces criteria and validation obligati
     try std.testing.expect(found_validate);
 }
 
-test "intent grounding: ambiguous intent produces resolve_class obligation" {
+test "intent grounding: light conversational input does not produce resolve_class obligation" {
     const allocator = std.testing.allocator;
 
     var gi = try intent_grounding.ground(allocator, "hello world", .{});
     defer gi.deinit();
 
-    try std.testing.expectEqual(intent_grounding.IntentClass.ambiguous, gi.intent_class);
+    try std.testing.expectEqual(intent_grounding.IntentClass.conversation, gi.intent_class);
+    try std.testing.expectEqual(intent_grounding.GroundedIntent.GroundingStatus.grounded, gi.status);
     var found_resolve = false;
     for (gi.obligations) |obl| {
         if (std.mem.eql(u8, obl.id, "resolve_class")) found_resolve = true;
     }
-    try std.testing.expect(found_resolve);
+    try std.testing.expect(!found_resolve);
 }
 
 test "intent grounding: obligation resolved when target known" {
@@ -10807,16 +11020,15 @@ test "intent grounding: partial output includes ambiguity without collapsing" {
     try std.testing.expect(gi.status != .grounded);
 }
 
-test "intent grounding: no hallucinated intent resolution" {
+test "intent grounding: unmatched light input defaults to conversational reasoning" {
     const allocator = std.testing.allocator;
 
     var gi = try intent_grounding.ground(allocator, "asdfghjkl", .{});
     defer gi.deinit();
 
-    // Nonsensical input must be classified as ambiguous, not fabricated.
-    try std.testing.expectEqual(intent_grounding.IntentClass.ambiguous, gi.intent_class);
-    try std.testing.expect(gi.status != .grounded);
-    try std.testing.expect(gi.fast_path_eligible == false);
+    try std.testing.expectEqual(intent_grounding.IntentClass.conversation, gi.intent_class);
+    try std.testing.expectEqual(intent_grounding.GroundedIntent.GroundingStatus.grounded, gi.status);
+    try std.testing.expect(gi.fast_path_eligible);
     // Must NOT have any fabricated candidate intents.
     try std.testing.expect(gi.candidate_intents.len == 0);
 }

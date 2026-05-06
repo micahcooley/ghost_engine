@@ -11004,6 +11004,8 @@ test "routing keeps exact corpus path and symbol evidence ahead of noisy surface
         .source_label = try allocator.dupe(u8, "fixture"),
         .provenance = try allocator.dupe(u8, "local"),
         .trust_class = .project,
+        .license_status = try allocator.dupe(u8, "verified"),
+        .license_authority_level = 1,
         .lineage_id = try allocator.dupe(u8, "runbook"),
         .lineage_version = 1,
     });
@@ -11014,6 +11016,8 @@ test "routing keeps exact corpus path and symbol evidence ahead of noisy surface
         .source_label = try allocator.dupe(u8, "fixture"),
         .provenance = try allocator.dupe(u8, "local"),
         .trust_class = .project,
+        .license_status = try allocator.dupe(u8, "verified"),
+        .license_authority_level = 1,
         .lineage_id = try allocator.dupe(u8, "guide-noise"),
         .lineage_version = 1,
     });

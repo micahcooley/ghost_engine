@@ -235,6 +235,14 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    const text_generation_lab_options = addCoreOptions(b, target, true);
+    text_generation_lab_tests.root_module.addOptions("build_options", text_generation_lab_options);
+    text_generation_lab_tests.root_module.linkSystemLibrary("c", .{});
+    if (target.result.os.tag == .linux) {
+        text_generation_lab_tests.root_module.linkSystemLibrary("dl", .{});
+        text_generation_lab_tests.root_module.linkSystemLibrary("vulkan", .{});
+    }
+    addVulkanIncludes(text_generation_lab_tests.root_module, target.result.os, vulkan_sdk, b);
     const run_text_generation_lab_tests = b.addRunArtifact(text_generation_lab_tests);
     const text_generation_lab_smoke_step = b.step("smoke-text-generation-lab", "Run experimental text generation lab tests and fixture corpus smoke");
     text_generation_lab_smoke_step.dependOn(&run_text_generation_lab_tests.step);
@@ -264,6 +272,7 @@ pub fn build(b: *std.Build) void {
     main_tests.root_module.linkSystemLibrary("c", .{});
     if (target.result.os.tag == .linux) {
         main_tests.root_module.linkSystemLibrary("dl", .{});
+        main_tests.root_module.linkSystemLibrary("vulkan", .{});
     }
     addVulkanIncludes(main_tests.root_module, target.result.os, vulkan_sdk, b);
 
@@ -283,6 +292,7 @@ pub fn build(b: *std.Build) void {
     lifecycle_tests.root_module.linkSystemLibrary("c", .{});
     if (target.result.os.tag == .linux) {
         lifecycle_tests.root_module.linkSystemLibrary("dl", .{});
+        lifecycle_tests.root_module.linkSystemLibrary("vulkan", .{});
     }
     const run_lifecycle_tests = b.addRunArtifact(lifecycle_tests);
     test_step.dependOn(&run_lifecycle_tests.step);
@@ -299,6 +309,7 @@ pub fn build(b: *std.Build) void {
     gip_cli_tests.root_module.linkSystemLibrary("c", .{});
     if (target.result.os.tag == .linux) {
         gip_cli_tests.root_module.linkSystemLibrary("dl", .{});
+        gip_cli_tests.root_module.linkSystemLibrary("vulkan", .{});
     }
     addVulkanIncludes(gip_cli_tests.root_module, target.result.os, vulkan_sdk, b);
     const run_gip_cli_tests = b.addRunArtifact(gip_cli_tests);
@@ -315,6 +326,7 @@ pub fn build(b: *std.Build) void {
     knowledge_pack_cli_tests.root_module.linkSystemLibrary("c", .{});
     if (target.result.os.tag == .linux) {
         knowledge_pack_cli_tests.root_module.linkSystemLibrary("dl", .{});
+        knowledge_pack_cli_tests.root_module.linkSystemLibrary("vulkan", .{});
     }
     addVulkanIncludes(knowledge_pack_cli_tests.root_module, target.result.os, vulkan_sdk, b);
     const run_knowledge_pack_cli_tests = b.addRunArtifact(knowledge_pack_cli_tests);
@@ -332,6 +344,7 @@ pub fn build(b: *std.Build) void {
     project_autopsy_cli_tests.root_module.linkSystemLibrary("c", .{});
     if (target.result.os.tag == .linux) {
         project_autopsy_cli_tests.root_module.linkSystemLibrary("dl", .{});
+        project_autopsy_cli_tests.root_module.linkSystemLibrary("vulkan", .{});
     }
     addVulkanIncludes(project_autopsy_cli_tests.root_module, target.result.os, vulkan_sdk, b);
     const run_project_autopsy_cli_tests = b.addRunArtifact(project_autopsy_cli_tests);
@@ -349,6 +362,7 @@ pub fn build(b: *std.Build) void {
     compute_dominance_tests.root_module.linkSystemLibrary("c", .{});
     if (target.result.os.tag == .linux) {
         compute_dominance_tests.root_module.linkSystemLibrary("dl", .{});
+        compute_dominance_tests.root_module.linkSystemLibrary("vulkan", .{});
     }
     addVulkanIncludes(compute_dominance_tests.root_module, target.result.os, vulkan_sdk, b);
     const run_compute_dominance_tests = b.addRunArtifact(compute_dominance_tests);

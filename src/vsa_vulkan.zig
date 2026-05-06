@@ -119,6 +119,11 @@ fn fixedCStringEquals(buf: []const u8, expected: []const u8) bool {
     return std.mem.eql(u8, buf[0..end], expected);
 }
 
+fn trimDeviceName(buf: []const u8) []const u8 {
+    const end = std.mem.indexOfScalar(u8, buf, 0) orelse buf.len;
+    return std.mem.trim(u8, buf[0..end], " \r\n\t");
+}
+
 fn beginGpuSubmit(self: *VulkanEngine) void {
     _ = self.active_gpu_submits.fetchAdd(1, .acq_rel);
 }
@@ -305,11 +310,11 @@ fn createInstance(ctx: *vl.VulkanCtx, allocator: std.mem.Allocator, app_name: [*
     const debug_utils_enabled = validation_enabled and try hasInstanceExtension(ctx, allocator, std.mem.span(DEBUG_UTILS_EXTENSION_NAME));
 
     if (validation_enabled) {
-        sys.printOut("[VULKAN] Validation layer enabled.\n");
+        std.debug.print("[VULKAN] Validation layer enabled.\n", .{});
     } else if (validation_allowed) {
-        sys.printOut("[VULKAN] Validation layer unavailable; continuing without Khronos diagnostics.\n");
+        std.debug.print("[VULKAN] Validation layer unavailable; continuing without Khronos diagnostics.\n", .{});
     } else {
-        sys.printOut("[VULKAN] Validation disabled for production/headless runtime.\n");
+        std.debug.print("[VULKAN] Validation disabled for production/headless runtime.\n", .{});
     }
 
     var layers = [_][*:0]const u8{VALIDATION_LAYER_NAME};
@@ -387,6 +392,7 @@ pub const VulkanEngine = struct {
     candidate_score_pipeline: vk.VkPipeline = null,
     neighborhood_score_pipeline: vk.VkPipeline = null,
     contradiction_filter_pipeline: vk.VkPipeline = null,
+    semantic_hash_pipeline: vk.VkPipeline = null,
     etch_pipeline: vk.VkPipeline = null,
     prune_pipeline: vk.VkPipeline = null,
     lookahead_pipeline: vk.VkPipeline = null,
@@ -623,9 +629,9 @@ pub const VulkanEngine = struct {
             }
         }
 
-        sys.print("[VULKAN-{d}] Selected Device: {s}\n", .{ self.device_index, devProps.deviceName });
-        sys.print("[VULKAN-{d}] VRAM Detect: {d} MB | Parallel Streams: {d}\n", .{ self.device_index, self.vram_size / 1048576, self.num_queues });
-        sys.print("[VULKAN-{d}] Headless compute mode active. Perf score: {d}\n", .{ self.device_index, self.performance_score });
+        std.debug.print("[VULKAN-{d}] Selected Device: {s}\n", .{ self.device_index, trimDeviceName(devProps.deviceName[0..]) });
+        std.debug.print("[VULKAN-{d}] VRAM Detect: {d} MB | Parallel Streams: {d}\n", .{ self.device_index, self.vram_size / 1048576, self.num_queues });
+        std.debug.print("[VULKAN-{d}] Headless compute mode active. Perf score: {d}\n", .{ self.device_index, self.performance_score });
 
         var qfCount: u32 = 0;
         self.vk_ctx.vkGetPhysicalDeviceQueueFamilyProperties.?(self.pdev, &qfCount, null);
@@ -661,11 +667,11 @@ pub const VulkanEngine = struct {
         if (transfer_family) |tf| {
             self.has_dedicated_transfer = true;
             self.transfer_queue_family = tf;
-            sys.print("[VULKAN-{d}] Dedicated Transfer Queue: Family {d}\n", .{ self.device_index, tf });
+            std.debug.print("[VULKAN-{d}] Dedicated Transfer Queue: Family {d}\n", .{ self.device_index, tf });
         } else {
             self.has_dedicated_transfer = false;
             self.transfer_queue_family = self.queue_family;
-            sys.print("[VULKAN-{d}] No dedicated transfer queue — using compute queue\n", .{self.device_index});
+            std.debug.print("[VULKAN-{d}] No dedicated transfer queue - using compute queue\n", .{self.device_index});
         }
     }
 
@@ -883,6 +889,7 @@ pub const VulkanEngine = struct {
         self.candidate_score_pipeline = try self.createComputePipeline(@embedFile("shaders/candidate_score.spv"), null);
         self.neighborhood_score_pipeline = try self.createComputePipeline(@embedFile("shaders/neighborhood_score.spv"), null);
         self.contradiction_filter_pipeline = try self.createComputePipeline(@embedFile("shaders/contradiction_filter.spv"), null);
+        self.semantic_hash_pipeline = try self.createComputePipeline(@embedFile("shaders/semantic_hash.spv"), null);
 
         var etch_wg_size: u32 = @min(1024, self.max_workgroup_invocations);
         var spec_map = vk.VkSpecializationMapEntry{ .constantID = 0, .offset = 0, .size = @sizeOf(u32) };
@@ -1120,6 +1127,7 @@ pub const VulkanEngine = struct {
             &self.candidate_score_pipeline,
             &self.neighborhood_score_pipeline,
             &self.contradiction_filter_pipeline,
+            &self.semantic_hash_pipeline,
             &self.lattice_pipeline,
         };
         for (pipelines) |p| if (p.* != null) self.vk_ctx.vkDestroyPipeline.?(self.dev, p.*, null);
@@ -1427,6 +1435,49 @@ pub const VulkanEngine = struct {
             .candidate_count = self.result_buffer[6],
             .survivor_count = self.result_buffer[7],
         };
+    }
+
+    pub fn dispatchSemanticHashBatch(self: *VulkanEngine, block_seeds: []const u64) ![]const u32 {
+        // Hash acceleration is metadata-only helper work for ingest/search
+        // indexing. CPU verification and final corpus authority remain outside
+        // this Vulkan dispatch.
+        beginGpuSubmit(self);
+        defer endGpuSubmit(self);
+
+        if (block_seeds.len == 0) return self.result_buffer[0..0];
+        if (block_seeds.len * 2 > self.result_buffer.len) return error.TooManyHashBlocks;
+
+        self.dispatch_mutex.lock();
+        defer self.dispatch_mutex.unlock();
+
+        const f = try self.acquireFrameSlot();
+        ghostCopy(u64, self.mapped_rotors[f].?[0..block_seeds.len], block_seeds);
+        self.mapped_config[f].?.* = .{ .rotor_stride = 1, .rotor_offset = 0, .batch_size = @intCast(block_seeds.len) };
+
+        var beginInfo = std.mem.zeroes(vk.VkCommandBufferBeginInfo);
+        beginInfo.sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        try check(self.vk_ctx.vkBeginCommandBuffer.?(self.command_buffers[f], &beginInfo));
+
+        self.vk_ctx.vkCmdBindPipeline.?(self.command_buffers[f], vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.semantic_hash_pipeline);
+        self.vk_ctx.vkCmdBindDescriptorSets.?(self.command_buffers[f], vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &self.descriptor_sets[f], 0, null);
+        const pc = [_]u32{ @intCast(block_seeds.len), 0, self.matrix_slots - 1, self.lattice_quarter };
+        self.vk_ctx.vkCmdPushConstants.?(self.command_buffers[f], self.pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &pc);
+
+        const wg_size: u32 = 64;
+        self.vk_ctx.vkCmdDispatch.?(self.command_buffers[f], (@as(u32, @intCast(block_seeds.len)) + (wg_size - 1)) / wg_size, 1, 1);
+        try check(self.vk_ctx.vkEndCommandBuffer.?(self.command_buffers[f]));
+
+        var submitInfo = std.mem.zeroes(vk.VkSubmitInfo);
+        submitInfo.sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &self.command_buffers[f];
+        try check(self.vk_ctx.vkQueueSubmit.?(self.queue, 1, &submitInfo, self.fences[f]));
+        self.advanceFrameSlot();
+        try self.waitForHardwareInterrupt(f);
+
+        const word_count = block_seeds.len * 2;
+        ghostCopy(u32, self.result_buffer[0..word_count], self.mapped_energy[f].?[0..word_count]);
+        return self.result_buffer[0..word_count];
     }
 
     pub fn dispatchEtch(self: *VulkanEngine, batch_size: u32) !void {
@@ -1921,7 +1972,7 @@ pub fn getFleet() ?*MultiGPU {
 pub fn initRuntime(allocator: std.mem.Allocator) !*VulkanEngine {
     if (config.FLEET_MODE) {
         global_fleet = initFleet(allocator) catch |err| {
-            sys.print("[MULTI-GPU] Fleet init failed ({any}), falling back to single engine\n", .{err});
+            std.debug.print("[MULTI-GPU] Fleet init failed ({any}), falling back to single engine\n", .{err});
             global_instance = try VulkanEngine.init(allocator);
             return global_instance.?;
         };

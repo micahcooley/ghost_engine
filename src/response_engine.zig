@@ -27,6 +27,7 @@ pub const MAX_PARTIAL_FINDINGS: usize = 16;
 pub const MAX_ELIGIBILITY_TRACES: usize = 16;
 pub const MAX_CORRECTION_ITEMS: usize = 16;
 pub const MAX_NEGATIVE_KNOWLEDGE_ITEMS: usize = 16;
+pub const DEFAULT_CONVERSATIONAL_RESPONSE = "Ready. System anchored to zenith_root. What are we building?";
 
 // ── Response Modes ─────────────────────────────────────────────────────
 
@@ -495,8 +496,8 @@ pub fn checkFastPathEligibility(
         return result;
     }
 
-    // Condition 4: artifact bindings resolved (at least one).
-    const bindings_resolved = gi.artifact_bindings.len > 0;
+    // Condition 4: artifact bindings resolved, except for conversational turns.
+    const bindings_resolved = gi.artifact_bindings.len > 0 or !intent_grounding.intentClassRequiresArtifact(gi.intent_class);
     result.artifact_bindings_resolved = bindings_resolved;
     if (!bindings_resolved) {
         result.eligible = false;
@@ -1552,6 +1553,7 @@ fn determineEscalation(
     // If there are missing obligations but the intent class implies action.
     if (!eligibility.no_missing_obligations) {
         switch (gi.intent_class) {
+            .conversation => return null,
             .direct_action, .transformation, .verification, .diagnostic => {
                 return .insufficient_support;
             },
@@ -2092,7 +2094,7 @@ test "response engine: simple query selects fast path in auto mode" {
     try std.testing.expectEqual(StopReason.supported, result.stop_reason);
 }
 
-test "response engine: ambiguous query stays unresolved in auto mode" {
+test "response engine: unmatched light input defaults to conversation" {
     const allocator = std.testing.allocator;
     var gi = try intent_grounding.ground(allocator, "asdfghjkl", .{});
     defer gi.deinit();
@@ -2100,8 +2102,8 @@ test "response engine: ambiguous query stays unresolved in auto mode" {
     var result = try execute(allocator, &gi, .autoPath());
     defer result.deinit();
 
-    // Truly ambiguous (unclassifiable) intent: no escalation justified, stays unresolved.
-    try std.testing.expectEqual(StopReason.unresolved, result.stop_reason);
+    try std.testing.expectEqual(intent_grounding.IntentClass.conversation, gi.intent_class);
+    try std.testing.expectEqual(StopReason.supported, result.stop_reason);
     try std.testing.expect(!result.escalated);
 }
 
@@ -2223,10 +2225,9 @@ test "response engine: budget exhaustion in deep path" {
     try std.testing.expectEqual(StopReason.budget, result.stop_reason);
 }
 
-test "response engine: no false fast path eligibility" {
+test "response engine: unmatched light input is conversational fast path" {
     const allocator = std.testing.allocator;
 
-    // Nonsensical input should never be fast path eligible.
     var gi = try intent_grounding.ground(allocator, "asdfghjkl", .{});
     defer gi.deinit();
 
@@ -2234,7 +2235,8 @@ test "response engine: no false fast path eligibility" {
     var eligibility = try checkFastPathEligibility(allocator, &gi, &budget);
     defer eligibility.deinit(allocator);
 
-    try std.testing.expect(!eligibility.eligible);
+    try std.testing.expectEqual(intent_grounding.IntentClass.conversation, gi.intent_class);
+    try std.testing.expect(eligibility.eligible);
 }
 
 test "response engine: deterministic results across repeated runs" {

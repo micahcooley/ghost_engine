@@ -10,6 +10,8 @@ Deterministic local inference and training over memory-mapped state, with option
 - `ghost_patch_candidates` runs an explicit `explore_then_proof` flow: exploratory candidate generation, clustered handoff into proof mode, bounded build/test/runtime verification, then minimal verified survivor selection.
 - Support output is permissioned. Final `supported` results require both decision traces and evidence traces; otherwise the result is forced back to `unresolved`.
 - Abstractions, reuse, merge, prune, and replay are explicit shard-local workflows with recorded provenance and trust boundaries.
+- The Hybrid Lens uses Vulkan `f32` similarity for candidate search while CPU `u32` and structured symbolic logic remain the truth layer.
+- Latent intent inference defaults low-confidence task routing to conversational reasoning instead of path-binding failure.
 
 ## What Ships
 
@@ -174,6 +176,24 @@ Phase 3 is wired as universal artifact plumbing, not a code-only side path:
 - deep path is the verifier-capable path. Speculative scheduler traces keep considered, selected, and pruned candidates visible; scheduler candidates do not authorize support by themselves.
 - verifier adapter results are evidence records. Passed adapters can discharge obligations, failed adapters produce failure evidence, and missing adapters remain obligations.
 
+## Intuition Layer And Zen Mode
+
+The current intuition layer is deterministic. `intent_grounding` projects input
+into a small `f32` concept space and only treats a request as code-heavy when it
+crosses the configured heavy-task confidence threshold. Otherwise it falls back
+to conversation anchored on `zenith_root` instead of emitting
+`bind_target_artifact` as a user-facing failure.
+
+Vulkan acceleration is a Hybrid Lens: `f32` similarity can narrow candidate
+search, but `u32` symbolic state, authority ranks, obligations, and verifier
+evidence still decide support. Rank 0 is Sovereign/Zenith local authority;
+Rank 2 is public/wiki material and cannot outrank local project state.
+
+The default CLI/TUI presentation is Zen Mode: user text is white, Ghost text is
+blue, and internal obligations or ambiguity sections stay hidden unless the
+operator asks for details. Use `--details` on CLI launch or `/details on` inside
+the TUI to show the diagnostic surface.
+
 ## Benchmark Snapshot
 
 Latest Linux serious-workflow report in this workspace:
@@ -231,6 +251,7 @@ zig build repo-hygiene
 
 ## Docs
 
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): Hybrid Lens, authority ranks, Zen Mode, and glossary
 - [ARCHITECTURE.md](ARCHITECTURE.md): implemented stack overview
 - [GUIDE_ARCHITECTURE.md](GUIDE_ARCHITECTURE.md): short operator view
 - [docs/RUNTIME_SETUP.md](docs/RUNTIME_SETUP.md): build, runtime, shell, and shard setup

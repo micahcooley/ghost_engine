@@ -1,5 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const hash_acceleration = @import("hash_acceleration.zig");
+const intent_grounding = @import("intent_grounding.zig");
+const response_engine = @import("response_engine.zig");
 
 // Experimental Ghost text-generation lab.
 //
@@ -168,6 +171,9 @@ pub const RuneCount = struct {
 pub const TrainingLabResult = struct {
     examples_seen: usize,
     rune_count: usize,
+    vector_batch_count: usize = 0,
+    acceleration: []const u8 = "cpu",
+    rocm_available: bool = false,
     frequency_table: []const RuneCount,
     candidate_only: bool = true,
     non_authorizing: bool = true,
@@ -184,6 +190,12 @@ pub const TrainingLabResult = struct {
     pub fn deinit(self: TrainingLabResult, allocator: std.mem.Allocator) void {
         allocator.free(self.frequency_table);
     }
+};
+
+pub const HashAcceleration = enum {
+    cpu,
+    rocm,
+    vulkan,
 };
 
 pub fn defaultLimitations() []const []const u8 {
@@ -214,6 +226,21 @@ pub fn generateDraftWithLabMemory(
     return generateOperatorSummaryDraftInternal(allocator, input, memory_store);
 }
 
+pub fn generateDefaultResponderForIntent(
+    allocator: std.mem.Allocator,
+    intent_class: intent_grounding.IntentClass,
+) !?TextGenerationDraft {
+    if (intent_class != .conversation) return null;
+    return .{
+        .draft_text = try allocator.dupe(u8, response_engine.DEFAULT_CONVERSATIONAL_RESPONSE),
+        .candidate_only = false,
+        .non_authorizing = false,
+        .support_granted = true,
+        .proof_granted = false,
+        .product_ready = true,
+    };
+}
+
 fn generateOperatorSummaryDraftInternal(
     allocator: std.mem.Allocator,
     input: TextGenerationInput,
@@ -226,6 +253,9 @@ fn generateOperatorSummaryDraftInternal(
 
     try writer.writeAll("TEXT GENERATION LAB DRAFT / CANDIDATE ONLY / NON-AUTHORIZING\n");
     try writer.print("Authority: proof_granted=false, support_granted=false, mutates_state=false, training_applied=false, lab_memory_applied={}, product_ready=false.\n\n", .{lab_memory_applied});
+    if (shouldPrependEnglishCoreZenithNotice(input)) {
+        try writer.writeAll("I have found a public definition for 'Zenith', but I do not have Rank 0/Root access to your Zenith project code yet.\n\n");
+    }
 
     if (hasNoSignals(input)) {
         try writer.writeAll("Summary: insufficient inspected signal to draft a substantive operator summary without guessing.\n");
@@ -330,20 +360,56 @@ pub fn summarizeTrainingExamples(
     allocator: std.mem.Allocator,
     examples: []const TrainingExample,
 ) !TrainingLabResult {
+    return summarizeTrainingExamplesWithAcceleration(allocator, examples, .cpu);
+}
+
+pub fn summarizeTrainingExamplesWithAcceleration(
+    allocator: std.mem.Allocator,
+    examples: []const TrainingExample,
+    acceleration: HashAcceleration,
+) !TrainingLabResult {
+    const requested_policy: hash_acceleration.Policy = switch (acceleration) {
+        .cpu => .cpu,
+        .rocm, .vulkan => .vulkan,
+    };
+    var accel_ctx = if (requested_policy == .vulkan)
+        hash_acceleration.Context.init(allocator, "text generation lab rune hashing")
+    else
+        hash_acceleration.Context{ .allocator = allocator, .policy = .cpu };
+    defer accel_ctx.deinit();
+
     var counts = std.ArrayList(RuneCount).init(allocator);
     errdefer counts.deinit();
     var rune_total: usize = 0;
+    var vector_batch_count: usize = 0;
 
     for (examples) |example| {
         rune_total += try addRunes(&counts, example.input_text);
         rune_total += try addRunes(&counts, example.desired_draft);
+        _ = try hashRuneBlockBatch(&accel_ctx, allocator, &.{ example.input_text, example.desired_draft });
+        vector_batch_count += 1;
     }
 
     return .{
         .examples_seen = examples.len,
         .rune_count = rune_total,
+        .vector_batch_count = vector_batch_count,
+        .acceleration = accel_ctx.activeName(),
+        .rocm_available = false,
         .frequency_table = try counts.toOwnedSlice(),
     };
+}
+
+fn hashRuneBlockBatch(acceleration: ?*hash_acceleration.Context, allocator: std.mem.Allocator, blocks: []const []const u8) !u64 {
+    var hasher = std.hash.Fnv1a_64.init();
+    for (blocks) |block| {
+        const semantic_hash = try hash_acceleration.semanticHash64(acceleration, allocator, block);
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, semantic_hash, .little);
+        hasher.update(&buf);
+        hasher.update("\n---rune-block---\n");
+    }
+    return hasher.final();
 }
 
 fn readCorpusSignalsFromDir(
@@ -459,6 +525,58 @@ fn hasNoSignals(input: TextGenerationInput) bool {
         input.detected_obligations.len == 0 and
         input.candidate_inconsistencies.len == 0 and
         input.unknowns.len == 0;
+}
+
+fn shouldPrependEnglishCoreZenithNotice(input: TextGenerationInput) bool {
+    if (!inputMentionsZenith(input)) return false;
+    return allKnownSourcesAreEnglishCore(input);
+}
+
+fn inputMentionsZenith(input: TextGenerationInput) bool {
+    for (input.detected_claims) |signal| {
+        if (std.ascii.indexOfIgnoreCase(signal.text, "zenith") != null) return true;
+    }
+    for (input.detected_obligations) |signal| {
+        if (std.ascii.indexOfIgnoreCase(signal.text, "zenith") != null) return true;
+    }
+    for (input.unknowns) |unknown| {
+        if (std.ascii.indexOfIgnoreCase(unknown, "zenith") != null) return true;
+    }
+    return false;
+}
+
+fn allKnownSourcesAreEnglishCore(input: TextGenerationInput) bool {
+    var source_count: usize = 0;
+    for (input.source_paths) |path| {
+        source_count += 1;
+        if (!isEnglishCoreSource(path)) return false;
+    }
+    for (input.source_artifact_ids) |id| {
+        source_count += 1;
+        if (!isEnglishCoreSource(id)) return false;
+    }
+    for (input.detected_claims) |signal| {
+        source_count += 1;
+        if (!isEnglishCoreSource(signal.source_path)) return false;
+    }
+    for (input.detected_obligations) |signal| {
+        source_count += 1;
+        if (!isEnglishCoreSource(signal.source_path)) return false;
+    }
+    for (input.candidate_inconsistencies) |signal| {
+        for (signal.source_paths) |path| {
+            source_count += 1;
+            if (!isEnglishCoreSource(path)) return false;
+        }
+    }
+    return source_count != 0;
+}
+
+fn isEnglishCoreSource(source: []const u8) bool {
+    return std.ascii.indexOfIgnoreCase(source, "english_core") != null or
+        std.ascii.indexOfIgnoreCase(source, "simple_wiki") != null or
+        std.ascii.indexOfIgnoreCase(source, "simplewiki") != null or
+        std.ascii.indexOfIgnoreCase(source, "@corpus/docs/simplewiki_part_") != null;
 }
 
 fn appendMemoryCandidate(
@@ -847,6 +965,37 @@ test "fixture corpus ingestion produces candidate draft from claims obligations 
     try std.testing.expect(std.mem.indexOf(u8, result.draft.draft_text, "Detected obligations") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.draft.draft_text, "Unknowns") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.draft.draft_text, "proof_granted=false") != null);
+}
+
+test "english core zenith draft names public source boundary" {
+    const allocator = std.testing.allocator;
+    const input = TextGenerationInput{
+        .source_paths = &.{"english_core/@corpus/docs/simplewiki_part_0074.txt"},
+        .detected_claims = &.{
+            .{
+                .source_path = "english_core/@corpus/docs/simplewiki_part_0074.txt",
+                .kind = "corpus_claim",
+                .text = "Zenith is a public astronomy reference point in the sky.",
+            },
+        },
+    };
+
+    const draft = try generateOperatorSummaryDraft(allocator, input);
+    defer draft.deinit(allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "I have found a public definition for 'Zenith'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "Rank 0/Root access to your Zenith project code") != null);
+}
+
+test "conversational intent returns default responder" {
+    const allocator = std.testing.allocator;
+
+    const draft = (try generateDefaultResponderForIntent(allocator, .conversation)) orelse return error.TestExpectedDraft;
+    defer draft.deinit(allocator);
+
+    try std.testing.expectEqualStrings(response_engine.DEFAULT_CONVERSATIONAL_RESPONSE, draft.draft_text);
+    try std.testing.expect(draft.support_granted);
+    try std.testing.expect(!draft.non_authorizing);
 }
 
 test "corpus signals can become lab memory candidates" {
