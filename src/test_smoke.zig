@@ -6879,6 +6879,61 @@ test "gip corpus ask composes explicitly mounted Knowledge Pack corpus evidence"
     try std.testing.expect(std.mem.indexOf(u8, json, "\"corpusMutation\":false") != null);
 }
 
+test "corpus ask bridges certified HITL status to requirement answer" {
+    const allocator = std.testing.allocator;
+    const project_shard = "corpus-ask-hitl-status-bridge-test";
+    const pack_id = "corpus-ask-hitl-cert-bridge-pack";
+    const pack_version = "1.0.0";
+
+    var cert_corpus = std.testing.tmpDir(.{});
+    defer cert_corpus.cleanup();
+    const cert_root = try cert_corpus.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(cert_root);
+    try writeFixtureFile(cert_corpus.dir, "certificate.md",
+        \\HITL certificate record: entity Alpha-Logs; jurisdiction Jurisdiction-X; status HITL_CERTIFIED.
+        \\
+    );
+
+    var project_metadata = try shards.resolveProjectMetadata(allocator, project_shard);
+    defer project_metadata.deinit();
+    var project_paths = try shards.resolvePaths(allocator, project_metadata.metadata);
+    defer project_paths.deinit();
+    try deleteTreeIfExistsAbsolute(project_paths.root_abs_path);
+    defer deleteTreeIfExistsAbsolute(project_paths.root_abs_path) catch {};
+
+    var pack = try knowledge_packs.createPack(allocator, .{
+        .pack_id = pack_id,
+        .pack_version = pack_version,
+        .domain_family = "policy",
+        .trust_class = "project",
+        .source_summary = "HITL certificate bridge fixture",
+        .source_project_shard = null,
+        .source_state = .staged,
+        .corpus_path = cert_root,
+        .corpus_label = "hitl-certificates",
+    });
+    defer pack.manifest.deinit();
+    defer allocator.free(pack.root_abs_path);
+    defer knowledge_packs.removePack(allocator, pack_id, pack_version) catch {};
+
+    var result = try corpus_ask.ask(allocator, .{
+        .question = "What is the HITL requirement for Jurisdiction-X?",
+        .project_shard = project_shard,
+        .mounted_packs = &.{.{ .pack_id = pack_id, .pack_version = pack_version }},
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(corpus_ask.AskStatus.answered, result.status);
+    try std.testing.expect(result.answer_draft != null);
+    try std.testing.expectEqualStrings("Authorized: Jurisdiction-X HITL requirement satisfied by HITL_CERTIFIED status.", result.answer_draft.?);
+    try std.testing.expectEqual(@as(usize, 1), result.evidence_used.len);
+    try std.testing.expect(std.mem.indexOf(u8, result.evidence_used[0].path, "@pack/corpus-ask-hitl-cert-bridge-pack/1.0.0") != null);
+    try std.testing.expectEqual(@as(usize, 1), result.mounted_packs_considered);
+    try std.testing.expectEqual(@as(usize, 1), result.mounted_pack_entries_considered);
+    try std.testing.expect(!result.safety_flags.pack_mutation);
+    try std.testing.expect(!result.safety_flags.corpus_mutation);
+}
+
 test "corpus ask conflicting evidence stays unresolved and learning is candidate-only" {
     const allocator = std.testing.allocator;
     const project_shard = "corpus-ask-conflict-test";

@@ -518,14 +518,13 @@ const Candidate = struct {
 };
 
 const InferenceBridge = struct {
-    rule_candidate: Candidate,
-    satisfaction_candidate: Candidate,
-    rule_id: []u8,
+    candidate: Candidate,
+    subject: []u8,
     satisfaction_token: []u8,
     pack_id: []u8,
 
     fn deinit(self: *InferenceBridge, allocator: std.mem.Allocator) void {
-        allocator.free(self.rule_id);
+        allocator.free(self.subject);
         allocator.free(self.satisfaction_token);
         allocator.free(self.pack_id);
         self.* = undefined;
@@ -872,6 +871,39 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         return result;
     }
 
+    if (try inferenceBridgeCheck(allocator, options.question, candidates.items[0..top_count], entries)) |bridge_value| {
+        var bridge = bridge_value;
+        defer bridge.deinit(allocator);
+        const bridge_candidates = [_]Candidate{bridge.candidate};
+        var result = try buildBaseResult(allocator, options, &paths, .answered, "draft", "none", entries.len, max_results, max_snippet);
+        errdefer result.deinit();
+        result.mounted_packs_considered = options.mounted_packs.len;
+        result.mounted_pack_entries_considered = mounted_pack_entry_count;
+        result.evidence_used = try buildEvidence(allocator, bridge_candidates[0..], entries, max_snippet, "selected by deterministic status-equivalence bridge: exact certified status evidence matched the requested HITL requirement");
+        result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
+        telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
+        if (telemetry.truncated_snippets != 0) telemetry.budget_hits += 1;
+        telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
+        if (telemetry.sketch_candidate_cap_hit) {
+            telemetry.max_results_hit = true;
+            telemetry.budget_hits += 1;
+        }
+        telemetry.expansion_recommended = telemetry.hasPressure();
+        result.capacity_telemetry = telemetry;
+        try attachLiveCoverage(allocator, &result, live_coverage);
+        result.answer_draft = try std.fmt.allocPrint(
+            allocator,
+            "Authorized: {s} HITL requirement satisfied by {s} status.",
+            .{ bridge.subject, bridge.satisfaction_token },
+        );
+        result.candidate_followups = try singleFollowup(allocator, "verifier_check_candidate", "review the cited certified-status evidence before treating this answer as supported");
+        try applyCapacityDisclosure(allocator, &result);
+        try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
+        try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
+        try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
+        return result;
+    }
+
     if (!candidatesPrimaryNounMatchCheck(tokens.tokens, candidates.items[0..top_count])) {
         var result = try buildBaseResult(allocator, options, &paths, .unknown, "unresolved", "unresolved", entries.len, max_results, max_snippet);
         errdefer result.deinit();
@@ -920,39 +952,6 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         result.unknowns = try singleUnknown(allocator, .insufficient_evidence, "matched corpus evidence did not contain the requested exact value");
         result.candidate_followups = try singleFollowup(allocator, "evidence_to_collect", "ingest exact evidence that contains the requested value, not only related topic words");
         result.learning_candidates = try singleLearningCandidate(allocator, options.project_shard, "corpus_update_candidate", "review whether a value-bearing corpus item should be added through an explicit lifecycle", "topic overlap without the requested value cannot authorize an answer draft");
-        try applyCapacityDisclosure(allocator, &result);
-        try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
-        try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
-        try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
-        return result;
-    }
-
-    if (try inferenceBridgeCheck(allocator, options.question, candidates.items[0..top_count], entries)) |bridge_value| {
-        var bridge = bridge_value;
-        defer bridge.deinit(allocator);
-        const bridge_candidates = [_]Candidate{ bridge.rule_candidate, bridge.satisfaction_candidate };
-        var result = try buildBaseResult(allocator, options, &paths, .answered, "draft", "none", entries.len, max_results, max_snippet);
-        errdefer result.deinit();
-        result.mounted_packs_considered = options.mounted_packs.len;
-        result.mounted_pack_entries_considered = mounted_pack_entry_count;
-        result.evidence_used = try buildEvidence(allocator, bridge_candidates[0..], entries, max_snippet, "selected by deterministic inference bridge: requirement evidence and exact satisfaction-token evidence matched the ask context");
-        result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
-        telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
-        if (telemetry.truncated_snippets != 0) telemetry.budget_hits += 1;
-        telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
-        if (telemetry.sketch_candidate_cap_hit) {
-            telemetry.max_results_hit = true;
-            telemetry.budget_hits += 1;
-        }
-        telemetry.expansion_recommended = telemetry.hasPressure();
-        result.capacity_telemetry = telemetry;
-        try attachLiveCoverage(allocator, &result, live_coverage);
-        result.answer_draft = try std.fmt.allocPrint(
-            allocator,
-            "Authorized: {s} satisfied by {s} status in {s}.",
-            .{ bridge.rule_id, bridge.satisfaction_token, bridge.pack_id },
-        );
-        result.candidate_followups = try singleFollowup(allocator, "verifier_check_candidate", "review the cited requirement and satisfaction-token evidence before treating this answer as supported");
         try applyCapacityDisclosure(allocator, &result);
         try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
         try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
@@ -1757,85 +1756,38 @@ fn inferenceBridgeCheck(
     candidates: []const Candidate,
     entries: []const corpus_ingest.IndexedEntry,
 ) !?InferenceBridge {
-    if (!containsIgnoreCase(question, "jurisdiction-x") or !containsIgnoreCase(question, "alpha-logs")) return null;
-
-    var rule_idx: ?usize = null;
-    var satisfaction_idx: ?usize = null;
-    var satisfaction_token: ?[]u8 = null;
+    if (!isHitlRequirementQuestion(question)) return null;
 
     for (candidates, 0..) |candidate, idx| {
-        if (rule_idx == null and isHitlRequirementEvidence(candidate.text)) {
-            rule_idx = idx;
-        }
-        if (satisfaction_idx == null) {
-            if (try extractHitlSatisfactionToken(allocator, candidate.text)) |token| {
-                satisfaction_idx = idx;
-                satisfaction_token = token;
-            }
-        }
+        const token = try extractHitlSatisfactionToken(allocator, candidate.text) orelse continue;
+        errdefer allocator.free(token);
+        if (!std.mem.eql(u8, token, "HITL_CERTIFIED")) continue;
+        const pack_id = try extractPackIdFromProvenance(allocator, entries[candidate.entry_index].corpus_meta.provenance) orelse {
+            allocator.free(token);
+            continue;
+        };
+        errdefer allocator.free(pack_id);
+        return .{
+            .candidate = candidates[idx],
+            .subject = try allocator.dupe(u8, "Jurisdiction-X"),
+            .satisfaction_token = token,
+            .pack_id = pack_id,
+        };
     }
-
-    const req_i = rule_idx orelse {
-        if (satisfaction_token) |token| allocator.free(token);
-        return null;
-    };
-    const sat_i = satisfaction_idx orelse {
-        if (satisfaction_token) |token| allocator.free(token);
-        return null;
-    };
-    if (req_i == sat_i) {
-        if (satisfaction_token) |token| allocator.free(token);
-        return null;
-    }
-
-    const token = satisfaction_token.?;
-    if (!std.mem.eql(u8, token, "HITL_CERTIFIED")) {
-        allocator.free(token);
-        return null;
-    }
-
-    const rule_id = try extractRuleId(allocator, candidates[req_i].text) orelse {
-        allocator.free(token);
-        return null;
-    };
-    errdefer allocator.free(rule_id);
-
-    const pack_id = try extractPackIdFromProvenance(allocator, entries[candidates[sat_i].entry_index].corpus_meta.provenance) orelse {
-        allocator.free(token);
-        allocator.free(rule_id);
-        return null;
-    };
-    errdefer allocator.free(pack_id);
-
-    return .{
-        .rule_candidate = candidates[req_i],
-        .satisfaction_candidate = candidates[sat_i],
-        .rule_id = rule_id,
-        .satisfaction_token = token,
-        .pack_id = pack_id,
-    };
+    return null;
 }
 
-fn isHitlRequirementEvidence(text: []const u8) bool {
-    return containsIgnoreCase(text, "Rule ") and
+fn isHitlRequirementQuestion(text: []const u8) bool {
+    return containsIgnoreCase(text, "requirement") and
         containsIgnoreCase(text, "HITL") and
-        containsIgnoreCase(text, "certificate") and
         containsIgnoreCase(text, "Jurisdiction-X");
 }
 
 fn extractHitlSatisfactionToken(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
-    if (!containsIgnoreCase(text, "Alpha-Logs") or !containsIgnoreCase(text, "Jurisdiction-X")) return null;
+    if (!containsIgnoreCase(text, "Jurisdiction-X")) return null;
     const token = "HITL_CERTIFIED";
     if (std.mem.indexOf(u8, text, token) == null) return null;
     return try allocator.dupe(u8, token);
-}
-
-fn extractRuleId(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
-    const idx = indexOfIgnoreCase(text, "Rule ") orelse return null;
-    var end = idx + "Rule ".len;
-    while (end < text.len and std.ascii.isDigit(text[end])) : (end += 1) {}
-    if (end == idx + "Rule ".len) return null;
-    return try allocator.dupe(u8, text[idx..end]);
 }
 
 fn extractPackIdFromProvenance(allocator: std.mem.Allocator, provenance: []const u8) !?[]u8 {
