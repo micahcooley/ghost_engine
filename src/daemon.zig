@@ -7,10 +7,15 @@ const intent_grounding = ghost_core.intent_grounding;
 const shards = ghost_core.shards;
 const vsa_vulkan = ghost_core.vsa_vulkan;
 
-pub const SOCKET_PATH = "/tmp/ghost.sock";
-pub const PID_PATH = "/tmp/ghost.pid";
+pub const DEFAULT_SOCKET_PATH = "/tmp/ghost.sock";
+pub const DEFAULT_PID_PATH = "/tmp/ghost.pid";
 const MAX_FRAME_BYTES: usize = 10 * 1024 * 1024;
 const DEFAULT_RESIDENT_SHARDS = [_][]const u8{ "english_core", "user_vault" };
+const SESSION_HOT_BYTES: usize = 16 * 1024 * 1024;
+const SESSION_HOT_FLUSH_PER_MILLE: usize = 800;
+const SESSION_HOT_KEEP_PER_MILLE: usize = 500;
+const CONTEXT_BIAS_MULTIPLIER_PER_MILLE: u32 = 1500;
+const GPU_SCORE_FLOOR: u32 = 120;
 
 var stop_requested = std.atomic.Value(bool).init(false);
 
@@ -43,26 +48,31 @@ pub fn runFromArgs(allocator: std.mem.Allocator, args: []const []const u8) !void
 
 fn runDaemon(allocator: std.mem.Allocator) !void {
     if (probeSocket()) {
-        try std.io.getStdErr().writer().print("ghostd already active at {s}\n", .{SOCKET_PATH});
+        try std.io.getStdErr().writer().print("ghostd already active at {s}\n", .{socketPath()});
         return error.DaemonAlreadyRunning;
     }
-    std.fs.deleteFileAbsolute(SOCKET_PATH) catch {};
+    std.fs.deleteFileAbsolute(socketPath()) catch {};
 
     try writePidFile();
-    errdefer std.fs.deleteFileAbsolute(PID_PATH) catch {};
+    errdefer std.fs.deleteFileAbsolute(pidPath()) catch {};
 
     var resident = try ResidentState.init(allocator);
     defer resident.deinit();
+    var archiver_thread = try std.Thread.spawn(.{}, ResidentState.archiverLoop, .{&resident});
+    defer {
+        resident.archiver_stop.store(true, .release);
+        archiver_thread.join();
+    }
 
-    var address = try std.net.Address.initUnix(SOCKET_PATH);
+    var address = try std.net.Address.initUnix(socketPath());
     var server = try address.listen(.{ .kernel_backlog = 128 });
     defer server.deinit();
-    defer std.fs.deleteFileAbsolute(SOCKET_PATH) catch {};
-    defer std.fs.deleteFileAbsolute(PID_PATH) catch {};
+    defer std.fs.deleteFileAbsolute(socketPath()) catch {};
+    defer std.fs.deleteFileAbsolute(pidPath()) catch {};
 
     try std.io.getStdErr().writer().print(
         "ghostd ready socket={s} shards={d} vulkan={s}\n",
-        .{ SOCKET_PATH, resident.loaded_shards, if (resident.vulkan_active) "resident" else "cpu" },
+        .{ socketPath(), resident.loaded_shards, if (resident.vulkan_active) "resident" else "cpu" },
     );
 
     while (!stop_requested.load(.acquire)) {
@@ -86,6 +96,7 @@ const ResidentShard = struct {
     lower_texts: [][]u8,
     offsets: []usize,
     vram_buffer: vsa_vulkan.ResidentBuffer = .{},
+    scan_entries: []vsa_vulkan.CorpusScanEntry,
 
     fn deinit(self: *ResidentShard, allocator: std.mem.Allocator, vk: ?*vsa_vulkan.VulkanEngine) void {
         if (vk) |engine| engine.destroyResidentBuffer(&self.vram_buffer);
@@ -96,7 +107,108 @@ const ResidentShard = struct {
         for (self.lower_texts) |text| allocator.free(text);
         allocator.free(self.lower_texts);
         allocator.free(self.offsets);
+        allocator.free(self.scan_entries);
         self.* = undefined;
+    }
+};
+
+const SessionHotShard = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.Thread.Mutex = .{},
+    bytes: []u8,
+    used: usize = 0,
+    vram_buffer: vsa_vulkan.ResidentBuffer = .{},
+
+    fn init(allocator: std.mem.Allocator, vk: ?*vsa_vulkan.VulkanEngine) !SessionHotShard {
+        const bytes = try allocator.alloc(u8, SESSION_HOT_BYTES);
+        @memset(bytes, 0);
+        var shard = SessionHotShard{
+            .allocator = allocator,
+            .bytes = bytes,
+        };
+        errdefer shard.deinit(null);
+        if (vk) |engine| {
+            shard.vram_buffer = try engine.createResidentBufferSize(SESSION_HOT_BYTES);
+            try engine.uploadResidentBufferBytes(&shard.vram_buffer, 0, shard.bytes);
+        }
+        return shard;
+    }
+
+    fn deinit(self: *SessionHotShard, vk: ?*vsa_vulkan.VulkanEngine) void {
+        self.flushAllToVault() catch {};
+        if (vk) |engine| engine.destroyResidentBuffer(&self.vram_buffer);
+        self.allocator.free(self.bytes);
+        self.* = undefined;
+    }
+
+    fn appendTurn(self: *SessionHotShard, vk: ?*vsa_vulkan.VulkanEngine, role: []const u8, text: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        try self.flushOldestIfNeededLocked(false);
+        const prefix_len = role.len + 2;
+        const max_text = @min(text.len, SESSION_HOT_BYTES / 8);
+        const needed = prefix_len + max_text + 1;
+        if (needed >= self.bytes.len) return;
+        while (self.used + needed > self.bytes.len) {
+            try self.flushOldestIfNeededLocked(true);
+            if (self.used + needed <= self.bytes.len) break;
+            self.used = 0;
+        }
+
+        const append_start = self.used;
+        @memcpy(self.bytes[self.used .. self.used + role.len], role);
+        self.used += role.len;
+        self.bytes[self.used] = ':';
+        self.used += 1;
+        self.bytes[self.used] = ' ';
+        self.used += 1;
+        for (text[0..max_text]) |byte| {
+            self.bytes[self.used] = if (byte == '\n' or byte == '\r') ' ' else byte;
+            self.used += 1;
+        }
+        self.bytes[self.used] = '\n';
+        self.used += 1;
+
+        if (vk) |engine| {
+            if (self.vram_buffer.buffer != null) try engine.uploadResidentBufferBytes(&self.vram_buffer, append_start, self.bytes[append_start..self.used]);
+        }
+    }
+
+    fn extractContextTarget(self: *SessionHotShard, allocator: std.mem.Allocator) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return intent_grounding.extractPrimarySemanticTargetFromText(allocator, tailTurns(self.bytes[0..self.used], 6));
+    }
+
+    fn flushOldestIfNeeded(self: *SessionHotShard) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.flushOldestIfNeededLocked(false);
+    }
+
+    fn flushAllToVault(self: *SessionHotShard) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.used == 0) return;
+        try appendVaultBytes(self.bytes[0..self.used]);
+        self.used = 0;
+    }
+
+    fn flushOldestIfNeededLocked(self: *SessionHotShard, force: bool) !void {
+        const threshold = (self.bytes.len * SESSION_HOT_FLUSH_PER_MILLE) / 1000;
+        if (!force and self.used < threshold) return;
+        if (self.used == 0) return;
+        const keep_target = (self.bytes.len * SESSION_HOT_KEEP_PER_MILLE) / 1000;
+        var cut = self.used - @min(self.used, keep_target);
+        while (cut < self.used and self.bytes[cut] != '\n') : (cut += 1) {}
+        if (cut < self.used) cut += 1;
+        if (cut == 0 or cut > self.used) return;
+        try appendVaultBytes(self.bytes[0..cut]);
+        const remaining = self.used - cut;
+        std.mem.copyForwards(u8, self.bytes[0..remaining], self.bytes[cut..self.used]);
+        @memset(self.bytes[remaining..self.used], 0);
+        self.used = remaining;
     }
 };
 
@@ -107,19 +219,27 @@ const ResidentState = struct {
     loaded_shards: usize = 0,
     vram_resident_bytes: usize = 0,
     shards: std.ArrayList(ResidentShard),
+    session_hot: SessionHotShard,
+    archiver_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     fn init(allocator: std.mem.Allocator) !ResidentState {
         var state = ResidentState{
             .allocator = allocator,
             .shards = std.ArrayList(ResidentShard).init(allocator),
+            .session_hot = undefined,
         };
-        errdefer state.deinit();
 
         if (vsa_vulkan.initRuntime(allocator)) |vk| {
             state.vulkan = vk;
             state.vulkan_active = true;
         } else |_| {
             state.vulkan_active = false;
+        }
+        errdefer if (state.vulkan_active) vsa_vulkan.deinitRuntime();
+        state.session_hot = try SessionHotShard.init(allocator, state.vulkan);
+        errdefer state.session_hot.deinit(state.vulkan);
+        if (state.session_hot.vram_buffer.size_bytes != 0) {
+            state.vram_resident_bytes += state.session_hot.vram_buffer.size_bytes;
         }
 
         for (DEFAULT_RESIDENT_SHARDS) |shard_id| {
@@ -131,10 +251,18 @@ const ResidentState = struct {
     }
 
     fn deinit(self: *ResidentState) void {
+        self.session_hot.deinit(self.vulkan);
         for (self.shards.items) |*shard| shard.deinit(self.allocator, self.vulkan);
         self.shards.deinit();
         if (self.vulkan_active) vsa_vulkan.deinitRuntime();
         self.* = undefined;
+    }
+
+    fn archiverLoop(self: *ResidentState) void {
+        while (!self.archiver_stop.load(.acquire)) {
+            std.time.sleep(250 * std.time.ns_per_ms);
+            self.session_hot.flushOldestIfNeeded() catch {};
+        }
     }
 
     fn findShard(self: *const ResidentState, shard_id: []const u8) ?*const ResidentShard {
@@ -160,6 +288,8 @@ const ResidentState = struct {
             vram_buffer = try vk.createResidentBufferFromBytes(loaded.image.items);
             self.vram_resident_bytes += vram_buffer.size_bytes;
         }
+        const scan_entries = try buildCorpusScanEntries(self.allocator, entries, loaded.offsets);
+        errdefer self.allocator.free(scan_entries);
         try self.shards.append(.{
             .id = try self.allocator.dupe(u8, shard_id),
             .entries = entries,
@@ -167,6 +297,7 @@ const ResidentState = struct {
             .lower_texts = loaded.lower_texts,
             .offsets = loaded.offsets,
             .vram_buffer = vram_buffer,
+            .scan_entries = scan_entries,
         });
         loaded.disarm();
         self.loaded_shards += 1;
@@ -196,6 +327,62 @@ const LoadedShardImage = struct {
     }
 };
 
+fn buildCorpusScanEntries(
+    allocator: std.mem.Allocator,
+    entries: []const corpus_ingest.IndexedEntry,
+    offsets: []const usize,
+) ![]vsa_vulkan.CorpusScanEntry {
+    const out = try allocator.alloc(vsa_vulkan.CorpusScanEntry, entries.len);
+    errdefer allocator.free(out);
+    for (entries, 0..) |entry, idx| {
+        out[idx] = .{
+            .byte_offset = @intCast(@min(offsets[idx], std.math.maxInt(u32))),
+            .byte_len = @intCast(@min(entry.size_bytes, std.math.maxInt(u32))),
+            .search_hash_lo = @intCast(entry.search_sketch_hash & 0xFFFF_FFFF),
+            .search_hash_hi = @intCast(entry.search_sketch_hash >> 32),
+            .semantic_hash_lo = @intCast(entry.semantic_hash & 0xFFFF_FFFF),
+            .semantic_hash_hi = @intCast(entry.semantic_hash >> 32),
+            .flags = if (entry.search_sketch_features != 0) 1 else 0,
+            .reserved = 0,
+        };
+    }
+    return out;
+}
+
+fn tailTurns(bytes: []const u8, max_lines: usize) []const u8 {
+    if (bytes.len == 0 or max_lines == 0) return bytes[0..0];
+    var seen: usize = 0;
+    var idx = bytes.len;
+    while (idx > 0) {
+        idx -= 1;
+        if (bytes[idx] != '\n') continue;
+        seen += 1;
+        if (seen > max_lines) return bytes[idx + 1 ..];
+    }
+    return bytes;
+}
+
+fn appendVaultBytes(bytes: []const u8) !void {
+    if (std.posix.getenv("GHOST_HISTORY_GABS_PATH")) |path| {
+        if (std.fs.path.dirname(path)) |parent| try std.fs.cwd().makePath(parent);
+        var file = try std.fs.createFileAbsolute(path, .{ .read = true, .truncate = false });
+        defer file.close();
+        try file.seekFromEnd(0);
+        try file.writer().writeAll(bytes);
+        return;
+    }
+    const home = std.posix.getenv("HOME") orelse return error.HomeNotSet;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&path_buf, "{s}/.config/ghost/vault", .{home});
+    try std.fs.cwd().makePath(dir);
+    var file_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&file_path_buf, "{s}/history.gabs", .{dir});
+    var file = try std.fs.createFileAbsolute(path, .{ .read = true, .truncate = false });
+    defer file.close();
+    try file.seekFromEnd(0);
+    try file.writer().writeAll(bytes);
+}
+
 fn loadShardImage(allocator: std.mem.Allocator, entries: []const corpus_ingest.IndexedEntry) !LoadedShardImage {
     const texts = try allocator.alloc([]u8, entries.len);
     @memset(texts, &.{});
@@ -215,7 +402,7 @@ fn loadShardImage(allocator: std.mem.Allocator, entries: []const corpus_ingest.I
     errdefer image.deinit();
     for (entries, 0..) |entry, idx| {
         offsets[idx] = image.items.len;
-        const max_cpu_bytes: usize = @intCast(@min(entry.size_bytes, 64 * 1024));
+        const max_cpu_bytes: usize = @intCast(@min(entry.size_bytes, maxResidentSnippetBytes(entry)));
         var file = std.fs.openFileAbsolute(entry.abs_path, .{}) catch {
             texts[idx] = try allocator.alloc(u8, 0);
             lower_texts[idx] = try allocator.alloc(u8, 0);
@@ -236,7 +423,12 @@ fn loadShardImage(allocator: std.mem.Allocator, entries: []const corpus_ingest.I
     return .{ .texts = texts, .lower_texts = lower_texts, .offsets = offsets, .image = image };
 }
 
-fn serveConnection(allocator: std.mem.Allocator, resident: *const ResidentState, stream: std.net.Stream) !void {
+fn maxResidentSnippetBytes(entry: corpus_ingest.IndexedEntry) usize {
+    if (std.mem.eql(u8, entry.corpus_meta.source_label, "simple_wiki")) return 2 * 1024 * 1024;
+    return 64 * 1024;
+}
+
+fn serveConnection(allocator: std.mem.Allocator, resident: *ResidentState, stream: std.net.Stream) !void {
     const request = try readFrame(allocator, stream);
     defer allocator.free(request);
     const response = try dispatchFrame(allocator, resident, request);
@@ -244,7 +436,7 @@ fn serveConnection(allocator: std.mem.Allocator, resident: *const ResidentState,
     try writeFrame(stream, response);
 }
 
-fn dispatchFrame(allocator: std.mem.Allocator, resident: *const ResidentState, request: []const u8) ![]u8 {
+fn dispatchFrame(allocator: std.mem.Allocator, resident: *ResidentState, request: []const u8) ![]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, request, .{}) catch {
         return try allocator.dupe(u8, "{\"status\":\"rejected\",\"error\":{\"code\":\"json_contract_error\",\"message\":\"invalid JSON\"}}");
     };
@@ -257,13 +449,10 @@ fn dispatchFrame(allocator: std.mem.Allocator, resident: *const ResidentState, r
     const kind_text = jsonStringField(obj, "kind");
     if (kind_text) |kind| {
         if (std.mem.eql(u8, kind, "daemon.status")) {
-            return try std.fmt.allocPrint(
-                allocator,
-                "{{\"status\":\"ok\",\"daemon\":{{\"status\":\"running\",\"socketPath\":\"/tmp/ghost.sock\",\"residentShards\":{d},\"vramResidentBytes\":{d},\"deviceLocal\":{s}}}}}",
-                .{ resident.loaded_shards, resident.vram_resident_bytes, if (resident.vram_resident_bytes > 0) "true" else "false" },
-            );
+            return try renderDaemonStatus(allocator, resident);
         }
         if (std.mem.eql(u8, kind, "daemon.stop")) {
+            try resident.session_hot.flushAllToVault();
             stop_requested.store(true, .release);
             return try allocator.dupe(u8, "{\"status\":\"ok\",\"daemon\":{\"status\":\"stopping\"}}");
         }
@@ -301,7 +490,7 @@ const HotCandidate = struct {
     distance: u7,
 };
 
-fn dispatchResidentCorpusAsk(allocator: std.mem.Allocator, resident: *const ResidentState, obj: std.json.ObjectMap) !?[]u8 {
+fn dispatchResidentCorpusAsk(allocator: std.mem.Allocator, resident: *ResidentState, obj: std.json.ObjectMap) !?[]u8 {
     const question = jsonStringField(obj, "question") orelse jsonStringField(obj, "message") orelse return null;
     const shard_id = jsonStringField(obj, "projectShard") orelse jsonStringField(obj, "project_shard") orelse "english_core";
     const shard = resident.findShard(shard_id) orelse return null;
@@ -309,37 +498,76 @@ fn dispatchResidentCorpusAsk(allocator: std.mem.Allocator, resident: *const Resi
 
     var salience = try intent_grounding.analyzeSalience(allocator, question);
     defer salience.deinit(allocator);
-    const target = if (salience.semantic_target.len != 0) salience.semantic_target else question;
-    const terms = try collectTerms(allocator, target);
+    const target = question;
+    const context_target = try resident.session_hot.extractContextTarget(allocator);
+    defer allocator.free(context_target);
+    try resident.session_hot.appendTurn(resident.vulkan, "user", question);
+    const effective_target = try contextualScanTarget(allocator, target, context_target);
+    defer allocator.free(effective_target);
+
+    const terms = try collectTerms(allocator, effective_target);
     defer freeTerms(allocator, terms);
     if (terms.len == 0) return null;
-    const scoring_terms = if (terms.len > 2) terms[terms.len - 2 ..] else terms;
-    const query_hash = try corpus_sketch.simHash64Query(allocator, target);
+    const scoring_terms = chooseScoringTerms(terms, context_target);
+    const query_hash = try corpus_sketch.simHash64Query(allocator, effective_target);
+    const bias_hash = if (context_target.len != 0) try corpus_sketch.simHash64Query(allocator, context_target) else corpus_sketch.Sketch{ .hash = 0, .feature_count = 0 };
 
     var candidates = std.ArrayList(HotCandidate).init(allocator);
     defer candidates.deinit();
-    for (shard.entries, 0..) |entry, idx| {
-        var distance: u7 = 64;
-        if (query_hash.valid() and entry.search_sketch_features != 0) {
-            distance = @min(distance, vsa_vulkan.ghostIndexDistance(query_hash.hash, entry.search_sketch_hash));
+
+    var used_gpu_scan = false;
+    if (resident.vulkan) |vk| {
+        if (query_hash.valid() and shard.vram_buffer.buffer != null and shard.scan_entries.len != 0) {
+            if (vk.dispatchCorpusScan(
+                &shard.vram_buffer,
+                shard.scan_entries,
+                scoring_terms,
+                query_hash.hash,
+                if (bias_hash.valid()) bias_hash.hash else 0,
+                CONTEXT_BIAS_MULTIPLIER_PER_MILLE,
+            )) |scores| {
+                used_gpu_scan = true;
+                for (scores, 0..) |score, idx| {
+                    if (score < GPU_SCORE_FLOOR) continue;
+                    const entry = shard.entries[idx];
+                    var distance: u7 = 64;
+                    if (entry.search_sketch_features != 0) {
+                        distance = @min(distance, vsa_vulkan.ghostIndexDistance(query_hash.hash, entry.search_sketch_hash));
+                    }
+                    if (entry.semantic_hash != 0) {
+                        distance = @min(distance, vsa_vulkan.ghostIndexDistance(query_hash.hash, entry.semantic_hash));
+                    }
+                    try candidates.append(.{ .index = idx, .score = score, .distance = distance });
+                }
+            } else |_| {}
         }
-        if (entry.semantic_hash != 0) {
-            distance = @min(distance, vsa_vulkan.ghostIndexDistance(query_hash.hash, entry.semantic_hash));
+    }
+
+    if (!used_gpu_scan) {
+        for (shard.entries, 0..) |entry, idx| {
+            var distance: u7 = 64;
+            if (query_hash.valid() and entry.search_sketch_features != 0) {
+                distance = @min(distance, vsa_vulkan.ghostIndexDistance(query_hash.hash, entry.search_sketch_hash));
+            }
+            if (entry.semantic_hash != 0) {
+                distance = @min(distance, vsa_vulkan.ghostIndexDistance(query_hash.hash, entry.semantic_hash));
+            }
+            if (distance != 64 and corpus_sketch.similarityScore(distance) < vsa_vulkan.GHOST_INDEX_SKIP_THRESHOLD_PER_MILLE) continue;
+            if (scoring_terms.len > 1 and !allTermsPresent(shard.lower_texts[idx], scoring_terms)) continue;
+            const text_score = scoreCachedText(shard.lower_texts[idx], scoring_terms);
+            if (text_score == 0) continue;
+            const score = text_score + if (distance == 64) 0 else @as(u32, corpus_sketch.similarityScore(distance) / 10);
+            try candidates.append(.{ .index = idx, .score = score, .distance = distance });
         }
-        if (distance != 64 and corpus_sketch.similarityScore(distance) < vsa_vulkan.GHOST_INDEX_SKIP_THRESHOLD_PER_MILLE) continue;
-        if (scoring_terms.len > 1 and !allTermsPresent(shard.lower_texts[idx], scoring_terms)) continue;
-        const text_score = scoreCachedText(shard.lower_texts[idx], scoring_terms);
-        if (text_score == 0) continue;
-        const score = text_score + if (distance == 64) 0 else @as(u32, corpus_sketch.similarityScore(distance) / 10);
-        try candidates.append(.{ .index = idx, .score = score, .distance = distance });
     }
     if (candidates.items.len == 0) return null;
     std.mem.sort(HotCandidate, candidates.items, {}, hotCandidateLessThan);
     const requested_limit: usize = if (salience.density_multiplier <= 2) 2 else @intCast(@min(@as(u32, salience.density_multiplier), 4));
     const top = candidates.items[0..@min(requested_limit, candidates.items.len)];
 
-    const result_json = try renderHotCorpusResult(allocator, question, shard_id, shard, scoring_terms, top);
+    const result_json = try renderHotCorpusResult(allocator, question, shard_id, shard, scoring_terms, top, used_gpu_scan, context_target);
     defer allocator.free(result_json);
+    try resident.session_hot.appendTurn(resident.vulkan, "engine", topSessionText(shard, scoring_terms, top));
     var state = gip.schema.draftResultState();
     state.non_authorization_notice = "corpus.ask output is draft/non-authorizing; cited corpus evidence is not proof and no verifier was executed";
     return try gip.schema.renderResponse(
@@ -358,6 +586,37 @@ fn dispatchResidentCorpusAsk(allocator: std.mem.Allocator, resident: *const Resi
 fn hotCandidateLessThan(_: void, lhs: HotCandidate, rhs: HotCandidate) bool {
     if (lhs.score == rhs.score) return lhs.distance < rhs.distance;
     return lhs.score > rhs.score;
+}
+
+fn contextualScanTarget(allocator: std.mem.Allocator, target: []const u8, context_target: []const u8) ![]u8 {
+    if (context_target.len == 0 or !containsDeicticReference(target)) return allocator.dupe(u8, target);
+    return try std.fmt.allocPrint(allocator, "{s} {s}", .{ context_target, target });
+}
+
+fn containsDeicticReference(text: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, text, " \r\n\t,.:;!?()[]{}\"'");
+    while (it.next()) |raw| {
+        if (std.ascii.eqlIgnoreCase(raw, "it") or
+            std.ascii.eqlIgnoreCase(raw, "that") or
+            std.ascii.eqlIgnoreCase(raw, "this") or
+            std.ascii.eqlIgnoreCase(raw, "they") or
+            std.ascii.eqlIgnoreCase(raw, "them"))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn chooseScoringTerms(terms: []const []const u8, context_target: []const u8) []const []const u8 {
+    if (context_target.len != 0) return terms;
+    if (terms.len > 3) return terms[terms.len - 3 ..];
+    return terms;
+}
+
+fn topSessionText(shard: *const ResidentShard, terms: []const []const u8, candidates: []const HotCandidate) []const u8 {
+    if (candidates.len == 0) return "";
+    return snippetAroundTerms(shard.texts[candidates[0].index], terms, 512);
 }
 
 fn collectTerms(allocator: std.mem.Allocator, text: []const u8) ![][]u8 {
@@ -385,7 +644,24 @@ fn appendLowerTerm(allocator: std.mem.Allocator, out: *std.ArrayList([]u8), raw:
     const term = try allocator.alloc(u8, raw.len);
     errdefer allocator.free(term);
     for (raw, 0..) |byte, idx| term[idx] = std.ascii.toLower(byte);
+    if (isHotStopTerm(term)) {
+        allocator.free(term);
+        return;
+    }
     try out.append(term);
+}
+
+fn isHotStopTerm(term: []const u8) bool {
+    const words = [_][]const u8{
+        "what", "whats", "how",  "why",   "where", "when", "who",
+        "the",  "and",   "for",  "with",  "that",  "this", "does",
+        "did",  "are",   "was",  "were",  "have",  "has",  "had",
+        "its",  "into",  "from", "about",
+    };
+    for (words) |word| {
+        if (std.mem.eql(u8, term, word)) return true;
+    }
+    return false;
 }
 
 fn freeTerms(allocator: std.mem.Allocator, terms: [][]u8) void {
@@ -431,6 +707,8 @@ fn renderHotCorpusResult(
     shard: *const ResidentShard,
     terms: []const []const u8,
     candidates: []const HotCandidate,
+    gpu_scan: bool,
+    context_target: []const u8,
 ) ![]u8 {
     var out = std.ArrayList(u8).init(allocator);
     errdefer out.deinit();
@@ -446,7 +724,11 @@ fn renderHotCorpusResult(
         if (rank != 0) try w.writeByte(',');
         try writeHotEvidence(w, shard, terms, candidate, rank + 1);
     }
-    try w.writeAll("],\"unknowns\":[],\"candidateFollowups\":[{\"kind\":\"verifier_check_candidate\",\"detail\":\"review the cited corpus evidence before treating this answer as supported\",\"executes\":false}],\"learningCandidates\":[],\"trace\":{\"corpusMutation\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false,\"corpusEntriesConsidered\":");
+    try w.writeAll("],\"unknowns\":[],\"candidateFollowups\":[{\"kind\":\"verifier_check_candidate\",\"detail\":\"review the cited corpus evidence before treating this answer as supported\",\"executes\":false}],\"learningCandidates\":[],\"trace\":{\"corpusMutation\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false,\"residentGpuScan\":");
+    try w.writeAll(if (gpu_scan) "true" else "false");
+    try w.writeAll(",\"sessionHotQueriedFirst\":true,\"contextBiasMultiplier\":1.5,\"contextTarget\":");
+    try std.json.stringify(context_target, .{}, w);
+    try w.writeAll(",\"corpusEntriesConsidered\":");
     try w.print("{d}", .{shard.entries.len});
     try w.writeAll(",\"residentDaemon\":true}}}");
     return out.toOwnedSlice();
@@ -537,6 +819,21 @@ fn jsonStringField(obj: std.json.ObjectMap, field: []const u8) ?[]const u8 {
     return if (value == .string) value.string else null;
 }
 
+fn renderDaemonStatus(allocator: std.mem.Allocator, resident: *const ResidentState) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"status\":\"ok\",\"daemon\":{\"status\":\"running\",\"socketPath\":");
+    try std.json.stringify(socketPath(), .{}, w);
+    try w.print(",\"residentShards\":{d},\"vramResidentBytes\":{d},\"deviceLocal\":{s}", .{
+        resident.loaded_shards,
+        resident.vram_resident_bytes,
+        if (resident.vram_resident_bytes > 0) "true" else "false",
+    });
+    try w.writeAll("}}");
+    return out.toOwnedSlice();
+}
+
 fn readFrame(allocator: std.mem.Allocator, stream: std.net.Stream) ![]u8 {
     var len_buf: [4]u8 = undefined;
     try stream.reader().readNoEof(&len_buf);
@@ -557,21 +854,29 @@ fn writeFrame(stream: std.net.Stream, payload: []const u8) !void {
 }
 
 fn probeSocket() bool {
-    var stream = std.net.connectUnixSocket(SOCKET_PATH) catch return false;
+    var stream = std.net.connectUnixSocket(socketPath()) catch return false;
     stream.close();
     return true;
 }
 
 fn writePidFile() !void {
-    var file = try std.fs.createFileAbsolute(PID_PATH, .{ .truncate = true });
+    var file = try std.fs.createFileAbsolute(pidPath(), .{ .truncate = true });
     defer file.close();
     try file.writer().print("{d}\n", .{std.os.linux.getpid()});
 }
 
 fn printLocalStatus() !void {
     if (probeSocket()) {
-        try std.io.getStdOut().writer().print("ghostd active socket={s}\n", .{SOCKET_PATH});
+        try std.io.getStdOut().writer().print("ghostd active socket={s}\n", .{socketPath()});
     } else {
-        try std.io.getStdOut().writer().print("ghostd inactive socket={s}\n", .{SOCKET_PATH});
+        try std.io.getStdOut().writer().print("ghostd inactive socket={s}\n", .{socketPath()});
     }
+}
+
+fn socketPath() []const u8 {
+    return std.posix.getenv("GHOSTD_SOCKET_PATH") orelse DEFAULT_SOCKET_PATH;
+}
+
+fn pidPath() []const u8 {
+    return std.posix.getenv("GHOSTD_PID_PATH") orelse DEFAULT_PID_PATH;
 }

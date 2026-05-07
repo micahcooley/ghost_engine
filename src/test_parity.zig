@@ -7,6 +7,8 @@ const layer2a_gpu = @import("layer2a_gpu.zig");
 const vl = @import("vulkan_loader.zig");
 const vk = vl.vk;
 
+var vulkan_test_mutex = std.Thread.Mutex{};
+
 const GoldenPayload = extern struct {
     lexical: u64 = 0xDEADBEEFCAFEBABE,
     semantic: u64 = 0x8BADF00D0D15EA5E,
@@ -341,6 +343,9 @@ fn expectNeighborhoodScoresEqual(expected: []const layer2a_gpu.NeighborhoodScore
 
 test "single-rune CPU and GPU etch agree bit-for-bit" {
     const allocator = std.testing.allocator;
+    vulkan_test_mutex.lock();
+    defer vulkan_test_mutex.unlock();
+
     const payload = GoldenPayload{};
     var trace = try PhaseTrace.init("single-rune CPU and GPU etch agree bit-for-bit");
     defer trace.finish();
@@ -448,6 +453,9 @@ test "single-rune CPU and GPU etch agree bit-for-bit" {
 
 test "layer2a candidate scoring matches exact cpu reference" {
     const allocator = std.testing.allocator;
+    vulkan_test_mutex.lock();
+    defer vulkan_test_mutex.unlock();
+
     var trace = try PhaseTrace.init("layer2a candidate scoring matches exact cpu reference");
     defer trace.finish();
 
@@ -491,6 +499,9 @@ test "layer2a candidate scoring matches exact cpu reference" {
 
 test "layer2a neighborhood scoring matches exact cpu reference" {
     const allocator = std.testing.allocator;
+    vulkan_test_mutex.lock();
+    defer vulkan_test_mutex.unlock();
+
     var trace = try PhaseTrace.init("layer2a neighborhood scoring matches exact cpu reference");
     defer trace.finish();
 
@@ -534,6 +545,9 @@ test "layer2a neighborhood scoring matches exact cpu reference" {
 
 test "layer2a contradiction filtering matches exact cpu reference" {
     const allocator = std.testing.allocator;
+    vulkan_test_mutex.lock();
+    defer vulkan_test_mutex.unlock();
+
     var trace = try PhaseTrace.init("layer2a contradiction filtering matches exact cpu reference");
     defer trace.finish();
 

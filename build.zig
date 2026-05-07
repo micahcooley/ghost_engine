@@ -5,6 +5,7 @@ fn addCoreOptions(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     test_mode: bool,
+    corpus_scan_spv_path: []const u8,
 ) *std.Build.Step.Options {
     const arch = target.result.cpu.arch;
     const features = target.result.cpu.features;
@@ -20,6 +21,7 @@ fn addCoreOptions(
     core_options.addOption(bool, "test_mode", test_mode);
     core_options.addOption(bool, "use_avx2", is_x86_64 and std.Target.x86.featureSetHas(features, .avx2));
     core_options.addOption(bool, "use_neon", arch == .aarch64 or arch == .arm);
+    core_options.addOption([]const u8, "corpus_scan_spv_path", corpus_scan_spv_path);
     return core_options;
 }
 
@@ -30,7 +32,18 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const test_filter = b.option([]const u8, "test-filter", "Run only tests whose name contains this text");
     const test_filters: []const []const u8 = if (test_filter) |filter| &.{filter} else &.{};
-    const core_options = addCoreOptions(b, target, false);
+    const generated_shader_dir = b.pathFromRoot(".zig-cache/ghost_shaders");
+    const corpus_scan_spv_path = b.pathJoin(&.{ generated_shader_dir, "corpus_scan.spv" });
+    const mkdir_generated_shaders = b.addSystemCommand(&.{ "mkdir", "-p", generated_shader_dir });
+    const compile_corpus_scan_shader = b.addSystemCommand(&.{
+        "glslc",
+        b.pathFromRoot("src/shaders/corpus_scan.comp"),
+        "-o",
+        corpus_scan_spv_path,
+    });
+    compile_corpus_scan_shader.step.dependOn(&mkdir_generated_shaders.step);
+
+    const core_options = addCoreOptions(b, target, false, corpus_scan_spv_path);
 
     // ── 1. External Dependencies (Vulkan headers only) ──
     // NOTE: We do NOT link against vulkan-1.dll at build time.
@@ -79,6 +92,7 @@ pub fn build(b: *std.Build) void {
             os: std.Target.Os,
             sdk_opt: ?[]const u8,
             add_vulkan_includes: *const fn (*std.Build.Module, std.Target.Os, ?[]const u8, *std.Build) void,
+            shader_step: *std.Build.Step.Run,
         ) *std.Build.Step.Compile {
             const exe = builder.addExecutable(.{
                 .name = exe_name,
@@ -98,11 +112,12 @@ pub fn build(b: *std.Build) void {
             if (std.mem.eql(u8, exe_name, "ghost_sovereign") and os.tag == .windows) {
                 exe.root_module.linkSystemLibrary("ws2_32", .{});
             }
+            exe.step.dependOn(&shader_step.step);
             return exe;
         }
     }.add;
 
-    // ── 3. Shader SPIR-V (Pre-compiled, embedded via @embedFile) ──
+    // ── 3. Shader SPIR-V ──
     const shader_names = [_][]const u8{
         "resonance_query",
         "genesis_etch",
@@ -112,6 +127,7 @@ pub fn build(b: *std.Build) void {
         "candidate_score",
         "neighborhood_score",
         "contradiction_filter",
+        "semantic_hash",
     };
     for (shader_names) |name| {
         const spv_path = b.pathJoin(&.{ "src", "shaders", b.fmt("{s}.spv", .{name}) });
@@ -134,6 +150,7 @@ pub fn build(b: *std.Build) void {
         target.result.os,
         vulkan_sdk,
         addVulkanIncludes,
+        compile_corpus_scan_shader,
     );
     b.installArtifact(monolith);
 
@@ -166,6 +183,7 @@ pub fn build(b: *std.Build) void {
             target.result.os,
             vulkan_sdk,
             addVulkanIncludes,
+            compile_corpus_scan_shader,
         );
         b.installArtifact(exe);
     }
@@ -187,6 +205,7 @@ pub fn build(b: *std.Build) void {
         target.result.os,
         vulkan_sdk,
         addVulkanIncludes,
+        compile_corpus_scan_shader,
     );
     const compute_bench_exe = addGhostExecutable(
         b,
@@ -199,6 +218,7 @@ pub fn build(b: *std.Build) void {
         target.result.os,
         vulkan_sdk,
         addVulkanIncludes,
+        compile_corpus_scan_shader,
     );
     const run_compute_bench = b.addRunArtifact(compute_bench_exe);
     run_compute_bench.step.dependOn(b.getInstallStep());
@@ -239,7 +259,8 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = test_filters,
     });
-    const text_generation_lab_options = addCoreOptions(b, target, true);
+    text_generation_lab_tests.step.dependOn(&compile_corpus_scan_shader.step);
+    const text_generation_lab_options = addCoreOptions(b, target, true, corpus_scan_spv_path);
     text_generation_lab_tests.root_module.addOptions("build_options", text_generation_lab_options);
     text_generation_lab_tests.root_module.linkSystemLibrary("c", .{});
     if (target.result.os.tag == .linux) {
@@ -260,7 +281,8 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = test_filters,
     });
-    const test_core_options = addCoreOptions(b, target, true);
+    main_tests.step.dependOn(&compile_corpus_scan_shader.step);
+    const test_core_options = addCoreOptions(b, target, true, corpus_scan_spv_path);
     const ghost_core_test = b.createModule(.{
         .root_source_file = b.path("src/ghost.zig"),
     });
@@ -285,8 +307,7 @@ pub fn build(b: *std.Build) void {
     const test_smoke_step = b.step("test-smoke", "Run src/test_smoke.zig tests");
     test_smoke_step.dependOn(&run_main_tests.step);
     const test_step = b.step("test", "Run all tests");
-    test_step.dependOn(&run_main_tests.step);
-    test_step.dependOn(&run_text_generation_lab_tests.step);
+    run_text_generation_lab_tests.step.dependOn(&run_main_tests.step);
 
     const lifecycle_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -296,6 +317,7 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = test_filters,
     });
+    lifecycle_tests.step.dependOn(&compile_corpus_scan_shader.step);
     lifecycle_tests.root_module.addOptions("build_options", test_core_options);
     lifecycle_tests.root_module.linkSystemLibrary("c", .{});
     if (target.result.os.tag == .linux) {
@@ -303,9 +325,9 @@ pub fn build(b: *std.Build) void {
         lifecycle_tests.root_module.linkSystemLibrary("vulkan", .{});
     }
     const run_lifecycle_tests = b.addRunArtifact(lifecycle_tests);
+    run_lifecycle_tests.step.dependOn(&run_text_generation_lab_tests.step);
     const test_lifecycle_step = b.step("test-lifecycle", "Run src/test_verifier_lifecycle.zig tests");
     test_lifecycle_step.dependOn(&run_lifecycle_tests.step);
-    test_step.dependOn(&run_lifecycle_tests.step);
 
     const gip_cli_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -315,6 +337,7 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = test_filters,
     });
+    gip_cli_tests.step.dependOn(&compile_corpus_scan_shader.step);
     gip_cli_tests.root_module.addImport("ghost_core", ghost_core_test);
     gip_cli_tests.root_module.addOptions("build_options", test_core_options);
     gip_cli_tests.root_module.linkSystemLibrary("c", .{});
@@ -324,9 +347,9 @@ pub fn build(b: *std.Build) void {
     }
     addVulkanIncludes(gip_cli_tests.root_module, target.result.os, vulkan_sdk, b);
     const run_gip_cli_tests = b.addRunArtifact(gip_cli_tests);
+    run_gip_cli_tests.step.dependOn(&run_lifecycle_tests.step);
     const test_gip_cli_step = b.step("test-gip-cli", "Run src/gip_cli.zig tests");
     test_gip_cli_step.dependOn(&run_gip_cli_tests.step);
-    test_step.dependOn(&run_gip_cli_tests.step);
 
     const knowledge_pack_cli_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -336,6 +359,7 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = test_filters,
     });
+    knowledge_pack_cli_tests.step.dependOn(&compile_corpus_scan_shader.step);
     knowledge_pack_cli_tests.root_module.addOptions("build_options", test_core_options);
     knowledge_pack_cli_tests.root_module.linkSystemLibrary("c", .{});
     if (target.result.os.tag == .linux) {
@@ -344,9 +368,9 @@ pub fn build(b: *std.Build) void {
     }
     addVulkanIncludes(knowledge_pack_cli_tests.root_module, target.result.os, vulkan_sdk, b);
     const run_knowledge_pack_cli_tests = b.addRunArtifact(knowledge_pack_cli_tests);
+    run_knowledge_pack_cli_tests.step.dependOn(&run_gip_cli_tests.step);
     const test_knowledge_packs_step = b.step("test-knowledge-packs", "Run src/knowledge_packs.zig tests");
     test_knowledge_packs_step.dependOn(&run_knowledge_pack_cli_tests.step);
-    test_step.dependOn(&run_knowledge_pack_cli_tests.step);
 
     const project_autopsy_cli_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -356,6 +380,7 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = test_filters,
     });
+    project_autopsy_cli_tests.step.dependOn(&compile_corpus_scan_shader.step);
     project_autopsy_cli_tests.root_module.addImport("ghost_core", ghost_core_test);
     project_autopsy_cli_tests.root_module.addOptions("build_options", test_core_options);
     project_autopsy_cli_tests.root_module.linkSystemLibrary("c", .{});
@@ -365,9 +390,9 @@ pub fn build(b: *std.Build) void {
     }
     addVulkanIncludes(project_autopsy_cli_tests.root_module, target.result.os, vulkan_sdk, b);
     const run_project_autopsy_cli_tests = b.addRunArtifact(project_autopsy_cli_tests);
+    run_project_autopsy_cli_tests.step.dependOn(&run_knowledge_pack_cli_tests.step);
     const test_project_autopsy_step = b.step("test-project-autopsy-cli", "Run src/project_autopsy_cli.zig tests");
     test_project_autopsy_step.dependOn(&run_project_autopsy_cli_tests.step);
-    test_step.dependOn(&run_project_autopsy_cli_tests.step);
 
     const compute_dominance_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -377,6 +402,7 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = test_filters,
     });
+    compute_dominance_tests.step.dependOn(&compile_corpus_scan_shader.step);
     compute_dominance_tests.root_module.addImport("ghost_core", ghost_core_test);
     compute_dominance_tests.root_module.addOptions("build_options", test_core_options);
     compute_dominance_tests.root_module.linkSystemLibrary("c", .{});
@@ -386,6 +412,7 @@ pub fn build(b: *std.Build) void {
     }
     addVulkanIncludes(compute_dominance_tests.root_module, target.result.os, vulkan_sdk, b);
     const run_compute_dominance_tests = b.addRunArtifact(compute_dominance_tests);
+    run_compute_dominance_tests.step.dependOn(&run_project_autopsy_cli_tests.step);
     const test_compute_dominance_step = b.step("test-compute-dominance", "Run src/bench_compute_dominance.zig tests");
     test_compute_dominance_step.dependOn(&run_compute_dominance_tests.step);
     test_step.dependOn(&run_compute_dominance_tests.step);
@@ -402,6 +429,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
+    parity_test.step.dependOn(&compile_corpus_scan_shader.step);
     parity_test.root_module.addImport("ghost_core", ghost_core);
     parity_test.root_module.addOptions("build_options", core_options);
     parity_test.root_module.linkSystemLibrary("c", .{});
@@ -430,6 +458,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
         }),
     });
+    release_exe.step.dependOn(&compile_corpus_scan_shader.step);
     release_exe.root_module.addImport("ghost_core", ghost_core);
     release_exe.root_module.addOptions("build_options", core_options);
     release_exe.root_module.linkSystemLibrary("c", .{});
@@ -457,6 +486,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    unicode_probe.step.dependOn(&compile_corpus_scan_shader.step);
     unicode_probe.root_module.addImport("ghost_core", ghost_core);
     unicode_probe.root_module.linkSystemLibrary("c", .{});
     if (target.result.os.tag == .linux) {
@@ -475,6 +505,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    seed_exe.step.dependOn(&compile_corpus_scan_shader.step);
     seed_exe.root_module.addImport("ghost_core", ghost_core);
     seed_exe.root_module.linkSystemLibrary("c", .{});
     if (target.result.os.tag == .linux) {
@@ -492,6 +523,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    corpus_exe.step.dependOn(&compile_corpus_scan_shader.step);
     corpus_exe.root_module.addImport("ghost_core", ghost_core);
     corpus_exe.root_module.linkSystemLibrary("c", .{});
     if (target.result.os.tag == .linux) {

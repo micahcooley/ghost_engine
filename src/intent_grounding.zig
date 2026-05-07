@@ -531,6 +531,87 @@ pub fn analyzeSalience(allocator: std.mem.Allocator, input: []const u8) !Salienc
     };
 }
 
+pub fn extractPrimarySemanticTargetFromText(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var best = std.ArrayList(u8).init(allocator);
+    errdefer best.deinit();
+
+    var it = std.mem.splitScalar(u8, input, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \r\n\t");
+        if (trimmed.len == 0) continue;
+        if (!std.ascii.startsWithIgnoreCase(trimmed, "user:")) continue;
+        var payload = trimmed;
+        if (std.mem.indexOfScalar(u8, trimmed, ':')) |colon| {
+            payload = std.mem.trim(u8, trimmed[colon + 1 ..], " \r\n\t");
+        }
+        if (payload.len == 0 or isDeicticOnly(payload)) continue;
+        if (try recentContextPhrase(allocator, payload)) |phrase| {
+            defer allocator.free(phrase);
+            best.clearRetainingCapacity();
+            try best.appendSlice(phrase);
+            continue;
+        }
+        var salience = try analyzeSalience(allocator, payload);
+        defer salience.deinit(allocator);
+        const target = if (salience.semantic_target.len != 0) salience.semantic_target else payload;
+        if (target.len == 0 or isDeicticOnly(target)) continue;
+        best.clearRetainingCapacity();
+        try best.appendSlice(target);
+    }
+    return best.toOwnedSlice();
+}
+
+fn isDeicticOnly(text: []const u8) bool {
+    var meaningful: usize = 0;
+    var deictic: usize = 0;
+    var it = std.mem.tokenizeAny(u8, text, " \r\n\t,.:;!?()[]{}\"'");
+    while (it.next()) |token| {
+        if (token.len <= 2 and !std.ascii.eqlIgnoreCase(token, "it")) continue;
+        meaningful += 1;
+        if (std.ascii.eqlIgnoreCase(token, "it") or
+            std.ascii.eqlIgnoreCase(token, "that") or
+            std.ascii.eqlIgnoreCase(token, "this") or
+            std.ascii.eqlIgnoreCase(token, "they") or
+            std.ascii.eqlIgnoreCase(token, "them"))
+        {
+            deictic += 1;
+        }
+    }
+    return meaningful != 0 and meaningful == deictic;
+}
+
+fn recentContextPhrase(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
+    var tokens = std.ArrayList([]const u8).init(allocator);
+    defer tokens.deinit();
+    var it = std.mem.tokenizeAny(u8, text, " \r\n\t,.:;!?()[]{}\"'");
+    while (it.next()) |token| {
+        if (token.len < 3 or isContextStopToken(token)) continue;
+        try tokens.append(token);
+    }
+    if (tokens.items.len == 0) return null;
+    const start = if (tokens.items.len >= 2) tokens.items.len - 2 else 0;
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    for (tokens.items[start..], 0..) |token, idx| {
+        if (idx != 0) try out.append(' ');
+        for (token) |byte| try out.append(std.ascii.toLower(byte));
+    }
+    return try out.toOwnedSlice();
+}
+
+fn isContextStopToken(token: []const u8) bool {
+    const words = [_][]const u8{
+        "what", "whats", "how",  "why",   "where", "when", "who",
+        "the",  "and",   "for",  "with",  "that",  "this", "does",
+        "did",  "are",   "was",  "were",  "have",  "has",  "had",
+        "its",  "into",  "from", "about",
+    };
+    for (words) |word| {
+        if (std.ascii.eqlIgnoreCase(token, word)) return true;
+    }
+    return false;
+}
+
 const SemanticWindow = struct {
     start: usize,
     end: usize,
@@ -671,7 +752,8 @@ fn joinSelectedSalienceRunes(allocator: std.mem.Allocator, runes: []const Salien
 
 fn densityMultiplier(noise_count: usize, avg_noise: u16) u8 {
     if (noise_count == 0) return 1;
-    const raw = 1 + @min(@as(usize, 7), (noise_count + 1) / 2 + @as(usize, avg_noise) / 350);
+    const count_component = noise_count / 2 + @min(noise_count % 2, 1);
+    const raw = 1 + @min(@as(usize, 7), count_component + @as(usize, avg_noise) / 350);
     return @intCast(@min(@as(usize, 8), raw));
 }
 

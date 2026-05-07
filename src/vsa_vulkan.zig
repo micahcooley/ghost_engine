@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const vl = @import("vulkan_loader.zig");
 const vk = vl.vk; // Types & constants only — no link-time dependency
 const builtin = @import("builtin");
@@ -17,6 +18,10 @@ pub const LAYER2A_MAX_CANDIDATES = config.BEAM_NUM_LANES;
 pub const LAYER2A_NO_WINNER: u32 = 0xFFFFFFFF;
 pub const GHOST_INDEX_BLOCK_BYTES: usize = 1024 * 1024;
 pub const GHOST_INDEX_SKIP_THRESHOLD_PER_MILLE: u16 = 100;
+pub const CORPUS_SCAN_MAX_ENTRIES: usize = 65_536;
+pub const CORPUS_SCAN_MAX_TERMS: usize = 4;
+pub const CORPUS_SCAN_TERM_BYTES: usize = 16;
+const DESCRIPTOR_BINDING_COUNT: u32 = 14;
 const FENCE_TIMEOUT_NS: u64 = 2_000_000_000;
 const SHUTDOWN_FENCE_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
 const VALIDATION_LAYER_NAME: [*:0]const u8 = "VK_LAYER_KHRONOS_validation";
@@ -136,6 +141,17 @@ pub const ResidentBuffer = struct {
     memory: vk.VkDeviceMemory = null,
     size_bytes: usize = 0,
     device_local: bool = false,
+};
+
+pub const CorpusScanEntry = extern struct {
+    byte_offset: u32 = 0,
+    byte_len: u32 = 0,
+    search_hash_lo: u32 = 0,
+    search_hash_hi: u32 = 0,
+    semantic_hash_lo: u32 = 0,
+    semantic_hash_hi: u32 = 0,
+    flags: u32 = 0,
+    reserved: u32 = 0,
 };
 
 pub fn buildGhostIndex(allocator: std.mem.Allocator, bytes: []const u8) ![]GhostIndexBlock {
@@ -533,6 +549,7 @@ pub const VulkanEngine = struct {
     neighborhood_score_pipeline: vk.VkPipeline = null,
     contradiction_filter_pipeline: vk.VkPipeline = null,
     semantic_hash_pipeline: vk.VkPipeline = null,
+    corpus_scan_pipeline: vk.VkPipeline = null,
     etch_pipeline: vk.VkPipeline = null,
     prune_pipeline: vk.VkPipeline = null,
     lookahead_pipeline: vk.VkPipeline = null,
@@ -619,6 +636,10 @@ pub const VulkanEngine = struct {
     energy_buffers: [FRAME_COUNT]vk.VkBuffer = [_]vk.VkBuffer{null} ** FRAME_COUNT,
     energy_memories: [FRAME_COUNT]vk.VkDeviceMemory = [_]vk.VkDeviceMemory{null} ** FRAME_COUNT,
     mapped_energy: [FRAME_COUNT]?[*]u32 = [_]?[*]u32{null} ** FRAME_COUNT,
+
+    corpus_entry_buffers: [FRAME_COUNT]vk.VkBuffer = [_]vk.VkBuffer{null} ** FRAME_COUNT,
+    corpus_entry_memories: [FRAME_COUNT]vk.VkDeviceMemory = [_]vk.VkDeviceMemory{null} ** FRAME_COUNT,
+    mapped_corpus_entries: [FRAME_COUNT]?[*]CorpusScanEntry = [_]?[*]CorpusScanEntry{null} ** FRAME_COUNT,
 
     config_buffers: [FRAME_COUNT]vk.VkBuffer = [_]vk.VkBuffer{null} ** FRAME_COUNT,
     config_memories: [FRAME_COUNT]vk.VkDeviceMemory = [_]vk.VkDeviceMemory{null} ** FRAME_COUNT,
@@ -954,6 +975,7 @@ pub const VulkanEngine = struct {
             self.mapped_chars[i] = @ptrCast(@alignCast(try self.createBuffer(config.MAX_STREAMS * 4, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, self.batch_flags, &self.char_buffers[i], &self.char_memories[i]) orelse return error.VulkanError));
             self.mapped_index[i] = @ptrCast(@alignCast(try self.createBuffer(config.MAX_STREAMS * 4, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, self.batch_flags, &self.index_buffers[i], &self.index_memories[i]) orelse return error.VulkanError));
             self.mapped_energy[i] = @ptrCast(@alignCast(try self.createBuffer(65536 * 4, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, self.batch_flags, &self.energy_buffers[i], &self.energy_memories[i]) orelse return error.VulkanError));
+            self.mapped_corpus_entries[i] = @ptrCast(@alignCast(try self.createBuffer(CORPUS_SCAN_MAX_ENTRIES * @sizeOf(CorpusScanEntry), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, self.batch_flags, &self.corpus_entry_buffers[i], &self.corpus_entry_memories[i]) orelse return error.VulkanError));
             self.mapped_config[i] = @ptrCast(@alignCast(try self.createBuffer(@sizeOf(EngineConfig), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, self.batch_flags, &self.config_buffers[i], &self.config_memories[i]) orelse return error.VulkanError));
         }
 
@@ -1013,9 +1035,9 @@ pub const VulkanEngine = struct {
     fn setupPipelines(self: *VulkanEngine) !void {
         var pcRange = std.mem.zeroes(vk.VkPushConstantRange);
         pcRange.stageFlags = vk.VK_SHADER_STAGE_COMPUTE_BIT;
-        pcRange.size = 16;
+        pcRange.size = 64;
 
-        var bindings = [_]vk.VkDescriptorSetLayoutBinding{std.mem.zeroes(vk.VkDescriptorSetLayoutBinding)} ** 12;
+        var bindings = [_]vk.VkDescriptorSetLayoutBinding{std.mem.zeroes(vk.VkDescriptorSetLayoutBinding)} ** DESCRIPTOR_BINDING_COUNT;
         for (&bindings, 0..) |*b, i| {
             b.binding = @intCast(i);
             b.descriptorType = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -1025,7 +1047,7 @@ pub const VulkanEngine = struct {
 
         var dslCreateInfo = std.mem.zeroes(vk.VkDescriptorSetLayoutCreateInfo);
         dslCreateInfo.sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        dslCreateInfo.bindingCount = 12;
+        dslCreateInfo.bindingCount = DESCRIPTOR_BINDING_COUNT;
         dslCreateInfo.pBindings = &bindings[0];
         try check(self.vk_ctx.vkCreateDescriptorSetLayout.?(self.dev, &dslCreateInfo, null, &self.descriptor_set_layout));
 
@@ -1042,6 +1064,9 @@ pub const VulkanEngine = struct {
         self.neighborhood_score_pipeline = try self.createComputePipeline(@embedFile("shaders/neighborhood_score.spv"), null);
         self.contradiction_filter_pipeline = try self.createComputePipeline(@embedFile("shaders/contradiction_filter.spv"), null);
         self.semantic_hash_pipeline = try self.createComputePipeline(@embedFile("shaders/semantic_hash.spv"), null);
+        const corpus_scan_spv = try std.fs.cwd().readFileAlloc(self.allocator, build_options.corpus_scan_spv_path, 1024 * 1024);
+        defer self.allocator.free(corpus_scan_spv);
+        self.corpus_scan_pipeline = try self.createComputePipeline(corpus_scan_spv, null);
 
         var etch_wg_size: u32 = @min(1024, self.max_workgroup_invocations);
         var spec_map = vk.VkSpecializationMapEntry{ .constantID = 0, .offset = 0, .size = @sizeOf(u32) };
@@ -1057,7 +1082,7 @@ pub const VulkanEngine = struct {
     }
 
     fn updateDescriptorSets(self: *VulkanEngine, f: u32) void {
-        var info = [_]vk.VkDescriptorBufferInfo{std.mem.zeroes(vk.VkDescriptorBufferInfo)} ** 13;
+        var info = [_]vk.VkDescriptorBufferInfo{std.mem.zeroes(vk.VkDescriptorBufferInfo)} ** DESCRIPTOR_BINDING_COUNT;
         info[0] = .{ .buffer = self.matrix_buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE };
         info[1] = .{ .buffer = self.rotor_buffers[f], .offset = 0, .range = vk.VK_WHOLE_SIZE };
         info[2] = .{ .buffer = self.char_buffers[f], .offset = 0, .range = vk.VK_WHOLE_SIZE };
@@ -1071,12 +1096,13 @@ pub const VulkanEngine = struct {
         info[10] = .{ .buffer = self.config_buffers[f], .offset = 0, .range = vk.VK_WHOLE_SIZE };
         info[11] = .{ .buffer = self.lock_mask_buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE };
         info[12] = .{ .buffer = self.general_ingest_buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE };
+        info[13] = .{ .buffer = self.corpus_entry_buffers[f], .offset = 0, .range = vk.VK_WHOLE_SIZE };
 
         var write = std.mem.zeroes(vk.VkWriteDescriptorSet);
         write.sType = vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         write.dstSet = self.descriptor_sets[f];
         write.dstBinding = 0;
-        write.descriptorCount = 13;
+        write.descriptorCount = DESCRIPTOR_BINDING_COUNT;
         write.descriptorType = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         write.pBufferInfo = &info[0];
         self.vk_ctx.vkUpdateDescriptorSets.?(self.dev, 1, &write, 0, null);
@@ -1110,7 +1136,7 @@ pub const VulkanEngine = struct {
     fn setupDescriptorPool(self: *VulkanEngine) !void {
         var poolSize = std.mem.zeroes(vk.VkDescriptorPoolSize);
         poolSize.type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        poolSize.descriptorCount = 12 * (FRAME_COUNT + INF_LANE_COUNT);
+        poolSize.descriptorCount = DESCRIPTOR_BINDING_COUNT * (FRAME_COUNT + INF_LANE_COUNT);
         var dpCreateInfo = std.mem.zeroes(vk.VkDescriptorPoolCreateInfo);
         dpCreateInfo.sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         dpCreateInfo.poolSizeCount = 1;
@@ -1278,6 +1304,92 @@ pub const VulkanEngine = struct {
         return resident;
     }
 
+    pub fn createResidentBufferSize(self: *VulkanEngine, size: usize) !ResidentBuffer {
+        if (size == 0) return .{};
+        var resident = ResidentBuffer{
+            .size_bytes = size,
+            .device_local = true,
+        };
+        errdefer self.destroyResidentBuffer(&resident);
+        _ = try self.createBuffer(
+            size,
+            vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            &resident.buffer,
+            &resident.memory,
+        );
+        return resident;
+    }
+
+    pub fn uploadResidentBufferBytes(self: *VulkanEngine, resident: *const ResidentBuffer, offset: usize, bytes: []const u8) !void {
+        if (bytes.len == 0) return;
+        if (resident.buffer == null or offset > resident.size_bytes or bytes.len > resident.size_bytes - offset) return error.ResidentUploadOutOfBounds;
+
+        beginGpuSubmit(self);
+        defer endGpuSubmit(self);
+
+        self.dispatch_mutex.lock();
+        defer self.dispatch_mutex.unlock();
+
+        var staging_buffer: vk.VkBuffer = null;
+        var staging_memory: vk.VkDeviceMemory = null;
+        const staging_ptr = try self.createBuffer(
+            bytes.len,
+            vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            &staging_buffer,
+            &staging_memory,
+        ) orelse return error.VulkanError;
+        defer self.destroyBuffer(&staging_buffer, &staging_memory, staging_ptr);
+
+        const staging_bytes: [*]u8 = @ptrCast(staging_ptr);
+        @memcpy(staging_bytes[0..bytes.len], bytes);
+
+        const f = try self.acquireFrameSlot();
+        var beginInfo = std.mem.zeroes(vk.VkCommandBufferBeginInfo);
+        beginInfo.sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        try check(self.vk_ctx.vkBeginCommandBuffer.?(self.command_buffers[f], &beginInfo));
+
+        var region = std.mem.zeroes(vk.VkBufferCopy);
+        region.srcOffset = 0;
+        region.dstOffset = offset;
+        region.size = bytes.len;
+        self.vk_ctx.vkCmdCopyBuffer.?(self.command_buffers[f], staging_buffer, resident.buffer, 1, &region);
+
+        var barrier = std.mem.zeroes(vk.VkBufferMemoryBarrier);
+        barrier.sType = vk.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        barrier.srcAccessMask = vk.VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = vk.VK_ACCESS_SHADER_READ_BIT;
+        barrier.srcQueueFamilyIndex = vk.VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = vk.VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = resident.buffer;
+        barrier.offset = offset;
+        barrier.size = bytes.len;
+        self.vk_ctx.vkCmdPipelineBarrier.?(
+            self.command_buffers[f],
+            vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
+            vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0,
+            0,
+            null,
+            1,
+            &barrier,
+            0,
+            null,
+        );
+
+        try check(self.vk_ctx.vkEndCommandBuffer.?(self.command_buffers[f]));
+
+        var submitInfo = std.mem.zeroes(vk.VkSubmitInfo);
+        submitInfo.sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &self.command_buffers[f];
+        try check(self.vk_ctx.vkQueueSubmit.?(self.queue, 1, &submitInfo, self.fences[f]));
+        self.advanceFrameSlot();
+        try self.waitForHardwareInterrupt(f);
+    }
+
     pub fn destroyResidentBuffer(self: *const VulkanEngine, resident: *ResidentBuffer) void {
         self.destroyBuffer(&resident.buffer, &resident.memory, null);
         resident.* = .{};
@@ -1318,6 +1430,7 @@ pub const VulkanEngine = struct {
             self.destroyBuffer(&self.char_buffers[i], &self.char_memories[i], self.mapped_chars[i]);
             self.destroyBuffer(&self.index_buffers[i], &self.index_memories[i], self.mapped_index[i]);
             self.destroyBuffer(&self.energy_buffers[i], &self.energy_memories[i], self.mapped_energy[i]);
+            self.destroyBuffer(&self.corpus_entry_buffers[i], &self.corpus_entry_memories[i], self.mapped_corpus_entries[i]);
             self.destroyBuffer(&self.config_buffers[i], &self.config_memories[i], self.mapped_config[i]);
         }
 
@@ -1340,6 +1453,7 @@ pub const VulkanEngine = struct {
             &self.neighborhood_score_pipeline,
             &self.contradiction_filter_pipeline,
             &self.semantic_hash_pipeline,
+            &self.corpus_scan_pipeline,
             &self.lattice_pipeline,
         };
         for (pipelines) |p| if (p.* != null) self.vk_ctx.vkDestroyPipeline.?(self.dev, p.*, null);
@@ -1690,6 +1804,100 @@ pub const VulkanEngine = struct {
         const word_count = block_seeds.len * 2;
         ghostCopy(u32, self.result_buffer[0..word_count], self.mapped_energy[f].?[0..word_count]);
         return self.result_buffer[0..word_count];
+    }
+
+    pub fn dispatchCorpusScan(
+        self: *VulkanEngine,
+        resident: *const ResidentBuffer,
+        entries: []const CorpusScanEntry,
+        terms: []const []const u8,
+        query_hash: u64,
+        bias_hash: u64,
+        bias_multiplier_per_mille: u32,
+    ) ![]const u32 {
+        // GPU corpus scan ranks resident shard entries by deterministic
+        // SimHash resonance. CPU callers may render snippets and enforce
+        // policy, but should not perform the hot full-shard scoring loop.
+        beginGpuSubmit(self);
+        defer endGpuSubmit(self);
+
+        if (resident.buffer == null or resident.size_bytes == 0) return error.EmptyResidentCorpus;
+        if (entries.len == 0) return self.result_buffer[0..0];
+        if (entries.len > CORPUS_SCAN_MAX_ENTRIES) return error.TooManyCorpusEntries;
+        if (entries.len > self.result_buffer.len) return error.TooManyCorpusEntries;
+
+        self.dispatch_mutex.lock();
+        defer self.dispatch_mutex.unlock();
+
+        const f = try self.acquireFrameSlot();
+        ghostCopy(CorpusScanEntry, self.mapped_corpus_entries[f].?[0..entries.len], entries);
+        var term_lens = [_]u32{0} ** CORPUS_SCAN_MAX_TERMS;
+        const query_word_count = (CORPUS_SCAN_MAX_TERMS * CORPUS_SCAN_TERM_BYTES + @sizeOf(u64) - 1) / @sizeOf(u64);
+        const query_bytes = std.mem.sliceAsBytes(self.mapped_rotors[f].?[0..query_word_count]);
+        @memset(query_bytes, 0);
+        const packed_terms = @min(terms.len, CORPUS_SCAN_MAX_TERMS);
+        for (terms[0..packed_terms], 0..) |term, term_idx| {
+            const len = @min(term.len, CORPUS_SCAN_TERM_BYTES);
+            term_lens[term_idx] = @intCast(len);
+            @memcpy(query_bytes[term_idx * CORPUS_SCAN_TERM_BYTES .. term_idx * CORPUS_SCAN_TERM_BYTES + len], term[0..len]);
+        }
+        self.mapped_config[f].?.* = .{ .rotor_stride = 0, .rotor_offset = 0, .batch_size = @intCast(entries.len) };
+
+        var corpus_info = std.mem.zeroes(vk.VkDescriptorBufferInfo);
+        corpus_info.buffer = resident.buffer;
+        corpus_info.offset = 0;
+        corpus_info.range = resident.size_bytes;
+
+        var corpus_write = std.mem.zeroes(vk.VkWriteDescriptorSet);
+        corpus_write.sType = vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        corpus_write.dstSet = self.descriptor_sets[f];
+        corpus_write.dstBinding = 12;
+        corpus_write.descriptorCount = 1;
+        corpus_write.descriptorType = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        corpus_write.pBufferInfo = &corpus_info;
+        self.vk_ctx.vkUpdateDescriptorSets.?(self.dev, 1, &corpus_write, 0, null);
+
+        var beginInfo = std.mem.zeroes(vk.VkCommandBufferBeginInfo);
+        beginInfo.sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        try check(self.vk_ctx.vkBeginCommandBuffer.?(self.command_buffers[f], &beginInfo));
+
+        self.vk_ctx.vkCmdBindPipeline.?(self.command_buffers[f], vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.corpus_scan_pipeline);
+        self.vk_ctx.vkCmdBindDescriptorSets.?(self.command_buffers[f], vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &self.descriptor_sets[f], 0, null);
+        const pc = [_]u32{
+            @intCast(entries.len),
+            bias_multiplier_per_mille,
+            @intCast(query_hash & 0xFFFF_FFFF),
+            @intCast(query_hash >> 32),
+            @intCast(bias_hash & 0xFFFF_FFFF),
+            @intCast(bias_hash >> 32),
+            @intCast(@min(resident.size_bytes, std.math.maxInt(u32))),
+            @intCast(packed_terms),
+            term_lens[0],
+            term_lens[1],
+            term_lens[2],
+            term_lens[3],
+            0,
+            0,
+            0,
+            0,
+        };
+        self.vk_ctx.vkCmdPushConstants.?(self.command_buffers[f], self.pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, 64, &pc);
+
+        const wg_size: u32 = 64;
+        self.vk_ctx.vkCmdDispatch.?(self.command_buffers[f], (@as(u32, @intCast(entries.len)) + (wg_size - 1)) / wg_size, 1, 1);
+        try check(self.vk_ctx.vkEndCommandBuffer.?(self.command_buffers[f]));
+
+        var submitInfo = std.mem.zeroes(vk.VkSubmitInfo);
+        submitInfo.sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &self.command_buffers[f];
+        try check(self.vk_ctx.vkQueueSubmit.?(self.queue, 1, &submitInfo, self.fences[f]));
+        self.advanceFrameSlot();
+        try self.waitForHardwareInterrupt(f);
+
+        ghostCopy(u32, self.result_buffer[0..entries.len], self.mapped_energy[f].?[0..entries.len]);
+        self.updateDescriptorSets(@intCast(f));
+        return self.result_buffer[0..entries.len];
     }
 
     pub fn dispatchEtch(self: *VulkanEngine, batch_size: u32) !void {
