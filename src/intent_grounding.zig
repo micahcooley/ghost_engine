@@ -1,6 +1,7 @@
 const std = @import("std");
 const task_intent = @import("task_intent.zig");
 const artifact_schema = @import("artifact_schema.zig");
+const vsa_vulkan = @import("vsa_vulkan.zig");
 
 // ──────────────────────────────────────────────────────────────────────────
 // Intent Grounding v2
@@ -518,7 +519,10 @@ pub fn analyzeSalience(allocator: std.mem.Allocator, input: []const u8) !Salienc
     }
 
     scoreSalienceRunes(runes.items);
-    const window = chooseSemanticWindow(runes.items);
+    const window = if (isDefinitionContentQuery(input))
+        chooseResonantContentWindow(runes.items) orelse chooseSemanticWindow(runes.items)
+    else
+        chooseSemanticWindow(runes.items);
     var target_score_total: usize = 0;
     var noise_score_total: usize = 0;
     var target_count: usize = 0;
@@ -562,6 +566,19 @@ const PositionalRune = struct {
 pub fn analyzeImperativeIntent(allocator: std.mem.Allocator, input: []const u8) !ImperativeIntent {
     const trimmed = std.mem.trim(u8, input, " \r\n\t");
     if (trimmed.len == 0 or std.mem.indexOfScalar(u8, trimmed, '?') != null) return .{};
+    if (startsWithQuestionRune(trimmed)) return .{};
+    if (isDefinitionContentQuery(trimmed)) return .{};
+
+    const global_match = vsa_vulkan.globalRuneMatch(trimmed);
+    if (global_match.commandOverridesTokenizer()) {
+        return .{
+            .detected = true,
+            .target_kind = .exact,
+            .target = try allocator.dupe(u8, global_match.command_target),
+            .strict_output = true,
+            .positional_score = global_match.command.score_per_mille,
+        };
+    }
 
     var runes = std.ArrayList(PositionalRune).init(allocator);
     defer runes.deinit();
@@ -628,6 +645,9 @@ pub fn analyzeImperativeIntent(allocator: std.mem.Allocator, input: []const u8) 
 }
 
 pub fn lacksSemanticTarget(input: []const u8) bool {
+    if (isLightSocialPrompt(input)) return false;
+    if (isDefinitionContentQuery(input) and vsa_vulkan.globalRuneMatch(input).contentOverridesEntropy()) return false;
+
     var meaningful_runes: usize = 0;
     var start: ?usize = null;
     var idx: usize = 0;
@@ -645,6 +665,27 @@ pub fn lacksSemanticTarget(input: []const u8) bool {
         }
     }
     return meaningful_runes == 0;
+}
+
+pub fn isLightSocialPrompt(input: []const u8) bool {
+    const trimmed = std.mem.trim(u8, input, " \r\n\t,.:;!?");
+    if (trimmed.len == 0) return false;
+    var token_count: usize = 0;
+    var social_count: usize = 0;
+    var it = std.mem.tokenizeAny(u8, trimmed, " \r\n\t,.:;!?()[]{}\"'");
+    while (it.next()) |token| {
+        token_count += 1;
+        if (std.ascii.eqlIgnoreCase(token, "hi") or
+            std.ascii.eqlIgnoreCase(token, "hello") or
+            std.ascii.eqlIgnoreCase(token, "hey") or
+            std.ascii.eqlIgnoreCase(token, "yo") or
+            std.ascii.eqlIgnoreCase(token, "thanks") or
+            std.ascii.eqlIgnoreCase(token, "morning"))
+        {
+            social_count += 1;
+        }
+    }
+    return token_count != 0 and token_count == social_count;
 }
 
 fn isSemanticSignalRune(token: []const u8) bool {
@@ -975,6 +1016,30 @@ fn scoreSalienceRunes(runes: []SalienceRune) void {
         rune.semantic_score = @intCast(@min(@as(usize, 1000), semantic / 100));
         rune.structural_score = @intCast(@min(@as(usize, 1000), structural / 100));
     }
+}
+
+fn isDefinitionContentQuery(input: []const u8) bool {
+    const match = vsa_vulkan.globalRuneMatch(input);
+    if (!match.contentOverridesEntropy()) return false;
+    return containsBoundedPhrase(input, "what is") != null or
+        containsBoundedPhrase(input, "what's") != null or
+        containsBoundedPhrase(input, "define") != null or
+        containsBoundedPhrase(input, "definition") != null;
+}
+
+fn startsWithQuestionRune(input: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, input, " \r\n\t,.:;!?()[]{}\"'");
+    const first = it.next() orelse return false;
+    return isQuestionToken(first) or std.ascii.eqlIgnoreCase(first, "who");
+}
+
+fn chooseResonantContentWindow(runes: []const SalienceRune) ?SemanticWindow {
+    for (runes, 0..) |rune, idx| {
+        if (vsa_vulkan.contentRuneResonancePerMille(rune.text) >= vsa_vulkan.GLOBAL_RUNE_RESONANCE_OVERRIDE_PER_MILLE) {
+            return .{ .start = idx, .end = idx + 1 };
+        }
+    }
+    return null;
 }
 
 fn chooseSemanticWindow(runes: []const SalienceRune) SemanticWindow {
@@ -2236,9 +2301,42 @@ test "salience mapping isolates semantic target and density" {
 }
 
 test "zero entropy mapper rejects greetings as semantic targets" {
-    try std.testing.expect(lacksSemanticTarget("hello"));
+    try std.testing.expect(isLightSocialPrompt("hello"));
+    try std.testing.expect(!lacksSemanticTarget("hello"));
     try std.testing.expect(lacksSemanticTarget("ok"));
     try std.testing.expect(!lacksSemanticTarget("Explain how a CPU processes data"));
+}
+
+test "question prefixes do not enter imperative command path" {
+    const allocator = std.testing.allocator;
+
+    var imperative = try analyzeImperativeIntent(allocator, "whats a computer");
+    defer imperative.deinit(allocator);
+
+    try std.testing.expect(!imperative.detected);
+}
+
+test "global rune resonance treats programming cluster as content" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expect(!lacksSemanticTarget("what is code"));
+    var salience = try analyzeSalience(allocator, "what is code");
+    defer salience.deinit(allocator);
+
+    try std.testing.expectEqualStrings("code", salience.semantic_target);
+    try std.testing.expect(vsa_vulkan.globalRuneMatch("what is code").content.score_per_mille >= vsa_vulkan.GLOBAL_RUNE_RESONANCE_OVERRIDE_PER_MILLE);
+}
+
+test "global rune resonance sees squished sayghost command" {
+    const allocator = std.testing.allocator;
+
+    var imperative = try analyzeImperativeIntent(allocator, "sayghost");
+    defer imperative.deinit(allocator);
+
+    try std.testing.expect(imperative.detected);
+    try std.testing.expectEqual(ImperativeTargetKind.exact, imperative.target_kind);
+    try std.testing.expectEqualStrings("ghost", imperative.target);
+    try std.testing.expect(imperative.strict_output);
 }
 
 test "imperative ngram shape isolates exact output target" {

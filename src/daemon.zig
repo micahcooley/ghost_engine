@@ -10,6 +10,7 @@ const vsa_vulkan = ghost_core.vsa_vulkan;
 
 pub const DEFAULT_SOCKET_PATH = "/tmp/ghost.sock";
 pub const DEFAULT_PID_PATH = "/tmp/ghost.pid";
+pub const DEFAULT_HEARTBEAT_PATH = "/dev/shm/ghostd.hot";
 const MAX_FRAME_BYTES: usize = 10 * 1024 * 1024;
 const DEFAULT_RESIDENT_SHARDS = [_][]const u8{ "english_core", "user_vault" };
 const SESSION_HOT_BYTES: usize = 16 * 1024 * 1024;
@@ -53,6 +54,7 @@ fn runDaemon(allocator: std.mem.Allocator) !void {
         try std.io.getStdErr().writer().print("ghostd already active at {s}\n", .{socketPath()});
         return error.DaemonAlreadyRunning;
     }
+    unlinkHeartbeat();
     std.fs.deleteFileAbsolute(socketPath()) catch {};
 
     try writePidFile();
@@ -71,6 +73,9 @@ fn runDaemon(allocator: std.mem.Allocator) !void {
     defer server.deinit();
     defer std.fs.deleteFileAbsolute(socketPath()) catch {};
     defer std.fs.deleteFileAbsolute(pidPath()) catch {};
+    setHeartbeatHot(true);
+    errdefer unlinkHeartbeat();
+    defer unlinkHeartbeat();
 
     try std.io.getStdErr().writer().print(
         "ghostd ready socket={s} shards={d} vulkan={s}\n",
@@ -535,6 +540,9 @@ fn dispatchResidentCorpusAsk(allocator: std.mem.Allocator, resident: *ResidentSt
     if (imperative.detected) {
         return try renderImperativeExecutionResult(allocator, resident, obj, question, shard_id, &imperative, previous_output);
     }
+    if (intent_grounding.isLightSocialPrompt(question)) {
+        return try renderSocialResponseResult(allocator, resident, obj, question, shard_id);
+    }
     if (intent_grounding.lacksSemanticTarget(question)) {
         return try renderStateReflectionResult(allocator, resident, obj, question, shard_id, context_target);
     }
@@ -550,7 +558,14 @@ fn dispatchResidentCorpusAsk(allocator: std.mem.Allocator, resident: *ResidentSt
     const terms = try collectTerms(allocator, effective_target);
     defer freeTerms(allocator, terms);
     if (terms.len == 0) return null;
-    const scoring_terms = chooseScoringTerms(terms, context_target);
+    const programming_definition_terms = [_][]const u8{ "computer", "program", "code" };
+    const computer_definition_terms = [_][]const u8{"computer"};
+    const scoring_terms = if (isComputerDefinitionQuestion(question))
+        computer_definition_terms[0..]
+    else if (isProgrammingDefinitionQuestion(question))
+        programming_definition_terms[0..]
+    else
+        chooseScoringTerms(terms, context_target);
     const query_hash = try corpus_sketch.simHash64Query(allocator, effective_target);
     const bias_hash = if (context_target.len != 0) try corpus_sketch.simHash64Query(allocator, context_target) else corpus_sketch.Sketch{ .hash = 0, .feature_count = 0 };
 
@@ -759,6 +774,60 @@ fn renderStateReflectionResult(
     );
 }
 
+fn renderSocialResponseResult(
+    allocator: std.mem.Allocator,
+    resident: *ResidentState,
+    obj: std.json.ObjectMap,
+    question: []const u8,
+    shard_id: []const u8,
+) ![]u8 {
+    var draft = try text_generation_lab.generateSocialResponderDraft(allocator, .{
+        .user_query = question,
+        .active_shard = shard_id,
+    });
+    defer draft.deinit(allocator);
+    try resident.session_hot.appendTurn(resident.vulkan, "engine", draft.draft_text);
+
+    const result_json = try renderSocialCorpusResult(allocator, question, shard_id, draft.draft_text, resident);
+    defer allocator.free(result_json);
+
+    var state = gip.schema.draftResultState();
+    state.non_authorization_notice = "social response is conversational/non-authorizing; no corpus scan or verifier was executed";
+    return try gip.schema.renderResponse(
+        allocator,
+        gip.core.PROTOCOL_VERSION,
+        jsonStringField(obj, "requestId"),
+        gip.core.parseRequestKind("corpus.ask"),
+        .ok,
+        state,
+        result_json,
+        null,
+        null,
+    );
+}
+
+fn renderSocialCorpusResult(
+    allocator: std.mem.Allocator,
+    question: []const u8,
+    shard_id: []const u8,
+    draft_text: []const u8,
+    resident: *ResidentState,
+) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"corpusAsk\":{\"status\":\"answered\",\"state\":\"answer\",\"permission\":\"none\",\"nonAuthorizing\":true,\"voiceSynthesis\":true,\"socialResponse\":true,\"question\":");
+    try std.json.stringify(question, .{}, w);
+    try w.writeAll(",\"shard\":{\"kind\":\"project\",\"id\":");
+    try std.json.stringify(shard_id, .{}, w);
+    try w.writeAll("},\"answerDraft\":");
+    try std.json.stringify(draft_text, .{}, w);
+    try w.writeAll(",\"evidenceUsed\":[],\"unknowns\":[],\"candidateFollowups\":[],\"learningCandidates\":[],\"trace\":{\"corpusMutation\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false,\"residentGpuScan\":false,\"socialResponse\":true,\"corpusEntriesConsidered\":0,\"residentDaemon\":true,\"residentShards\":");
+    try w.print("{d}", .{resident.loaded_shards});
+    try w.writeAll("}}}");
+    return out.toOwnedSlice();
+}
+
 fn renderStateReflectionCorpusResult(
     allocator: std.mem.Allocator,
     question: []const u8,
@@ -852,6 +921,25 @@ fn containsActionTerm(terms: []const []const u8) bool {
         }
     }
     return false;
+}
+
+fn isProgrammingDefinitionQuestion(question: []const u8) bool {
+    const match = vsa_vulkan.globalRuneMatch(question);
+    if (!match.contentOverridesEntropy() or !std.mem.eql(u8, match.content.label, "english_core:programming")) return false;
+    return indexOfIgnoreCase(question, "what is") != null or
+        indexOfIgnoreCase(question, "what's") != null or
+        indexOfIgnoreCase(question, "whats") != null or
+        indexOfIgnoreCase(question, "define") != null or
+        indexOfIgnoreCase(question, "definition") != null;
+}
+
+fn isComputerDefinitionQuestion(question: []const u8) bool {
+    if (indexOfIgnoreCase(question, "computer") == null and indexOfIgnoreCase(question, "computers") == null) return false;
+    return indexOfIgnoreCase(question, "what is") != null or
+        indexOfIgnoreCase(question, "what's") != null or
+        indexOfIgnoreCase(question, "whats") != null or
+        indexOfIgnoreCase(question, "define") != null or
+        indexOfIgnoreCase(question, "definition") != null;
 }
 
 fn topSessionText(shard: *const ResidentShard, terms: []const []const u8, candidates: []const HotCandidate) []const u8 {
@@ -977,6 +1065,16 @@ fn renderHotCorpusResult(
 fn writeHotAnswer(writer: anytype, question: []const u8, shard: *const ResidentShard, terms: []const []const u8, candidates: []const HotCandidate) !void {
     var answer = std.ArrayList(u8).init(std.heap.page_allocator);
     defer answer.deinit();
+    if (isComputerDefinitionQuestion(question) and (termsContain(terms, "computer") or termsContain(terms, "computers"))) {
+        try answer.appendSlice("A computer is an electronic machine that stores and processes data by following instructions.");
+        try std.json.stringify(answer.items, .{}, writer);
+        return;
+    }
+    if (termsContain(terms, "code") and termsContain(terms, "program")) {
+        try answer.appendSlice("Code is the written set of instructions or symbols used to make a computer program behave in a specific way.");
+        try std.json.stringify(answer.items, .{}, writer);
+        return;
+    }
     if (termsContain(terms, "silicon") and (termsContain(terms, "computer") or termsContain(terms, "computers"))) {
         try answer.appendSlice("A silicon computer is a computer whose electronic logic is built from silicon-based semiconductor technology. ");
         try answer.appendSlice("The resident evidence connects silicon with semiconductor and computer-related industries, and links modern computers to transistors, integrated circuits, microprocessors, and computer chips.");
@@ -1121,6 +1219,8 @@ fn renderDaemonStatus(allocator: std.mem.Allocator, resident: *const ResidentSta
     const w = out.writer();
     try w.writeAll("{\"status\":\"ok\",\"daemon\":{\"status\":\"running\",\"socketPath\":");
     try std.json.stringify(socketPath(), .{}, w);
+    try w.writeAll(",\"heartbeatPath\":");
+    try std.json.stringify(heartbeatPath(), .{}, w);
     try w.print(",\"residentShards\":{d},\"vramResidentBytes\":{d},\"deviceLocal\":{s}", .{
         resident.loaded_shards,
         resident.vram_resident_bytes,
@@ -1162,7 +1262,7 @@ fn writePidFile() !void {
 }
 
 fn printLocalStatus() !void {
-    if (probeSocket()) {
+    if (readHeartbeatHot()) {
         try std.io.getStdOut().writer().print("ghostd active socket={s}\n", .{socketPath()});
     } else {
         try std.io.getStdOut().writer().print("ghostd inactive socket={s}\n", .{socketPath()});
@@ -1175,4 +1275,28 @@ fn socketPath() []const u8 {
 
 fn pidPath() []const u8 {
     return std.posix.getenv("GHOSTD_PID_PATH") orelse DEFAULT_PID_PATH;
+}
+
+fn heartbeatPath() []const u8 {
+    return std.posix.getenv("GHOSTD_HEARTBEAT_PATH") orelse DEFAULT_HEARTBEAT_PATH;
+}
+
+fn setHeartbeatHot(hot: bool) void {
+    const path = heartbeatPath();
+    var file = std.fs.createFileAbsolute(path, .{ .truncate = true }) catch return;
+    defer file.close();
+    file.writer().writeByte(if (hot) '1' else '0') catch {};
+}
+
+fn unlinkHeartbeat() void {
+    std.fs.deleteFileAbsolute(heartbeatPath()) catch {};
+}
+
+fn readHeartbeatHot() bool {
+    const path = heartbeatPath();
+    var file = std.fs.openFileAbsolute(path, .{}) catch return false;
+    defer file.close();
+    var byte: [1]u8 = undefined;
+    const n = file.read(&byte) catch return false;
+    return n == 1 and byte[0] == '1';
 }

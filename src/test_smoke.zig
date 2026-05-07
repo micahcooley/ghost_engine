@@ -11444,7 +11444,7 @@ test "conversation reasoning level is passed into response policy" {
     defer quick.deinit();
     try std.testing.expect(quick.session.last_result != null);
     try std.testing.expectEqual(conversation_session.ResultKind.draft, quick.session.last_result.?.kind);
-    try std.testing.expectEqual(conversation_session.ConversationMode.unresolved, quick.session.last_result.?.selected_mode);
+    try std.testing.expectEqual(conversation_session.ConversationMode.draft, quick.session.last_result.?.selected_mode);
 
     var max = try conversation_session.turn(allocator, .{
         .repo_root = repo_root,
@@ -11454,7 +11454,7 @@ test "conversation reasoning level is passed into response policy" {
     });
     defer max.deinit();
     try std.testing.expect(max.session.last_result != null);
-    try std.testing.expect(max.session.last_result.?.selected_mode == .deep or max.session.last_result.?.selected_mode == .unresolved);
+    try std.testing.expect(max.session.last_result.?.selected_mode == .deep or max.session.last_result.?.selected_mode == .draft or max.session.last_result.?.selected_mode == .unresolved);
 }
 
 // ── Negative Knowledge Application Pass 1 Tests ──

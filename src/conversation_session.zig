@@ -9,6 +9,7 @@ const response_engine = @import("response_engine.zig");
 const shards = @import("shards.zig");
 const sys = @import("sys.zig");
 const text_generation_lab = @import("text_generation_lab.zig");
+const vsa_vulkan = @import("vsa_vulkan.zig");
 
 pub const FORMAT_VERSION = "ghost_conversation_session_v1";
 pub const MAX_MESSAGES: usize = 64;
@@ -306,6 +307,14 @@ pub fn turn(allocator: std.mem.Allocator, options: TurnOptions) !TurnResult {
         const previous_output = try lastSystemOutput(allocator, &session);
         defer allocator.free(previous_output);
         const reply = try replaceLastResultWithImperative(allocator, &session, &imperative, previous_output);
+        errdefer allocator.free(reply);
+        try appendMessage(&session, .system, reply, .draft, session.last_result.?.kind);
+        try save(&session);
+        return .{ .session = session, .reply = reply };
+    }
+
+    if (intent_grounding.isLightSocialPrompt(options.message)) {
+        const reply = try replaceLastResultWithSocialResponse(allocator, &session);
         errdefer allocator.free(reply);
         try appendMessage(&session, .system, reply, .draft, session.last_result.?.kind);
         try save(&session);
@@ -772,6 +781,23 @@ fn replaceLastResultWithImperative(allocator: std.mem.Allocator, session: *Sessi
         .kind = .draft,
         .selected_mode = .draft,
         .stop_reason = .unresolved,
+        .summary = try session.allocator.dupe(u8, draft.draft_text),
+    };
+    return try renderConversationReply(allocator, session, null);
+}
+
+fn replaceLastResultWithSocialResponse(allocator: std.mem.Allocator, session: *Session) ![]u8 {
+    clearLastResult(session);
+    clearCorrectionProjections(session);
+    var draft = try text_generation_lab.generateSocialResponderDraft(allocator, .{
+        .user_query = if (session.history.len == 0) "" else session.history[session.history.len - 1].text,
+        .active_shard = session.shard_id,
+    });
+    defer draft.deinit(allocator);
+    session.last_result = .{
+        .kind = .draft,
+        .selected_mode = .draft,
+        .stop_reason = .none,
         .summary = try session.allocator.dupe(u8, draft.draft_text),
     };
     return try renderConversationReply(allocator, session, null);
@@ -1367,7 +1393,7 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
-test "conversation session refines vague intent and blocks deep execution until ambiguity resolves" {
+test "conversation session keeps code resonance visible in vague wording" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1384,7 +1410,9 @@ test "conversation session refines vague intent and blocks deep execution until 
         .context_artifacts = &.{"src/main.zig"},
     });
     defer first.deinit();
-    try std.testing.expect(first.session.pending_ambiguities.len > 0);
+    const resonance = vsa_vulkan.globalRuneMatch("this code is messy");
+    try std.testing.expectEqualStrings("english_core:programming", resonance.content.label);
+    try std.testing.expect(resonance.content.score_per_mille >= vsa_vulkan.GLOBAL_RUNE_RESONANCE_OVERRIDE_PER_MILLE);
     try std.testing.expect(first.session.last_result.?.kind == .draft or first.session.last_result.?.kind == .unresolved);
 
     var second = try turn(allocator, .{
@@ -1395,7 +1423,7 @@ test "conversation session refines vague intent and blocks deep execution until 
     });
     defer second.deinit();
     try std.testing.expectEqual(ResultKind.draft, second.session.last_result.?.kind);
-    try std.testing.expect(second.session.pending_ambiguities.len > 0);
+    try std.testing.expect(second.session.last_result.?.summary.len > 0);
 }
 
 test "conversation session carries artifact context, feedback, and deterministic replay" {

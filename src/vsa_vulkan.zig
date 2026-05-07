@@ -154,6 +154,127 @@ pub const CorpusScanEntry = extern struct {
     reserved: u32 = 0,
 };
 
+pub const GLOBAL_RUNE_RESONANCE_OVERRIDE_PER_MILLE: u16 = 850;
+
+pub const GlobalRuneHit = struct {
+    label: []const u8 = "",
+    score_per_mille: u16 = 0,
+};
+
+pub const GlobalRuneMatch = struct {
+    command: GlobalRuneHit = .{},
+    content: GlobalRuneHit = .{},
+    command_target: []const u8 = "",
+    simultaneous_hits: u8 = 0,
+
+    pub fn contentOverridesEntropy(self: GlobalRuneMatch) bool {
+        return self.content.score_per_mille >= GLOBAL_RUNE_RESONANCE_OVERRIDE_PER_MILLE;
+    }
+
+    pub fn commandOverridesTokenizer(self: GlobalRuneMatch) bool {
+        return self.command.score_per_mille >= GLOBAL_RUNE_RESONANCE_OVERRIDE_PER_MILLE and self.command_target.len != 0;
+    }
+};
+
+const RuneConcept = enum {
+    command,
+    command_target,
+    content,
+};
+
+const RuneMetadata = struct {
+    rune: []const u8,
+    concept: RuneConcept,
+    label: []const u8,
+    target: []const u8 = "",
+};
+
+const ENGLISH_CORE_RUNE_METADATA = [_]RuneMetadata{
+    .{ .rune = "say", .concept = .command, .label = "command_lobe:say" },
+    .{ .rune = "speak", .concept = .command, .label = "command_lobe:say" },
+    .{ .rune = "ghost", .concept = .command_target, .label = "command_lobe:ghost", .target = "ghost" },
+    .{ .rune = "code", .concept = .content, .label = "english_core:programming" },
+    .{ .rune = "programming", .concept = .content, .label = "english_core:programming" },
+    .{ .rune = "program", .concept = .content, .label = "english_core:programming" },
+    .{ .rune = "software", .concept = .content, .label = "english_core:programming" },
+};
+
+/// Shader-compatible global rune match.
+///
+/// The Vulkan corpus shader performs the full resident-shard scoring loop.
+/// This helper keeps the same integer-only resonance contract available to
+/// CPU-side intent gating and tests, so compact inputs such as "sayghost" are
+/// evaluated as overlapping rune segments instead of a single low-information
+/// token.
+pub fn globalRuneMatch(input: []const u8) GlobalRuneMatch {
+    var result = GlobalRuneMatch{};
+    var command_seen = false;
+    var target_seen = false;
+    var content_seen = false;
+
+    for (ENGLISH_CORE_RUNE_METADATA) |entry| {
+        const score = segmentResonancePerMille(input, entry.rune);
+        if (score < GLOBAL_RUNE_RESONANCE_OVERRIDE_PER_MILLE) continue;
+        result.simultaneous_hits +|= 1;
+        switch (entry.concept) {
+            .command => {
+                command_seen = true;
+                if (score > result.command.score_per_mille) {
+                    result.command = .{ .label = entry.label, .score_per_mille = score };
+                }
+            },
+            .command_target => {
+                target_seen = true;
+                if (result.command_target.len == 0 or score > result.command.score_per_mille) {
+                    result.command_target = entry.target;
+                }
+            },
+            .content => {
+                content_seen = true;
+                if (score > result.content.score_per_mille) {
+                    result.content = .{ .label = entry.label, .score_per_mille = score };
+                }
+            },
+        }
+    }
+
+    if (command_seen and target_seen and result.command.score_per_mille == 0) {
+        result.command = .{ .label = "command_lobe:compound", .score_per_mille = GLOBAL_RUNE_RESONANCE_OVERRIDE_PER_MILLE };
+    }
+    if (!(command_seen and target_seen)) result.command_target = "";
+    if (!content_seen) result.content = .{};
+    return result;
+}
+
+pub fn contentRuneResonancePerMille(input: []const u8) u16 {
+    return globalRuneMatch(input).content.score_per_mille;
+}
+
+fn segmentResonancePerMille(input: []const u8, rune: []const u8) u16 {
+    if (rune.len == 0) return 0;
+    var start: usize = 0;
+    while (start < input.len) : (start += 1) {
+        if (foldedByte(input[start]) != rune[0]) continue;
+        var cursor = start;
+        var matched: usize = 0;
+        while (cursor < input.len and matched < rune.len) : (cursor += 1) {
+            const byte = input[cursor];
+            if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-') continue;
+            if (foldedByte(byte) != rune[matched]) break;
+            matched += 1;
+        }
+        if (matched == rune.len) return 1000;
+        if (matched >= 3 and matched * 1000 / rune.len >= GLOBAL_RUNE_RESONANCE_OVERRIDE_PER_MILLE) {
+            return @intCast((matched * 1000) / rune.len);
+        }
+    }
+    return 0;
+}
+
+fn foldedByte(byte: u8) u8 {
+    return std.ascii.toLower(byte);
+}
+
 pub fn buildGhostIndex(allocator: std.mem.Allocator, bytes: []const u8) ![]GhostIndexBlock {
     const block_count = @max(@as(usize, 1), (bytes.len + GHOST_INDEX_BLOCK_BYTES - 1) / GHOST_INDEX_BLOCK_BYTES);
     const blocks = try allocator.alloc(GhostIndexBlock, block_count);

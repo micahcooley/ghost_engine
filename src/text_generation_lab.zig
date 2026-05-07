@@ -715,9 +715,9 @@ pub fn generateSocialResponderDraft(allocator: std.mem.Allocator, input: SocialR
     if (input.active_shard) |shard| hasher.update(shard);
     const variant = hasher.final() % 3;
     const draft_text = switch (variant) {
-        0 => try allocator.dupe(u8, "Ghost is online and reading the active corpus."),
-        1 => try allocator.dupe(u8, "Ghost is awake; the current shard state is ready."),
-        else => try allocator.dupe(u8, "Ghost is active and listening through the available shards."),
+        0 => try allocator.dupe(u8, "I am listening."),
+        1 => try allocator.dupe(u8, "I am here."),
+        else => try allocator.dupe(u8, "Ready."),
     };
     return .{
         .draft_text = draft_text,
