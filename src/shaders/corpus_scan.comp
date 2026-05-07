@@ -24,6 +24,10 @@ struct CorpusEntry {
     uint semantic_hash_hi;
     uint flags;
     uint reserved;
+    uint relation_hash_lo;
+    uint relation_hash_hi;
+    uint inverse_relation_hash_lo;
+    uint inverse_relation_hash_hi;
 };
 
 layout(std430, binding = 13) readonly buffer CorpusEntries {
@@ -43,10 +47,10 @@ layout(push_constant) uniform Constants {
     uint term1_len;
     uint term2_len;
     uint term3_len;
-    uint reserved0;
-    uint reserved1;
-    uint reserved2;
-    uint reserved3;
+    uint query_relation_hash_lo;
+    uint query_relation_hash_hi;
+    uint inverse_relation_hash_lo;
+    uint inverse_relation_hash_hi;
 } params;
 
 const uint TERM_BYTES = 16u;
@@ -158,6 +162,10 @@ void main() {
     uint64_t bias_hash = makeHash(params.bias_hash_lo, params.bias_hash_hi);
     uint64_t search_hash = makeHash(entry.search_hash_lo, entry.search_hash_hi);
     uint64_t semantic_hash = makeHash(entry.semantic_hash_lo, entry.semantic_hash_hi);
+    uint64_t relation_hash = makeHash(entry.relation_hash_lo, entry.relation_hash_hi);
+    uint64_t inverse_entry_relation_hash = makeHash(entry.inverse_relation_hash_lo, entry.inverse_relation_hash_hi);
+    uint64_t query_relation_hash = makeHash(params.query_relation_hash_lo, params.query_relation_hash_hi);
+    uint64_t inverse_query_relation_hash = makeHash(params.inverse_relation_hash_lo, params.inverse_relation_hash_hi);
 
     uint score = termHitScore(entry.byte_offset, entry.byte_len);
     uint resonance_score = 0u;
@@ -181,6 +189,21 @@ void main() {
             score += (bias_score * max(params.bias_multiplier_per_mille, 1000u)) / 1000u;
         } else if (bias_score >= 500u) {
             score += ((bias_score * (max(params.bias_multiplier_per_mille, 1000u) - 1000u)) / 1000u);
+        }
+    }
+
+    if (query_relation_hash != 0ul && relation_hash != 0ul) {
+        if (relation_hash == query_relation_hash) {
+            score += 4200u;
+        } else if (relation_hash == inverse_query_relation_hash || inverse_entry_relation_hash == query_relation_hash) {
+            score = (score * 125u) / 1000u;
+        } else {
+            uint relation_resonance = similarityPerMille(query_relation_hash, relation_hash);
+            if (relation_resonance >= 780u) {
+                score += 900u;
+            } else if (inverse_query_relation_hash != 0ul && similarityPerMille(inverse_query_relation_hash, relation_hash) >= 780u) {
+                score = (score * 250u) / 1000u;
+            }
         }
     }
 

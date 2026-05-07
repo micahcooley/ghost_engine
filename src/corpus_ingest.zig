@@ -8,6 +8,7 @@ const hash_acceleration = @import("hash_acceleration.zig");
 const knowledge_pack_store = @import("knowledge_pack_store.zig");
 const shards = @import("shards.zig");
 const vsa = @import("vsa_core.zig");
+const vsa_vulkan = @import("vsa_vulkan.zig");
 
 pub const MANIFEST_VERSION = "GCIN1";
 pub const CORPUS_REL_PREFIX = "@corpus";
@@ -194,6 +195,8 @@ pub const IndexedEntry = struct {
     semantic_hash: u64,
     search_sketch_hash: u64,
     search_sketch_features: usize,
+    spo_forward_hash: u64,
+    spo_inverse_hash: u64,
     corpus_meta: CorpusMeta,
 
     pub fn deinit(self: *IndexedEntry) void {
@@ -235,6 +238,8 @@ const SourceUnit = struct {
     semantic_hash: u64,
     search_sketch_hash: u64,
     search_sketch_features: usize,
+    spo_forward_hash: u64,
+    spo_inverse_hash: u64,
     dedup: DedupStatus = .unique,
     canonical_rel_path: ?[]u8 = null,
     lineage_id: []u8,
@@ -559,6 +564,8 @@ pub fn collectLiveScanEntries(allocator: std.mem.Allocator, paths: *const shards
             .semantic_hash = item.semantic_hash,
             .search_sketch_hash = item.search_sketch_hash,
             .search_sketch_features = item.search_sketch_features,
+            .spo_forward_hash = item.spo_forward_hash,
+            .spo_inverse_hash = item.spo_inverse_hash,
             .corpus_meta = .{
                 .allocator = allocator,
                 .class = item.class,
@@ -689,6 +696,8 @@ pub fn collectPackScanEntries(
             .semantic_hash = item.semantic_hash,
             .search_sketch_hash = item.search_sketch_hash,
             .search_sketch_features = item.search_sketch_features,
+            .spo_forward_hash = item.spo_forward_hash,
+            .spo_inverse_hash = item.spo_inverse_hash,
             .corpus_meta = .{
                 .allocator = allocator,
                 .class = item.class,
@@ -1492,6 +1501,7 @@ fn parseOneFileForIngest(
     _ = acceleration;
     const index_text = lower_text[0..@min(lower_text.len, MAX_FILE_READ_INDEX_BYTES)];
     const search_sketch = try corpus_sketch.simHash64(allocator, index_text);
+    const spo_vector = vsa_vulkan.extractSpoVector(index_text);
     const synthetic_rel_path = try std.fs.path.join(allocator, &.{ CORPUS_REL_PREFIX, className(class), rel_path });
     errdefer allocator.free(synthetic_rel_path);
     const storage_rel_path = try std.fs.path.join(allocator, &.{ config.CORPUS_INGEST_FILES_DIR_NAME, className(class), rel_path });
@@ -1522,6 +1532,8 @@ fn parseOneFileForIngest(
         .semantic_hash = 0,
         .search_sketch_hash = search_sketch.hash,
         .search_sketch_features = search_sketch.feature_count,
+        .spo_forward_hash = spo_vector.forward_hash,
+        .spo_inverse_hash = spo_vector.inverse_hash,
         .lineage_id = lineage_id,
         .provenance = provenance,
         .lower_text = lower_text,
@@ -2120,6 +2132,8 @@ fn cloneSourceUnit(allocator: std.mem.Allocator, item: SourceUnit) !SourceUnit {
         .semantic_hash = item.semantic_hash,
         .search_sketch_hash = item.search_sketch_hash,
         .search_sketch_features = item.search_sketch_features,
+        .spo_forward_hash = item.spo_forward_hash,
+        .spo_inverse_hash = item.spo_inverse_hash,
         .dedup = item.dedup,
         .canonical_rel_path = if (item.canonical_rel_path) |value| try allocator.dupe(u8, value) else null,
         .lineage_id = try allocator.dupe(u8, item.lineage_id),
@@ -2275,7 +2289,7 @@ fn serializeManifest(allocator: std.mem.Allocator, manifest: *Manifest) ![]u8 {
         try writeJsonFieldString(writer, "sourceLabel", item.source_label, false);
         try writeJsonFieldString(writer, "licenseStatus", item.license_status, false);
         try writer.print(",\"authorityLevel\":{d}", .{item.license_authority_level});
-        try writer.print(",\"sourceMtimeNs\":{d},\"sizeBytes\":{d},\"rawHash\":{d},\"normalizedHash\":{d},\"semanticHash\":{d},\"searchSketchHash\":{d},\"searchSketchFeatures\":{d}", .{
+        try writer.print(",\"sourceMtimeNs\":{d},\"sizeBytes\":{d},\"rawHash\":{d},\"normalizedHash\":{d},\"semanticHash\":{d},\"searchSketchHash\":{d},\"searchSketchFeatures\":{d},\"spoForwardHash\":{d},\"spoInverseHash\":{d}", .{
             item.source_mtime_ns,
             item.size_bytes,
             item.raw_hash,
@@ -2283,6 +2297,8 @@ fn serializeManifest(allocator: std.mem.Allocator, manifest: *Manifest) ![]u8 {
             item.semantic_hash,
             item.search_sketch_hash,
             item.search_sketch_features,
+            item.spo_forward_hash,
+            item.spo_inverse_hash,
         });
         try writeOptionalStringField(writer, "dedup", dedupName(item.dedup));
         if (item.canonical_rel_path) |value| try writeOptionalStringField(writer, "canonicalRelPath", value);
@@ -2355,6 +2371,8 @@ fn loadManifestFromPath(allocator: std.mem.Allocator, abs_path: []const u8) !str
         semanticHash: ?u64 = null,
         searchSketchHash: ?u64 = null,
         searchSketchFeatures: ?usize = null,
+        spoForwardHash: ?u64 = null,
+        spoInverseHash: ?u64 = null,
         dedup: []const u8,
         canonicalRelPath: ?[]const u8 = null,
         lineageId: []const u8,
@@ -2450,6 +2468,8 @@ fn loadManifestFromPath(allocator: std.mem.Allocator, abs_path: []const u8) !str
             .semantic_hash = item.semanticHash orelse item.normalizedHash,
             .search_sketch_hash = item.searchSketchHash orelse 0,
             .search_sketch_features = item.searchSketchFeatures orelse 0,
+            .spo_forward_hash = item.spoForwardHash orelse 0,
+            .spo_inverse_hash = item.spoInverseHash orelse 0,
             .dedup = parseDedup(item.dedup) orelse return error.InvalidCorpusManifest,
             .canonical_rel_path = if (item.canonicalRelPath) |value| try allocator.dupe(u8, value) else null,
             .lineage_id = try allocator.dupe(u8, item.lineageId),

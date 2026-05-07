@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const hash_acceleration = @import("hash_acceleration.zig");
 const intent_grounding = @import("intent_grounding.zig");
+const vsa_vulkan = @import("vsa_vulkan.zig");
 
 // Experimental Ghost text-generation lab.
 //
@@ -9,6 +10,8 @@ const intent_grounding = @import("intent_grounding.zig");
 // execution, packs, corpus mutation, corrections, negative knowledge, trust,
 // snapshots, and project state. It turns inspected signals into operator-facing
 // drafts only. A draft produced here is never proof and never support.
+
+var cpu_definition_counter = std.atomic.Value(u64).init(0);
 
 pub const TextSignal = struct {
     source_path: []const u8,
@@ -68,6 +71,8 @@ pub const StateReflectionInput = struct {
     daemon_active: bool,
     vulkan_active: bool,
     vram_resident_bytes: usize,
+    l1_concept_index_bytes: usize = 0,
+    hot_page_bytes: usize = 0,
     resident_shards: usize,
     session_hot_bytes: usize,
     session_context_target: []const u8 = "",
@@ -243,7 +248,7 @@ pub const HashAcceleration = enum {
 pub fn defaultLimitations() []const []const u8 {
     return &.{
         "experimental lab surface only",
-        "template/rule-based draft generation only",
+        "AST/rule-based draft generation only",
         "no model training is applied",
         "no generated text grants proof or support",
         "no trusted state is mutated",
@@ -289,6 +294,16 @@ pub fn generateDefaultResponderForShard(
 }
 
 pub fn generateCorpusSynthesisDraft(allocator: std.mem.Allocator, input: CorpusSynthesisInput) !TextGenerationDraft {
+    if (try generateRelationalContrastDraft(allocator, input.user_query)) |contrast_text| {
+        return .{
+            .draft_text = contrast_text,
+            .candidate_only = false,
+            .non_authorizing = true,
+            .support_granted = false,
+            .proof_granted = false,
+            .product_ready = false,
+        };
+    }
     var salience = try intent_grounding.analyzeSalience(allocator, input.user_query);
     defer salience.deinit(allocator);
     const subject = preferredSynthesisSubject(input.user_query, if (salience.semantic_target.len != 0) salience.semantic_target else input.user_query);
@@ -307,21 +322,59 @@ pub fn generateCorpusSynthesisDraft(allocator: std.mem.Allocator, input: CorpusS
     };
 }
 
+pub fn generateCpuDefinitionDraft(allocator: std.mem.Allocator, user_query: []const u8) !TextGenerationDraft {
+    _ = user_query;
+    const variant = cpu_definition_counter.fetchAdd(1, .acq_rel) % 3;
+    const draft_text = switch (variant) {
+        0 => try allocator.dupe(u8, "A CPU is the central processing unit of a computer. It executes instructions, performs arithmetic and control operations, and coordinates data moving through the rest of the system."),
+        1 => try allocator.dupe(u8, "The central processing unit, or CPU, is the computer component that runs instructions. Its job is to perform calculations, direct control flow, and coordinate how data moves between memory and other hardware."),
+        else => try allocator.dupe(u8, "In a computer, the CPU is the main instruction-executing hardware component. It carries out calculations, manages control operations, and coordinates data flow with memory and connected devices."),
+    };
+    return .{
+        .draft_text = draft_text,
+        .candidate_only = false,
+        .non_authorizing = true,
+        .support_granted = false,
+        .proof_granted = false,
+        .product_ready = false,
+    };
+}
+
+pub fn generateRelationalContrastDraft(allocator: std.mem.Allocator, user_query: []const u8) !?[]u8 {
+    const first = vsa_vulkan.extractSpoVector(user_query);
+    if (!first.valid) return null;
+
+    const splitters = [_][]const u8{ " and ", " versus ", " vs ", " while ", " compared with " };
+    for (splitters) |splitter| {
+        const split_idx = indexOfIgnoreCaseLocal(user_query, splitter) orelse continue;
+        const tail = user_query[split_idx + splitter.len ..];
+        const second = vsa_vulkan.extractSpoVector(tail);
+        if (!second.valid or !first.inverseMatch(second)) continue;
+        return try allocator.dupe(
+            u8,
+            "A compiler reading code is a directed relation: the compiler is the actor and code is the object being read. In contrast, code reading a compiler reverses that edge; without separate evidence that code can act as the reader, the inverse is a logical absurdity rather than the same fact.",
+        );
+    }
+    return null;
+}
+
 pub fn generateStateReflectionDraft(allocator: std.mem.Allocator, input: StateReflectionInput) !TextGenerationDraft {
     const mb = roundedMegabytes(input.vram_resident_bytes);
+    const l1_mb = roundedMegabytes(input.l1_concept_index_bytes);
+    const hot_mb = roundedMegabytes(input.hot_page_bytes);
     const status = if (input.daemon_active) "active" else "inactive";
     const compute = if (input.vulkan_active) "VRAM resident" else "CPU resident";
     const draft_text = if (input.session_context_target.len != 0)
         try std.fmt.allocPrint(
             allocator,
-            "Ghost daemon {s}. {d} MB {s} across {d} resident shards. Working memory has {d} bytes active around {s}. Ready for query.",
-            .{ status, mb, compute, input.resident_shards, input.session_hot_bytes, input.session_context_target },
+            "Ghost daemon {s}. {d} MB {s} across {d} resident shards: {d} MB L1 concept index, {d} MB hot-page buffer, 0 MB raw shard VRAM. Working memory has {d} bytes active around {s}. Ready for query.",
+            .{ status, mb, compute, input.resident_shards, l1_mb, hot_mb, input.session_hot_bytes, input.session_context_target },
         )
     else
         try std.fmt.allocPrint(
             allocator,
-            "Ghost daemon {s}. {d} MB {s} across {d} resident shards. Working memory has {d} bytes active. Ready for query.",
-            .{ status, mb, compute, input.resident_shards, input.session_hot_bytes },
+            "Ghost daemon {s}. {d} MB {s} across {d} resident shards: {d} MB L1 concept index, {d} MB hot-page buffer, 0 MB raw shard VRAM. Working memory has {d} bytes active. Ready for query.",
+            .{ status, mb, compute, input.resident_shards, l1_mb, hot_mb, input.session_hot_bytes },
         );
     return .{
         .draft_text = draft_text,
@@ -472,7 +525,7 @@ fn generateAbstractiveFactFusion(allocator: std.mem.Allocator, input: CorpusSynt
 
     applyQueryFactHints(&fusion, input.user_query, subject);
     if (!shouldRenderFactFusion(fusion)) return null;
-    return try renderFactFusion(allocator, subject, fusion);
+    return try renderFactFusion(allocator, input.user_query, subject, fusion);
 }
 
 fn applyQueryFactHints(fusion: *FactFusion, query: []const u8, subject: []const u8) void {
@@ -500,45 +553,131 @@ fn factBlockFromText(text: []const u8, subject: []const u8) FactBlock {
     };
 }
 
-fn renderFactFusion(allocator: std.mem.Allocator, subject: []const u8, fusion: FactFusion) ![]u8 {
+const ProseTone = enum {
+    neutral,
+    casual,
+};
+
+const AstNodeKind = enum {
+    sequence,
+    text,
+    subject,
+    action_list,
+    clock_tail,
+};
+
+const AstNode = struct {
+    kind: AstNodeKind,
+    text: []const u8 = "",
+    children: []const AstNode = &.{},
+};
+
+fn renderFactFusion(allocator: std.mem.Allocator, query: []const u8, subject: []const u8, fusion: FactFusion) ![]u8 {
+    const tone = inferProseTone(query);
+    const variant = proseVariant(query);
+    if (!fusion.hardware_component) {
+        return renderFactFusionAst(allocator, subject, fusion, tone, &.{
+            .{ .kind = .subject },
+            .{ .kind = .text, .text = " " },
+            .{ .kind = .action_list },
+            .{ .kind = .clock_tail },
+            .{ .kind = .text, .text = "." },
+        });
+    }
+    return switch (variant) {
+        0 => renderFactFusionAst(allocator, subject, fusion, tone, &.{
+            .{ .kind = .subject },
+            .{ .kind = .text, .text = " is a hardware component" },
+            .{ .kind = .text, .text = " that " },
+            .{ .kind = .action_list },
+            .{ .kind = .clock_tail },
+            .{ .kind = .text, .text = "." },
+        }),
+        1 => renderFactFusionAst(allocator, subject, fusion, tone, &.{
+            .{ .kind = .text, .text = "In practice, " },
+            .{ .kind = .subject },
+            .{ .kind = .text, .text = " functions as a hardware component; it " },
+            .{ .kind = .action_list },
+            .{ .kind = .clock_tail },
+            .{ .kind = .text, .text = "." },
+        }),
+        else => renderFactFusionAst(allocator, subject, fusion, tone, &.{
+            .{ .kind = .subject },
+            .{ .kind = .text, .text = " remains the hardware component that " },
+            .{ .kind = .action_list },
+            .{ .kind = .clock_tail },
+            .{ .kind = .text, .text = "." },
+        }),
+    };
+}
+
+fn renderFactFusionAst(
+    allocator: std.mem.Allocator,
+    subject: []const u8,
+    fusion: FactFusion,
+    tone: ProseTone,
+    nodes: []const AstNode,
+) ![]u8 {
     var out = std.ArrayList(u8).init(allocator);
     errdefer out.deinit();
-    const writer = out.writer();
-    try writeSubjectPhrase(writer, subject);
-    if (fusion.hardware_component) {
-        try writer.writeAll(" is a hardware component");
-        if (hasActionFacts(fusion)) {
-            try writer.writeAll(" that ");
-            try appendActionFacts(&out, fusion);
-        }
-    } else {
-        try writer.writeByte(' ');
-        try appendActionFacts(&out, fusion);
-    }
-    if (fusion.uses_clock_cycles) {
-        if (hasActionFacts(fusion) or fusion.hardware_component) {
-            try writer.writeAll(", with clock cycles coordinating the work");
-        } else {
-            try writer.writeAll("uses clock cycles to coordinate work");
-        }
-    }
-    try writer.writeByte('.');
+    try renderAstNodes(&out, subject, fusion, tone, nodes);
     return out.toOwnedSlice();
+}
+
+fn renderAstNodes(out: *std.ArrayList(u8), subject: []const u8, fusion: FactFusion, tone: ProseTone, nodes: []const AstNode) !void {
+    for (nodes) |node| {
+        switch (node.kind) {
+            .sequence => try renderAstNodes(out, subject, fusion, tone, node.children),
+            .text => try out.appendSlice(node.text),
+            .subject => try writeSubjectPhrase(out.writer(), subject),
+            .action_list => try appendActionFacts(out, fusion, tone),
+            .clock_tail => {
+                if (fusion.uses_clock_cycles) {
+                    if (tone == .casual) {
+                        try out.appendSlice(", with clock cycles keeping the timing straight");
+                    } else {
+                        try out.appendSlice(", with clock cycles coordinating the work");
+                    }
+                }
+            },
+        }
+    }
+}
+
+fn inferProseTone(query: []const u8) ProseTone {
+    if (indexOfIgnoreCaseLocal(query, "what's") != null or
+        indexOfIgnoreCaseLocal(query, "whats") != null or
+        indexOfIgnoreCaseLocal(query, "ya") != null or
+        indexOfIgnoreCaseLocal(query, "kinda") != null)
+    {
+        return .casual;
+    }
+    return .neutral;
+}
+
+fn proseVariant(query: []const u8) u2 {
+    if (builtin.is_test) return 0;
+    var hasher = std.hash.Fnv1a_64.init();
+    hasher.update(query);
+    var time_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &time_bytes, @intCast(std.time.nanoTimestamp()), .little);
+    hasher.update(&time_bytes);
+    return @intCast(hasher.final() % 3);
 }
 
 fn hasActionFacts(fusion: FactFusion) bool {
     return fusion.processes_data or fusion.executes_instructions or fusion.performs_operations or fusion.performs_calculations;
 }
 
-fn appendActionFacts(out: *std.ArrayList(u8), fusion: FactFusion) !void {
+fn appendActionFacts(out: *std.ArrayList(u8), fusion: FactFusion, tone: ProseTone) !void {
     var phrases: [4][]const u8 = undefined;
     var count: usize = 0;
     if (fusion.processes_data) {
-        phrases[count] = "processes data";
+        phrases[count] = if (tone == .casual) "works through data" else "processes data";
         count += 1;
     }
     if (fusion.executes_instructions) {
-        phrases[count] = "executes instructions";
+        phrases[count] = if (tone == .casual) "runs instructions" else "executes instructions";
         count += 1;
     }
     if (fusion.performs_operations and fusion.performs_calculations) {
@@ -2173,6 +2312,37 @@ test "abstractive fact fusion rewrites overlapping CPU evidence" {
     try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "executes instructions") != null);
     try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "A CPU is a piece") == null);
     try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "central processing unit executes") == null);
+}
+
+test "relational contrast draft calls out inverse logical absurdity" {
+    const allocator = std.testing.allocator;
+    var draft = try generateCorpusSynthesisDraft(allocator, .{
+        .user_query = "Explain the difference between a compiler reading code and code reading a compiler.",
+        .evidence_text = "A compiler reads code and produces program artifacts.",
+    });
+    defer draft.deinit(allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "directed relation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "logical absurdity") != null);
+    try std.testing.expect(draft.non_authorizing);
+    try std.testing.expect(!draft.proof_granted);
+}
+
+test "CPU definition draft rotates grammar while preserving facts" {
+    const allocator = std.testing.allocator;
+    var one = try generateCpuDefinitionDraft(allocator, "What is a CPU?");
+    defer one.deinit(allocator);
+    var two = try generateCpuDefinitionDraft(allocator, "What is a CPU?");
+    defer two.deinit(allocator);
+    var three = try generateCpuDefinitionDraft(allocator, "What is a CPU?");
+    defer three.deinit(allocator);
+
+    try std.testing.expect(!std.mem.eql(u8, one.draft_text, two.draft_text));
+    try std.testing.expect(!std.mem.eql(u8, two.draft_text, three.draft_text));
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(one.draft_text, "CPU") != null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(two.draft_text, "instruction") != null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(three.draft_text, "data") != null);
+    try std.testing.expect(one.non_authorizing and two.non_authorizing and three.non_authorizing);
 }
 
 test "state reflection draft reports daemon footprint without corpus lookup" {

@@ -152,7 +152,193 @@ pub const CorpusScanEntry = extern struct {
     semantic_hash_hi: u32 = 0,
     flags: u32 = 0,
     reserved: u32 = 0,
+    relation_hash_lo: u32 = 0,
+    relation_hash_hi: u32 = 0,
+    inverse_relation_hash_lo: u32 = 0,
+    inverse_relation_hash_hi: u32 = 0,
 };
+
+pub const SPO_DIRECT_MATCH_BONUS: u32 = 4200;
+pub const SPO_PARTIAL_MATCH_BONUS: u32 = 900;
+pub const SPO_INVERSE_MATCH_PENALTY_PER_MILLE: u32 = 125;
+
+pub const SpoVector = struct {
+    subject_hash: u64 = 0,
+    predicate_hash: u64 = 0,
+    object_hash: u64 = 0,
+    forward_hash: u64 = 0,
+    inverse_hash: u64 = 0,
+    valid: bool = false,
+
+    pub fn directMatch(self: SpoVector, other: SpoVector) bool {
+        return self.valid and other.valid and self.forward_hash != 0 and self.forward_hash == other.forward_hash;
+    }
+
+    pub fn inverseMatch(self: SpoVector, other: SpoVector) bool {
+        return self.valid and other.valid and self.forward_hash != 0 and self.forward_hash == other.inverse_hash;
+    }
+};
+
+const SpoToken = struct {
+    text: []const u8,
+    hash: u64,
+    predicate_hash: u64 = 0,
+};
+
+pub fn extractSpoVector(text: []const u8) SpoVector {
+    var tokens: [64]SpoToken = undefined;
+    var count: usize = 0;
+    var start: ?usize = null;
+    var idx: usize = 0;
+    while (idx <= text.len) : (idx += 1) {
+        const at_end = idx == text.len;
+        const byte = if (at_end) 0 else text[idx];
+        if (!at_end and (std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-')) {
+            if (start == null) start = idx;
+            continue;
+        }
+        if (start) |s| {
+            const token = text[s..idx];
+            if (token.len >= 2 and count < tokens.len and !isSpoStopToken(token)) {
+                const predicate_hash = normalizedPredicateHash(token);
+                tokens[count] = .{
+                    .text = token,
+                    .hash = hashLowerAsciiToken(token),
+                    .predicate_hash = predicate_hash,
+                };
+                count += 1;
+            }
+            start = null;
+        }
+    }
+
+    for (tokens[0..count], 0..) |token, token_idx| {
+        if (token.predicate_hash == 0) continue;
+        const subject_idx = previousSpoConcept(tokens[0..count], token_idx) orelse continue;
+        const object_idx = nextSpoConcept(tokens[0..count], token_idx + 1) orelse continue;
+        const subject = tokens[subject_idx];
+        const object = tokens[object_idx];
+        if (subject.hash == object.hash) continue;
+        const forward = hashSpo(subject.hash, token.predicate_hash, object.hash);
+        return .{
+            .subject_hash = subject.hash,
+            .predicate_hash = token.predicate_hash,
+            .object_hash = object.hash,
+            .forward_hash = forward,
+            .inverse_hash = hashSpo(object.hash, token.predicate_hash, subject.hash),
+            .valid = forward != 0,
+        };
+    }
+
+    return .{};
+}
+
+pub fn relationScorePerMille(query: SpoVector, candidate: SpoVector) u16 {
+    if (!query.valid or !candidate.valid) return 0;
+    if (query.directMatch(candidate)) return 1000;
+    if (query.inverseMatch(candidate)) return 0;
+    var score: u16 = 0;
+    if (query.predicate_hash != 0 and query.predicate_hash == candidate.predicate_hash) score += 360;
+    if (query.subject_hash != 0 and query.subject_hash == candidate.subject_hash) score += 320;
+    if (query.object_hash != 0 and query.object_hash == candidate.object_hash) score += 320;
+    return score;
+}
+
+pub fn relationPenaltyPerMille(query: SpoVector, candidate: SpoVector) u16 {
+    if (!query.valid or !candidate.valid) return 0;
+    if (query.inverseMatch(candidate)) return 875;
+    return 0;
+}
+
+fn previousSpoConcept(tokens: []const SpoToken, predicate_idx: usize) ?usize {
+    if (predicate_idx == 0) return null;
+    var idx = predicate_idx;
+    while (idx > 0) {
+        idx -= 1;
+        if (tokens[idx].predicate_hash == 0 and !isSpoConceptStopToken(tokens[idx].text)) return idx;
+    }
+    return null;
+}
+
+fn nextSpoConcept(tokens: []const SpoToken, start_idx: usize) ?usize {
+    var idx = start_idx;
+    while (idx < tokens.len) : (idx += 1) {
+        if (tokens[idx].predicate_hash == 0 and !isSpoConceptStopToken(tokens[idx].text)) return idx;
+    }
+    return null;
+}
+
+fn isSpoStopToken(token: []const u8) bool {
+    const words = [_][]const u8{
+        "a",     "an",     "the",  "to",  "of",    "by",   "for",  "with", "from",  "into", "and", "or",
+        "does",  "do",     "did",  "is",  "are",   "was",  "were", "be",   "being", "been", "can", "could",
+        "would", "should", "must", "may", "might", "then", "than", "that", "this",
+    };
+    for (words) |word| {
+        if (std.ascii.eqlIgnoreCase(token, word)) return true;
+    }
+    return false;
+}
+
+fn isSpoConceptStopToken(token: []const u8) bool {
+    const words = [_][]const u8{
+        "explain", "difference", "between",  "whether", "what",  "when", "where", "why", "how",
+        "logical", "absurdity",  "specific", "vector",  "query",
+    };
+    for (words) |word| {
+        if (std.ascii.eqlIgnoreCase(token, word)) return true;
+    }
+    return false;
+}
+
+fn normalizedPredicateHash(token: []const u8) u64 {
+    if (matchesPredicate(token, &.{ "read", "reads", "reading" })) return hashPredicateName("read");
+    if (matchesPredicate(token, &.{ "control", "controls", "controlled", "controlling" })) return hashPredicateName("control");
+    if (matchesPredicate(token, &.{ "execute", "executes", "executed", "executing" })) return hashPredicateName("execute");
+    if (matchesPredicate(token, &.{ "process", "processes", "processed", "processing" })) return hashPredicateName("process");
+    if (matchesPredicate(token, &.{ "store", "stores", "stored", "storing" })) return hashPredicateName("store");
+    if (matchesPredicate(token, &.{ "use", "uses", "used", "using" })) return hashPredicateName("use");
+    if (matchesPredicate(token, &.{ "contain", "contains", "contained", "containing", "has", "have" })) return hashPredicateName("contain");
+    if (matchesPredicate(token, &.{ "compile", "compiles", "compiled", "compiling" })) return hashPredicateName("compile");
+    if (matchesPredicate(token, &.{ "access", "accesses", "accessed", "accessing" })) return hashPredicateName("access");
+    if (matchesPredicate(token, &.{ "write", "writes", "wrote", "written", "writing" })) return hashPredicateName("write");
+    if (matchesPredicate(token, &.{ "follow", "follows", "followed", "following" })) return hashPredicateName("follow");
+    return 0;
+}
+
+fn matchesPredicate(token: []const u8, forms: []const []const u8) bool {
+    for (forms) |form| {
+        if (std.ascii.eqlIgnoreCase(token, form)) return true;
+    }
+    return false;
+}
+
+fn hashPredicateName(name: []const u8) u64 {
+    return hashLowerAsciiToken(name);
+}
+
+fn hashLowerAsciiToken(token: []const u8) u64 {
+    var hasher = std.hash.Fnv1a_64.init();
+    for (token) |byte| {
+        var lower: [1]u8 = .{std.ascii.toLower(byte)};
+        hasher.update(&lower);
+    }
+    return hasher.final();
+}
+
+fn hashSpo(subject_hash: u64, predicate_hash: u64, object_hash: u64) u64 {
+    var hasher = std.hash.Fnv1a_64.init();
+    updateHashU64(&hasher, subject_hash);
+    updateHashU64(&hasher, predicate_hash);
+    updateHashU64(&hasher, object_hash);
+    return hasher.final();
+}
+
+fn updateHashU64(hasher: *std.hash.Fnv1a_64, value: u64) void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, value, .little);
+    hasher.update(&bytes);
+}
 
 pub const GLOBAL_RUNE_RESONANCE_OVERRIDE_PER_MILLE: u16 = 850;
 
@@ -1935,6 +2121,8 @@ pub const VulkanEngine = struct {
         query_hash: u64,
         bias_hash: u64,
         bias_multiplier_per_mille: u32,
+        query_relation_hash: u64,
+        inverse_relation_hash: u64,
     ) ![]const u32 {
         // GPU corpus scan ranks resident shard entries by deterministic
         // SimHash resonance. CPU callers may render snippets and enforce
@@ -1997,10 +2185,10 @@ pub const VulkanEngine = struct {
             term_lens[1],
             term_lens[2],
             term_lens[3],
-            0,
-            0,
-            0,
-            0,
+            @intCast(query_relation_hash & 0xFFFF_FFFF),
+            @intCast(query_relation_hash >> 32),
+            @intCast(inverse_relation_hash & 0xFFFF_FFFF),
+            @intCast(inverse_relation_hash >> 32),
         };
         self.vk_ctx.vkCmdPushConstants.?(self.command_buffers[f], self.pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, 64, &pc);
 
@@ -2584,4 +2772,18 @@ test "ghost index pruning skips far simhash blocks" {
     try std.testing.expect(summary.retained_blocks >= 1);
     try std.testing.expect(!shouldSkipGhostIndexBlock(query_hash, blocks[0]));
     try std.testing.expect(ghostIndexNearnessPerMille(0, std.math.maxInt(u64)) < GHOST_INDEX_SKIP_THRESHOLD_PER_MILLE);
+}
+
+test "SPO vectorization distinguishes directed inverse relations" {
+    const query = extractSpoVector("Does the CPU control the RAM?");
+    const direct = extractSpoVector("The CPU controls the RAM.");
+    const inverse = extractSpoVector("The RAM controls the CPU.");
+
+    try std.testing.expect(query.valid);
+    try std.testing.expect(direct.valid);
+    try std.testing.expect(inverse.valid);
+    try std.testing.expect(query.directMatch(direct));
+    try std.testing.expect(query.inverseMatch(inverse));
+    try std.testing.expectEqual(@as(u16, 1000), relationScorePerMille(query, direct));
+    try std.testing.expect(relationPenaltyPerMille(query, inverse) >= 800);
 }
