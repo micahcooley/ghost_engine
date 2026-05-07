@@ -6,6 +6,7 @@ const build_options = @import("build_options");
 pub const TEST_MODE = build_options.test_mode;
 pub const PLATFORM_SUBDIR = build_options.platform_subdir;
 pub const STATE_SUBDIR = if (TEST_MODE) "state/test" else PLATFORM_SUBDIR ++ "/state";
+pub const TEST_ROOT_ABS_PATH = "/tmp/ghost_test";
 
 pub const MAX_VRAM_GB: usize = 4; // Target hardware profile
 pub const FLEET_MODE: bool = true; // Training and dashboard control paths expect a fleet handle, even on one GPU.
@@ -88,6 +89,15 @@ pub fn getPath(allocator: std.mem.Allocator, sub_path: []const u8) ![]u8 {
         return std.fs.path.join(allocator, &.{ env_path, sub_path });
     }
 
+    if (TEST_MODE and shouldUseTestRoot(sub_path)) {
+        const path = try std.fs.path.join(allocator, &.{ TEST_ROOT_ABS_PATH, sub_path });
+        errdefer allocator.free(path);
+        if (std.fs.path.dirname(path)) |parent| {
+            try std.fs.cwd().makePath(parent);
+        }
+        return path;
+    }
+
     const exe_dir = try std.fs.selfExeDirPathAlloc(allocator);
     defer allocator.free(exe_dir);
 
@@ -96,6 +106,11 @@ pub fn getPath(allocator: std.mem.Allocator, sub_path: []const u8) ![]u8 {
     const project_root = std.fs.path.dirname(p1) orelse p1;
 
     return std.fs.path.join(allocator, &.{ project_root, sub_path });
+}
+
+fn shouldUseTestRoot(sub_path: []const u8) bool {
+    return std.mem.eql(u8, sub_path, "ghost_config.toml") or
+        std.mem.startsWith(u8, sub_path, "state/");
 }
 
 pub const LATTICE_FILE_NAME = "unified_lattice.bin";

@@ -2,7 +2,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const hash_acceleration = @import("hash_acceleration.zig");
 const intent_grounding = @import("intent_grounding.zig");
-const response_engine = @import("response_engine.zig");
 
 // Experimental Ghost text-generation lab.
 //
@@ -230,9 +229,17 @@ pub fn generateDefaultResponderForIntent(
     allocator: std.mem.Allocator,
     intent_class: intent_grounding.IntentClass,
 ) !?TextGenerationDraft {
+    return generateDefaultResponderForShard(allocator, intent_class, "current shard");
+}
+
+pub fn generateDefaultResponderForShard(
+    allocator: std.mem.Allocator,
+    intent_class: intent_grounding.IntentClass,
+    shard_name: []const u8,
+) !?TextGenerationDraft {
     if (intent_class != .conversation) return null;
     return .{
-        .draft_text = try allocator.dupe(u8, response_engine.DEFAULT_CONVERSATIONAL_RESPONSE),
+        .draft_text = try std.fmt.allocPrint(allocator, "Ready. System anchored to {s}. How can I assist?", .{shard_name}),
         .candidate_only = false,
         .non_authorizing = false,
         .support_granted = true,
@@ -993,7 +1000,7 @@ test "conversational intent returns default responder" {
     const draft = (try generateDefaultResponderForIntent(allocator, .conversation)) orelse return error.TestExpectedDraft;
     defer draft.deinit(allocator);
 
-    try std.testing.expectEqualStrings(response_engine.DEFAULT_CONVERSATIONAL_RESPONSE, draft.draft_text);
+    try std.testing.expectEqualStrings("Ready. System anchored to current shard. How can I assist?", draft.draft_text);
     try std.testing.expect(draft.support_granted);
     try std.testing.expect(!draft.non_authorizing);
 }

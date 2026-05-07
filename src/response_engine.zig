@@ -27,7 +27,7 @@ pub const MAX_PARTIAL_FINDINGS: usize = 16;
 pub const MAX_ELIGIBILITY_TRACES: usize = 16;
 pub const MAX_CORRECTION_ITEMS: usize = 16;
 pub const MAX_NEGATIVE_KNOWLEDGE_ITEMS: usize = 16;
-pub const DEFAULT_CONVERSATIONAL_RESPONSE = "Ready. System anchored to zenith_root. What are we building?";
+pub const DEFAULT_CONVERSATIONAL_RESPONSE = "Ready. System anchored to current shard. How can I assist?";
 
 // ── Response Modes ─────────────────────────────────────────────────────
 

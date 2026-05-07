@@ -20,6 +20,21 @@ const SHUTDOWN_FENCE_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
 const VALIDATION_LAYER_NAME: [*:0]const u8 = "VK_LAYER_KHRONOS_validation";
 const DEBUG_UTILS_EXTENSION_NAME: [*:0]const u8 = "VK_EXT_debug_utils";
 
+pub fn runtimeLogsEnabled() bool {
+    return envFlag("GHOST_ENGINE_DEBUG") or
+        envFlag("GHOST_ENGINE_VERBOSE") or
+        envFlag("GHOST_DEBUG") or
+        envFlag("GHOST_VERBOSE");
+}
+
+fn envFlag(name: []const u8) bool {
+    const value = std.posix.getenv(name) orelse return false;
+    return value.len != 0 and
+        !std.mem.eql(u8, value, "0") and
+        !std.ascii.eqlIgnoreCase(value, "false") and
+        !std.ascii.eqlIgnoreCase(value, "no");
+}
+
 const Mutex = struct {
     state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     pub fn lock(self: *Mutex) void {
@@ -310,11 +325,11 @@ fn createInstance(ctx: *vl.VulkanCtx, allocator: std.mem.Allocator, app_name: [*
     const debug_utils_enabled = validation_enabled and try hasInstanceExtension(ctx, allocator, std.mem.span(DEBUG_UTILS_EXTENSION_NAME));
 
     if (validation_enabled) {
-        std.debug.print("[VULKAN] Validation layer enabled.\n", .{});
+        if (runtimeLogsEnabled()) std.debug.print("[VULKAN] Validation layer enabled.\n", .{});
     } else if (validation_allowed) {
-        std.debug.print("[VULKAN] Validation layer unavailable; continuing without Khronos diagnostics.\n", .{});
+        if (runtimeLogsEnabled()) std.debug.print("[VULKAN] Validation layer unavailable; continuing without Khronos diagnostics.\n", .{});
     } else {
-        std.debug.print("[VULKAN] Validation disabled for production/headless runtime.\n", .{});
+        if (runtimeLogsEnabled()) std.debug.print("[VULKAN] Validation disabled for production/headless runtime.\n", .{});
     }
 
     var layers = [_][*:0]const u8{VALIDATION_LAYER_NAME};
@@ -456,6 +471,12 @@ pub const VulkanEngine = struct {
     panopticon_buffer: vk.VkBuffer = null,
     panopticon_memory: vk.VkDeviceMemory = null,
     mapped_edges: ?[*]u32 = null,
+
+    // V34: General Ingest Lobe (Non-code data)
+    general_ingest_buffer: vk.VkBuffer = null,
+    general_ingest_memory: vk.VkDeviceMemory = null,
+    mapped_general_ingest: ?[*]u32 = null,
+    general_ingest_size: usize = 0,
 
     // Batch Ring Buffers
     rotor_buffers: [FRAME_COUNT]vk.VkBuffer = [_]vk.VkBuffer{null} ** FRAME_COUNT,
@@ -629,9 +650,11 @@ pub const VulkanEngine = struct {
             }
         }
 
-        std.debug.print("[VULKAN-{d}] Selected Device: {s}\n", .{ self.device_index, trimDeviceName(devProps.deviceName[0..]) });
-        std.debug.print("[VULKAN-{d}] VRAM Detect: {d} MB | Parallel Streams: {d}\n", .{ self.device_index, self.vram_size / 1048576, self.num_queues });
-        std.debug.print("[VULKAN-{d}] Headless compute mode active. Perf score: {d}\n", .{ self.device_index, self.performance_score });
+        if (runtimeLogsEnabled()) {
+            std.debug.print("[VULKAN-{d}] Selected Device: {s}\n", .{ self.device_index, trimDeviceName(devProps.deviceName[0..]) });
+            std.debug.print("[VULKAN-{d}] VRAM Detect: {d} MB | Parallel Streams: {d}\n", .{ self.device_index, self.vram_size / 1048576, self.num_queues });
+            std.debug.print("[VULKAN-{d}] Headless compute mode active. Perf score: {d}\n", .{ self.device_index, self.performance_score });
+        }
 
         var qfCount: u32 = 0;
         self.vk_ctx.vkGetPhysicalDeviceQueueFamilyProperties.?(self.pdev, &qfCount, null);
@@ -667,11 +690,11 @@ pub const VulkanEngine = struct {
         if (transfer_family) |tf| {
             self.has_dedicated_transfer = true;
             self.transfer_queue_family = tf;
-            std.debug.print("[VULKAN-{d}] Dedicated Transfer Queue: Family {d}\n", .{ self.device_index, tf });
+            if (runtimeLogsEnabled()) std.debug.print("[VULKAN-{d}] Dedicated Transfer Queue: Family {d}\n", .{ self.device_index, tf });
         } else {
             self.has_dedicated_transfer = false;
             self.transfer_queue_family = self.queue_family;
-            std.debug.print("[VULKAN-{d}] No dedicated transfer queue - using compute queue\n", .{self.device_index});
+            if (runtimeLogsEnabled()) std.debug.print("[VULKAN-{d}] No dedicated transfer queue - using compute queue\n", .{self.device_index});
         }
     }
 
@@ -826,6 +849,10 @@ pub const VulkanEngine = struct {
         self.mapped_edges = @ptrCast(@alignCast(try self.createBuffer(panop_size, matrix_usage, self.matrix_flags, &self.panopticon_buffer, &self.panopticon_memory) orelse return error.VulkanError));
         var graph = vsa_core.FlatGraph.fromMapped(@as([*]vsa_core.GraphNode, @ptrCast(@alignCast(self.mapped_edges.?))), self.matrix_slots);
         graph.clear();
+
+        self.general_ingest_size = 16 * 1024 * 1024; // 16MB default
+        self.mapped_general_ingest = @ptrCast(@alignCast(try self.createBuffer(self.general_ingest_size, matrix_usage, self.matrix_flags, &self.general_ingest_buffer, &self.general_ingest_memory) orelse return error.VulkanError));
+        @memset(std.mem.sliceAsBytes(self.mapped_general_ingest.?[0 .. self.general_ingest_size / 4]), 0);
     }
 
     fn createComputePipeline(self: *VulkanEngine, spv: []const u8, spec_info: ?*const vk.VkSpecializationInfo) !vk.VkPipeline {
@@ -905,7 +932,7 @@ pub const VulkanEngine = struct {
     }
 
     fn updateDescriptorSets(self: *VulkanEngine, f: u32) void {
-        var info = [_]vk.VkDescriptorBufferInfo{std.mem.zeroes(vk.VkDescriptorBufferInfo)} ** 12;
+        var info = [_]vk.VkDescriptorBufferInfo{std.mem.zeroes(vk.VkDescriptorBufferInfo)} ** 13;
         info[0] = .{ .buffer = self.matrix_buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE };
         info[1] = .{ .buffer = self.rotor_buffers[f], .offset = 0, .range = vk.VK_WHOLE_SIZE };
         info[2] = .{ .buffer = self.char_buffers[f], .offset = 0, .range = vk.VK_WHOLE_SIZE };
@@ -918,12 +945,13 @@ pub const VulkanEngine = struct {
         info[9] = .{ .buffer = self.panopticon_buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE };
         info[10] = .{ .buffer = self.config_buffers[f], .offset = 0, .range = vk.VK_WHOLE_SIZE };
         info[11] = .{ .buffer = self.lock_mask_buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE };
+        info[12] = .{ .buffer = self.general_ingest_buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE };
 
         var write = std.mem.zeroes(vk.VkWriteDescriptorSet);
         write.sType = vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         write.dstSet = self.descriptor_sets[f];
         write.dstBinding = 0;
-        write.descriptorCount = 12;
+        write.descriptorCount = 13;
         write.descriptorType = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         write.pBufferInfo = &info[0];
         self.vk_ctx.vkUpdateDescriptorSets.?(self.dev, 1, &write, 0, null);
@@ -1972,7 +2000,7 @@ pub fn getFleet() ?*MultiGPU {
 pub fn initRuntime(allocator: std.mem.Allocator) !*VulkanEngine {
     if (config.FLEET_MODE) {
         global_fleet = initFleet(allocator) catch |err| {
-            std.debug.print("[MULTI-GPU] Fleet init failed ({any}), falling back to single engine\n", .{err});
+            if (runtimeLogsEnabled()) std.debug.print("[MULTI-GPU] Fleet init failed ({any}), falling back to single engine\n", .{err});
             global_instance = try VulkanEngine.init(allocator);
             return global_instance.?;
         };

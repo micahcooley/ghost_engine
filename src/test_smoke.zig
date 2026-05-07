@@ -7002,6 +7002,8 @@ test "gip corpus ask composes explicitly mounted Knowledge Pack corpus evidence"
     const runtime_pack_id = "corpus-ask-runtime-core-pack";
     const hardening_pack_id = "corpus-ask-manual-hardening-pack";
     const pack_version = "v1";
+    knowledge_packs.removePack(allocator, runtime_pack_id, pack_version) catch {};
+    knowledge_packs.removePack(allocator, hardening_pack_id, pack_version) catch {};
 
     var runtime_corpus = std.testing.tmpDir(.{});
     defer runtime_corpus.cleanup();
@@ -7096,6 +7098,7 @@ test "corpus ask bridges certified HITL status to requirement answer" {
     const project_shard = "corpus-ask-hitl-status-bridge-test";
     const pack_id = "corpus-ask-hitl-cert-bridge-pack";
     const pack_version = "1.0.0";
+    knowledge_packs.removePack(allocator, pack_id, pack_version) catch {};
 
     var cert_corpus = std.testing.tmpDir(.{});
     defer cert_corpus.cleanup();

@@ -31,7 +31,9 @@ pub const Context = struct {
         }
 
         const engine = vsa_vulkan.initRuntime(allocator) catch |err| {
-            std.debug.print("[ACCEL] Vulkan acceleration requested for {s}, but initialization failed: {any}. Falling back to CPU hashing/search metadata.\n", .{ purpose, err });
+            if (vsa_vulkan.runtimeLogsEnabled()) {
+                std.debug.print("[ACCEL] Vulkan acceleration requested for {s}, but initialization failed: {any}. Falling back to CPU hashing/search metadata.\n", .{ purpose, err });
+            }
             ctx.policy = .cpu;
             return ctx;
         };
@@ -68,7 +70,9 @@ pub fn semanticHash64(ctx: ?*Context, allocator: std.mem.Allocator, text: []cons
         if (actual_ctx.policy == .vulkan) {
             if (actual_ctx.vulkan) |engine| {
                 const mixed_words = engine.dispatchSemanticHashBatch(seeds) catch |err| {
-                    std.debug.print("[ACCEL] Vulkan semantic hash dispatch failed: {any}. Falling back to CPU semantic hash.\n", .{err});
+                    if (vsa_vulkan.runtimeLogsEnabled()) {
+                        std.debug.print("[ACCEL] Vulkan semantic hash dispatch failed: {any}. Falling back to CPU semantic hash.\n", .{err});
+                    }
                     return semanticHash64Cpu(text);
                 };
                 return foldGpuWords(mixed_words, seeds.len);
@@ -122,7 +126,9 @@ pub fn semanticHash64Batch(ctx: ?*Context, allocator: std.mem.Allocator, texts: 
     while (seed_offset < seeds.len) {
         const batch_len = @min(MAX_GPU_BLOCKS, seeds.len - seed_offset);
         const words = ctx.?.vulkan.?.dispatchSemanticHashBatch(seeds[seed_offset .. seed_offset + batch_len]) catch |err| {
-            std.debug.print("[ACCEL] Vulkan batched semantic hash dispatch failed: {any}. Falling back to CPU semantic hashes.\n", .{err});
+            if (vsa_vulkan.runtimeLogsEnabled()) {
+                std.debug.print("[ACCEL] Vulkan batched semantic hash dispatch failed: {any}. Falling back to CPU semantic hashes.\n", .{err});
+            }
             for (texts, 0..) |text, idx| out[idx] = semanticHash64Cpu(text);
             return;
         };
@@ -230,6 +236,7 @@ fn mix64(value: u64) u64 {
 }
 
 fn logVulkanReady(engine: *const vsa_vulkan.VulkanEngine, purpose: []const u8) void {
+    if (!vsa_vulkan.runtimeLogsEnabled()) return;
     const name = trimDeviceName(engine.device_name[0..]);
     const navi10 = std.ascii.indexOfIgnoreCase(name, "5700 XT") != null or
         std.ascii.indexOfIgnoreCase(name, "Navi 10") != null;

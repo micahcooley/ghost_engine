@@ -28,6 +28,8 @@ pub fn build(b: *std.Build) void {
     // by default, or an explicit target such as `-Dtarget=x86_64-linux`.
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const test_filter = b.option([]const u8, "test-filter", "Run only tests whose name contains this text");
+    const test_filters: []const []const u8 = if (test_filter) |filter| &.{filter} else &.{};
     const core_options = addCoreOptions(b, target, false);
 
     // ── 1. External Dependencies (Vulkan headers only) ──
@@ -234,6 +236,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         }),
+        .filters = test_filters,
     });
     const text_generation_lab_options = addCoreOptions(b, target, true);
     text_generation_lab_tests.root_module.addOptions("build_options", text_generation_lab_options);
@@ -254,6 +257,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         }),
+        .filters = test_filters,
     });
     const test_core_options = addCoreOptions(b, target, true);
     const ghost_core_test = b.createModule(.{
@@ -277,6 +281,8 @@ pub fn build(b: *std.Build) void {
     addVulkanIncludes(main_tests.root_module, target.result.os, vulkan_sdk, b);
 
     const run_main_tests = b.addRunArtifact(main_tests);
+    const test_smoke_step = b.step("test-smoke", "Run src/test_smoke.zig tests");
+    test_smoke_step.dependOn(&run_main_tests.step);
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_main_tests.step);
     test_step.dependOn(&run_text_generation_lab_tests.step);
@@ -287,6 +293,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         }),
+        .filters = test_filters,
     });
     lifecycle_tests.root_module.addOptions("build_options", test_core_options);
     lifecycle_tests.root_module.linkSystemLibrary("c", .{});
@@ -295,6 +302,8 @@ pub fn build(b: *std.Build) void {
         lifecycle_tests.root_module.linkSystemLibrary("vulkan", .{});
     }
     const run_lifecycle_tests = b.addRunArtifact(lifecycle_tests);
+    const test_lifecycle_step = b.step("test-lifecycle", "Run src/test_verifier_lifecycle.zig tests");
+    test_lifecycle_step.dependOn(&run_lifecycle_tests.step);
     test_step.dependOn(&run_lifecycle_tests.step);
 
     const gip_cli_tests = b.addTest(.{
@@ -303,6 +312,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         }),
+        .filters = test_filters,
     });
     gip_cli_tests.root_module.addImport("ghost_core", ghost_core_test);
     gip_cli_tests.root_module.addOptions("build_options", test_core_options);
@@ -313,6 +323,8 @@ pub fn build(b: *std.Build) void {
     }
     addVulkanIncludes(gip_cli_tests.root_module, target.result.os, vulkan_sdk, b);
     const run_gip_cli_tests = b.addRunArtifact(gip_cli_tests);
+    const test_gip_cli_step = b.step("test-gip-cli", "Run src/gip_cli.zig tests");
+    test_gip_cli_step.dependOn(&run_gip_cli_tests.step);
     test_step.dependOn(&run_gip_cli_tests.step);
 
     const knowledge_pack_cli_tests = b.addTest(.{
@@ -321,6 +333,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         }),
+        .filters = test_filters,
     });
     knowledge_pack_cli_tests.root_module.addOptions("build_options", test_core_options);
     knowledge_pack_cli_tests.root_module.linkSystemLibrary("c", .{});
@@ -330,6 +343,8 @@ pub fn build(b: *std.Build) void {
     }
     addVulkanIncludes(knowledge_pack_cli_tests.root_module, target.result.os, vulkan_sdk, b);
     const run_knowledge_pack_cli_tests = b.addRunArtifact(knowledge_pack_cli_tests);
+    const test_knowledge_packs_step = b.step("test-knowledge-packs", "Run src/knowledge_packs.zig tests");
+    test_knowledge_packs_step.dependOn(&run_knowledge_pack_cli_tests.step);
     test_step.dependOn(&run_knowledge_pack_cli_tests.step);
 
     const project_autopsy_cli_tests = b.addTest(.{
@@ -338,6 +353,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         }),
+        .filters = test_filters,
     });
     project_autopsy_cli_tests.root_module.addImport("ghost_core", ghost_core_test);
     project_autopsy_cli_tests.root_module.addOptions("build_options", test_core_options);
@@ -348,6 +364,8 @@ pub fn build(b: *std.Build) void {
     }
     addVulkanIncludes(project_autopsy_cli_tests.root_module, target.result.os, vulkan_sdk, b);
     const run_project_autopsy_cli_tests = b.addRunArtifact(project_autopsy_cli_tests);
+    const test_project_autopsy_step = b.step("test-project-autopsy-cli", "Run src/project_autopsy_cli.zig tests");
+    test_project_autopsy_step.dependOn(&run_project_autopsy_cli_tests.step);
     test_step.dependOn(&run_project_autopsy_cli_tests.step);
 
     const compute_dominance_tests = b.addTest(.{
@@ -356,6 +374,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         }),
+        .filters = test_filters,
     });
     compute_dominance_tests.root_module.addImport("ghost_core", ghost_core_test);
     compute_dominance_tests.root_module.addOptions("build_options", test_core_options);
@@ -366,6 +385,8 @@ pub fn build(b: *std.Build) void {
     }
     addVulkanIncludes(compute_dominance_tests.root_module, target.result.os, vulkan_sdk, b);
     const run_compute_dominance_tests = b.addRunArtifact(compute_dominance_tests);
+    const test_compute_dominance_step = b.step("test-compute-dominance", "Run src/bench_compute_dominance.zig tests");
+    test_compute_dominance_step.dependOn(&run_compute_dominance_tests.step);
     test_step.dependOn(&run_compute_dominance_tests.step);
 
     // ── 10. Parity Test ──

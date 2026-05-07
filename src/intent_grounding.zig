@@ -56,6 +56,12 @@ const LatentIntentMatch = struct {
     vector: [LATENT_VECTOR_DIMS]f32,
 };
 
+pub const IntentConfidence = struct {
+    concept: LatentConcept,
+    score: f32,
+    strong_heavy_task: bool,
+};
+
 /// Scope of the intent — how wide its effect surface is.
 pub const IntentScope = enum {
     artifact_local,
@@ -984,6 +990,15 @@ fn inferLatentIntent(normalized: []const u8) LatentIntentMatch {
     best.strong_heavy_task = hasExplicitHeavyTaskSignal(normalized) and
         (heavy_lane_present or path_backed_diagnostic or (isHeavyConcept(best.concept) and best.similarity >= HEAVY_TASK_THRESHOLD));
     return best;
+}
+
+pub fn estimateIntentConfidence(normalized: []const u8) IntentConfidence {
+    const match = inferLatentIntent(normalized);
+    return .{
+        .concept = match.concept,
+        .score = match.similarity,
+        .strong_heavy_task = match.strong_heavy_task,
+    };
 }
 
 fn isHeavyConcept(concept: LatentConcept) bool {

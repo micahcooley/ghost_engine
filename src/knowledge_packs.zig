@@ -838,12 +838,12 @@ fn claimTemporaryBuildShard(allocator: std.mem.Allocator, pack_id: []const u8, p
         errdefer allocator.free(shard_id);
         var metadata = try shards.resolveProjectMetadata(allocator, shard_id);
         defer metadata.deinit();
-        var paths = try shards.resolvePaths(allocator, metadata.metadata);
-        defer paths.deinit();
 
-        const parent = std.fs.path.dirname(paths.root_abs_path) orelse return error.InvalidArguments;
+        const root_abs_path = try config.getPath(allocator, metadata.metadata.rel_root);
+        defer allocator.free(root_abs_path);
+        const parent = std.fs.path.dirname(root_abs_path) orelse return error.InvalidArguments;
         try sys.makePath(allocator, parent);
-        std.fs.makeDirAbsolute(paths.root_abs_path) catch |err| switch (err) {
+        std.fs.makeDirAbsolute(root_abs_path) catch |err| switch (err) {
             error.PathAlreadyExists => {
                 allocator.free(shard_id);
                 continue;

@@ -836,6 +836,12 @@ pub fn stage(allocator: std.mem.Allocator, options: Options) !StageResult {
 
     const corpus_root = try std.fs.cwd().realpathAlloc(allocator, options.corpus_path);
     errdefer allocator.free(corpus_root);
+    const root_kind = try pathKindAbsolute(corpus_root);
+    const manifest_root = if (root_kind == .file)
+        try allocator.dupe(u8, std.fs.path.dirname(corpus_root) orelse corpus_root)
+    else
+        try allocator.dupe(u8, corpus_root);
+    defer allocator.free(manifest_root);
 
     const source_label = if (options.source_label) |label|
         try allocator.dupe(u8, label)
@@ -846,9 +852,9 @@ pub fn stage(allocator: std.mem.Allocator, options: Options) !StageResult {
     const trust_class = options.trust_class orelse defaultTrustForKind(paths.metadata.kind);
     try validateTrustClass(paths.metadata.kind, trust_class);
 
-    var manifest = try Manifest.init(allocator, corpus_root, source_label);
+    var manifest = try Manifest.init(allocator, manifest_root, source_label);
     defer manifest.deinit();
-    var external_meta = try loadExternalMetadata(allocator, corpus_root);
+    var external_meta = try loadExternalMetadata(allocator, manifest_root);
     defer deinitExternalMetadataMap(allocator, &external_meta);
     var acceleration = hash_acceleration.Context.init(allocator, "corpus ingest hashing");
     defer acceleration.deinit();
@@ -903,6 +909,11 @@ pub fn stage(allocator: std.mem.Allocator, options: Options) !StageResult {
         .capacity_telemetry = manifest.capacity_telemetry,
         .items = results,
     };
+}
+
+fn pathKindAbsolute(path: []const u8) !std.fs.File.Kind {
+    const stat = try std.fs.cwd().statFile(path);
+    return stat.kind;
 }
 
 fn ingestProfileEnabled() bool {
@@ -1167,6 +1178,11 @@ fn scanDirParallel(
     defer allocator.free(license_status);
     const license_authority_level = try readLicenseAuthorityLevel(manifest.source_root);
 
+    if (config.TEST_MODE or candidates.items.len <= 1) {
+        try scanCandidatesSerial(allocator, candidates.items, root_hint, source_label, owner_kind, owner_id, trust_class, options, external_meta, manifest, license_status, license_authority_level, acceleration);
+        return;
+    }
+
     const results = try allocator.alloc(ScanResult, candidates.items.len);
     defer {
         for (results) |*result| result.deinit();
@@ -1209,6 +1225,35 @@ fn scanDirParallel(
         }
         if (manifest.next_cursor) |old| allocator.free(old);
         manifest.next_cursor = try allocator.dupe(u8, candidates.items[index].rel_path);
+    }
+    try applyBatchedSemanticHashes(allocator, manifest, acceleration);
+}
+
+fn scanCandidatesSerial(
+    allocator: std.mem.Allocator,
+    candidates: []const FileCandidate,
+    root_hint: RootHint,
+    source_label: []const u8,
+    owner_kind: shards.Kind,
+    owner_id: []const u8,
+    trust_class: abstractions.TrustClass,
+    options: Options,
+    external_meta: *const std.StringHashMap(ExternalMetadata),
+    manifest: *Manifest,
+    license_status: []const u8,
+    license_authority_level: u8,
+    acceleration: *hash_acceleration.Context,
+) !void {
+    for (candidates) |candidate| {
+        var outcome = try parseOneFileForIngest(allocator, candidate.abs_path, candidate.rel_path, root_hint, source_label, owner_kind, owner_id, trust_class, options, external_meta, license_status, license_authority_level, acceleration);
+        errdefer outcome.deinit();
+        switch (outcome) {
+            .unit => |*unit| try appendScannedUnit(manifest, unit),
+            .rejection => |*rejection| try manifest.rejections.append(rejection.*),
+        }
+        if (manifest.next_cursor) |old| allocator.free(old);
+        manifest.next_cursor = try allocator.dupe(u8, candidate.rel_path);
+        outcome = undefined;
     }
     try applyBatchedSemanticHashes(allocator, manifest, acceleration);
 }
@@ -1816,6 +1861,9 @@ fn classifyInput(path: []const u8, root_hint: RootHint, bytes: []const u8) ?Item
     if (isCodeExtension(path)) return .code;
     if (isSymbolicExtension(path)) return .symbolic;
     if (isConfigExtension(path)) return .configs;
+    if (isRawTextExtension(path)) {
+        return if (root_hint == .specs) .specs else .docs;
+    }
     if (isDocExtension(path)) {
         return if (root_hint == .specs) .specs else .docs;
     }
@@ -1844,6 +1892,11 @@ fn isCodeExtension(path: []const u8) bool {
         std.mem.endsWith(u8, path, ".hh") or
         std.mem.endsWith(u8, path, ".hpp") or
         std.mem.endsWith(u8, path, ".hxx");
+}
+
+fn isRawTextExtension(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".txt") or
+        std.mem.endsWith(u8, path, ".md");
 }
 
 fn isDocExtension(path: []const u8) bool {

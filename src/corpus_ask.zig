@@ -772,9 +772,6 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
             }
         }
         if (best_distance) |distance| {
-            if (idx == 1 or idx == 2) {
-                std.debug.print("INIT LOOP: Entry {d} best_distance={d} sim_score={d}\n", .{ idx, distance, corpus_sketch.similarityScore(distance) });
-            }
             try index_scan_candidates.append(.{
                 .entry_index = idx,
                 .hamming_distance = distance,
@@ -824,7 +821,11 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         const score_start = askProfileNow(&profile_timer);
         var scored = try scoreTextDirect(allocator, file_text, tokens.tokens);
         askProfileAccumulate(&profile_timer, score_start, &profile_score_ns);
-        // allow zero-keyword matches to pass through for vector scoring!
+        if (scored.score == 0) {
+            scored.deinit(allocator);
+            allocator.free(file_text);
+            continue;
+        }
 
         const intent_start = askProfileNow(&profile_timer);
         const value_match = evidenceMatchesIntent(file_text, query_intent);
@@ -838,10 +839,6 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         }
         if (entry.semantic_hash != 0) {
             best_distance = @min(best_distance, corpus_sketch.hammingDistance(query_semantic_hash, entry.semantic_hash));
-        }
-
-        if (idx == 1 or idx == 2 or idx == 3) {
-            std.debug.print("Entry {d} best_distance={d} sim_score={d}\n", .{ idx, best_distance, corpus_sketch.similarityScore(best_distance) });
         }
         const similarity_score = corpus_sketch.similarityScore(best_distance);
 
@@ -914,11 +911,6 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     }
 
     std.mem.sort(Candidate, candidates.items, {}, candidateLessThan);
-    std.debug.print("\n=== TOP 3 CANDIDATES ===\n", .{});
-    for (candidates.items[0..@min(3, candidates.items.len)], 0..) |cand, i| {
-        std.debug.print("#{d}: Entry {d} | hybrid_score: {d:.4} | kw_score: {d} | sim_score: {d}\n", .{i+1, cand.entry_index, cand.hybrid_score, cand.score, cand.similarity_score});
-    }
-    std.debug.print("========================\n\n", .{});
     const top_count = @min(max_results, candidates.items.len);
     telemetry.exact_candidate_cap_hit = candidates.items.len > top_count;
     telemetry.max_results_hit = telemetry.exact_candidate_cap_hit;
@@ -2318,11 +2310,11 @@ fn appendToken(allocator: std.mem.Allocator, tokens: *std.ArrayList([]u8), raw: 
 
 fn isStopWord(token: []const u8) bool {
     const words = [_][]const u8{
-        "the",      "and",      "for",   "with",    "from",    "what",     "when",       "where",     "which",  "this",       "that",
-        "does",     "into",     "about", "using",   "should",  "would",    "could",      "tell",      "give",   "show",       "hello",
-        "based",    "only",     "have",  "your",    "also",    "keep",     "explain",    "encounter", "word",   "current",    "shard",
-        "ingested", "grounded", "data",  "logical", "english", "patterns", "understand", "concept",   "answer", "definition", "public",
-        "found",    "yet",      "not",   "corpus",
+        "the",        "and",    "for",      "with",     "from",  "what",    "when",    "where",    "which",      "this",      "that",
+        "whats",      "what's", "does",     "into",     "about", "using",   "should",  "would",    "could",      "tell",      "give",
+        "show",       "hello",  "based",    "only",     "have",  "your",    "also",    "keep",     "explain",    "encounter", "word",
+        "current",    "shard",  "ingested", "grounded", "data",  "logical", "english", "patterns", "understand", "concept",   "answer",
+        "definition", "public", "found",    "yet",      "not",   "corpus",
     };
     for (words) |word| {
         if (std.ascii.eqlIgnoreCase(token, word)) return true;
@@ -3047,10 +3039,60 @@ fn cloneStringSlice(allocator: std.mem.Allocator, values: []const []const u8) ![
 
 fn makeSnippet(allocator: std.mem.Allocator, text: []const u8, first_match: usize, max_bytes: usize) !Snippet {
     if (text.len <= max_bytes) return .{ .text = try cleanSnippet(allocator, text), .truncated = false };
-    const half = max_bytes / 2;
-    const start = if (first_match > half) first_match - half else 0;
+    const start = structuralSnippetStart(text, first_match, max_bytes);
     const end = @min(text.len, start + max_bytes);
     return .{ .text = try cleanSnippet(allocator, text[start..end]), .truncated = true };
+}
+
+fn structuralSnippetStart(text: []const u8, first_match: usize, max_bytes: usize) usize {
+    const bounded_match = @min(first_match, text.len);
+    if (findStructuralAnchor(text, bounded_match)) |anchor| return anchor;
+
+    const half = max_bytes / 2;
+    var start = if (bounded_match > half) bounded_match - half else 0;
+    while (start > 0 and isUtf8ContinuationByte(text[start])) : (start -= 1) {}
+    while (start < text.len and isUtf8ContinuationByte(text[start])) : (start += 1) {}
+    return start;
+}
+
+fn findStructuralAnchor(text: []const u8, from: usize) ?usize {
+    var cursor = @min(from, text.len);
+    while (cursor > 0) {
+        const line_start = previousRuneLineStart(text, cursor);
+        const line = std.mem.trim(u8, text[line_start..cursor], " \t\r\n");
+        if (std.ascii.startsWithIgnoreCase(line, "title:") or isMarkdownHeader(line)) return line_start;
+        if (line_start >= 2 and text[line_start - 1] == '\n' and text[line_start - 2] == '\n') return line_start;
+        if (line_start == 0) return 0;
+        cursor = previousRuneStart(text, line_start - 1);
+    }
+    return null;
+}
+
+fn previousRuneLineStart(text: []const u8, from: usize) usize {
+    var cursor = @min(from, text.len);
+    while (cursor > 0) {
+        const prev = previousRuneStart(text, cursor - 1);
+        if (text[prev] == '\n' or text[prev] == '\r') return cursor;
+        cursor = prev;
+    }
+    return 0;
+}
+
+fn previousRuneStart(text: []const u8, index: usize) usize {
+    if (text.len == 0) return 0;
+    var cursor = @min(index, text.len - 1);
+    while (cursor > 0 and isUtf8ContinuationByte(text[cursor])) : (cursor -= 1) {}
+    return cursor;
+}
+
+fn isUtf8ContinuationByte(byte: u8) bool {
+    return (byte & 0b1100_0000) == 0b1000_0000;
+}
+
+fn isMarkdownHeader(line: []const u8) bool {
+    var idx: usize = 0;
+    while (idx < line.len and line[idx] == '#') : (idx += 1) {}
+    return idx > 0 and idx < line.len and (line[idx] == ' ' or line[idx] == '\t');
 }
 
 fn cleanSnippet(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
