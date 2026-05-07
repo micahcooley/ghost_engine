@@ -55,6 +55,7 @@ pub const CorpusSynthesisInput = struct {
     user_query: []const u8,
     evidence_text: []const u8,
     evidence_texts: []const []const u8 = &.{},
+    evidence_source_ids: []const []const u8 = &.{},
     consensus_gate_authorized: bool = false,
 };
 
@@ -268,7 +269,7 @@ pub fn generateDefaultResponderForShard(
 pub fn generateCorpusSynthesisDraft(allocator: std.mem.Allocator, input: CorpusSynthesisInput) !TextGenerationDraft {
     var salience = try intent_grounding.analyzeSalience(allocator, input.user_query);
     defer salience.deinit(allocator);
-    const subject = if (salience.semantic_target.len != 0) salience.semantic_target else input.user_query;
+    const subject = preferredSynthesisSubject(input.user_query, if (salience.semantic_target.len != 0) salience.semantic_target else input.user_query);
     const draft_text = try synthesizeEvidenceBlocks(allocator, input, subject, salience.density_multiplier);
     const consensus = input.consensus_gate_authorized and finalConsensusResonance(subject, if (input.evidence_texts.len == 0) &.{input.evidence_text} else input.evidence_texts) >= 0.8;
     return .{
@@ -298,6 +299,43 @@ pub fn finalConsensusResonance(subject: []const u8, evidence_texts: []const []co
     }
     if (relevant_terms == 0) return 0;
     return @as(f32, @floatFromInt(matched_terms)) / @as(f32, @floatFromInt(relevant_terms));
+}
+
+fn preferredSynthesisSubject(user_query: []const u8, salience_subject: []const u8) []const u8 {
+    if (acronymSubject(user_query)) |subject| return subject;
+    return salience_subject;
+}
+
+fn acronymSubject(text: []const u8) ?[]const u8 {
+    var start: ?usize = null;
+    for (text, 0..) |byte, idx| {
+        if (std.ascii.isAlphanumeric(byte)) {
+            if (start == null) start = idx;
+        } else if (start) |s| {
+            if (isAcronymToken(text[s..idx])) return text[s..idx];
+            start = null;
+        }
+    }
+    if (start) |s| {
+        if (isAcronymToken(text[s..])) return text[s..];
+    }
+    return null;
+}
+
+fn isAcronymToken(token: []const u8) bool {
+    if (token.len < 2 or token.len > 6) return false;
+    var has_upper = false;
+    var has_alpha = false;
+    for (token) |byte| {
+        if (std.ascii.isAlphabetic(byte)) {
+            has_alpha = true;
+            if (std.ascii.isUpper(byte)) has_upper = true;
+            if (std.ascii.isLower(byte)) return false;
+        } else if (!std.ascii.isDigit(byte)) {
+            return false;
+        }
+    }
+    return has_alpha and has_upper;
 }
 
 pub fn generateSocialResponderDraft(allocator: std.mem.Allocator, input: SocialResponderInput) !TextGenerationDraft {
@@ -353,40 +391,69 @@ fn synthesizeEvidenceBlocks(allocator: std.mem.Allocator, input: CorpusSynthesis
     var out = std.ArrayList(u8).init(allocator);
     errdefer out.deinit();
 
-    const target_blocks = @max(@as(usize, 1), @min(@as(usize, 8), density_multiplier));
+    const available_blocks = if (input.evidence_texts.len == 0) @as(usize, 1) else input.evidence_texts.len;
+    const conversational_blocks = if (available_blocks > 1) @min(@as(usize, 3), available_blocks) else @as(usize, 1);
+    const target_blocks = @max(conversational_blocks, @max(@as(usize, 1), @min(@as(usize, 8), density_multiplier)));
     const requested_variance = runeVarianceScore(input.user_query);
     const target_variance = requested_variance * @as(u32, @min(density_multiplier, 4));
     var selected: usize = 0;
+    var subject_state = SubjectState{};
+    const strict_target_blocks = isAcronymToken(primarySubjectAlias(subject));
 
     if (input.evidence_texts.len == 0) {
-        const sentence = try synthesizeEvidenceSentence(allocator, input.evidence_text, subject);
-        defer allocator.free(sentence);
-        try out.appendSlice(sentence);
+        var block = try synthesizeEvidenceBlock(allocator, input.evidence_text, subject, sourceHintForIndex(input, 0));
+        defer block.deinit(allocator);
+        try appendCohesiveBlock(allocator, &out, block, subject, &subject_state, selected);
         selected = 1;
     } else {
-        for (input.evidence_texts) |evidence_text| {
+        for (input.evidence_texts, 0..) |evidence_text, evidence_idx| {
             if (selected >= target_blocks and runeVarianceScore(out.items) >= target_variance) break;
-            const sentence = try synthesizeEvidenceSentence(allocator, evidence_text, subject);
-            defer allocator.free(sentence);
-            if (sentence.len == 0) continue;
-            if (std.mem.indexOf(u8, out.items, sentence) != null) continue;
-            if (out.items.len != 0) try out.append(' ');
-            try out.appendSlice(sentence);
+            var block = try synthesizeEvidenceBlock(allocator, evidence_text, subject, sourceHintForIndex(input, evidence_idx));
+            defer block.deinit(allocator);
+            if (block.text.len == 0) continue;
+            if (strict_target_blocks and !block.target_match) continue;
+            if (std.mem.indexOf(u8, out.items, block.text) != null) continue;
+            try appendCohesiveBlock(allocator, &out, block, subject, &subject_state, selected);
             selected += 1;
         }
         if (selected == 0) {
-            const sentence = try synthesizeEvidenceSentence(allocator, input.evidence_text, subject);
-            defer allocator.free(sentence);
-            try out.appendSlice(sentence);
+            var block = try synthesizeEvidenceBlock(allocator, input.evidence_text, subject, sourceHintForIndex(input, 0));
+            defer block.deinit(allocator);
+            try appendCohesiveBlock(allocator, &out, block, subject, &subject_state, selected);
         }
     }
 
     return out.toOwnedSlice();
 }
 
-fn synthesizeEvidenceSentence(allocator: std.mem.Allocator, evidence_text: []const u8, subject: []const u8) ![]u8 {
+const SubjectState = struct {
+    previous_subject_leading: bool = false,
+    previous_source_hash: u64 = 0,
+    previous_has_source: bool = false,
+};
+
+const SynthesizedBlock = struct {
+    text: []u8,
+    source_key: []u8,
+    subject_leading: bool,
+    target_match: bool,
+
+    fn deinit(self: *SynthesizedBlock, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        allocator.free(self.source_key);
+    }
+};
+
+fn sourceHintForIndex(input: CorpusSynthesisInput, idx: usize) ?[]const u8 {
+    if (idx < input.evidence_source_ids.len) return input.evidence_source_ids[idx];
+    return null;
+}
+
+fn synthesizeEvidenceBlock(allocator: std.mem.Allocator, evidence_text: []const u8, subject: []const u8, source_hint: ?[]const u8) !SynthesizedBlock {
     const cleaned = try cleanEvidenceText(allocator, evidence_text);
     defer allocator.free(cleaned);
+    const source_key = try sourceKeyForEvidence(allocator, evidence_text, source_hint);
+    errdefer allocator.free(source_key);
 
     const trimmed = std.mem.trim(u8, cleaned, " \r\n\t");
     var best = trimmed;
@@ -415,7 +482,262 @@ fn synthesizeEvidenceSentence(allocator: std.mem.Allocator, evidence_text: []con
 
     const focused = focusDefinitionStart(best, subject);
     const bounded = boundSentence(focused);
-    return allocator.dupe(u8, bounded);
+    const boundary_trimmed = trimSnippetBoundary(bounded);
+    return .{
+        .text = try finishSentenceAlloc(allocator, boundary_trimmed),
+        .source_key = source_key,
+        .subject_leading = leadingSubjectEnd(boundary_trimmed, subject) != null,
+        .target_match = containsSubjectRune(boundary_trimmed, subject),
+    };
+}
+
+fn synthesizeEvidenceSentence(allocator: std.mem.Allocator, evidence_text: []const u8, subject: []const u8) ![]u8 {
+    var block = try synthesizeEvidenceBlock(allocator, evidence_text, subject, null);
+    defer block.deinit(allocator);
+    return allocator.dupe(u8, block.text);
+}
+
+fn appendCohesiveBlock(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    block: SynthesizedBlock,
+    subject: []const u8,
+    state: *SubjectState,
+    selected: usize,
+) !void {
+    const deduped = try applySubjectDeduplication(allocator, block.text, subject, state.previous_subject_leading and block.subject_leading);
+    defer allocator.free(deduped);
+
+    var used_glue = false;
+    if (out.items.len != 0) {
+        const current_source_hash = metadataSourceHash(block.source_key);
+        if (state.previous_has_source and block.source_key.len != 0 and state.previous_source_hash == current_source_hash) {
+            try out.appendSlice(" Additionally, ");
+            used_glue = true;
+        } else if (block.target_match) {
+            try out.appendSlice(specifyingGlue(block.source_key, selected));
+            used_glue = true;
+        } else {
+            try out.append(' ');
+        }
+    }
+    try appendSentenceWithCase(out, deduped, used_glue);
+    state.previous_subject_leading = block.subject_leading;
+    state.previous_source_hash = metadataSourceHash(block.source_key);
+    state.previous_has_source = block.source_key.len != 0;
+}
+
+fn sourceKeyForEvidence(allocator: std.mem.Allocator, evidence_text: []const u8, source_hint: ?[]const u8) ![]u8 {
+    if (source_hint) |hint| {
+        const trimmed = std.mem.trim(u8, hint, " \r\n\t");
+        if (trimmed.len != 0) return allocator.dupe(u8, trimmed);
+    }
+    if (std.mem.indexOf(u8, evidence_text, "]]")) |end| {
+        const key = std.mem.trim(u8, evidence_text[0..end], " \r\n\t");
+        if (key.len != 0 and key.len <= 160) return allocator.dupe(u8, key);
+    }
+    if (std.mem.indexOfScalar(u8, evidence_text, '\n')) |line_end| {
+        const key = std.mem.trim(u8, evidence_text[0..line_end], " \r\n\t");
+        if (key.len != 0 and key.len <= 160) return allocator.dupe(u8, key);
+    }
+    const trimmed = std.mem.trim(u8, evidence_text, " \r\n\t");
+    return allocator.dupe(u8, trimmed[0..@min(trimmed.len, 160)]);
+}
+
+fn metadataRuneDistance(a: []const u8, b: []const u8) u32 {
+    if (a.len == 0 or b.len == 0) return 64;
+    return @popCount(metadataRuneMask(a) ^ metadataRuneMask(b));
+}
+
+fn metadataSourceHash(text: []const u8) u64 {
+    var hasher = std.hash.Fnv1a_64.init();
+    hasher.update(text);
+    return hasher.final();
+}
+
+fn metadataRuneMask(text: []const u8) u64 {
+    var mask: u64 = 0;
+    for (text) |byte| {
+        if (!std.ascii.isAlphanumeric(byte)) continue;
+        const lower = std.ascii.toLower(byte);
+        const slot: u6 = @intCast(@as(u32, lower) & 63);
+        mask |= @as(u64, 1) << slot;
+    }
+    return mask;
+}
+
+fn specifyingGlue(source_key: []const u8, selected: usize) []const u8 {
+    var hasher = std.hash.Fnv1a_64.init();
+    hasher.update(source_key);
+    var index_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &index_bytes, selected, .little);
+    hasher.update(&index_bytes);
+    return if (hasher.final() & 1 == 0) " Specifically, " else " In practice, ";
+}
+
+fn applySubjectDeduplication(allocator: std.mem.Allocator, sentence: []const u8, subject: []const u8, should_replace: bool) ![]u8 {
+    if (!should_replace) return allocator.dupe(u8, sentence);
+    const subject_end = leadingSubjectEnd(sentence, subject) orelse return allocator.dupe(u8, sentence);
+    const remainder = std.mem.trimLeft(u8, sentence[subject_end..], " \r\n\t,:;-");
+    if (remainder.len == 0) return allocator.dupe(u8, sentence);
+    return std.fmt.allocPrint(allocator, "{s} {s}", .{ pronounForSubject(subject), remainder });
+}
+
+fn pronounForSubject(subject: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, subject, " \r\n\t.,;:!?()[]{}\"'");
+    if (isPluralSubject(trimmed)) return "They";
+    if (std.ascii.indexOfIgnoreCase(trimmed, "component") != null) return "This component";
+    return "It";
+}
+
+fn isPluralSubject(subject: []const u8) bool {
+    if (std.ascii.indexOfIgnoreCase(subject, " and ") != null) return true;
+    if (subject.len < 2) return false;
+    const last = std.ascii.toLower(subject[subject.len - 1]);
+    const prev = std.ascii.toLower(subject[subject.len - 2]);
+    return last == 's' and prev != 's';
+}
+
+fn leadingSubjectEnd(sentence: []const u8, subject: []const u8) ?usize {
+    const trimmed_subject = std.mem.trim(u8, subject, " \r\n\t.,;:!?()[]{}\"'");
+    if (trimmed_subject.len == 0) return null;
+    if (leadingSubjectEndExact(sentence, trimmed_subject)) |end| return end;
+    const alias = primarySubjectAlias(trimmed_subject);
+    if (!std.mem.eql(u8, alias, trimmed_subject)) return leadingSubjectEndExact(sentence, alias);
+    return null;
+}
+
+fn leadingSubjectEndExact(sentence: []const u8, subject: []const u8) ?usize {
+    var start: usize = 0;
+    while (start < sentence.len and std.ascii.isWhitespace(sentence[start])) : (start += 1) {}
+    const article_prefixes = [_][]const u8{ "a ", "an ", "the " };
+    for (article_prefixes) |article| {
+        if (startsWithIgnoreCaseAt(sentence, start, article)) {
+            if (subjectAt(sentence, start + article.len, subject)) |end| return end;
+        }
+    }
+    return subjectAt(sentence, start, subject);
+}
+
+fn primarySubjectAlias(subject: []const u8) []const u8 {
+    var it = std.mem.tokenizeAny(u8, subject, " \r\n\t.,;:!?()[]{}\"'");
+    while (it.next()) |token| {
+        if (token.len < 3) continue;
+        if (isSubjectAliasStopWord(token)) continue;
+        return token;
+    }
+    return subject;
+}
+
+fn isSubjectAliasStopWord(token: []const u8) bool {
+    const words = [_][]const u8{ "the", "and", "for", "with", "how", "why", "what", "explain", "processes" };
+    for (words) |word| {
+        if (std.ascii.eqlIgnoreCase(token, word)) return true;
+    }
+    return false;
+}
+
+fn subjectAt(sentence: []const u8, start: usize, subject: []const u8) ?usize {
+    if (start + subject.len > sentence.len) return null;
+    if (!std.ascii.eqlIgnoreCase(sentence[start .. start + subject.len], subject)) return null;
+    const end = start + subject.len;
+    if (end < sentence.len and std.ascii.isAlphanumeric(sentence[end])) return null;
+    return end;
+}
+
+fn startsWithIgnoreCaseAt(text: []const u8, start: usize, prefix: []const u8) bool {
+    return start + prefix.len <= text.len and std.ascii.eqlIgnoreCase(text[start .. start + prefix.len], prefix);
+}
+
+fn appendSentenceWithCase(out: *std.ArrayList(u8), sentence: []const u8, after_glue: bool) !void {
+    if (!after_glue and out.items.len == 0 and sentence.len != 0) {
+        try out.append(std.ascii.toUpper(sentence[0]));
+        try out.appendSlice(sentence[1..]);
+        return;
+    }
+    if (!after_glue or sentence.len == 0 or !startsWithContextPronoun(sentence)) {
+        try out.appendSlice(sentence);
+        return;
+    }
+    try out.append(std.ascii.toLower(sentence[0]));
+    try out.appendSlice(sentence[1..]);
+}
+
+fn startsWithContextPronoun(sentence: []const u8) bool {
+    return std.mem.startsWith(u8, sentence, "It ") or
+        std.mem.startsWith(u8, sentence, "They ") or
+        std.mem.startsWith(u8, sentence, "This component ");
+}
+
+fn trimSnippetBoundary(sentence: []const u8) []const u8 {
+    var trimmed = std.mem.trim(u8, sentence, " \r\n\t,;:-");
+    while (stripLeadingDanglingWord(trimmed)) |next| trimmed = next;
+    trimmed = stripIncompleteParenthetical(trimmed);
+    trimmed = stripTrailingDanglingWord(trimmed);
+    return std.mem.trim(u8, trimmed, " \r\n\t,;:-");
+}
+
+fn stripLeadingDanglingWord(sentence: []const u8) ?[]const u8 {
+    const words = [_][]const u8{ "and", "but", "or" };
+    for (words) |word| {
+        if (sentence.len <= word.len) continue;
+        if (!std.ascii.eqlIgnoreCase(sentence[0..word.len], word)) continue;
+        if (!std.ascii.isWhitespace(sentence[word.len]) and sentence[word.len] != ',') continue;
+        return std.mem.trimLeft(u8, sentence[word.len..], " \r\n\t,;:-");
+    }
+    return null;
+}
+
+fn stripTrailingDanglingWord(sentence: []const u8) []const u8 {
+    var trimmed = std.mem.trimRight(u8, sentence, " \r\n\t,;:-.!?");
+    const words = [_][]const u8{ "and", "but", "or", "could", "would", "should", "can", "to", "with", "of", "the", "a", "an", "one", "either", "compete", "miners", "called", "are" };
+    while (true) {
+        var changed = false;
+        for (words) |word| {
+            if (trimmed.len < word.len) continue;
+            const start = trimmed.len - word.len;
+            if (!std.ascii.eqlIgnoreCase(trimmed[start..], word)) continue;
+            if (start != 0 and std.ascii.isAlphanumeric(trimmed[start - 1])) continue;
+            trimmed = std.mem.trimRight(u8, trimmed[0..start], " \r\n\t,;:-.!?");
+            changed = true;
+            break;
+        }
+        if (!changed) break;
+    }
+    return trimmed;
+}
+
+fn stripIncompleteParenthetical(sentence: []const u8) []const u8 {
+    var depth: usize = 0;
+    var last_unclosed_open: ?usize = null;
+    var start: usize = 0;
+    while (start < sentence.len and sentence[start] == ')') : (start += 1) {}
+    for (sentence[start..], start..) |byte, idx| {
+        switch (byte) {
+            '(' => {
+                depth += 1;
+                last_unclosed_open = idx;
+            },
+            ')' => if (depth > 0) {
+                depth -= 1;
+                if (depth == 0) last_unclosed_open = null;
+            },
+            else => {},
+        }
+    }
+    if (last_unclosed_open) |open_idx| {
+        return std.mem.trimRight(u8, sentence[start..open_idx], " \r\n\t,;:-");
+    }
+    return sentence[start..];
+}
+
+fn finishSentenceAlloc(allocator: std.mem.Allocator, sentence: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, sentence, " \r\n\t");
+    if (trimmed.len == 0) return allocator.dupe(u8, "");
+    switch (trimmed[trimmed.len - 1]) {
+        '.', '!', '?' => return allocator.dupe(u8, trimmed),
+        else => return std.fmt.allocPrint(allocator, "{s}.", .{trimmed}),
+    }
 }
 
 fn cleanEvidenceText(allocator: std.mem.Allocator, evidence_text: []const u8) ![]u8 {
@@ -458,15 +780,20 @@ fn appendSentenceBoundary(out: *std.ArrayList(u8)) !void {
 fn scoreEvidenceSentence(sentence: []const u8, subject: []const u8) i32 {
     if (sentence.len == 0) return std.math.minInt(i32);
     var score: i32 = 0;
-    if (indexOfIgnoreCaseLocal(sentence, subject) != null) score += 40;
+    if (containsSubjectRune(sentence, subject)) score += 40;
     if (definitionSubjectIndex(sentence, subject) != null) score += 90;
     if (startsWithMetadataLabel(sentence)) score -= 15;
     return score;
 }
 
 fn focusDefinitionStart(sentence: []const u8, subject: []const u8) []const u8 {
+    if (startsWithMetadataLabel(sentence)) {
+        if (afterFirstSentenceBoundary(sentence)) |body| return focusDefinitionStart(body, subject);
+    }
+    const alias = primarySubjectAlias(subject);
     const subject_idx = definitionSubjectIndex(sentence, subject) orelse
         indexOfIgnoreCaseLocal(sentence, subject) orelse
+        indexOfIgnoreCaseLocal(sentence, alias) orelse
         return stripTitleLead(sentence);
     var start = subject_idx;
     if (parameterPrefixStart(sentence, start)) |prefix_start| start = prefix_start;
@@ -476,6 +803,20 @@ fn focusDefinitionStart(sentence: []const u8, subject: []const u8) []const u8 {
         if (std.ascii.eqlIgnoreCase(article, "a")) start = article_start;
     }
     return std.mem.trim(u8, sentence[start..], " \r\n\t:;-");
+}
+
+fn afterFirstSentenceBoundary(sentence: []const u8) ?[]const u8 {
+    for (sentence, 0..) |byte, idx| {
+        switch (byte) {
+            '.', '!', '?' => {
+                const body = std.mem.trim(u8, sentence[idx + 1 ..], " \r\n\t");
+                if (body.len != 0) return body;
+                return null;
+            },
+            else => {},
+        }
+    }
+    return null;
 }
 
 fn parameterPrefixStart(sentence: []const u8, subject_start: usize) ?usize {
@@ -490,6 +831,13 @@ fn parameterPrefixStart(sentence: []const u8, subject_start: usize) ?usize {
 }
 
 fn definitionSubjectIndex(sentence: []const u8, subject: []const u8) ?usize {
+    if (definitionSubjectIndexExact(sentence, subject)) |idx| return idx;
+    const alias = primarySubjectAlias(subject);
+    if (!std.mem.eql(u8, alias, subject)) return definitionSubjectIndexExact(sentence, alias);
+    return null;
+}
+
+fn definitionSubjectIndexExact(sentence: []const u8, subject: []const u8) ?usize {
     var search_start: usize = 0;
     while (indexOfIgnoreCasePosLocal(sentence, search_start, subject)) |idx| {
         const after = sentence[idx + subject.len ..];
@@ -500,6 +848,11 @@ fn definitionSubjectIndex(sentence: []const u8, subject: []const u8) ?usize {
         search_start = idx + subject.len;
     }
     return null;
+}
+
+fn containsSubjectRune(sentence: []const u8, subject: []const u8) bool {
+    return indexOfIgnoreCaseLocal(sentence, subject) != null or
+        indexOfIgnoreCaseLocal(sentence, primarySubjectAlias(subject)) != null;
 }
 
 fn definitionVerbInSameClause(window: []const u8) bool {
@@ -1398,6 +1751,34 @@ test "corpus synthesis recursively uses non redundant evidence for dense request
 
     try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "semiconductor") != null);
     try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "architecture") != null);
+}
+
+test "corpus synthesis applies lexical glue and subject deduplication" {
+    const allocator = std.testing.allocator;
+    const blocks = [_][]const u8{
+        "TITLE: CPU core ]] and CPU processes data by executing instructions,",
+        "TITLE: CPU core ]] CPU handles arithmetic and control operations.",
+        "TITLE: CPU clock ]] CPU uses clock cycles to coordinate work.",
+    };
+    const source_ids = [_][]const u8{
+        "simplewiki_part_cpu_core",
+        "simplewiki_part_cpu_core",
+        "simplewiki_part_cpu_clock",
+    };
+
+    var draft = try generateCorpusSynthesisDraft(allocator, .{
+        .user_query = "Explain how a CPU processes data.",
+        .evidence_text = blocks[0],
+        .evidence_texts = &blocks,
+        .evidence_source_ids = &source_ids,
+    });
+    defer draft.deinit(allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "and CPU") == null);
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "CPU processes data by executing instructions.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "Additionally, it handles arithmetic") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "Specifically, it uses clock cycles") != null or
+        std.mem.indexOf(u8, draft.draft_text, "In practice, it uses clock cycles") != null);
 }
 
 test "corpus signals can become lab memory candidates" {

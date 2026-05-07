@@ -37,6 +37,7 @@ pub const support_routing = @import("support_routing.zig");
 pub const artifact_schema = @import("artifact_schema.zig");
 pub const hypothesis_core = @import("hypothesis_core.zig");
 pub const intent_grounding = @import("intent_grounding.zig");
+pub const text_generation_lab = @import("text_generation_lab.zig");
 pub const response_engine = @import("response_engine.zig");
 pub const epistemic_renderer = @import("epistemic_renderer.zig");
 pub const conversation_session = @import("conversation_session.zig");

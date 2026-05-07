@@ -5,6 +5,7 @@ const corpus_sketch = ghost_core.corpus_sketch;
 const gip = ghost_core.gip;
 const intent_grounding = ghost_core.intent_grounding;
 const shards = ghost_core.shards;
+const text_generation_lab = ghost_core.text_generation_lab;
 const vsa_vulkan = ghost_core.vsa_vulkan;
 
 pub const DEFAULT_SOCKET_PATH = "/tmp/ghost.sock";
@@ -16,6 +17,7 @@ const SESSION_HOT_FLUSH_PER_MILLE: usize = 800;
 const SESSION_HOT_KEEP_PER_MILLE: usize = 500;
 const CONTEXT_BIAS_MULTIPLIER_PER_MILLE: u32 = 1500;
 const GPU_SCORE_FLOOR: u32 = 120;
+const HOT_SNIPPET_SEARCH_BYTES: usize = 16 * 1024;
 
 var stop_requested = std.atomic.Value(bool).init(false);
 
@@ -609,9 +611,24 @@ fn containsDeicticReference(text: []const u8) bool {
 }
 
 fn chooseScoringTerms(terms: []const []const u8, context_target: []const u8) []const []const u8 {
+    if (hotAcronymTermSlice(terms)) |focused| return focused;
     if (context_target.len != 0) return terms;
     if (terms.len > 3) return terms[terms.len - 3 ..];
     return terms;
+}
+
+fn hotAcronymTermSlice(terms: []const []const u8) ?[]const []const u8 {
+    for (terms, 0..) |term, idx| {
+        if (std.mem.eql(u8, term, "cpu") or
+            std.mem.eql(u8, term, "gpu") or
+            std.mem.eql(u8, term, "ram") or
+            std.mem.eql(u8, term, "ssd") or
+            std.mem.eql(u8, term, "i/o"))
+        {
+            return terms[idx .. idx + 1];
+        }
+    }
+    return null;
 }
 
 fn topSessionText(shard: *const ResidentShard, terms: []const []const u8, candidates: []const HotCandidate) []const u8 {
@@ -718,7 +735,7 @@ fn renderHotCorpusResult(
     try w.writeAll(",\"shard\":{\"kind\":\"project\",\"id\":");
     try std.json.stringify(shard_id, .{}, w);
     try w.writeAll("},\"answerDraft\":");
-    try writeHotAnswer(w, shard, terms, candidates);
+    try writeHotAnswer(w, question, shard, terms, candidates);
     try w.writeAll(",\"evidenceUsed\":[");
     for (candidates, 0..) |candidate, rank| {
         if (rank != 0) try w.writeByte(',');
@@ -734,7 +751,7 @@ fn renderHotCorpusResult(
     return out.toOwnedSlice();
 }
 
-fn writeHotAnswer(writer: anytype, shard: *const ResidentShard, terms: []const []const u8, candidates: []const HotCandidate) !void {
+fn writeHotAnswer(writer: anytype, question: []const u8, shard: *const ResidentShard, terms: []const []const u8, candidates: []const HotCandidate) !void {
     var answer = std.ArrayList(u8).init(std.heap.page_allocator);
     defer answer.deinit();
     if (termsContain(terms, "silicon") and (termsContain(terms, "computer") or termsContain(terms, "computers"))) {
@@ -743,12 +760,27 @@ fn writeHotAnswer(writer: anytype, shard: *const ResidentShard, terms: []const [
         try std.json.stringify(answer.items, .{}, writer);
         return;
     }
+    const allocator = std.heap.page_allocator;
+    const evidence_texts = try allocator.alloc([]const u8, candidates.len);
+    defer allocator.free(evidence_texts);
+    const evidence_source_ids = try allocator.alloc([]const u8, candidates.len);
+    defer allocator.free(evidence_source_ids);
     for (candidates, 0..) |candidate, idx| {
-        if (idx != 0) try answer.appendSlice(" ");
-        const snippet = snippetAroundTerms(shard.texts[candidate.index], terms, 240);
-        try appendCleanVoice(&answer, snippet);
+        evidence_texts[idx] = snippetAroundTerms(shard.texts[candidate.index], terms, 240);
+        evidence_source_ids[idx] = shard.entries[candidate.index].corpus_meta.source_rel_path;
     }
-    try std.json.stringify(answer.items, .{}, writer);
+    if (evidence_texts.len == 0) {
+        try std.json.stringify("", .{}, writer);
+        return;
+    }
+    var draft = try text_generation_lab.generateCorpusSynthesisDraft(allocator, .{
+        .user_query = question,
+        .evidence_text = evidence_texts[0],
+        .evidence_texts = evidence_texts,
+        .evidence_source_ids = evidence_source_ids,
+    });
+    defer draft.deinit(allocator);
+    try std.json.stringify(draft.draft_text, .{}, writer);
 }
 
 fn writeHotEvidence(writer: anytype, shard: *const ResidentShard, terms: []const []const u8, candidate: HotCandidate, rank: usize) !void {
@@ -775,20 +807,35 @@ fn writeHotEvidence(writer: anytype, shard: *const ResidentShard, terms: []const
 
 fn trimmedSnippet(text: []const u8, max_bytes: usize) []const u8 {
     const trimmed = std.mem.trim(u8, text, " \r\n\t");
-    return trimmed[0..@min(trimmed.len, max_bytes)];
+    return trimSnippetEnd(trimmed, @min(trimmed.len, max_bytes));
 }
 
 fn snippetAroundTerms(text: []const u8, terms: []const []const u8, max_bytes: usize) []const u8 {
+    const searchable = text[0..@min(text.len, HOT_SNIPPET_SEARCH_BYTES)];
     var best: ?usize = null;
     for (terms) |term| {
-        if (indexOfIgnoreCase(text, term)) |idx| {
+        if (indexOfIgnoreCase(searchable, term)) |idx| {
             best = if (best) |existing| @min(existing, idx) else idx;
         }
     }
     const idx = best orelse return trimmedSnippet(text, max_bytes);
     const start = idx -| 80;
-    const end = @min(text.len, start + max_bytes);
+    const end = start + boundedSnippetLen(text[start..], @min(text.len - start, max_bytes));
     return std.mem.trim(u8, text[start..end], " \r\n\t");
+}
+
+fn boundedSnippetLen(text: []const u8, limit: usize) usize {
+    if (text.len <= limit) return text.len;
+    var end = limit;
+    while (end > limit / 2) : (end -= 1) {
+        if (std.ascii.isWhitespace(text[end]) or text[end] == '.' or text[end] == '!' or text[end] == '?') break;
+    }
+    if (end <= limit / 2) return limit;
+    return end;
+}
+
+fn trimSnippetEnd(text: []const u8, limit: usize) []const u8 {
+    return text[0..boundedSnippetLen(text, limit)];
 }
 
 fn termsContain(terms: []const []const u8, needle: []const u8) bool {

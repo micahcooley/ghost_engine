@@ -1037,10 +1037,13 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
             try attachLiveCoverage(allocator, &result, live_coverage);
             const evidence_texts = try buildSynthesisEvidenceTexts(allocator, result.evidence_used);
             defer allocator.free(evidence_texts);
+            const evidence_source_ids = try buildSynthesisEvidenceSourceIds(allocator, result.evidence_used);
+            defer allocator.free(evidence_source_ids);
             var draft = try text_generation_lab.generateCorpusSynthesisDraft(allocator, .{
                 .user_query = options.question,
                 .evidence_text = result.evidence_used[0].snippet,
                 .evidence_texts = evidence_texts,
+                .evidence_source_ids = evidence_source_ids,
             });
             defer draft.deinit(allocator);
             result.answer_draft = try allocator.dupe(u8, draft.draft_text);
@@ -1220,10 +1223,13 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     try attachLiveCoverage(allocator, &result, live_coverage);
     const evidence_texts = try buildSynthesisEvidenceTexts(allocator, result.evidence_used);
     defer allocator.free(evidence_texts);
+    const evidence_source_ids = try buildSynthesisEvidenceSourceIds(allocator, result.evidence_used);
+    defer allocator.free(evidence_source_ids);
     var draft = try text_generation_lab.generateCorpusSynthesisDraft(allocator, .{
         .user_query = options.question,
         .evidence_text = result.evidence_used[0].snippet,
         .evidence_texts = evidence_texts,
+        .evidence_source_ids = evidence_source_ids,
     });
     defer draft.deinit(allocator);
     result.answer_draft = try allocator.dupe(u8, draft.draft_text);
@@ -1390,6 +1396,12 @@ fn buildSynthesisEvidenceTexts(allocator: std.mem.Allocator, evidence_used: []co
     const texts = try allocator.alloc([]const u8, evidence_used.len);
     for (evidence_used, 0..) |evidence, idx| texts[idx] = evidence.snippet;
     return texts;
+}
+
+fn buildSynthesisEvidenceSourceIds(allocator: std.mem.Allocator, evidence_used: []const EvidenceUsed) ![]const []const u8 {
+    const source_ids = try allocator.alloc([]const u8, evidence_used.len);
+    for (evidence_used, 0..) |evidence, idx| source_ids[idx] = evidence.source_path;
+    return source_ids;
 }
 
 fn applyDraftSafetyNotices(allocator: std.mem.Allocator, options: Options, result: *Result) !void {
