@@ -51,6 +51,18 @@ pub const DenialInput = struct {
     active_shard: ?[]const u8 = null,
 };
 
+pub const CorpusSynthesisInput = struct {
+    user_query: []const u8,
+    evidence_text: []const u8,
+    evidence_texts: []const []const u8 = &.{},
+    consensus_gate_authorized: bool = false,
+};
+
+pub const SocialResponderInput = struct {
+    user_query: []const u8,
+    active_shard: ?[]const u8 = null,
+};
+
 pub const TextGenerationDraft = struct {
     draft_text: []const u8,
     source_artifact_ids: []const []const u8 = &.{},
@@ -253,6 +265,61 @@ pub fn generateDefaultResponderForShard(
     return null;
 }
 
+pub fn generateCorpusSynthesisDraft(allocator: std.mem.Allocator, input: CorpusSynthesisInput) !TextGenerationDraft {
+    var salience = try intent_grounding.analyzeSalience(allocator, input.user_query);
+    defer salience.deinit(allocator);
+    const subject = if (salience.semantic_target.len != 0) salience.semantic_target else input.user_query;
+    const draft_text = try synthesizeEvidenceBlocks(allocator, input, subject, salience.density_multiplier);
+    const consensus = input.consensus_gate_authorized and finalConsensusResonance(subject, if (input.evidence_texts.len == 0) &.{input.evidence_text} else input.evidence_texts) >= 0.8;
+    return .{
+        .draft_text = draft_text,
+        .candidate_only = false,
+        .non_authorizing = !consensus,
+        .support_granted = consensus,
+        .proof_granted = false,
+        .product_ready = consensus,
+    };
+}
+
+pub fn finalConsensusResonance(subject: []const u8, evidence_texts: []const []const u8) f32 {
+    var relevant_terms: u32 = 0;
+    var matched_terms: u32 = 0;
+    var it = std.mem.tokenizeScalar(u8, subject, ' ');
+    while (it.next()) |raw_term| {
+        const term = std.mem.trim(u8, raw_term, " \r\n\t.,;:!?()[]{}\"");
+        if (term.len < 3) continue;
+        relevant_terms += 1;
+        for (evidence_texts) |evidence| {
+            if (indexOfIgnoreCaseLocal(evidence, term) != null) {
+                matched_terms += 1;
+                break;
+            }
+        }
+    }
+    if (relevant_terms == 0) return 0;
+    return @as(f32, @floatFromInt(matched_terms)) / @as(f32, @floatFromInt(relevant_terms));
+}
+
+pub fn generateSocialResponderDraft(allocator: std.mem.Allocator, input: SocialResponderInput) !TextGenerationDraft {
+    var hasher = std.hash.Fnv1a_64.init();
+    hasher.update(input.user_query);
+    if (input.active_shard) |shard| hasher.update(shard);
+    const variant = hasher.final() % 3;
+    const draft_text = switch (variant) {
+        0 => try allocator.dupe(u8, "Ghost is online and reading the active corpus."),
+        1 => try allocator.dupe(u8, "Ghost is awake; the current shard state is ready."),
+        else => try allocator.dupe(u8, "Ghost is active and listening through the available shards."),
+    };
+    return .{
+        .draft_text = draft_text,
+        .candidate_only = false,
+        .non_authorizing = true,
+        .support_granted = false,
+        .proof_granted = false,
+        .product_ready = false,
+    };
+}
+
 pub fn generateDenialDraft(allocator: std.mem.Allocator, input: DenialInput) !TextGenerationDraft {
     const subject = try denialSubject(allocator, input.user_query);
     defer allocator.free(subject);
@@ -282,6 +349,255 @@ pub fn generateDenialDraft(allocator: std.mem.Allocator, input: DenialInput) !Te
     };
 }
 
+fn synthesizeEvidenceBlocks(allocator: std.mem.Allocator, input: CorpusSynthesisInput, subject: []const u8, density_multiplier: u8) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+
+    const target_blocks = @max(@as(usize, 1), @min(@as(usize, 8), density_multiplier));
+    const requested_variance = runeVarianceScore(input.user_query);
+    const target_variance = requested_variance * @as(u32, @min(density_multiplier, 4));
+    var selected: usize = 0;
+
+    if (input.evidence_texts.len == 0) {
+        const sentence = try synthesizeEvidenceSentence(allocator, input.evidence_text, subject);
+        defer allocator.free(sentence);
+        try out.appendSlice(sentence);
+        selected = 1;
+    } else {
+        for (input.evidence_texts) |evidence_text| {
+            if (selected >= target_blocks and runeVarianceScore(out.items) >= target_variance) break;
+            const sentence = try synthesizeEvidenceSentence(allocator, evidence_text, subject);
+            defer allocator.free(sentence);
+            if (sentence.len == 0) continue;
+            if (std.mem.indexOf(u8, out.items, sentence) != null) continue;
+            if (out.items.len != 0) try out.append(' ');
+            try out.appendSlice(sentence);
+            selected += 1;
+        }
+        if (selected == 0) {
+            const sentence = try synthesizeEvidenceSentence(allocator, input.evidence_text, subject);
+            defer allocator.free(sentence);
+            try out.appendSlice(sentence);
+        }
+    }
+
+    return out.toOwnedSlice();
+}
+
+fn synthesizeEvidenceSentence(allocator: std.mem.Allocator, evidence_text: []const u8, subject: []const u8) ![]u8 {
+    const cleaned = try cleanEvidenceText(allocator, evidence_text);
+    defer allocator.free(cleaned);
+
+    const trimmed = std.mem.trim(u8, cleaned, " \r\n\t");
+    var best = trimmed;
+    var best_score: i32 = scoreEvidenceSentence(trimmed, subject);
+    var start: usize = 0;
+    var idx: usize = 0;
+    while (idx < cleaned.len) : (idx += 1) {
+        switch (cleaned[idx]) {
+            '.', '!', '?' => {
+                const sentence = std.mem.trim(u8, cleaned[start .. idx + 1], " \r\n\t");
+                const score = scoreEvidenceSentence(sentence, subject);
+                if (sentence.len != 0 and score > best_score) {
+                    best = sentence;
+                    best_score = score;
+                }
+                start = idx + 1;
+            },
+            else => {},
+        }
+    }
+    const tail = std.mem.trim(u8, cleaned[start..], " \r\n\t");
+    const tail_score = scoreEvidenceSentence(tail, subject);
+    if (tail.len != 0 and tail_score > best_score) {
+        best = tail;
+    }
+
+    const focused = focusDefinitionStart(best, subject);
+    const bounded = boundSentence(focused);
+    return allocator.dupe(u8, bounded);
+}
+
+fn cleanEvidenceText(allocator: std.mem.Allocator, evidence_text: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    var previous_space = true;
+    var idx: usize = 0;
+    while (idx < evidence_text.len) : (idx += 1) {
+        const byte = evidence_text[idx];
+        if (byte == ']' and idx + 1 < evidence_text.len and evidence_text[idx + 1] == ']') {
+            try appendSentenceBoundary(&out);
+            previous_space = true;
+            idx += 1;
+            continue;
+        }
+        const as_space = std.ascii.isWhitespace(byte) or byte == '[' or byte == ']';
+        if (as_space) {
+            if (!previous_space) try out.append(' ');
+            previous_space = true;
+            continue;
+        }
+        try out.append(byte);
+        previous_space = false;
+    }
+    return out.toOwnedSlice();
+}
+
+fn appendSentenceBoundary(out: *std.ArrayList(u8)) !void {
+    while (out.items.len != 0 and std.ascii.isWhitespace(out.items[out.items.len - 1])) {
+        _ = out.pop();
+    }
+    const needs_period = out.items.len == 0 or switch (out.items[out.items.len - 1]) {
+        '.', '!', '?' => false,
+        else => true,
+    };
+    if (needs_period) try out.append('.');
+    try out.append(' ');
+}
+
+fn scoreEvidenceSentence(sentence: []const u8, subject: []const u8) i32 {
+    if (sentence.len == 0) return std.math.minInt(i32);
+    var score: i32 = 0;
+    if (indexOfIgnoreCaseLocal(sentence, subject) != null) score += 40;
+    if (definitionSubjectIndex(sentence, subject) != null) score += 90;
+    if (startsWithMetadataLabel(sentence)) score -= 15;
+    return score;
+}
+
+fn focusDefinitionStart(sentence: []const u8, subject: []const u8) []const u8 {
+    const subject_idx = definitionSubjectIndex(sentence, subject) orelse
+        indexOfIgnoreCaseLocal(sentence, subject) orelse
+        return stripTitleLead(sentence);
+    var start = subject_idx;
+    if (parameterPrefixStart(sentence, start)) |prefix_start| start = prefix_start;
+    if (start >= 2 and sentence[start - 1] == ' ') {
+        const article_start = if (start >= 3 and sentence[start - 3] == ' ') start - 2 else start - 2;
+        const article = sentence[article_start .. start - 1];
+        if (std.ascii.eqlIgnoreCase(article, "a")) start = article_start;
+    }
+    return std.mem.trim(u8, sentence[start..], " \r\n\t:;-");
+}
+
+fn parameterPrefixStart(sentence: []const u8, subject_start: usize) ?usize {
+    if (subject_start == 0 or sentence[subject_start - 1] != ' ') return null;
+    var start = subject_start - 1;
+    while (start > 0 and !std.ascii.isWhitespace(sentence[start - 1])) : (start -= 1) {}
+    const prefix = sentence[start .. subject_start - 1];
+    for (prefix) |byte| {
+        if (std.ascii.isDigit(byte) or byte == '-' or byte == '_' or byte == '/') return start;
+    }
+    return null;
+}
+
+fn definitionSubjectIndex(sentence: []const u8, subject: []const u8) ?usize {
+    var search_start: usize = 0;
+    while (indexOfIgnoreCasePosLocal(sentence, search_start, subject)) |idx| {
+        const after = sentence[idx + subject.len ..];
+        const window = after[0..@min(after.len, 96)];
+        if (definitionVerbInSameClause(window)) {
+            return idx;
+        }
+        search_start = idx + subject.len;
+    }
+    return null;
+}
+
+fn definitionVerbInSameClause(window: []const u8) bool {
+    var idx: usize = 0;
+    while (idx < window.len and std.ascii.isWhitespace(window[idx])) : (idx += 1) {}
+    var paren_depth: usize = 0;
+    while (idx < window.len) : (idx += 1) {
+        switch (window[idx]) {
+            '(' => paren_depth += 1,
+            ')' => if (paren_depth > 0) {
+                paren_depth -= 1;
+            },
+            '.', '!', '?' => return false,
+            else => {},
+        }
+        if (paren_depth == 0) {
+            const rest = window[idx..];
+            if (startsWithDefinitionVerb(rest)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn startsWithDefinitionVerb(text: []const u8) bool {
+    const verbs = [_][]const u8{ " is ", " are ", " refers " };
+    for (verbs) |verb| {
+        if (std.ascii.startsWithIgnoreCase(text, verb)) return true;
+    }
+    return false;
+}
+
+fn startsWithMetadataLabel(text: []const u8) bool {
+    const labels = [_][]const u8{ "title:", "source:", "path:" };
+    for (labels) |label| {
+        if (std.ascii.startsWithIgnoreCase(text, label)) return true;
+    }
+    return false;
+}
+
+fn stripTitleLead(sentence: []const u8) []const u8 {
+    if (!std.ascii.startsWithIgnoreCase(sentence, "title:")) return sentence;
+    if (std.mem.indexOf(u8, sentence, "  ")) |idx| {
+        return std.mem.trim(u8, sentence[idx..], " \r\n\t");
+    }
+    return std.mem.trim(u8, sentence["title:".len..], " \r\n\t");
+}
+
+fn boundSentence(sentence: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, sentence, " \r\n\t");
+    if (trimmed.len <= 260) return trimmed;
+    var end: usize = 260;
+    while (end > 160) : (end -= 1) {
+        if (std.ascii.isWhitespace(trimmed[end])) break;
+    }
+    return std.mem.trim(u8, trimmed[0..end], " \r\n\t,;:");
+}
+
+fn runeVarianceScore(text: []const u8) u32 {
+    if (text.len == 0) return 0;
+    var counts = [_]u16{0} ** 256;
+    var total: u32 = 0;
+    for (text) |byte| {
+        if (!isVarianceRuneByte(byte)) continue;
+        counts[byte] += 1;
+        total += 1;
+    }
+    if (total == 0) return 0;
+    var unique: u32 = 0;
+    var spread: u32 = 0;
+    for (counts) |count| {
+        if (count == 0) continue;
+        unique += 1;
+        spread += @as(u32, count) * @as(u32, count);
+    }
+    const uniqueness = (unique * 1000) / total;
+    const repetition_penalty = @min(@as(u32, 1000), spread / total);
+    return uniqueness + (1000 - repetition_penalty);
+}
+
+fn isVarianceRuneByte(byte: u8) bool {
+    return byte >= 0x80 or std.ascii.isAlphanumeric(byte);
+}
+
+fn indexOfIgnoreCaseLocal(haystack: []const u8, needle: []const u8) ?usize {
+    return indexOfIgnoreCasePosLocal(haystack, 0, needle);
+}
+
+fn indexOfIgnoreCasePosLocal(haystack: []const u8, start: usize, needle: []const u8) ?usize {
+    if (needle.len == 0 or needle.len > haystack.len) return null;
+    var idx: usize = start;
+    while (idx + needle.len <= haystack.len) : (idx += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[idx .. idx + needle.len], needle)) return idx;
+    }
+    return null;
+}
+
 fn denialSubject(allocator: std.mem.Allocator, query: []const u8) ![]u8 {
     const trimmed = std.mem.trim(u8, query, " \t\r\n\"'`.,;:!?()[]{}");
     if (trimmed.len == 0) return allocator.dupe(u8, "the requested query");
@@ -292,6 +608,12 @@ fn denialSubject(allocator: std.mem.Allocator, query: []const u8) ![]u8 {
 
     const prefixes = [_][]const u8{
         "what is ",
+        "whats a ",
+        "what's a ",
+        "whats an ",
+        "what's an ",
+        "whats ",
+        "what's ",
         "what are ",
         "who is ",
         "who are ",
@@ -1038,6 +1360,44 @@ test "denial draft is query-shaped and no fluff" {
     try std.testing.expect(!one.support_granted);
     try std.testing.expect(!one.proof_granted);
     try std.testing.expect(one.non_authorizing);
+}
+
+test "corpus synthesis starts at definition rune instead of title noise" {
+    const allocator = std.testing.allocator;
+
+    var draft = try generateCorpusSynthesisDraft(allocator, .{
+        .user_query = "whats a father",
+        .evidence_text = "TITLE: Father ]] A father (also called dad or daddy) is a male parent. Most humans are born from a mother and a father.",
+    });
+    defer draft.deinit(allocator);
+
+    try std.testing.expectEqualStrings("A father (also called dad or daddy) is a male parent.", draft.draft_text);
+
+    var negated_modifier = try generateCorpusSynthesisDraft(allocator, .{
+        .user_query = "subject not excluded",
+        .evidence_text = "TITLE: Subject .]] Subject is the primary definition sentence. Excluded is unrelated metadata.",
+    });
+    defer negated_modifier.deinit(allocator);
+    try std.testing.expectEqualStrings("Subject is the primary definition sentence.", negated_modifier.draft_text);
+}
+
+test "corpus synthesis recursively uses non redundant evidence for dense requests" {
+    const allocator = std.testing.allocator;
+    const blocks = [_][]const u8{
+        "TITLE: Silicon computer ]] Silicon computers use semiconductor devices to represent logic states.",
+        "TITLE: Silicon computer architecture ]] Computer architecture organizes processors, memory, and input/output around executable instructions.",
+        "TITLE: Silicon fabrication ]] Silicon chips are manufactured through layered photolithography and doping steps.",
+    };
+
+    var draft = try generateCorpusSynthesisDraft(allocator, .{
+        .user_query = "i require an exhaustive explanation regarding the nature of silicon computers",
+        .evidence_text = blocks[0],
+        .evidence_texts = &blocks,
+    });
+    defer draft.deinit(allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "semiconductor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "architecture") != null);
 }
 
 test "corpus signals can become lab memory candidates" {

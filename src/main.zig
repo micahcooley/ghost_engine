@@ -13,6 +13,7 @@ const sigil_runtime = core.sigil_runtime;
 const sigil_vm = core.sigil_vm;
 const panic_dump = core.panic_dump;
 const shell = @import("shell.zig");
+const daemon = @import("daemon.zig");
 
 pub const panic = std.debug.FullPanic(panic_dump.panicCall);
 
@@ -339,9 +340,14 @@ pub fn main_wrapped(allocator: std.mem.Allocator) !void {
         _ = SetConsoleCtrlHandler(ctrlHandler, 1);
     }
 
+    const args = try sys.getArgs(allocator);
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "daemon")) {
+        try daemon.runFromArgs(allocator, if (args.len > 2) args[2..] else &.{});
+        return;
+    }
+
     sys.printOut("[MONOLITH] Mapping Cortex...\n");
 
-    const args = try sys.getArgs(allocator);
     const launch = parseLaunchConfig(args);
     if (launch.invalid_reasoning_mode) |mode_text| {
         sys.print("\n[FATAL] Unsupported reasoning mode '{s}'. Use proof or exploratory.\n", .{mode_text});

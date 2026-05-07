@@ -448,6 +448,284 @@ pub const GroundingOptions = struct {
     schema_registry: ?*const artifact_schema.SchemaRegistry = null,
 };
 
+pub const MAX_SALIENCE_RUNES: usize = 48;
+
+pub const SalienceRune = struct {
+    text: []u8,
+    start: usize,
+    end: usize,
+    semantic_score: u16,
+    structural_score: u16,
+    selected_target: bool = false,
+};
+
+pub const SalienceMap = struct {
+    semantic_target: []u8,
+    structural_noise: []u8,
+    density_multiplier: u8,
+    target_score: u16,
+    structural_noise_score: u16,
+    runes: []SalienceRune,
+
+    pub fn deinit(self: *SalienceMap, allocator: std.mem.Allocator) void {
+        allocator.free(self.semantic_target);
+        allocator.free(self.structural_noise);
+        for (self.runes) |rune| allocator.free(rune.text);
+        allocator.free(self.runes);
+        self.* = undefined;
+    }
+};
+
+pub fn analyzeSalience(allocator: std.mem.Allocator, input: []const u8) !SalienceMap {
+    var runes = std.ArrayList(SalienceRune).init(allocator);
+    errdefer {
+        for (runes.items) |rune| allocator.free(rune.text);
+        runes.deinit();
+    }
+    try tokenizeSalienceRunes(allocator, input, &runes);
+
+    if (runes.items.len == 0) {
+        return .{
+            .semantic_target = try allocator.dupe(u8, std.mem.trim(u8, input, " \r\n\t")),
+            .structural_noise = try allocator.dupe(u8, ""),
+            .density_multiplier = 1,
+            .target_score = 0,
+            .structural_noise_score = 0,
+            .runes = try runes.toOwnedSlice(),
+        };
+    }
+
+    scoreSalienceRunes(runes.items);
+    const window = chooseSemanticWindow(runes.items);
+    var target_score_total: usize = 0;
+    var noise_score_total: usize = 0;
+    var target_count: usize = 0;
+    var noise_count: usize = 0;
+    for (runes.items, 0..) |*rune, idx| {
+        rune.selected_target = idx >= window.start and idx < window.end;
+        if (rune.selected_target) {
+            target_score_total += rune.semantic_score;
+            target_count += 1;
+        } else {
+            noise_score_total += rune.structural_score;
+            noise_count += 1;
+        }
+    }
+
+    const semantic_target = try joinSelectedSalienceRunes(allocator, runes.items, true);
+    errdefer allocator.free(semantic_target);
+    const structural_noise = try joinSelectedSalienceRunes(allocator, runes.items, false);
+    errdefer allocator.free(structural_noise);
+
+    const avg_target: u16 = if (target_count == 0) 0 else @intCast(@min(@as(usize, 1000), target_score_total / target_count));
+    const avg_noise: u16 = if (noise_count == 0) 0 else @intCast(@min(@as(usize, 1000), noise_score_total / noise_count));
+    const density_multiplier = densityMultiplier(noise_count, avg_noise);
+
+    return .{
+        .semantic_target = semantic_target,
+        .structural_noise = structural_noise,
+        .density_multiplier = density_multiplier,
+        .target_score = avg_target,
+        .structural_noise_score = avg_noise,
+        .runes = try runes.toOwnedSlice(),
+    };
+}
+
+const SemanticWindow = struct {
+    start: usize,
+    end: usize,
+};
+
+fn tokenizeSalienceRunes(allocator: std.mem.Allocator, input: []const u8, runes: *std.ArrayList(SalienceRune)) !void {
+    var start: ?usize = null;
+    var idx: usize = 0;
+    while (idx <= input.len) : (idx += 1) {
+        const at_end = idx == input.len;
+        const byte = if (at_end) 0 else input[idx];
+        if (!at_end and isSalienceRuneByte(byte)) {
+            if (start == null) start = idx;
+            continue;
+        }
+        if (start) |s| {
+            try appendSalienceRune(allocator, input, s, idx, runes);
+            start = null;
+            if (runes.items.len >= MAX_SALIENCE_RUNES) break;
+        }
+    }
+}
+
+fn appendSalienceRune(allocator: std.mem.Allocator, input: []const u8, start: usize, end: usize, runes: *std.ArrayList(SalienceRune)) !void {
+    const trimmed = std.mem.trim(u8, input[start..end], "_-");
+    if (trimmed.len == 0) return;
+    if (trimmed.len == 1 and std.ascii.isAlphabetic(trimmed[0])) return;
+
+    const lower = try allocator.alloc(u8, trimmed.len);
+    errdefer allocator.free(lower);
+    for (trimmed, 0..) |byte, idx| lower[idx] = std.ascii.toLower(byte);
+    try runes.append(.{
+        .text = lower,
+        .start = start,
+        .end = end,
+        .semantic_score = 0,
+        .structural_score = 0,
+    });
+}
+
+fn isSalienceRuneByte(byte: u8) bool {
+    return byte >= 0x80 or std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-';
+}
+
+fn scoreSalienceRunes(runes: []SalienceRune) void {
+    for (runes, 0..) |*rune, idx| {
+        const entropy = byteEntropyPerMille(rune.text);
+        const unique = uniqueByteRatioPerMille(rune.text);
+        const length = lengthSaliencePerMille(rune.text);
+        const position = positionPerMille(idx, runes.len);
+        const repeat = repeatedRunePerMille(runes, rune.text);
+
+        const semantic =
+            (@as(usize, entropy) * 34) +
+            (@as(usize, unique) * 18) +
+            (@as(usize, length) * 22) +
+            (@as(usize, position) * 22) -
+            (@as(usize, repeat) * 18);
+        const structural =
+            (@as(usize, 1000 - entropy) * 30) +
+            (@as(usize, 1000 - length) * 22) +
+            (@as(usize, 1000 - position) * 18) +
+            (@as(usize, repeat) * 30);
+
+        rune.semantic_score = @intCast(@min(@as(usize, 1000), semantic / 100));
+        rune.structural_score = @intCast(@min(@as(usize, 1000), structural / 100));
+    }
+}
+
+fn chooseSemanticWindow(runes: []const SalienceRune) SemanticWindow {
+    if (runes.len <= 2) return .{ .start = 0, .end = runes.len };
+
+    var best = SemanticWindow{ .start = runes.len - 1, .end = runes.len };
+    var best_score: i64 = std.math.minInt(i64);
+    const max_width = @min(@as(usize, 4), runes.len);
+    var width: usize = 1;
+    while (width <= max_width) : (width += 1) {
+        var start: usize = 0;
+        while (start + width <= runes.len) : (start += 1) {
+            const end = start + width;
+            var semantic_sum: usize = 0;
+            for (runes[start..end]) |rune| semantic_sum += rune.semantic_score;
+            const average_semantic: i64 = @intCast(semantic_sum / width);
+            const tail_pressure: i64 = @intCast((end * 1000) / runes.len);
+            const width_bias: i64 = switch (width) {
+                1 => if (runes.len <= 3) -120 else -260,
+                2 => 520,
+                3 => 80,
+                else => 0,
+            };
+            const prefix_penalty: i64 = if (start == 0) 110 else 0;
+            const barrier_penalty: i64 = if (start > 0 and isStructuralBarrier(runes[start - 1])) 620 else 0;
+            const score = (average_semantic * 61) + (tail_pressure * 39) + width_bias - prefix_penalty - barrier_penalty;
+            if (score > best_score) {
+                best_score = score;
+                best = .{ .start = start, .end = end };
+            }
+        }
+    }
+    if (best.start > 0 and isStructuralBarrier(runes[best.start - 1])) {
+        best.end = best.start - 1;
+        best.start = best.end;
+        while (best.start > 0 and runes[best.start - 1].text.len >= 4 and !isStructuralBarrier(runes[best.start - 1])) {
+            best.start -= 1;
+            break;
+        }
+        if (best.start == best.end) best.end = best.start + 1;
+    } else if (best.end - best.start == 1 and best.start > 0) {
+        const previous = runes[best.start - 1];
+        const current = runes[best.start];
+        if (previous.text.len >= 4 and
+            !isStructuralBarrier(previous) and
+            @as(usize, previous.semantic_score) + 260 >= @as(usize, current.semantic_score))
+        {
+            best.start -= 1;
+        }
+    }
+    return best;
+}
+
+fn isStructuralBarrier(rune: SalienceRune) bool {
+    if (rune.text.len <= 3 and rune.structural_score < 350) return true;
+    return rune.text.len >= 3 and
+        rune.semantic_score < 520 and
+        rune.structural_score > rune.semantic_score + 180;
+}
+
+fn joinSelectedSalienceRunes(allocator: std.mem.Allocator, runes: []const SalienceRune, selected: bool) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    for (runes) |rune| {
+        if (rune.selected_target != selected) continue;
+        if (out.items.len != 0) try out.append(' ');
+        try out.appendSlice(rune.text);
+    }
+    return out.toOwnedSlice();
+}
+
+fn densityMultiplier(noise_count: usize, avg_noise: u16) u8 {
+    if (noise_count == 0) return 1;
+    const raw = 1 + @min(@as(usize, 7), (noise_count + 1) / 2 + @as(usize, avg_noise) / 350);
+    return @intCast(@min(@as(usize, 8), raw));
+}
+
+fn byteEntropyPerMille(bytes: []const u8) u16 {
+    if (bytes.len <= 1) return 0;
+    var counts = [_]u16{0} ** 256;
+    for (bytes) |byte| counts[byte] += 1;
+
+    const total: f64 = @floatFromInt(bytes.len);
+    var entropy: f64 = 0.0;
+    for (counts) |count| {
+        if (count == 0) continue;
+        const p = @as(f64, @floatFromInt(count)) / total;
+        entropy -= p * @log2(p);
+    }
+    const max_symbols = @min(bytes.len, 256);
+    const max_entropy = @log2(@as(f64, @floatFromInt(max_symbols)));
+    if (max_entropy <= 0.0) return 0;
+    const scaled = @min(@as(f64, 1000.0), (entropy / max_entropy) * 1000.0);
+    return @intFromFloat(scaled);
+}
+
+fn uniqueByteRatioPerMille(bytes: []const u8) u16 {
+    if (bytes.len == 0) return 0;
+    var seen = [_]bool{false} ** 256;
+    var unique: usize = 0;
+    for (bytes) |byte| {
+        if (!seen[byte]) {
+            seen[byte] = true;
+            unique += 1;
+        }
+    }
+    return @intCast((unique * 1000) / bytes.len);
+}
+
+fn lengthSaliencePerMille(bytes: []const u8) u16 {
+    const bounded: usize = @min(bytes.len, @as(usize, 14));
+    return @intCast((bounded * @as(usize, 1000)) / @as(usize, 14));
+}
+
+fn positionPerMille(idx: usize, count: usize) u16 {
+    if (count <= 1) return 1000;
+    return @intCast((idx * 1000) / (count - 1));
+}
+
+fn repeatedRunePerMille(runes: []const SalienceRune, text: []const u8) u16 {
+    var count: usize = 0;
+    for (runes) |rune| {
+        if (std.mem.eql(u8, rune.text, text)) count += 1;
+    }
+    if (count <= 1) return 0;
+    return @intCast(@min(@as(usize, 1000), ((count - 1) * 1000) / @max(@as(usize, 1), runes.len - 1)));
+}
+
 // ── Vague Request Phrase Table ─────────────────────────────────────────
 
 const VaguePhrase = struct {
@@ -1080,12 +1358,7 @@ fn hasExplicitHeavyTaskSignal(normalized: []const u8) bool {
 }
 
 fn isSocialToken(token: []const u8) bool {
-    return std.mem.eql(u8, token, "hi") or
-        std.mem.eql(u8, token, "hello") or
-        std.mem.eql(u8, token, "hey") or
-        std.mem.eql(u8, token, "yo") or
-        std.mem.eql(u8, token, "sup") or
-        std.mem.eql(u8, token, "thanks") or
+    return std.mem.eql(u8, token, "thanks") or
         std.mem.eql(u8, token, "morning");
 }
 
@@ -1571,6 +1844,17 @@ test "intent grounding: heavy modification still requires artifact binding" {
 
     try std.testing.expectEqual(IntentClass.transformation, gi.intent_class);
     try std.testing.expect(gi.missing_obligations.len > 0);
+}
+
+test "salience mapping isolates semantic target and density" {
+    const allocator = std.testing.allocator;
+
+    var salience = try analyzeSalience(allocator, "i require an exhaustive explanation regarding the nature of silicon computers");
+    defer salience.deinit(allocator);
+
+    try std.testing.expectEqualStrings("silicon computers", salience.semantic_target);
+    try std.testing.expect(std.mem.indexOf(u8, salience.structural_noise, "exhaustive") != null);
+    try std.testing.expect(salience.density_multiplier > 1);
 }
 
 fn lowercaseAscii(allocator: std.mem.Allocator, text: []const u8) ![]u8 {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const intent_grounding = @import("intent_grounding.zig");
 
 pub const Sketch = struct {
     hash: u64,
@@ -9,14 +10,35 @@ pub const Sketch = struct {
     }
 };
 
-const MAX_TOKENS: usize = 128;
+const MAX_RUNES: usize = 128;
 const MAX_NORMALIZED_BYTES: usize = 4096;
 
 pub fn simHash64(allocator: std.mem.Allocator, text: []const u8) !Sketch {
-    var tokens = std.ArrayList([]u8).init(allocator);
+    return simHash64Internal(allocator, text, .plain);
+}
+
+pub fn simHash64Query(allocator: std.mem.Allocator, text: []const u8) !Sketch {
+    var salience = try intent_grounding.analyzeSalience(allocator, text);
+    defer salience.deinit(allocator);
+    if (salience.semantic_target.len == 0) return simHash64Internal(allocator, text, .plain);
+    return simHash64Salience(salience.runes);
+}
+
+const SketchMode = enum {
+    plain,
+    query_focus,
+};
+
+const Rune = struct {
+    text: []u8,
+    weight: i32,
+};
+
+fn simHash64Internal(allocator: std.mem.Allocator, text: []const u8, mode: SketchMode) !Sketch {
+    var runes = std.ArrayList(Rune).init(allocator);
     defer {
-        for (tokens.items) |token| allocator.free(token);
-        tokens.deinit();
+        for (runes.items) |rune| allocator.free(rune.text);
+        runes.deinit();
     }
 
     var normalized = std.ArrayList(u8).init(allocator);
@@ -26,43 +48,43 @@ pub fn simHash64(allocator: std.mem.Allocator, text: []const u8) !Sketch {
     var i: usize = 0;
     while (i < text.len) : (i += 1) {
         const c = text[i];
-        if (isTokenByte(c)) {
+        if (isRuneByte(c)) {
             if (start == null) start = i;
         } else if (start) |s| {
-            try appendNormalizedToken(allocator, &tokens, &normalized, text[s..i]);
+            try appendNormalizedRune(allocator, &runes, &normalized, text[s..i]);
             start = null;
         }
-        if (tokens.items.len >= MAX_TOKENS and normalized.items.len >= MAX_NORMALIZED_BYTES) break;
+        if (runes.items.len >= MAX_RUNES and normalized.items.len >= MAX_NORMALIZED_BYTES) break;
     }
     if (start) |s| {
-        if (tokens.items.len < MAX_TOKENS or normalized.items.len < MAX_NORMALIZED_BYTES) {
-            try appendNormalizedToken(allocator, &tokens, &normalized, text[s..]);
+        if (runes.items.len < MAX_RUNES or normalized.items.len < MAX_NORMALIZED_BYTES) {
+            try appendNormalizedRune(allocator, &runes, &normalized, text[s..]);
         }
     }
-
     var weights = [_]i32{0} ** 64;
     var feature_count: usize = 0;
 
-    for (tokens.items) |token| {
-        addFeature(&weights, "tok", token, null);
+    for (runes.items) |rune| {
+        addFeature(&weights, "rune", rune.text, null, rune.weight);
         feature_count += 1;
     }
 
-    if (tokens.items.len >= 2) {
+    if (runes.items.len >= 2) {
         var idx: usize = 0;
-        while (idx + 1 < tokens.items.len) : (idx += 1) {
-            addFeature(&weights, "bi", tokens.items[idx], tokens.items[idx + 1]);
+        while (idx + 1 < runes.items.len) : (idx += 1) {
+            const weight = @divTrunc(runes.items[idx].weight + runes.items[idx + 1].weight, 2);
+            addFeature(&weights, "bi", runes.items[idx].text, runes.items[idx + 1].text, weight);
             feature_count += 1;
         }
     }
 
     const normalized_text = normalized.items;
-    if (normalized_text.len >= 3) {
+    if (mode == .plain and normalized_text.len >= 3) {
         var idx: usize = 0;
         while (idx + 3 <= normalized_text.len) : (idx += 1) {
             const tri = normalized_text[idx .. idx + 3];
             if (tri[0] == ' ' or tri[2] == ' ') continue;
-            addFeature(&weights, "tri", tri, null);
+            addFeature(&weights, "tri", tri, null, 5);
             feature_count += 1;
         }
     }
@@ -85,13 +107,39 @@ pub fn similarityScore(distance: u7) u16 {
     return @intCast((@as(u32, remaining) * 1000) / 64);
 }
 
-fn isTokenByte(byte: u8) bool {
-    return std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-';
+fn isRuneByte(byte: u8) bool {
+    return byte >= 0x80 or std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-';
 }
 
-fn appendNormalizedToken(
+fn simHash64Salience(runes: []const intent_grounding.SalienceRune) Sketch {
+    var weights = [_]i32{0} ** 64;
+    var feature_count: usize = 0;
+    var last_selected: ?usize = null;
+    for (runes, 0..) |rune, idx| {
+        if (rune.selected_target) last_selected = idx;
+    }
+    for (runes, 0..) |rune, idx| {
+        if (!rune.selected_target) continue;
+        var weight: i32 = @intCast(@max(@as(u16, 1), rune.semantic_score / 80));
+        if (last_selected != null and idx == last_selected.?) weight += 256;
+        addFeature(&weights, "rune", rune.text, null, weight);
+        feature_count += 1;
+    }
+    if (last_selected) |idx| {
+        addFeature(&weights, "tail", runes[idx].text, null, 256);
+        feature_count += 1;
+    }
+    if (feature_count == 0) return .{ .hash = 0, .feature_count = 0 };
+    var hash: u64 = 0;
+    for (weights, 0..) |weight, bit| {
+        if (weight >= 0) hash |= (@as(u64, 1) << @intCast(bit));
+    }
+    return .{ .hash = hash, .feature_count = feature_count };
+}
+
+fn appendNormalizedRune(
     allocator: std.mem.Allocator,
-    tokens: *std.ArrayList([]u8),
+    runes: *std.ArrayList(Rune),
     normalized: *std.ArrayList(u8),
     raw: []const u8,
 ) !void {
@@ -111,8 +159,8 @@ fn appendNormalizedToken(
     };
     defer if (lower_owned) |owned| allocator.free(owned);
 
-    if (tokens.items.len < MAX_TOKENS) {
-        try tokens.append(try allocator.dupe(u8, lower));
+    if (runes.items.len < MAX_RUNES) {
+        try runes.append(.{ .text = try allocator.dupe(u8, lower), .weight = 10 });
     }
     if (normalized.items.len < MAX_NORMALIZED_BYTES) {
         if (normalized.items.len != 0) try normalized.append(' ');
@@ -121,7 +169,7 @@ fn appendNormalizedToken(
     }
 }
 
-fn addFeature(weights: *[64]i32, prefix: []const u8, first: []const u8, second: ?[]const u8) void {
+fn addFeature(weights: *[64]i32, prefix: []const u8, first: []const u8, second: ?[]const u8, weight: i32) void {
     var hasher = std.hash.Fnv1a_64.init();
     hasher.update(prefix);
     hasher.update(":");
@@ -134,9 +182,9 @@ fn addFeature(weights: *[64]i32, prefix: []const u8, first: []const u8, second: 
     for (0..64) |bit| {
         const mask = @as(u64, 1) << @intCast(bit);
         if ((hash & mask) != 0) {
-            weights[bit] += 1;
+            weights[bit] += weight;
         } else {
-            weights[bit] -= 1;
+            weights[bit] -= weight;
         }
     }
 }
@@ -153,6 +201,25 @@ test "simhash is stable for identical text and near for small local variation" {
     const near_distance = hammingDistance(base.hash, near.hash);
     const unrelated_distance = hammingDistance(base.hash, unrelated.hash);
     try std.testing.expect(near_distance < unrelated_distance);
+}
+
+test "query simhash focuses subject runes over inquiry runes" {
+    const allocator = std.testing.allocator;
+    const subject = try simHash64Query(allocator, "father");
+    const inquiry = try simHash64Query(allocator, "whats a father");
+    const unrelated = try simHash64Query(allocator, "whats a circuit");
+
+    try std.testing.expect(subject.valid());
+    try std.testing.expect(similarityScore(hammingDistance(subject.hash, inquiry.hash)) >= 900);
+    try std.testing.expect(hammingDistance(subject.hash, inquiry.hash) < hammingDistance(subject.hash, unrelated.hash));
+}
+
+test "simhash preserves utf8 rune bytes" {
+    const allocator = std.testing.allocator;
+    const one = try simHash64Query(allocator, "¿qué es padre?");
+    const two = try simHash64Query(allocator, "padre");
+    try std.testing.expect(one.valid());
+    try std.testing.expect(two.valid());
 }
 
 test "hammingDistance edge cases" {

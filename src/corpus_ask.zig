@@ -4,9 +4,12 @@ const corpus_ingest = @import("corpus_ingest.zig");
 const corpus_sketch = @import("corpus_sketch.zig");
 const correction_review = @import("correction_review.zig");
 const hash_acceleration = @import("hash_acceleration.zig");
+const intent_grounding = @import("intent_grounding.zig");
 const negative_knowledge_review = @import("negative_knowledge_review.zig");
 const learning_store = @import("learning_store.zig");
 const shards = @import("shards.zig");
+const text_generation_lab = @import("text_generation_lab.zig");
+const vsa_vulkan = @import("vsa_vulkan.zig");
 
 pub const DEFAULT_MAX_RESULTS: usize = 3;
 pub const MAX_RESULTS: usize = 8;
@@ -659,7 +662,15 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         return malformedResult(allocator, options.question, "question must be non-empty");
     }
 
-    const capped_results = @min(options.max_results, MAX_RESULTS);
+    var salience = try intent_grounding.analyzeSalience(allocator, options.question);
+    defer salience.deinit(allocator);
+    const high_noise_request = salience.density_multiplier >= 3 and hasMultiRuneTarget(salience.semantic_target);
+    const search_question = if (high_noise_request and salience.semantic_target.len != 0) salience.semantic_target else options.question;
+    const requested_results = if (options.max_results == DEFAULT_MAX_RESULTS and options.max_snippet_bytes == DEFAULT_MAX_SNIPPET_BYTES)
+        @min(MAX_RESULTS, DEFAULT_MAX_RESULTS * @as(usize, salience.density_multiplier))
+    else
+        options.max_results;
+    const capped_results = @min(requested_results, MAX_RESULTS);
     const max_results = if (capped_results == 0) DEFAULT_MAX_RESULTS else capped_results;
     const capped_snippet = @min(options.max_snippet_bytes, MAX_SNIPPET_BYTES);
     const max_snippet = if (capped_snippet == 0) DEFAULT_MAX_SNIPPET_BYTES else capped_snippet;
@@ -692,9 +703,15 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     defer live_coverage.deinit(allocator);
     askProfileMark(&profile_timer, &profile_last_ns, "collect_entries_coverage");
 
-    var tokens = try tokenizeQuery(allocator, options.question);
-    defer tokens.deinit(allocator);
-    const query_intent = classifyQueryIntent(options.question, tokens.tokens);
+    var guard_tokens = try tokenizeQuery(allocator, options.question);
+    defer guard_tokens.deinit(allocator);
+    var search_tokens = try tokenizeQuery(allocator, search_question);
+    defer search_tokens.deinit(allocator);
+    const autonomous_salience_scoring = options.max_results == DEFAULT_MAX_RESULTS and
+        options.max_snippet_bytes == DEFAULT_MAX_SNIPPET_BYTES and
+        high_noise_request;
+    const scoring_tokens = if (autonomous_salience_scoring and search_tokens.tokens.len != 0) search_tokens.tokens else guard_tokens.tokens;
+    const query_intent = classifyQueryIntent(options.question, guard_tokens.tokens);
     askProfileMark(&profile_timer, &profile_last_ns, "tokenize_query");
 
     if (entries.len == 0) {
@@ -708,7 +725,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
         return result;
     }
-    if (tokens.tokens.len == 0) {
+    if (guard_tokens.tokens.len == 0 and scoring_tokens.len == 0) {
         var result = try unknownResult(allocator, options, &paths, .insufficient_evidence, "question did not contain enough searchable terms", entries.len, max_results, max_snippet);
         errdefer result.deinit();
         result.mounted_packs_considered = options.mounted_packs.len;
@@ -727,10 +744,10 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     }
     var sketch_candidates = std.ArrayList(SketchCandidate).init(allocator);
     defer sketch_candidates.deinit();
-    const query_sketch = try corpus_sketch.simHash64(allocator, options.question);
+    const query_sketch = try corpus_sketch.simHash64Query(allocator, search_question);
     var acceleration = hash_acceleration.Context.init(allocator, "corpus ask vector search");
     defer acceleration.deinit();
-    const query_semantic_hash = try hash_acceleration.semanticHash64(&acceleration, allocator, options.question);
+    const query_semantic_hash = try hash_acceleration.semanticHash64(&acceleration, allocator, search_question);
     var telemetry = CapacityTelemetry{};
     if (!live_coverage.complete) {
         telemetry.skipped_inputs += 1;
@@ -747,7 +764,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         var best_distance: ?u7 = null;
         if (query_sketch.valid()) {
             if (entry.search_sketch_features != 0) {
-                const distance = corpus_sketch.hammingDistance(query_sketch.hash, entry.search_sketch_hash);
+                const distance = vsa_vulkan.ghostIndexDistance(query_sketch.hash, entry.search_sketch_hash);
                 best_distance = if (best_distance) |existing| @min(existing, distance) else distance;
                 if (distance <= MAX_SIMHASH_DISTANCE) {
                     try sketch_candidates.append(.{
@@ -760,7 +777,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
             }
         }
         if (entry.semantic_hash != 0) {
-            const semantic_distance = corpus_sketch.hammingDistance(query_semantic_hash, entry.semantic_hash);
+            const semantic_distance = vsa_vulkan.ghostIndexDistance(query_semantic_hash, entry.semantic_hash);
             best_distance = if (best_distance) |existing| @min(existing, semantic_distance) else semantic_distance;
             if (semantic_distance <= MAX_SIMHASH_DISTANCE and !hasSketchCandidate(sketch_candidates.items, idx)) {
                 try sketch_candidates.append(.{
@@ -772,6 +789,10 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
             }
         }
         if (best_distance) |distance| {
+            if (corpus_sketch.similarityScore(distance) < vsa_vulkan.GHOST_INDEX_SKIP_THRESHOLD_PER_MILLE) {
+                telemetry.skipped_inputs += 1;
+                continue;
+            }
             try index_scan_candidates.append(.{
                 .entry_index = idx,
                 .hamming_distance = distance,
@@ -783,7 +804,10 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     }
 
     std.mem.sort(IndexScanCandidate, index_scan_candidates.items, {}, indexScanCandidateLessThan);
-    const indexed_scan_count = askIndexScanLimit(tokens.tokens.len, index_scan_candidates.items.len);
+    const indexed_scan_count = if (high_noise_request)
+        @min(max_results, index_scan_candidates.items.len)
+    else
+        askIndexScanLimit(scoring_tokens.len, index_scan_candidates.items.len);
     for (index_scan_candidates.items[0..indexed_scan_count]) |candidate| {
         scan_entries[candidate.entry_index] = true;
     }
@@ -819,7 +843,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
             telemetry.budget_hits += 1;
         }
         const score_start = askProfileNow(&profile_timer);
-        var scored = try scoreTextDirect(allocator, file_text, tokens.tokens);
+        var scored = try scoreTextDirect(allocator, file_text, scoring_tokens);
         askProfileAccumulate(&profile_timer, score_start, &profile_score_ns);
         if (scored.score == 0) {
             scored.deinit(allocator);
@@ -835,23 +859,23 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
 
         var best_distance: u7 = 64;
         if (query_sketch.valid() and entry.search_sketch_features != 0) {
-            best_distance = @min(best_distance, corpus_sketch.hammingDistance(query_sketch.hash, entry.search_sketch_hash));
+            best_distance = @min(best_distance, vsa_vulkan.ghostIndexDistance(query_sketch.hash, entry.search_sketch_hash));
         }
         if (entry.semantic_hash != 0) {
-            best_distance = @min(best_distance, corpus_sketch.hammingDistance(query_semantic_hash, entry.semantic_hash));
+            best_distance = @min(best_distance, vsa_vulkan.ghostIndexDistance(query_semantic_hash, entry.semantic_hash));
         }
         const similarity_score = corpus_sketch.similarityScore(best_distance);
 
-        const base_score = scored.score + value_bonus + primaryNounScoreBonus(tokens.tokens, scored.matched_terms);
+        const base_score = scored.score + value_bonus + primaryNounScoreBonus(scoring_tokens, scored.matched_terms);
         const normalized_score = @as(f32, @floatFromInt(base_score)) / 100.0;
         const normalized_vector_score = @as(f32, @floatFromInt(similarity_score)) / 300.0;
 
         var keyword_weight: f32 = 0.5;
         var vector_weight: f32 = 0.5;
-        if (tokens.tokens.len <= 2) {
+        if (scoring_tokens.len <= 2) {
             keyword_weight = 0.8;
             vector_weight = 0.2;
-        } else if (tokens.tokens.len > 4) {
+        } else if (scoring_tokens.len > 4) {
             keyword_weight = 0.1;
             vector_weight = 0.9;
         }
@@ -882,7 +906,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     askProfileMark(&profile_timer, &profile_last_ns, "read_score_indexed_entries");
 
     if (candidates.items.len == 0) {
-        if (try authorityOverrideCheck(allocator, options.question, tokens.tokens, candidates.items, &reviewed)) |override_value| {
+        if (try authorityOverrideCheck(allocator, options.question, guard_tokens.tokens, candidates.items, &reviewed)) |override_value| {
             var authority = override_value;
             defer authority.deinit(allocator);
             var result = try buildAuthorityOverrideResult(allocator, options, &paths, entries.len, max_results, max_snippet, authority, candidates.items, entries, &telemetry, live_coverage, mounted_pack_entry_count);
@@ -915,7 +939,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     telemetry.exact_candidate_cap_hit = candidates.items.len > top_count;
     telemetry.max_results_hit = telemetry.exact_candidate_cap_hit;
     if (telemetry.exact_candidate_cap_hit) telemetry.budget_hits += 1;
-    if (try authorityOverrideCheck(allocator, options.question, tokens.tokens, candidates.items[0..top_count], &reviewed)) |override_value| {
+    if (try authorityOverrideCheck(allocator, options.question, guard_tokens.tokens, candidates.items[0..top_count], &reviewed)) |override_value| {
         var authority = override_value;
         defer authority.deinit(allocator);
         var result = try buildAuthorityOverrideResult(allocator, options, &paths, entries.len, max_results, max_snippet, authority, candidates.items[0..top_count], entries, &telemetry, live_coverage, mounted_pack_entry_count);
@@ -1011,11 +1035,16 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
             telemetry.expansion_recommended = telemetry.hasPressure();
             result.capacity_telemetry = telemetry;
             try attachLiveCoverage(allocator, &result, live_coverage);
-            result.answer_draft = try std.fmt.allocPrint(
-                allocator,
-                "Draft answer from verified corpus evidence: {s}",
-                .{result.evidence_used[0].snippet},
-            );
+            const evidence_texts = try buildSynthesisEvidenceTexts(allocator, result.evidence_used);
+            defer allocator.free(evidence_texts);
+            var draft = try text_generation_lab.generateCorpusSynthesisDraft(allocator, .{
+                .user_query = options.question,
+                .evidence_text = result.evidence_used[0].snippet,
+                .evidence_texts = evidence_texts,
+            });
+            defer draft.deinit(allocator);
+            result.answer_draft = try allocator.dupe(u8, draft.draft_text);
+            try applyDraftSafetyNotices(allocator, options, &result);
             result.candidate_followups = try singleFollowup(allocator, "license_review_candidate", "unverified contradictory evidence was suppressed; review shard licensing before treating this draft as supported");
             try applyCapacityDisclosure(allocator, &result);
             try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
@@ -1079,7 +1108,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         return result;
     }
 
-    if (!candidatesParameterMatchCheck(tokens.tokens, selected_candidates)) {
+    if (!candidatesParameterMatchCheck(guard_tokens.tokens, selected_candidates)) {
         var result = try buildBaseResult(allocator, options, &paths, .unknown, "unresolved", "unresolved", entries.len, max_results, max_snippet);
         errdefer result.deinit();
         result.parameter_match_failure = true;
@@ -1134,7 +1163,6 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
             "Authorized: {s} HITL requirement satisfied by {s} status.",
             .{ bridge.subject, bridge.satisfaction_token },
         );
-        try prependUnverifiedSourceTag(allocator, &result);
         result.candidate_followups = try singleFollowup(allocator, "verifier_check_candidate", "review the cited certified-status evidence before treating this answer as supported");
         try applyCapacityDisclosure(allocator, &result);
         try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
@@ -1143,7 +1171,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         return result;
     }
 
-    const primary_noun_soft_failure = !candidatesPrimaryNounMatchCheck(tokens.tokens, selected_candidates);
+    const primary_noun_soft_failure = !candidatesPrimaryNounMatchCheck(scoring_tokens, selected_candidates);
 
     if (query_intent != .general and !top.value_match) {
         var result = try buildBaseResult(allocator, options, &paths, .unknown, "unresolved", "unresolved", entries.len, max_results, max_snippet);
@@ -1190,14 +1218,17 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     telemetry.expansion_recommended = telemetry.hasPressure();
     result.capacity_telemetry = telemetry;
     try attachLiveCoverage(allocator, &result, live_coverage);
-    result.answer_draft = try std.fmt.allocPrint(
-        allocator,
-        "Draft answer from corpus evidence: {s}",
-        .{result.evidence_used[0].snippet},
-    );
+    const evidence_texts = try buildSynthesisEvidenceTexts(allocator, result.evidence_used);
+    defer allocator.free(evidence_texts);
+    var draft = try text_generation_lab.generateCorpusSynthesisDraft(allocator, .{
+        .user_query = options.question,
+        .evidence_text = result.evidence_used[0].snippet,
+        .evidence_texts = evidence_texts,
+    });
+    defer draft.deinit(allocator);
+    result.answer_draft = try allocator.dupe(u8, draft.draft_text);
+    try applyDraftSafetyNotices(allocator, options, &result);
     result.primary_noun_match_failure = primary_noun_soft_failure;
-    try prependUnverifiedSourceTag(allocator, &result);
-    try prependEnglishCoreZenithNoticeIfNeeded(allocator, options, &result);
     result.candidate_followups = try singleFollowup(allocator, "verifier_check_candidate", "review the cited corpus evidence before treating this answer as supported");
     try applyCapacityDisclosure(allocator, &result);
     try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
@@ -1209,6 +1240,16 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
 fn askProfileEnabled() bool {
     const raw = std.posix.getenv("GHOST_PROFILE_ASK") orelse return false;
     return raw.len != 0 and !std.mem.eql(u8, raw, "0") and !std.ascii.eqlIgnoreCase(raw, "false");
+}
+
+fn hasMultiRuneTarget(target: []const u8) bool {
+    var seen_first = false;
+    var it = std.mem.tokenizeScalar(u8, target, ' ');
+    while (it.next()) |_| {
+        if (seen_first) return true;
+        seen_first = true;
+    }
+    return false;
 }
 
 fn askProfileMark(timer: *?std.time.Timer, last_ns: *u64, label: []const u8) void {
@@ -1343,6 +1384,17 @@ fn applyAcceptedLearningInfluence(allocator: std.mem.Allocator, result: *Result,
         }
         break;
     }
+}
+
+fn buildSynthesisEvidenceTexts(allocator: std.mem.Allocator, evidence_used: []const EvidenceUsed) ![]const []const u8 {
+    const texts = try allocator.alloc([]const u8, evidence_used.len);
+    for (evidence_used, 0..) |evidence, idx| texts[idx] = evidence.snippet;
+    return texts;
+}
+
+fn applyDraftSafetyNotices(allocator: std.mem.Allocator, options: Options, result: *Result) !void {
+    try prependUnverifiedSourceTag(allocator, result);
+    try prependEnglishCoreZenithNoticeIfNeeded(allocator, options, result);
 }
 
 fn prependUnverifiedSourceTag(allocator: std.mem.Allocator, result: *Result) !void {
@@ -2275,25 +2327,34 @@ fn tokenizeQuery(allocator: std.mem.Allocator, question: []const u8) !QueryToken
     }
 
     var start: ?usize = null;
+    var skip_next_excluded_subject = false;
     for (question, 0..) |c, idx| {
         if (std.ascii.isAlphanumeric(c) or c == '_' or c == '-') {
             if (start == null) start = idx;
         } else if (start) |s| {
-            try appendToken(allocator, &tokens, question[s..idx]);
+            try appendQueryRune(allocator, &tokens, question[s..idx], &skip_next_excluded_subject);
             start = null;
             if (tokens.items.len >= MAX_QUERY_TOKENS) break;
         }
     }
     if (start) |s| {
-        if (tokens.items.len < MAX_QUERY_TOKENS) try appendToken(allocator, &tokens, question[s..]);
+        if (tokens.items.len < MAX_QUERY_TOKENS) try appendQueryRune(allocator, &tokens, question[s..], &skip_next_excluded_subject);
     }
 
     return .{ .tokens = try tokens.toOwnedSlice() };
 }
 
-fn appendToken(allocator: std.mem.Allocator, tokens: *std.ArrayList([]u8), raw: []const u8) !void {
+fn appendQueryRune(allocator: std.mem.Allocator, tokens: *std.ArrayList([]u8), raw: []const u8, skip_next_excluded_subject: *bool) !void {
     const trimmed = std.mem.trim(u8, raw, " \r\n\t.,:;!?()[]{}\"'");
-    if (trimmed.len < MIN_TOKEN_LEN) return;
+    if (trimmed.len < MIN_TOKEN_LEN and !isShortSearchRune(trimmed)) return;
+    if (isNegativeModifierRune(trimmed)) {
+        skip_next_excluded_subject.* = true;
+        return;
+    }
+    if (skip_next_excluded_subject.*) {
+        skip_next_excluded_subject.* = false;
+        return;
+    }
     if (isStopWord(trimmed)) return;
 
     const lower = try allocator.alloc(u8, trimmed.len);
@@ -2308,13 +2369,25 @@ fn appendToken(allocator: std.mem.Allocator, tokens: *std.ArrayList([]u8), raw: 
     try tokens.append(lower);
 }
 
+fn isShortSearchRune(rune: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(rune, "hi") or
+        std.ascii.eqlIgnoreCase(rune, "yo");
+}
+
+fn isNegativeModifierRune(rune: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(rune, "not") or
+        std.ascii.eqlIgnoreCase(rune, "without") or
+        std.ascii.eqlIgnoreCase(rune, "excluding") or
+        std.ascii.eqlIgnoreCase(rune, "exclude");
+}
+
 fn isStopWord(token: []const u8) bool {
     const words = [_][]const u8{
-        "the",        "and",    "for",      "with",     "from",  "what",    "when",    "where",    "which",      "this",      "that",
-        "whats",      "what's", "does",     "into",     "about", "using",   "should",  "would",    "could",      "tell",      "give",
-        "show",       "hello",  "based",    "only",     "have",  "your",    "also",    "keep",     "explain",    "encounter", "word",
-        "current",    "shard",  "ingested", "grounded", "data",  "logical", "english", "patterns", "understand", "concept",   "answer",
-        "definition", "public", "found",    "yet",      "not",   "corpus",
+        "the",    "and",      "for",      "with", "from",    "what",    "when",     "where",      "which",     "this",   "that",
+        "whats",  "what's",   "does",     "into", "about",   "using",   "should",   "would",      "could",     "tell",   "give",
+        "show",   "based",    "only",     "have", "your",    "also",    "keep",     "explain",    "encounter", "word",   "current",
+        "shard",  "ingested", "grounded", "data", "logical", "english", "patterns", "understand", "concept",   "answer", "definition",
+        "public", "found",    "yet",      "not",  "corpus",
     };
     for (words) |word| {
         if (std.ascii.eqlIgnoreCase(token, word)) return true;

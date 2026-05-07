@@ -15,6 +15,8 @@ pub const INF_LANE_COUNT = 5; // Parallel inference streams for Monte Carlo
 pub const ROTOR_STRIDE = 18; // 16x u64 spatial + 2x u64 (lexical, semantic)
 pub const LAYER2A_MAX_CANDIDATES = config.BEAM_NUM_LANES;
 pub const LAYER2A_NO_WINNER: u32 = 0xFFFFFFFF;
+pub const GHOST_INDEX_BLOCK_BYTES: usize = 1024 * 1024;
+pub const GHOST_INDEX_SKIP_THRESHOLD_PER_MILLE: u16 = 100;
 const FENCE_TIMEOUT_NS: u64 = 2_000_000_000;
 const SHUTDOWN_FENCE_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
 const VALIDATION_LAYER_NAME: [*:0]const u8 = "VK_LAYER_KHRONOS_validation";
@@ -115,6 +117,115 @@ pub const Layer2aContradictionSummary = struct {
     candidate_count: u32,
     survivor_count: u32,
 };
+
+pub const GhostIndexBlock = struct {
+    byte_start: usize,
+    byte_end: usize,
+    simhash: u64,
+    feature_count: usize,
+};
+
+pub const GhostIndexPruneSummary = struct {
+    scanned_blocks: usize = 0,
+    skipped_blocks: usize = 0,
+    retained_blocks: usize = 0,
+};
+
+pub const ResidentBuffer = struct {
+    buffer: vk.VkBuffer = null,
+    memory: vk.VkDeviceMemory = null,
+    size_bytes: usize = 0,
+    device_local: bool = false,
+};
+
+pub fn buildGhostIndex(allocator: std.mem.Allocator, bytes: []const u8) ![]GhostIndexBlock {
+    const block_count = @max(@as(usize, 1), (bytes.len + GHOST_INDEX_BLOCK_BYTES - 1) / GHOST_INDEX_BLOCK_BYTES);
+    const blocks = try allocator.alloc(GhostIndexBlock, block_count);
+    for (blocks, 0..) |*block, idx| {
+        const start = idx * GHOST_INDEX_BLOCK_BYTES;
+        const end = @min(bytes.len, start + GHOST_INDEX_BLOCK_BYTES);
+        const slice = if (start < bytes.len) bytes[start..end] else bytes[0..0];
+        block.* = .{
+            .byte_start = start,
+            .byte_end = end,
+            .simhash = simHashBlock64(slice, idx),
+            .feature_count = if (slice.len == 0) 0 else 1,
+        };
+    }
+    return blocks;
+}
+
+pub fn ghostIndexDistance(lhs: u64, rhs: u64) u7 {
+    return @intCast(@popCount(lhs ^ rhs));
+}
+
+pub fn ghostIndexNearnessPerMille(lhs: u64, rhs: u64) u16 {
+    const distance = ghostIndexDistance(lhs, rhs);
+    const remaining: u16 = 64 - @as(u16, distance);
+    return @intCast((@as(u32, remaining) * 1000) / 64);
+}
+
+pub fn shouldSkipGhostIndexBlock(input_hash: u64, block: GhostIndexBlock) bool {
+    if (block.feature_count == 0) return false;
+    return ghostIndexNearnessPerMille(input_hash, block.simhash) < GHOST_INDEX_SKIP_THRESHOLD_PER_MILLE;
+}
+
+pub fn pruneGhostIndexBlocks(input_hash: u64, blocks: []const GhostIndexBlock, scan_blocks: []bool) !GhostIndexPruneSummary {
+    if (scan_blocks.len < blocks.len) return error.OutputTooSmall;
+    var summary = GhostIndexPruneSummary{ .scanned_blocks = blocks.len };
+    for (blocks, 0..) |block, idx| {
+        const skip = shouldSkipGhostIndexBlock(input_hash, block);
+        scan_blocks[idx] = !skip;
+        if (skip) {
+            summary.skipped_blocks += 1;
+        } else {
+            summary.retained_blocks += 1;
+        }
+    }
+    return summary;
+}
+
+fn simHashBlock64(bytes: []const u8, block_index: usize) u64 {
+    var weights = [_]i32{0} ** 64;
+    var has_feature = false;
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        while (offset < bytes.len and !isGhostIndexByte(bytes[offset])) : (offset += 1) {}
+        const start = offset;
+        while (offset < bytes.len and isGhostIndexByte(bytes[offset])) : (offset += 1) {}
+        if (offset == start) continue;
+        has_feature = true;
+        addGhostIndexFeature(&weights, bytes[start..offset], block_index);
+    }
+    if (!has_feature) addGhostIndexFeature(&weights, bytes, block_index);
+
+    var hash: u64 = 0;
+    for (weights, 0..) |weight, bit| {
+        if (weight >= 0) hash |= @as(u64, 1) << @intCast(bit);
+    }
+    return hash;
+}
+
+fn isGhostIndexByte(byte: u8) bool {
+    return byte >= 0x80 or std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-';
+}
+
+fn addGhostIndexFeature(weights: *[64]i32, bytes: []const u8, block_index: usize) void {
+    var hasher = std.hash.Fnv1a_64.init();
+    hasher.update(bytes);
+    var index_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &index_bytes, @intCast(block_index), .little);
+    hasher.update(&index_bytes);
+    const hash = hasher.final();
+    for (0..64) |bit| {
+        const mask = @as(u64, 1) << @intCast(bit);
+        if ((hash & mask) != 0) {
+            weights[bit] += 1;
+        } else {
+            weights[bit] -= 1;
+        }
+    }
+}
 
 fn check(result: vk.VkResult) !void {
     if (result != vk.VK_SUCCESS) {
@@ -1113,6 +1224,65 @@ pub const VulkanEngine = struct {
         memory.* = null;
     }
 
+    pub fn createResidentBufferFromBytes(self: *VulkanEngine, bytes: []const u8) !ResidentBuffer {
+        if (bytes.len == 0) return .{};
+
+        var staging_buffer: vk.VkBuffer = null;
+        var staging_memory: vk.VkDeviceMemory = null;
+        const staging_ptr = try self.createBuffer(
+            bytes.len,
+            vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            &staging_buffer,
+            &staging_memory,
+        ) orelse return error.VulkanError;
+        defer self.destroyBuffer(&staging_buffer, &staging_memory, staging_ptr);
+
+        const staging_bytes: [*]u8 = @ptrCast(staging_ptr);
+        @memcpy(staging_bytes[0..bytes.len], bytes);
+
+        var resident = ResidentBuffer{
+            .size_bytes = bytes.len,
+            .device_local = true,
+        };
+        errdefer self.destroyResidentBuffer(&resident);
+        _ = try self.createBuffer(
+            bytes.len,
+            vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            &resident.buffer,
+            &resident.memory,
+        );
+
+        const f = self.frame_idx;
+        try self.recycleHardwareFenceWithTimeout(f, SHUTDOWN_FENCE_TIMEOUT_NS);
+
+        var beginInfo = std.mem.zeroes(vk.VkCommandBufferBeginInfo);
+        beginInfo.sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        try check(self.vk_ctx.vkBeginCommandBuffer.?(self.command_buffers[f], &beginInfo));
+
+        var region = std.mem.zeroes(vk.VkBufferCopy);
+        region.size = bytes.len;
+        self.vk_ctx.vkCmdCopyBuffer.?(self.command_buffers[f], staging_buffer, resident.buffer, 1, &region);
+        try check(self.vk_ctx.vkEndCommandBuffer.?(self.command_buffers[f]));
+
+        var submitInfo = std.mem.zeroes(vk.VkSubmitInfo);
+        submitInfo.sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &self.command_buffers[f];
+        try check(self.vk_ctx.vkQueueSubmit.?(self.queue, 1, &submitInfo, self.fences[f]));
+        try self.waitForHardwareInterruptWithTimeout(f, SHUTDOWN_FENCE_TIMEOUT_NS);
+        self.frame_idx = (self.frame_idx + 1) % FRAME_COUNT;
+
+        return resident;
+    }
+
+    pub fn destroyResidentBuffer(self: *const VulkanEngine, resident: *ResidentBuffer) void {
+        self.destroyBuffer(&resident.buffer, &resident.memory, null);
+        resident.* = .{};
+    }
+
     pub fn deinit(self: *VulkanEngine) void {
         self.allocator.free(self.result_buffer);
 
@@ -2068,4 +2238,21 @@ pub fn deinitRuntime() void {
     global_fleet = null;
     global_instance = null;
     thread_engine = null;
+}
+
+test "ghost index pruning skips far simhash blocks" {
+    const allocator = std.testing.allocator;
+    const text = "silicon computers use semiconductor logic. vulkan pipelines are unrelated to the bakery ledger.";
+    const blocks = try buildGhostIndex(allocator, text);
+    defer allocator.free(blocks);
+    try std.testing.expect(blocks.len >= 1);
+
+    const query_hash = blocks[0].simhash;
+    const scan = try allocator.alloc(bool, blocks.len);
+    defer allocator.free(scan);
+    const summary = try pruneGhostIndexBlocks(query_hash, blocks, scan);
+    try std.testing.expectEqual(blocks.len, summary.scanned_blocks);
+    try std.testing.expect(summary.retained_blocks >= 1);
+    try std.testing.expect(!shouldSkipGhostIndexBlock(query_hash, blocks[0]));
+    try std.testing.expect(ghostIndexNearnessPerMille(0, std.math.maxInt(u64)) < GHOST_INDEX_SKIP_THRESHOLD_PER_MILLE);
 }
