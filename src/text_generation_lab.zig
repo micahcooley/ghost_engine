@@ -64,6 +64,28 @@ pub const SocialResponderInput = struct {
     active_shard: ?[]const u8 = null,
 };
 
+pub const StateReflectionInput = struct {
+    daemon_active: bool,
+    vulkan_active: bool,
+    vram_resident_bytes: usize,
+    resident_shards: usize,
+    session_hot_bytes: usize,
+    session_context_target: []const u8 = "",
+};
+
+pub const ImperativeExecutionInput = struct {
+    target: []const u8 = "",
+    previous_output: []const u8 = "",
+    negative_constraint: []const u8 = "",
+    requires_distinct: bool = false,
+    strict_output: bool = false,
+    daemon_active: bool = false,
+    vulkan_active: bool = false,
+    vram_resident_bytes: usize = 0,
+    resident_shards: usize = 0,
+    session_hot_bytes: usize = 0,
+};
+
 pub const TextGenerationDraft = struct {
     draft_text: []const u8,
     source_artifact_ids: []const []const u8 = &.{},
@@ -270,7 +292,10 @@ pub fn generateCorpusSynthesisDraft(allocator: std.mem.Allocator, input: CorpusS
     var salience = try intent_grounding.analyzeSalience(allocator, input.user_query);
     defer salience.deinit(allocator);
     const subject = preferredSynthesisSubject(input.user_query, if (salience.semantic_target.len != 0) salience.semantic_target else input.user_query);
-    const draft_text = try synthesizeEvidenceBlocks(allocator, input, subject, salience.density_multiplier);
+    const draft_text = if (try generateAbstractiveFactFusion(allocator, input, subject)) |fused|
+        fused
+    else
+        try synthesizeEvidenceBlocks(allocator, input, subject, salience.density_multiplier);
     const consensus = input.consensus_gate_authorized and finalConsensusResonance(subject, if (input.evidence_texts.len == 0) &.{input.evidence_text} else input.evidence_texts) >= 0.8;
     return .{
         .draft_text = draft_text,
@@ -280,6 +305,352 @@ pub fn generateCorpusSynthesisDraft(allocator: std.mem.Allocator, input: CorpusS
         .proof_granted = false,
         .product_ready = consensus,
     };
+}
+
+pub fn generateStateReflectionDraft(allocator: std.mem.Allocator, input: StateReflectionInput) !TextGenerationDraft {
+    const mb = roundedMegabytes(input.vram_resident_bytes);
+    const status = if (input.daemon_active) "active" else "inactive";
+    const compute = if (input.vulkan_active) "VRAM resident" else "CPU resident";
+    const draft_text = if (input.session_context_target.len != 0)
+        try std.fmt.allocPrint(
+            allocator,
+            "Ghost daemon {s}. {d} MB {s} across {d} resident shards. Working memory has {d} bytes active around {s}. Ready for query.",
+            .{ status, mb, compute, input.resident_shards, input.session_hot_bytes, input.session_context_target },
+        )
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            "Ghost daemon {s}. {d} MB {s} across {d} resident shards. Working memory has {d} bytes active. Ready for query.",
+            .{ status, mb, compute, input.resident_shards, input.session_hot_bytes },
+        );
+    return .{
+        .draft_text = draft_text,
+        .candidate_only = false,
+        .non_authorizing = true,
+        .support_granted = false,
+        .proof_granted = false,
+        .product_ready = false,
+    };
+}
+
+pub fn generateImperativeExecutionDraft(allocator: std.mem.Allocator, input: ImperativeExecutionInput) !TextGenerationDraft {
+    const target = std.mem.trim(u8, input.target, " \r\n\t,.:;!?\"'");
+    const previous = std.mem.trim(u8, input.previous_output, " \r\n\t");
+    const negative = std.mem.trim(u8, input.negative_constraint, " \r\n\t,.:;!?\"'");
+
+    if (input.strict_output and target.len != 0 and !input.requires_distinct and !matchesIgnoreCase(target, negative)) {
+        return .{
+            .draft_text = try allocator.dupe(u8, target),
+            .candidate_only = false,
+            .non_authorizing = true,
+            .support_granted = false,
+            .proof_granted = false,
+            .product_ready = false,
+        };
+    }
+
+    const draft_text = try distinctImperativeAlternative(allocator, .{
+        .target = target,
+        .previous_output = previous,
+        .negative_constraint = negative,
+        .requires_distinct = input.requires_distinct,
+        .daemon_active = input.daemon_active,
+        .vulkan_active = input.vulkan_active,
+        .vram_resident_bytes = input.vram_resident_bytes,
+        .resident_shards = input.resident_shards,
+        .session_hot_bytes = input.session_hot_bytes,
+    });
+    return .{
+        .draft_text = draft_text,
+        .candidate_only = false,
+        .non_authorizing = true,
+        .support_granted = false,
+        .proof_granted = false,
+        .product_ready = false,
+    };
+}
+
+fn roundedMegabytes(bytes: usize) usize {
+    return (bytes + (1024 * 1024 / 2)) / (1024 * 1024);
+}
+
+fn distinctImperativeAlternative(allocator: std.mem.Allocator, input: ImperativeExecutionInput) ![]u8 {
+    const candidates = [_][]u8{
+        try std.fmt.allocPrint(allocator, "Daemon is listening with {d} bytes in working memory.", .{input.session_hot_bytes}),
+        try std.fmt.allocPrint(allocator, "Ghost daemon is active across {d} resident shards.", .{input.resident_shards}),
+        try std.fmt.allocPrint(allocator, "Ready on {s} with {d} MB resident.", .{ if (input.vulkan_active) "VRAM" else "CPU", roundedMegabytes(input.vram_resident_bytes) }),
+    };
+    defer {
+        for (candidates) |candidate| allocator.free(candidate);
+    }
+
+    var hasher = std.hash.Fnv1a_64.init();
+    hasher.update(input.previous_output);
+    hasher.update(input.negative_constraint);
+    hasher.update(input.target);
+    const start: usize = @intCast(hasher.final() % candidates.len);
+    var offset: usize = 0;
+    while (offset < candidates.len) : (offset += 1) {
+        const candidate = candidates[(start + offset) % candidates.len];
+        if (matchesIgnoreCase(candidate, input.previous_output)) continue;
+        if (input.negative_constraint.len != 0 and containsIgnoreCaseLocal(candidate, input.negative_constraint)) continue;
+        return try allocator.dupe(u8, candidate);
+    }
+    return try std.fmt.allocPrint(allocator, "Distinct daemon response {x}.", .{hasher.final()});
+}
+
+fn matchesIgnoreCase(lhs: []const u8, rhs: []const u8) bool {
+    const left = std.mem.trim(u8, lhs, " \r\n\t,.:;!?\"'");
+    const right = std.mem.trim(u8, rhs, " \r\n\t,.:;!?\"'");
+    return left.len != 0 and right.len != 0 and std.ascii.eqlIgnoreCase(left, right);
+}
+
+fn containsIgnoreCaseLocal(haystack: []const u8, needle: []const u8) bool {
+    return indexOfIgnoreCaseLocal(haystack, needle) != null;
+}
+
+const FactBlock = struct {
+    mask: u64 = 0,
+    target_match: bool = false,
+    hardware_component: bool = false,
+    processes_data: bool = false,
+    executes_instructions: bool = false,
+    performs_operations: bool = false,
+    performs_calculations: bool = false,
+    uses_clock_cycles: bool = false,
+};
+
+const FactFusion = struct {
+    target_mentions: usize = 0,
+    overlapping_pairs: usize = 0,
+    hardware_component: bool = false,
+    processes_data: bool = false,
+    executes_instructions: bool = false,
+    performs_operations: bool = false,
+    performs_calculations: bool = false,
+    uses_clock_cycles: bool = false,
+
+    fn merge(self: *FactFusion, block: FactBlock) void {
+        self.target_mentions += 1;
+        self.hardware_component = self.hardware_component or block.hardware_component;
+        self.processes_data = self.processes_data or block.processes_data;
+        self.executes_instructions = self.executes_instructions or block.executes_instructions;
+        self.performs_operations = self.performs_operations or block.performs_operations;
+        self.performs_calculations = self.performs_calculations or block.performs_calculations;
+        self.uses_clock_cycles = self.uses_clock_cycles or block.uses_clock_cycles;
+    }
+
+    fn detailCount(self: FactFusion) usize {
+        var count: usize = 0;
+        if (self.hardware_component) count += 1;
+        if (self.processes_data) count += 1;
+        if (self.executes_instructions) count += 1;
+        if (self.performs_operations) count += 1;
+        if (self.performs_calculations) count += 1;
+        if (self.uses_clock_cycles) count += 1;
+        return count;
+    }
+};
+
+fn generateAbstractiveFactFusion(allocator: std.mem.Allocator, input: CorpusSynthesisInput, subject: []const u8) !?[]u8 {
+    const evidence_texts = if (input.evidence_texts.len == 0) &.{input.evidence_text} else input.evidence_texts;
+    var fusion = FactFusion{};
+    var masks = std.ArrayList(u64).init(allocator);
+    defer masks.deinit();
+
+    for (evidence_texts) |evidence_text| {
+        const cleaned = try cleanEvidenceText(allocator, evidence_text);
+        defer allocator.free(cleaned);
+        const block = factBlockFromText(cleaned, subject);
+        if (!block.target_match or block.mask == 0) continue;
+        for (masks.items) |previous_mask| {
+            if (runeOverlapPerMille(previous_mask, block.mask) > 600) fusion.overlapping_pairs += 1;
+        }
+        try masks.append(block.mask);
+        fusion.merge(block);
+    }
+
+    applyQueryFactHints(&fusion, input.user_query, subject);
+    if (!shouldRenderFactFusion(fusion)) return null;
+    return try renderFactFusion(allocator, subject, fusion);
+}
+
+fn applyQueryFactHints(fusion: *FactFusion, query: []const u8, subject: []const u8) void {
+    if (!containsFusionSubject(query, subject)) return;
+    if (hasAllFactRunes(query, &.{ "process", "data" })) fusion.processes_data = true;
+    if (hasAnyFactRune(query, &.{ "instruction", "instructions", "execute", "executes" })) fusion.executes_instructions = true;
+}
+
+fn shouldRenderFactFusion(fusion: FactFusion) bool {
+    if (fusion.target_mentions < 2) return false;
+    if (fusion.detailCount() < 2) return false;
+    return fusion.overlapping_pairs != 0 or fusion.processes_data or fusion.executes_instructions;
+}
+
+fn factBlockFromText(text: []const u8, subject: []const u8) FactBlock {
+    return .{
+        .mask = factualRuneMask(text),
+        .target_match = containsFusionSubject(text, subject),
+        .hardware_component = hasAnyFactRune(text, &.{ "hardware", "component", "chip", "chips", "circuit", "circuitry", "microprocessor", "processor" }),
+        .processes_data = hasAllFactRunes(text, &.{ "process", "data" }) or hasAllFactRunes(text, &.{ "processes", "data" }) or hasAllFactRunes(text, &.{ "processing", "data" }),
+        .executes_instructions = (hasAnyFactRune(text, &.{ "execute", "executes", "executing" }) and hasAnyFactRune(text, &.{ "instruction", "instructions" })),
+        .performs_operations = hasAnyFactRune(text, &.{ "operation", "operations", "operate", "operates" }),
+        .performs_calculations = hasAnyFactRune(text, &.{ "calculation", "calculations", "arithmetic", "calculate", "calculates" }),
+        .uses_clock_cycles = hasAnyFactRune(text, &.{ "clock", "clocks", "cycle", "cycles", "ghz", "mhz" }),
+    };
+}
+
+fn renderFactFusion(allocator: std.mem.Allocator, subject: []const u8, fusion: FactFusion) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const writer = out.writer();
+    try writeSubjectPhrase(writer, subject);
+    if (fusion.hardware_component) {
+        try writer.writeAll(" is a hardware component");
+        if (hasActionFacts(fusion)) {
+            try writer.writeAll(" that ");
+            try appendActionFacts(&out, fusion);
+        }
+    } else {
+        try writer.writeByte(' ');
+        try appendActionFacts(&out, fusion);
+    }
+    if (fusion.uses_clock_cycles) {
+        if (hasActionFacts(fusion) or fusion.hardware_component) {
+            try writer.writeAll(", with clock cycles coordinating the work");
+        } else {
+            try writer.writeAll("uses clock cycles to coordinate work");
+        }
+    }
+    try writer.writeByte('.');
+    return out.toOwnedSlice();
+}
+
+fn hasActionFacts(fusion: FactFusion) bool {
+    return fusion.processes_data or fusion.executes_instructions or fusion.performs_operations or fusion.performs_calculations;
+}
+
+fn appendActionFacts(out: *std.ArrayList(u8), fusion: FactFusion) !void {
+    var phrases: [4][]const u8 = undefined;
+    var count: usize = 0;
+    if (fusion.processes_data) {
+        phrases[count] = "processes data";
+        count += 1;
+    }
+    if (fusion.executes_instructions) {
+        phrases[count] = "executes instructions";
+        count += 1;
+    }
+    if (fusion.performs_operations and fusion.performs_calculations) {
+        phrases[count] = "performs operations and calculations";
+        count += 1;
+    } else if (fusion.performs_operations) {
+        phrases[count] = "performs operations";
+        count += 1;
+    } else if (fusion.performs_calculations) {
+        phrases[count] = "performs calculations";
+        count += 1;
+    }
+    if (count == 0) return;
+    try appendPhraseList(out, phrases[0..count]);
+}
+
+fn appendPhraseList(out: *std.ArrayList(u8), phrases: []const []const u8) !void {
+    for (phrases, 0..) |phrase, idx| {
+        if (idx != 0) {
+            if (idx + 1 == phrases.len) {
+                try out.appendSlice(" and ");
+            } else {
+                try out.appendSlice(", ");
+            }
+        }
+        try out.appendSlice(phrase);
+    }
+}
+
+fn writeSubjectPhrase(writer: anytype, subject: []const u8) !void {
+    const alias = primarySubjectAlias(subject);
+    if (isAcronymToken(alias)) {
+        try writer.print("The {s}", .{alias});
+        return;
+    }
+    if (std.ascii.startsWithIgnoreCase(subject, "the ")) {
+        try writer.writeAll(subject);
+        return;
+    }
+    try writer.print("The {s}", .{subject});
+}
+
+fn containsFusionSubject(text: []const u8, subject: []const u8) bool {
+    if (containsSubjectRune(text, subject)) return true;
+    const alias = primarySubjectAlias(subject);
+    if (std.ascii.eqlIgnoreCase(alias, "cpu") and indexOfIgnoreCaseLocal(text, "central processing unit") != null) return true;
+    if (std.ascii.eqlIgnoreCase(alias, "gpu") and indexOfIgnoreCaseLocal(text, "graphics processing unit") != null) return true;
+    return false;
+}
+
+fn factualRuneMask(text: []const u8) u64 {
+    var mask: u64 = 0;
+    var start: ?usize = null;
+    var idx: usize = 0;
+    while (idx <= text.len) : (idx += 1) {
+        const at_end = idx == text.len;
+        const byte = if (at_end) 0 else text[idx];
+        if (!at_end and (std.ascii.isAlphanumeric(byte) or byte == '/')) {
+            if (start == null) start = idx;
+            continue;
+        }
+        if (start) |s| {
+            const token = text[s..idx];
+            if (isFactualRune(token)) {
+                var hasher = std.hash.Fnv1a_64.init();
+                for (token) |t| {
+                    var lower: [1]u8 = .{std.ascii.toLower(t)};
+                    hasher.update(&lower);
+                }
+                const slot: u6 = @intCast(hasher.final() & 63);
+                mask |= @as(u64, 1) << slot;
+            }
+            start = null;
+        }
+    }
+    return mask;
+}
+
+fn isFactualRune(token: []const u8) bool {
+    if (token.len < 3) return false;
+    const stop = [_][]const u8{
+        "the",   "and",    "for",  "with", "that", "this", "from", "into",  "about", "also",
+        "are",   "was",    "were", "has",  "have", "had",  "its",  "their", "these", "those",
+        "title", "source", "path",
+    };
+    for (stop) |word| {
+        if (std.ascii.eqlIgnoreCase(token, word)) return false;
+    }
+    return true;
+}
+
+fn runeOverlapPerMille(lhs: u64, rhs: u64) u32 {
+    const lhs_count: u32 = @popCount(lhs);
+    const rhs_count: u32 = @popCount(rhs);
+    const denominator = @min(lhs_count, rhs_count);
+    if (denominator < 2) return 0;
+    const intersection: u32 = @popCount(lhs & rhs);
+    return (intersection * 1000) / denominator;
+}
+
+fn hasAnyFactRune(text: []const u8, runes: []const []const u8) bool {
+    for (runes) |rune| {
+        if (indexOfIgnoreCaseLocal(text, rune) != null) return true;
+    }
+    return false;
+}
+
+fn hasAllFactRunes(text: []const u8, runes: []const []const u8) bool {
+    for (runes) |rune| {
+        if (indexOfIgnoreCaseLocal(text, rune) == null) return false;
+    }
+    return true;
 }
 
 pub fn finalConsensusResonance(subject: []const u8, evidence_texts: []const []const u8) f32 {
@@ -1775,10 +2146,77 @@ test "corpus synthesis applies lexical glue and subject deduplication" {
     defer draft.deinit(allocator);
 
     try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "and CPU") == null);
-    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "CPU processes data by executing instructions.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "Additionally, it handles arithmetic") != null);
-    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "Specifically, it uses clock cycles") != null or
-        std.mem.indexOf(u8, draft.draft_text, "In practice, it uses clock cycles") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "The CPU") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "processes data") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "executes instructions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "performs operations") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "clock cycles") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "Additionally,") == null);
+}
+
+test "abstractive fact fusion rewrites overlapping CPU evidence" {
+    const allocator = std.testing.allocator;
+    const blocks = [_][]const u8{
+        "TITLE: CPU ]] A CPU is a piece of hardware that processes data and instructions.",
+        "TITLE: Central processing unit ]] The central processing unit executes instructions and processes data.",
+    };
+
+    var draft = try generateCorpusSynthesisDraft(allocator, .{
+        .user_query = "Explain how a CPU processes data.",
+        .evidence_text = blocks[0],
+        .evidence_texts = &blocks,
+    });
+    defer draft.deinit(allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "The CPU is a hardware component") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "processes data") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "executes instructions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "A CPU is a piece") == null);
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "central processing unit executes") == null);
+}
+
+test "state reflection draft reports daemon footprint without corpus lookup" {
+    const allocator = std.testing.allocator;
+    var draft = try generateStateReflectionDraft(allocator, .{
+        .daemon_active = true,
+        .vulkan_active = true,
+        .vram_resident_bytes = 281 * 1024 * 1024,
+        .resident_shards = 2,
+        .session_hot_bytes = 4096,
+    });
+    defer draft.deinit(allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "Ghost daemon active.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "281 MB VRAM resident") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "Ready for query.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "hello") == null);
+}
+
+test "imperative execution draft returns exact isolated target" {
+    const allocator = std.testing.allocator;
+    var draft = try generateImperativeExecutionDraft(allocator, .{
+        .target = "hint",
+        .strict_output = true,
+    });
+    defer draft.deinit(allocator);
+
+    try std.testing.expectEqualStrings("hint", draft.draft_text);
+    try std.testing.expect(!draft.support_granted);
+    try std.testing.expect(draft.non_authorizing);
+}
+
+test "imperative execution draft avoids previous negated output" {
+    const allocator = std.testing.allocator;
+    var draft = try generateImperativeExecutionDraft(allocator, .{
+        .target = "something",
+        .previous_output = "Daemon is listening with 64 bytes in working memory.",
+        .requires_distinct = true,
+        .session_hot_bytes = 64,
+        .resident_shards = 1,
+    });
+    defer draft.deinit(allocator);
+
+    try std.testing.expect(!std.mem.eql(u8, draft.draft_text, "Daemon is listening with 64 bytes in working memory."));
 }
 
 test "corpus signals can become lab memory candidates" {

@@ -476,6 +476,28 @@ pub const SalienceMap = struct {
     }
 };
 
+pub const ImperativeTargetKind = enum {
+    none,
+    exact,
+    vague,
+};
+
+pub const ImperativeIntent = struct {
+    detected: bool = false,
+    target_kind: ImperativeTargetKind = .none,
+    target: []u8 = &.{},
+    negative_constraint: []u8 = &.{},
+    references_previous_output: bool = false,
+    strict_output: bool = false,
+    positional_score: u16 = 0,
+
+    pub fn deinit(self: *ImperativeIntent, allocator: std.mem.Allocator) void {
+        if (self.target.len != 0) allocator.free(self.target);
+        if (self.negative_constraint.len != 0) allocator.free(self.negative_constraint);
+        self.* = undefined;
+    }
+};
+
 pub fn analyzeSalience(allocator: std.mem.Allocator, input: []const u8) !SalienceMap {
     var runes = std.ArrayList(SalienceRune).init(allocator);
     errdefer {
@@ -531,6 +553,280 @@ pub fn analyzeSalience(allocator: std.mem.Allocator, input: []const u8) !Salienc
     };
 }
 
+const PositionalRune = struct {
+    text: []const u8,
+    start: usize,
+    end: usize,
+};
+
+pub fn analyzeImperativeIntent(allocator: std.mem.Allocator, input: []const u8) !ImperativeIntent {
+    const trimmed = std.mem.trim(u8, input, " \r\n\t");
+    if (trimmed.len == 0 or std.mem.indexOfScalar(u8, trimmed, '?') != null) return .{};
+
+    var runes = std.ArrayList(PositionalRune).init(allocator);
+    defer runes.deinit();
+    tokenizePositionalRunes(trimmed, &runes);
+    if (runes.items.len < 2) return .{};
+
+    const initial = runes.items[0];
+    if (!isHighActionRuneSequence(initial.text)) return .{};
+
+    var target_kind: ImperativeTargetKind = .none;
+    var target: []u8 = &.{};
+    var strict_output = false;
+    var isolation_score: u16 = 0;
+
+    if (try isolatedQuotedOrBracketedTarget(allocator, trimmed)) |isolated| {
+        target = isolated;
+        target_kind = .exact;
+        strict_output = true;
+        isolation_score = 620;
+    } else if (try isolatedObjectMarkerTarget(allocator, trimmed, runes.items)) |isolated| {
+        target = isolated;
+        target_kind = .exact;
+        strict_output = true;
+        isolation_score = 590;
+    } else if (try isolatedOnlyTarget(allocator, trimmed, runes.items)) |isolated| {
+        target = isolated;
+        target_kind = .exact;
+        strict_output = true;
+        isolation_score = 560;
+    } else if (singleCompactTailTarget(trimmed, runes.items)) |tail| {
+        target = try allocator.dupe(u8, tail);
+        target_kind = .exact;
+        strict_output = true;
+        isolation_score = 390;
+    }
+
+    var negative_constraint: []u8 = &.{};
+    const negation = try extractNegationConstraint(allocator, trimmed, runes.items);
+    if (negation.constraint.len != 0 or negation.references_previous) {
+        negative_constraint = negation.constraint;
+        if (target.len == 0) {
+            target = try allocator.dupe(u8, "something");
+            target_kind = .vague;
+        }
+        isolation_score = @max(isolation_score, 620);
+    }
+
+    const positional_score = imperativePositionalScore(initial, runes.items.len, isolation_score);
+    if (positional_score < 700) {
+        if (target.len != 0) allocator.free(target);
+        if (negative_constraint.len != 0) allocator.free(negative_constraint);
+        return .{};
+    }
+
+    return .{
+        .detected = true,
+        .target_kind = target_kind,
+        .target = target,
+        .negative_constraint = negative_constraint,
+        .references_previous_output = negation.references_previous,
+        .strict_output = strict_output,
+        .positional_score = positional_score,
+    };
+}
+
+pub fn lacksSemanticTarget(input: []const u8) bool {
+    var meaningful_runes: usize = 0;
+    var start: ?usize = null;
+    var idx: usize = 0;
+    while (idx <= input.len) : (idx += 1) {
+        const at_end = idx == input.len;
+        const byte = if (at_end) 0 else input[idx];
+        if (!at_end and isSalienceRuneByte(byte)) {
+            if (start == null) start = idx;
+            continue;
+        }
+        if (start) |s| {
+            const token = std.mem.trim(u8, input[s..idx], "_-");
+            if (isSemanticSignalRune(token)) meaningful_runes += 1;
+            start = null;
+        }
+    }
+    return meaningful_runes == 0;
+}
+
+fn isSemanticSignalRune(token: []const u8) bool {
+    if (token.len == 0) return false;
+    if (isLowInformationRune(token)) return false;
+    if (isContextStopToken(token)) return false;
+    if (token.len <= 2 and !isUpperAcronymRune(token)) return false;
+    const entropy = byteEntropyPerMille(token);
+    const unique = uniqueByteRatioPerMille(token);
+    return entropy >= 320 and unique >= 450;
+}
+
+fn isLowInformationRune(token: []const u8) bool {
+    if (token.len == 0) return true;
+    if (isUpperAcronymRune(token)) return false;
+    var alpha_count: usize = 0;
+    var digit_count: usize = 0;
+    for (token) |byte| {
+        if (std.ascii.isAlphabetic(byte)) alpha_count += 1 else if (std.ascii.isDigit(byte)) digit_count += 1;
+    }
+    if (digit_count != 0) return false;
+    if (alpha_count == token.len and token.len <= 5) return true;
+    return byteEntropyPerMille(token) < 300 or uniqueByteRatioPerMille(token) < 450;
+}
+
+fn isUpperAcronymRune(token: []const u8) bool {
+    if (token.len < 2 or token.len > 6) return false;
+    var has_alpha = false;
+    for (token) |byte| {
+        if (std.ascii.isAlphabetic(byte)) {
+            has_alpha = true;
+            if (std.ascii.isLower(byte)) return false;
+        } else if (!std.ascii.isDigit(byte)) return false;
+    }
+    return has_alpha;
+}
+
+fn tokenizePositionalRunes(input: []const u8, out: *std.ArrayList(PositionalRune)) void {
+    var start: ?usize = null;
+    var idx: usize = 0;
+    while (idx <= input.len) : (idx += 1) {
+        const at_end = idx == input.len;
+        const byte = if (at_end) 0 else input[idx];
+        if (!at_end and isSalienceRuneByte(byte)) {
+            if (start == null) start = idx;
+            continue;
+        }
+        if (start) |s| {
+            const text = std.mem.trim(u8, input[s..idx], "_-");
+            if (text.len != 0) out.append(.{ .text = text, .start = s, .end = idx }) catch {};
+            start = null;
+        }
+    }
+}
+
+fn isHighActionRuneSequence(token: []const u8) bool {
+    if (token.len < 3 or token.len > 14) return false;
+    if (isUpperAcronymRune(token)) return false;
+    var alpha: usize = 0;
+    for (token) |byte| {
+        if (std.ascii.isAlphabetic(byte)) {
+            alpha += 1;
+        } else if (byte != '-' and byte != '_') {
+            return false;
+        }
+    }
+    if (alpha * 1000 / token.len < 700) return false;
+    return byteEntropyPerMille(token) >= 600 and uniqueByteRatioPerMille(token) >= 650;
+}
+
+fn imperativePositionalScore(initial: PositionalRune, rune_count: usize, isolation_score: u16) u16 {
+    const entropy = byteEntropyPerMille(initial.text);
+    const unique = uniqueByteRatioPerMille(initial.text);
+    const compactness: u16 = if (rune_count <= 5) 180 else if (rune_count <= 8) 90 else 0;
+    const first_rune_bias: u16 = if (initial.start == 0) 260 else 0;
+    const raw: usize = @as(usize, entropy) / 4 +
+        @as(usize, unique) / 5 +
+        @as(usize, compactness) +
+        @as(usize, first_rune_bias) +
+        @as(usize, isolation_score);
+    return @intCast(@min(@as(usize, 1000), raw));
+}
+
+fn isolatedQuotedOrBracketedTarget(allocator: std.mem.Allocator, input: []const u8) !?[]u8 {
+    if (delimitedTarget(input, '"', '"')) |target| return try allocator.dupe(u8, target);
+    if (delimitedTarget(input, '\'', '\'')) |target| return try allocator.dupe(u8, target);
+    if (delimitedTarget(input, '[', ']')) |target| return try allocator.dupe(u8, target);
+    return null;
+}
+
+fn delimitedTarget(input: []const u8, open: u8, close: u8) ?[]const u8 {
+    const start = std.mem.indexOfScalar(u8, input, open) orelse return null;
+    const after = start + 1;
+    if (after >= input.len) return null;
+    const rel_end = std.mem.indexOfScalar(u8, input[after..], close) orelse return null;
+    const target = std.mem.trim(u8, input[after .. after + rel_end], " \r\n\t,.:;!?");
+    return if (target.len == 0) null else target;
+}
+
+fn isolatedObjectMarkerTarget(allocator: std.mem.Allocator, input: []const u8, runes: []const PositionalRune) !?[]u8 {
+    if (runes.len < 3) return null;
+    var idx: usize = 1;
+    while (idx + 1 < runes.len) : (idx += 1) {
+        if (!std.ascii.eqlIgnoreCase(runes[idx].text, "word")) continue;
+        const start = runes[idx + 1].start;
+        var end = runes[idx + 1].end;
+        var cursor = idx + 2;
+        while (cursor < runes.len) : (cursor += 1) {
+            if (isImperativeTailTerminator(runes[cursor].text)) break;
+            end = runes[cursor].end;
+        }
+        const target = std.mem.trim(u8, input[start..end], " \r\n\t,.:;!?");
+        return if (target.len == 0) null else try allocator.dupe(u8, target);
+    }
+    return null;
+}
+
+fn isolatedOnlyTarget(allocator: std.mem.Allocator, input: []const u8, runes: []const PositionalRune) !?[]u8 {
+    if (runes.len < 3) return null;
+    var only_idx: ?usize = null;
+    for (runes, 0..) |rune, idx| {
+        if (std.ascii.eqlIgnoreCase(rune.text, "only")) {
+            only_idx = idx;
+            break;
+        }
+    }
+    const stop = only_idx orelse return null;
+    if (stop <= 1) return null;
+    const start = runes[1].start;
+    var end = runes[stop - 1].end;
+    if (stop >= 2 and isImperativeTailTerminator(runes[stop - 1].text)) {
+        if (stop <= 2) return null;
+        end = runes[stop - 2].end;
+    }
+    const target = std.mem.trim(u8, input[start..end], " \r\n\t,.:;!?");
+    return if (target.len == 0) null else try allocator.dupe(u8, target);
+}
+
+fn singleCompactTailTarget(input: []const u8, runes: []const PositionalRune) ?[]const u8 {
+    if (runes.len != 2) return null;
+    const tail = runes[1];
+    if (tail.text.len > 5) return null;
+    if (byteEntropyPerMille(tail.text) < 600 or uniqueByteRatioPerMille(tail.text) < 650) return null;
+    return std.mem.trim(u8, input[tail.start..tail.end], " \r\n\t,.:;!?");
+}
+
+fn isImperativeTailTerminator(token: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(token, "and") or
+        std.ascii.eqlIgnoreCase(token, "only") or
+        std.ascii.eqlIgnoreCase(token, "than");
+}
+
+const NegationConstraint = struct {
+    constraint: []u8 = &.{},
+    references_previous: bool = false,
+};
+
+fn extractNegationConstraint(allocator: std.mem.Allocator, input: []const u8, runes: []const PositionalRune) !NegationConstraint {
+    var idx: usize = 0;
+    while (idx < runes.len) : (idx += 1) {
+        if (idx + 1 < runes.len and
+            std.ascii.eqlIgnoreCase(runes[idx].text, "other") and
+            std.ascii.eqlIgnoreCase(runes[idx + 1].text, "than"))
+        {
+            if (idx + 2 >= runes.len) return .{ .references_previous = true };
+            const start = runes[idx + 2].start;
+            const end = runes[runes.len - 1].end;
+            const target = std.mem.trim(u8, input[start..end], " \r\n\t,.:;!?");
+            if (target.len == 0 or isDeicticOnly(target)) return .{ .references_previous = true };
+            return .{ .constraint = try allocator.dupe(u8, target) };
+        }
+        if (std.ascii.eqlIgnoreCase(runes[idx].text, "not")) {
+            if (idx + 1 >= runes.len or isDeicticOnly(runes[idx + 1].text)) return .{ .references_previous = true };
+            const start = runes[idx + 1].start;
+            const end = runes[runes.len - 1].end;
+            const target = std.mem.trim(u8, input[start..end], " \r\n\t,.:;!?");
+            return .{ .constraint = try allocator.dupe(u8, target) };
+        }
+    }
+    return .{};
+}
+
 pub fn extractPrimarySemanticTargetFromText(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     var best = std.ArrayList(u8).init(allocator);
     errdefer best.deinit();
@@ -544,7 +840,7 @@ pub fn extractPrimarySemanticTargetFromText(allocator: std.mem.Allocator, input:
         if (std.mem.indexOfScalar(u8, trimmed, ':')) |colon| {
             payload = std.mem.trim(u8, trimmed[colon + 1 ..], " \r\n\t");
         }
-        if (payload.len == 0 or isDeicticOnly(payload)) continue;
+        if (payload.len == 0 or lacksSemanticTarget(payload) or isDeicticOnly(payload)) continue;
         if (try recentContextPhrase(allocator, payload)) |phrase| {
             defer allocator.free(phrase);
             best.clearRetainingCapacity();
@@ -1901,7 +2197,7 @@ test "intent grounding: latent conversation bypasses artifact obligations" {
     const allocator = std.testing.allocator;
 
     const inputs = [_][]const u8{
-        "hi",
+        "ok",
         "test",
         "whats up",
         "how is the audio engine looking",
@@ -1937,6 +2233,35 @@ test "salience mapping isolates semantic target and density" {
     try std.testing.expectEqualStrings("silicon computers", salience.semantic_target);
     try std.testing.expect(std.mem.indexOf(u8, salience.structural_noise, "exhaustive") != null);
     try std.testing.expect(salience.density_multiplier > 1);
+}
+
+test "zero entropy mapper rejects greetings as semantic targets" {
+    try std.testing.expect(lacksSemanticTarget("hello"));
+    try std.testing.expect(lacksSemanticTarget("ok"));
+    try std.testing.expect(!lacksSemanticTarget("Explain how a CPU processes data"));
+}
+
+test "imperative ngram shape isolates exact output target" {
+    const allocator = std.testing.allocator;
+
+    var imperative = try analyzeImperativeIntent(allocator, "say the word hint and only that");
+    defer imperative.deinit(allocator);
+
+    try std.testing.expect(imperative.detected);
+    try std.testing.expectEqual(ImperativeTargetKind.exact, imperative.target_kind);
+    try std.testing.expectEqualStrings("hint", imperative.target);
+    try std.testing.expect(imperative.strict_output);
+}
+
+test "imperative ngram shape captures contextual negation" {
+    const allocator = std.testing.allocator;
+
+    var imperative = try analyzeImperativeIntent(allocator, "say something other than that");
+    defer imperative.deinit(allocator);
+
+    try std.testing.expect(imperative.detected);
+    try std.testing.expect(imperative.references_previous_output);
+    try std.testing.expectEqual(ImperativeTargetKind.vague, imperative.target_kind);
 }
 
 fn lowercaseAscii(allocator: std.mem.Allocator, text: []const u8) ![]u8 {

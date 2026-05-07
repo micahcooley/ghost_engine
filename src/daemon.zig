@@ -183,6 +183,18 @@ const SessionHotShard = struct {
         return intent_grounding.extractPrimarySemanticTargetFromText(allocator, tailTurns(self.bytes[0..self.used], 6));
     }
 
+    fn extractLastEngineOutput(self: *SessionHotShard, allocator: std.mem.Allocator) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return lastRoleLine(allocator, self.bytes[0..self.used], "engine");
+    }
+
+    fn usedBytes(self: *SessionHotShard) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.used;
+    }
+
     fn flushOldestIfNeeded(self: *SessionHotShard) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -364,6 +376,23 @@ fn tailTurns(bytes: []const u8, max_lines: usize) []const u8 {
     return bytes;
 }
 
+fn lastRoleLine(allocator: std.mem.Allocator, bytes: []const u8, role: []const u8) ![]u8 {
+    if (bytes.len == 0) return allocator.dupe(u8, "");
+    const prefix = try std.fmt.allocPrint(allocator, "{s}: ", .{role});
+    defer allocator.free(prefix);
+    var search_end = bytes.len;
+    while (search_end > 0) {
+        const haystack = bytes[0..search_end];
+        const idx = std.mem.lastIndexOf(u8, haystack, prefix) orelse break;
+        const line_start = idx + prefix.len;
+        const rel_end = std.mem.indexOfScalar(u8, bytes[line_start..search_end], '\n') orelse (search_end - line_start);
+        const line = std.mem.trim(u8, bytes[line_start .. line_start + rel_end], " \r\n\t");
+        if (line.len != 0) return allocator.dupe(u8, line);
+        search_end = idx;
+    }
+    return allocator.dupe(u8, "");
+}
+
 fn appendVaultBytes(bytes: []const u8) !void {
     if (std.posix.getenv("GHOST_HISTORY_GABS_PATH")) |path| {
         if (std.fs.path.dirname(path)) |parent| try std.fs.cwd().makePath(parent);
@@ -495,15 +524,26 @@ const HotCandidate = struct {
 fn dispatchResidentCorpusAsk(allocator: std.mem.Allocator, resident: *ResidentState, obj: std.json.ObjectMap) !?[]u8 {
     const question = jsonStringField(obj, "question") orelse jsonStringField(obj, "message") orelse return null;
     const shard_id = jsonStringField(obj, "projectShard") orelse jsonStringField(obj, "project_shard") orelse "english_core";
+    const target = question;
+    const context_target = try resident.session_hot.extractContextTarget(allocator);
+    defer allocator.free(context_target);
+    var imperative = try intent_grounding.analyzeImperativeIntent(allocator, question);
+    defer imperative.deinit(allocator);
+    const previous_output = if (imperative.references_previous_output) try resident.session_hot.extractLastEngineOutput(allocator) else try allocator.dupe(u8, "");
+    defer allocator.free(previous_output);
+    try resident.session_hot.appendTurn(resident.vulkan, "user", question);
+    if (imperative.detected) {
+        return try renderImperativeExecutionResult(allocator, resident, obj, question, shard_id, &imperative, previous_output);
+    }
+    if (intent_grounding.lacksSemanticTarget(question)) {
+        return try renderStateReflectionResult(allocator, resident, obj, question, shard_id, context_target);
+    }
+
     const shard = resident.findShard(shard_id) orelse return null;
     if (shard.entries.len == 0) return null;
 
     var salience = try intent_grounding.analyzeSalience(allocator, question);
     defer salience.deinit(allocator);
-    const target = question;
-    const context_target = try resident.session_hot.extractContextTarget(allocator);
-    defer allocator.free(context_target);
-    try resident.session_hot.appendTurn(resident.vulkan, "user", question);
     const effective_target = try contextualScanTarget(allocator, target, context_target);
     defer allocator.free(effective_target);
 
@@ -585,6 +625,169 @@ fn dispatchResidentCorpusAsk(allocator: std.mem.Allocator, resident: *ResidentSt
     );
 }
 
+fn renderImperativeExecutionResult(
+    allocator: std.mem.Allocator,
+    resident: *ResidentState,
+    obj: std.json.ObjectMap,
+    question: []const u8,
+    shard_id: []const u8,
+    imperative: *const intent_grounding.ImperativeIntent,
+    previous_output: []const u8,
+) ![]u8 {
+    var draft = try text_generation_lab.generateImperativeExecutionDraft(allocator, .{
+        .target = imperative.target,
+        .previous_output = previous_output,
+        .negative_constraint = imperative.negative_constraint,
+        .requires_distinct = imperative.references_previous_output or imperative.negative_constraint.len != 0,
+        .strict_output = imperative.strict_output,
+        .daemon_active = true,
+        .vulkan_active = resident.vulkan_active,
+        .vram_resident_bytes = resident.vram_resident_bytes,
+        .resident_shards = resident.loaded_shards,
+        .session_hot_bytes = resident.session_hot.usedBytes(),
+    });
+    defer draft.deinit(allocator);
+    try resident.session_hot.appendTurn(resident.vulkan, "engine", draft.draft_text);
+
+    const result_json = try renderImperativeCorpusResult(
+        allocator,
+        question,
+        shard_id,
+        draft.draft_text,
+        imperative,
+        previous_output,
+        resident,
+    );
+    defer allocator.free(result_json);
+
+    var state = gip.schema.draftResultState();
+    state.non_authorization_notice = "imperative output is command-backed/non-authorizing; no corpus scan or verifier was executed";
+    return try gip.schema.renderResponse(
+        allocator,
+        gip.core.PROTOCOL_VERSION,
+        jsonStringField(obj, "requestId"),
+        gip.core.parseRequestKind("corpus.ask"),
+        .ok,
+        state,
+        result_json,
+        null,
+        null,
+    );
+}
+
+fn renderImperativeCorpusResult(
+    allocator: std.mem.Allocator,
+    question: []const u8,
+    shard_id: []const u8,
+    draft_text: []const u8,
+    imperative: *const intent_grounding.ImperativeIntent,
+    previous_output: []const u8,
+    resident: *ResidentState,
+) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"corpusAsk\":{\"status\":\"answered\",\"state\":\"answer\",\"permission\":\"none\",\"nonAuthorizing\":true,\"voiceSynthesis\":true,\"imperativeCommand\":true,\"question\":");
+    try std.json.stringify(question, .{}, w);
+    try w.writeAll(",\"shard\":{\"kind\":\"project\",\"id\":");
+    try std.json.stringify(shard_id, .{}, w);
+    try w.writeAll("},\"answerDraft\":");
+    try std.json.stringify(draft_text, .{}, w);
+    try w.writeAll(",\"evidenceUsed\":[],\"unknowns\":[],\"candidateFollowups\":[],\"learningCandidates\":[],\"trace\":{\"corpusMutation\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false,\"residentGpuScan\":false,\"vulkanBypass\":true,\"imperativeExecuted\":true,\"commandIsEvidence\":true,\"targetKind\":");
+    try std.json.stringify(@tagName(imperative.target_kind), .{}, w);
+    try w.writeAll(",\"target\":");
+    try std.json.stringify(imperative.target, .{}, w);
+    try w.writeAll(",\"strictOutput\":");
+    try w.writeAll(if (imperative.strict_output) "true" else "false");
+    try w.writeAll(",\"positionalScore\":");
+    try w.print("{d}", .{imperative.positional_score});
+    try w.writeAll(",\"negativeResonanceMultiplier\":");
+    try w.writeAll(if (imperative.references_previous_output or imperative.negative_constraint.len != 0) "-1.5" else "0");
+    try w.writeAll(",\"previousOutput\":");
+    try std.json.stringify(previous_output, .{}, w);
+    try w.print(",\"corpusEntriesConsidered\":0,\"residentDaemon\":true,\"residentShards\":{d},\"vramResidentBytes\":{d},\"sessionHotBytes\":{d},\"vulkanActive\":{s}", .{
+        resident.loaded_shards,
+        resident.vram_resident_bytes,
+        resident.session_hot.usedBytes(),
+        if (resident.vulkan_active) "true" else "false",
+    });
+    try w.writeAll("}}}");
+    return out.toOwnedSlice();
+}
+
+fn renderStateReflectionResult(
+    allocator: std.mem.Allocator,
+    resident: *ResidentState,
+    obj: std.json.ObjectMap,
+    question: []const u8,
+    shard_id: []const u8,
+    context_target: []const u8,
+) ![]u8 {
+    var draft = try text_generation_lab.generateStateReflectionDraft(allocator, .{
+        .daemon_active = true,
+        .vulkan_active = resident.vulkan_active,
+        .vram_resident_bytes = resident.vram_resident_bytes,
+        .resident_shards = resident.loaded_shards,
+        .session_hot_bytes = resident.session_hot.usedBytes(),
+        .session_context_target = context_target,
+    });
+    defer draft.deinit(allocator);
+    try resident.session_hot.appendTurn(resident.vulkan, "engine", draft.draft_text);
+
+    const result_json = try renderStateReflectionCorpusResult(
+        allocator,
+        question,
+        shard_id,
+        draft.draft_text,
+        resident,
+        context_target,
+    );
+    defer allocator.free(result_json);
+
+    var state = gip.schema.draftResultState();
+    state.non_authorization_notice = "state reflection output is daemon telemetry/non-authorizing; no corpus scan or verifier was executed";
+    return try gip.schema.renderResponse(
+        allocator,
+        gip.core.PROTOCOL_VERSION,
+        jsonStringField(obj, "requestId"),
+        gip.core.parseRequestKind("corpus.ask"),
+        .ok,
+        state,
+        result_json,
+        null,
+        null,
+    );
+}
+
+fn renderStateReflectionCorpusResult(
+    allocator: std.mem.Allocator,
+    question: []const u8,
+    shard_id: []const u8,
+    draft_text: []const u8,
+    resident: *ResidentState,
+    context_target: []const u8,
+) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"corpusAsk\":{\"status\":\"answered\",\"state\":\"answer\",\"permission\":\"none\",\"nonAuthorizing\":true,\"voiceSynthesis\":true,\"stateReflection\":true,\"question\":");
+    try std.json.stringify(question, .{}, w);
+    try w.writeAll(",\"shard\":{\"kind\":\"project\",\"id\":");
+    try std.json.stringify(shard_id, .{}, w);
+    try w.writeAll("},\"answerDraft\":");
+    try std.json.stringify(draft_text, .{}, w);
+    try w.writeAll(",\"evidenceUsed\":[],\"unknowns\":[],\"candidateFollowups\":[],\"learningCandidates\":[],\"trace\":{\"corpusMutation\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false,\"residentGpuScan\":false,\"stateReflection\":true,\"sessionHotQueriedFirst\":true,\"contextBiasMultiplier\":1.5,\"contextTarget\":");
+    try std.json.stringify(context_target, .{}, w);
+    try w.print(",\"corpusEntriesConsidered\":0,\"residentDaemon\":true,\"residentShards\":{d},\"vramResidentBytes\":{d},\"sessionHotBytes\":{d},\"vulkanActive\":{s}", .{
+        resident.loaded_shards,
+        resident.vram_resident_bytes,
+        resident.session_hot.usedBytes(),
+        if (resident.vulkan_active) "true" else "false",
+    });
+    try w.writeAll("}}}");
+    return out.toOwnedSlice();
+}
+
 fn hotCandidateLessThan(_: void, lhs: HotCandidate, rhs: HotCandidate) bool {
     if (lhs.score == rhs.score) return lhs.distance < rhs.distance;
     return lhs.score > rhs.score;
@@ -618,6 +821,7 @@ fn chooseScoringTerms(terms: []const []const u8, context_target: []const u8) []c
 }
 
 fn hotAcronymTermSlice(terms: []const []const u8) ?[]const []const u8 {
+    if (containsActionTerm(terms)) return null;
     for (terms, 0..) |term, idx| {
         if (std.mem.eql(u8, term, "cpu") or
             std.mem.eql(u8, term, "gpu") or
@@ -629,6 +833,25 @@ fn hotAcronymTermSlice(terms: []const []const u8) ?[]const []const u8 {
         }
     }
     return null;
+}
+
+fn containsActionTerm(terms: []const []const u8) bool {
+    for (terms) |term| {
+        if (std.mem.eql(u8, term, "process") or
+            std.mem.eql(u8, term, "processes") or
+            std.mem.eql(u8, term, "processing") or
+            std.mem.eql(u8, term, "processed") or
+            std.mem.eql(u8, term, "data") or
+            std.mem.eql(u8, term, "instruction") or
+            std.mem.eql(u8, term, "instructions") or
+            std.mem.eql(u8, term, "execute") or
+            std.mem.eql(u8, term, "executes") or
+            std.mem.eql(u8, term, "executing"))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn topSessionText(shard: *const ResidentShard, terms: []const []const u8, candidates: []const HotCandidate) []const u8 {
@@ -763,10 +986,17 @@ fn writeHotAnswer(writer: anytype, question: []const u8, shard: *const ResidentS
     const allocator = std.heap.page_allocator;
     const evidence_texts = try allocator.alloc([]const u8, candidates.len);
     defer allocator.free(evidence_texts);
+    const synthesis_texts = try allocator.alloc([]u8, candidates.len);
+    for (synthesis_texts) |*text| text.* = &.{};
+    defer {
+        for (synthesis_texts) |text| allocator.free(text);
+        allocator.free(synthesis_texts);
+    }
     const evidence_source_ids = try allocator.alloc([]const u8, candidates.len);
     defer allocator.free(evidence_source_ids);
     for (candidates, 0..) |candidate, idx| {
-        evidence_texts[idx] = snippetAroundTerms(shard.texts[candidate.index], terms, 240);
+        synthesis_texts[idx] = try synthesisSnippetForTerms(allocator, shard.texts[candidate.index], terms);
+        evidence_texts[idx] = synthesis_texts[idx];
         evidence_source_ids[idx] = shard.entries[candidate.index].corpus_meta.source_rel_path;
     }
     if (evidence_texts.len == 0) {
@@ -781,6 +1011,25 @@ fn writeHotAnswer(writer: anytype, question: []const u8, shard: *const ResidentS
     });
     defer draft.deinit(allocator);
     try std.json.stringify(draft.draft_text, .{}, writer);
+}
+
+fn synthesisSnippetForTerms(allocator: std.mem.Allocator, text: []const u8, terms: []const []const u8) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    for (terms) |term| {
+        const snippet = snippetAroundSingleTerm(text, term, 320);
+        if (snippet.len == 0) continue;
+        if (out.items.len != 0) try out.appendSlice(". ");
+        try out.appendSlice(snippet);
+        if (out.items.len >= 1024) break;
+    }
+    if (out.items.len == 0) try out.appendSlice(trimmedSnippet(text, 640));
+    return out.toOwnedSlice();
+}
+
+fn snippetAroundSingleTerm(text: []const u8, term: []const u8, max_bytes: usize) []const u8 {
+    const single = [_][]const u8{term};
+    return snippetAroundTerms(text, &single, max_bytes);
 }
 
 fn writeHotEvidence(writer: anytype, shard: *const ResidentShard, terms: []const []const u8, candidate: HotCandidate, rank: usize) !void {

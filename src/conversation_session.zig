@@ -8,6 +8,7 @@ const epistemic_renderer = @import("epistemic_renderer.zig");
 const response_engine = @import("response_engine.zig");
 const shards = @import("shards.zig");
 const sys = @import("sys.zig");
+const text_generation_lab = @import("text_generation_lab.zig");
 
 pub const FORMAT_VERSION = "ghost_conversation_session_v1";
 pub const MAX_MESSAGES: usize = 64;
@@ -299,16 +300,28 @@ pub fn turn(allocator: std.mem.Allocator, options: TurnOptions) !TurnResult {
     });
     defer gi.deinit();
 
-    const corpus_lookup_attempted = shouldAttemptCorpusFallback(&session, &gi, normalized_message);
-    if (try maybeAnswerFromCorpusFallback(allocator, &session, &gi, normalized_message)) |reply| {
+    var imperative = try intent_grounding.analyzeImperativeIntent(allocator, options.message);
+    defer imperative.deinit(allocator);
+    if (imperative.detected) {
+        const previous_output = try lastSystemOutput(allocator, &session);
+        defer allocator.free(previous_output);
+        const reply = try replaceLastResultWithImperative(allocator, &session, &imperative, previous_output);
         errdefer allocator.free(reply);
         try appendMessage(&session, .system, reply, .draft, session.last_result.?.kind);
         try save(&session);
         return .{ .session = session, .reply = reply };
     }
 
-    if (isGreetingOnly(normalized_message)) {
-        const reply = try replaceLastResultWithGreeting(allocator, &session);
+    if (intent_grounding.lacksSemanticTarget(options.message)) {
+        const reply = try replaceLastResultWithStateReflection(allocator, &session, context_target);
+        errdefer allocator.free(reply);
+        try appendMessage(&session, .system, reply, .draft, session.last_result.?.kind);
+        try save(&session);
+        return .{ .session = session, .reply = reply };
+    }
+
+    const corpus_lookup_attempted = shouldAttemptCorpusFallback(&session, &gi, normalized_message);
+    if (try maybeAnswerFromCorpusFallback(allocator, &session, &gi, normalized_message)) |reply| {
         errdefer allocator.free(reply);
         try appendMessage(&session, .system, reply, .draft, session.last_result.?.kind);
         try save(&session);
@@ -739,14 +752,48 @@ fn replaceLastResultWithCorpusAnswer(session: *Session, answer: []const u8, shar
     };
 }
 
-fn replaceLastResultWithGreeting(allocator: std.mem.Allocator, session: *Session) ![]u8 {
+fn replaceLastResultWithImperative(allocator: std.mem.Allocator, session: *Session, imperative: *const intent_grounding.ImperativeIntent, previous_output: []const u8) ![]u8 {
     clearLastResult(session);
     clearCorrectionProjections(session);
+    var draft = try text_generation_lab.generateImperativeExecutionDraft(allocator, .{
+        .target = imperative.target,
+        .previous_output = previous_output,
+        .negative_constraint = imperative.negative_constraint,
+        .requires_distinct = imperative.references_previous_output or imperative.negative_constraint.len != 0,
+        .strict_output = imperative.strict_output,
+        .daemon_active = false,
+        .vulkan_active = false,
+        .vram_resident_bytes = 0,
+        .resident_shards = 1,
+        .session_hot_bytes = sessionTranscriptBytes(session),
+    });
+    defer draft.deinit(allocator);
     session.last_result = .{
         .kind = .draft,
         .selected_mode = .draft,
         .stop_reason = .unresolved,
-        .summary = try session.allocator.dupe(u8, "Hello."),
+        .summary = try session.allocator.dupe(u8, draft.draft_text),
+    };
+    return try renderConversationReply(allocator, session, null);
+}
+
+fn replaceLastResultWithStateReflection(allocator: std.mem.Allocator, session: *Session, context_target: ?[]const u8) ![]u8 {
+    clearLastResult(session);
+    clearCorrectionProjections(session);
+    var draft = try text_generation_lab.generateStateReflectionDraft(allocator, .{
+        .daemon_active = false,
+        .vulkan_active = false,
+        .vram_resident_bytes = 0,
+        .resident_shards = 1,
+        .session_hot_bytes = sessionTranscriptBytes(session),
+        .session_context_target = context_target orelse "",
+    });
+    defer draft.deinit(allocator);
+    session.last_result = .{
+        .kind = .draft,
+        .selected_mode = .draft,
+        .stop_reason = .unresolved,
+        .summary = try session.allocator.dupe(u8, draft.draft_text),
     };
     return try renderConversationReply(allocator, session, null);
 }
@@ -809,17 +856,6 @@ fn isCorpusQueryStopToken(token: []const u8) bool {
         std.ascii.eqlIgnoreCase(token, "does") or
         std.ascii.eqlIgnoreCase(token, "your") or
         std.ascii.eqlIgnoreCase(token, "have");
-}
-
-fn isGreetingOnly(text: []const u8) bool {
-    const trimmed = std.mem.trim(u8, text, " \r\n\t,.:;!?");
-    return std.mem.eql(u8, trimmed, "hi") or
-        std.mem.eql(u8, trimmed, "hello") or
-        std.mem.eql(u8, trimmed, "hey") or
-        std.mem.eql(u8, trimmed, "yo") or
-        std.mem.eql(u8, trimmed, "sup") or
-        std.mem.eql(u8, trimmed, "whats up") or
-        std.mem.eql(u8, trimmed, "what's up");
 }
 
 fn summarizeResponse(allocator: std.mem.Allocator, result: *const response_engine.ResponseResult, mode: ConversationMode, deep_blocked_by_ambiguity: bool, shard_id: []const u8) ![]u8 {
@@ -1014,6 +1050,22 @@ fn appendMessage(session: *Session, role: Role, text: []const u8, mode: Conversa
         .result_kind = kind,
     });
     session.history = try list.toOwnedSlice();
+}
+
+fn lastSystemOutput(allocator: std.mem.Allocator, session: *const Session) ![]u8 {
+    var idx = session.history.len;
+    while (idx > 0) {
+        idx -= 1;
+        const message = session.history[idx];
+        if (message.role == .system and message.text.len != 0) return allocator.dupe(u8, message.text);
+    }
+    return allocator.dupe(u8, "");
+}
+
+fn sessionTranscriptBytes(session: *const Session) usize {
+    var total: usize = 0;
+    for (session.history) |message| total += message.text.len;
+    return total;
 }
 
 fn buildTransition(allocator: std.mem.Allocator, from: ConversationMode, to: ConversationMode, result: *const response_engine.ResponseResult, deep_blocked_by_ambiguity: bool) !?ModeTransition {

@@ -2382,8 +2382,8 @@ fn appendQueryRune(allocator: std.mem.Allocator, tokens: *std.ArrayList([]u8), r
 }
 
 fn isShortSearchRune(rune: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(rune, "hi") or
-        std.ascii.eqlIgnoreCase(rune, "yo");
+    _ = rune;
+    return false;
 }
 
 fn isNegativeModifierRune(rune: []const u8) bool {
