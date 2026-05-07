@@ -116,14 +116,7 @@ pub fn countEvents(allocator: std.mem.Allocator, paths: *const shards.Paths) !us
 pub fn appendEvent(allocator: std.mem.Allocator, paths: *const shards.Paths, event: Event) !void {
     const dir = try std.fs.path.join(allocator, &.{ paths.root_abs_path, FEEDBACK_DIR });
     defer allocator.free(dir);
-    std.fs.makeDirAbsolute(paths.root_abs_path) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
-    std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
+    try std.fs.cwd().makePath(dir);
     const file_path = try std.fs.path.join(allocator, &.{ dir, EVENTS_FILE });
     defer allocator.free(file_path);
     var file = try std.fs.createFileAbsolute(file_path, .{ .read = true, .truncate = false });

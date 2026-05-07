@@ -4,9 +4,12 @@ const build_options = @import("build_options");
 /// ── Sovereign Configuration: The Comptime Spine ──
 /// Derived memory algebra for bit-perfect hardware alignment.
 pub const TEST_MODE = build_options.test_mode;
+pub const PROJECT_ROOT_ABS_PATH = build_options.project_root;
 pub const PLATFORM_SUBDIR = build_options.platform_subdir;
 pub const STATE_SUBDIR = if (TEST_MODE) "state/test" else PLATFORM_SUBDIR ++ "/state";
 pub const TEST_ROOT_ABS_PATH = "/tmp/ghost_test";
+
+var test_root_initialized = std.atomic.Value(bool).init(false);
 
 pub const MAX_VRAM_GB: usize = 4; // Target hardware profile
 pub const FLEET_MODE: bool = true; // Training and dashboard control paths expect a fleet handle, even on one GPU.
@@ -85,17 +88,19 @@ pub const CHECKSUM_RESERVED_BYTES: usize = 1024; // Reserved tail space for hash
 pub fn getPath(allocator: std.mem.Allocator, sub_path: []const u8) ![]u8 {
     if (std.fs.path.isAbsolute(sub_path)) return allocator.dupe(u8, sub_path);
 
-    if (std.posix.getenv("GHOST_ENGINE_ROOT")) |env_path| {
-        return std.fs.path.join(allocator, &.{ env_path, sub_path });
+    if (TEST_MODE and shouldUseTestRoot(sub_path)) {
+        const test_root = try testRootPath(allocator);
+        defer allocator.free(test_root);
+        try ensureTestRootInitialized(test_root);
+        return std.fs.path.join(allocator, &.{ test_root, sub_path });
     }
 
-    if (TEST_MODE and shouldUseTestRoot(sub_path)) {
-        const path = try std.fs.path.join(allocator, &.{ TEST_ROOT_ABS_PATH, sub_path });
-        errdefer allocator.free(path);
-        if (std.fs.path.dirname(path)) |parent| {
-            try std.fs.cwd().makePath(parent);
-        }
-        return path;
+    if (TEST_MODE) {
+        return std.fs.path.join(allocator, &.{ PROJECT_ROOT_ABS_PATH, sub_path });
+    }
+
+    if (std.posix.getenv("GHOST_ENGINE_ROOT")) |env_path| {
+        return std.fs.path.join(allocator, &.{ env_path, sub_path });
     }
 
     const exe_dir = try std.fs.selfExeDirPathAlloc(allocator);
@@ -111,6 +116,20 @@ pub fn getPath(allocator: std.mem.Allocator, sub_path: []const u8) ![]u8 {
 fn shouldUseTestRoot(sub_path: []const u8) bool {
     return std.mem.eql(u8, sub_path, "ghost_config.toml") or
         std.mem.startsWith(u8, sub_path, "state/");
+}
+
+fn testRootPath(allocator: std.mem.Allocator) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}-{d}", .{ TEST_ROOT_ABS_PATH, std.os.linux.getpid() });
+}
+
+fn ensureTestRootInitialized(test_root: []const u8) !void {
+    if (!TEST_MODE) return;
+    if (test_root_initialized.swap(true, .seq_cst)) return;
+    std.fs.deleteTreeAbsolute(test_root) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    try std.fs.cwd().makePath(test_root);
 }
 
 pub const LATTICE_FILE_NAME = "unified_lattice.bin";

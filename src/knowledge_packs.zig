@@ -496,6 +496,7 @@ pub fn createPack(allocator: std.mem.Allocator, options: CreateOptions) !CreateR
     };
     errdefer manifest.deinit();
     try store.saveManifest(allocator, root_abs_path, &manifest);
+    try cleanupPreparedSourceRoot(&source);
 
     return .{
         .manifest = manifest,
@@ -529,6 +530,13 @@ const PreparedSource = struct {
         self.* = undefined;
     }
 };
+
+fn cleanupPreparedSourceRoot(source: *PreparedSource) !void {
+    const root = source.cleanup_root orelse return;
+    try deleteTreeIfExistsAbsolute(root);
+    source.allocator.free(root);
+    source.cleanup_root = null;
+}
 
 fn prepareSource(allocator: std.mem.Allocator, options: CreateOptions, pack_id: []const u8, pack_version: []const u8) !PreparedSource {
     if (options.corpus_path) |corpus_path| {
@@ -834,7 +842,7 @@ fn claimTemporaryBuildShard(allocator: std.mem.Allocator, pack_id: []const u8, p
 
     var suffix: usize = 0;
     while (true) : (suffix += 1) {
-        const shard_id = try std.fmt.allocPrint(allocator, "{s}-{s}-{s}-{d}", .{ TEMP_SHARD_PREFIX, pack_id, pack_version, suffix });
+        const shard_id = try std.fmt.allocPrint(allocator, "{s}-{s}-{s}-tmp-{d}-{d}", .{ TEMP_SHARD_PREFIX, pack_id, pack_version, std.os.linux.getpid(), suffix });
         errdefer allocator.free(shard_id);
         var metadata = try shards.resolveProjectMetadata(allocator, shard_id);
         defer metadata.deinit();

@@ -504,6 +504,17 @@ pub fn checkFastPathEligibility(
         return result;
     }
 
+    if (isUnclassifiableLightInput(gi.normalized_form)) {
+        result.eligible = false;
+        result.no_ambiguity_sets = true;
+        result.no_missing_obligations = true;
+        result.artifact_bindings_resolved = true;
+        result.no_verification_required = true;
+        result.support_graph_within_bounds = true;
+        result.reason = try allocator.dupe(u8, "unclassifiable light input");
+        return result;
+    }
+
     // Condition 2: no ambiguity sets.
     const no_ambiguity = gi.ambiguity_sets.len == 0;
     result.no_ambiguity_sets = no_ambiguity;
@@ -574,6 +585,27 @@ fn elapsedUs(start_ns: i128) u64 {
 
 fn hasPhrase(gi: *const intent_grounding.GroundedIntent, phrase: []const u8) bool {
     return std.mem.indexOf(u8, gi.normalized_form, phrase) != null;
+}
+
+fn isUnclassifiableLightInput(normalized: []const u8) bool {
+    var token_count: usize = 0;
+    var token: []const u8 = "";
+    var it = std.mem.tokenizeAny(u8, normalized, " \r\n\t,.:;!?()[]{}\"'");
+    while (it.next()) |next| {
+        token_count += 1;
+        if (token_count > 1) return false;
+        token = next;
+    }
+    if (token_count != 1 or token.len < 6) return false;
+    var vowels: usize = 0;
+    var letters: usize = 0;
+    for (token) |c| {
+        if (!std.ascii.isAlphabetic(c)) return false;
+        letters += 1;
+        const lower = std.ascii.toLower(c);
+        if (lower == 'a' or lower == 'e' or lower == 'i' or lower == 'o' or lower == 'u') vowels += 1;
+    }
+    return letters >= 6 and vowels * 4 <= letters;
 }
 
 pub fn reasoningLevelName(level: ReasoningLevel) []const u8 {
@@ -875,7 +907,12 @@ fn applyPolicyTrace(result: *ResponseResult, config: ResponseConfig, reason: Mod
 fn shouldAttachLowConfidenceDenial(result: *const ResponseResult, config: ResponseConfig) bool {
     if (!config.corpus_lookup_missed) return false;
     if (result.generated_denial != null) return false;
-    if (result.grounded_intent.intent_class != .conversation) return false;
+    if (result.grounded_intent.intent_class != .conversation and
+        result.grounded_intent.intent_class != .ambiguous and
+        result.grounded_intent.status == .grounded)
+    {
+        return false;
+    }
     return result.stop_reason != .budget;
 }
 
@@ -2190,7 +2227,7 @@ test "response engine: unmatched light input defaults to conversation" {
     defer result.deinit();
 
     try std.testing.expectEqual(intent_grounding.IntentClass.conversation, gi.intent_class);
-    try std.testing.expectEqual(StopReason.supported, result.stop_reason);
+    try std.testing.expectEqual(StopReason.unresolved, result.stop_reason);
     try std.testing.expect(!result.escalated);
 }
 
@@ -2312,7 +2349,7 @@ test "response engine: budget exhaustion in deep path" {
     try std.testing.expectEqual(StopReason.budget, result.stop_reason);
 }
 
-test "response engine: unmatched light input is conversational fast path" {
+test "response engine: unmatched light input is not fast path eligible" {
     const allocator = std.testing.allocator;
 
     var gi = try intent_grounding.ground(allocator, "asdfghjkl", .{});
@@ -2323,7 +2360,7 @@ test "response engine: unmatched light input is conversational fast path" {
     defer eligibility.deinit(allocator);
 
     try std.testing.expectEqual(intent_grounding.IntentClass.conversation, gi.intent_class);
-    try std.testing.expect(eligibility.eligible);
+    try std.testing.expect(!eligibility.eligible);
 }
 
 test "response engine: deterministic results across repeated runs" {

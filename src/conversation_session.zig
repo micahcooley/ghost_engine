@@ -307,6 +307,14 @@ pub fn turn(allocator: std.mem.Allocator, options: TurnOptions) !TurnResult {
         return .{ .session = session, .reply = reply };
     }
 
+    if (isGreetingOnly(normalized_message)) {
+        const reply = try replaceLastResultWithGreeting(allocator, &session);
+        errdefer allocator.free(reply);
+        try appendMessage(&session, .system, reply, .draft, session.last_result.?.kind);
+        try save(&session);
+        return .{ .session = session, .reply = reply };
+    }
+
     var config = chooseResponseConfig(&session, &gi, normalized_message, options.compute_budget_request, options.reasoning_level);
     config.corpus_lookup_missed = corpus_lookup_attempted;
     const deep_blocked_by_ambiguity = wantsDeep(normalized_message) and (session.pending_ambiguities.len > 0 or gi.ambiguity_sets.len > 0);
@@ -695,10 +703,10 @@ fn maybeAnswerFromCorpusFallback(allocator: std.mem.Allocator, session: *Session
 
 fn shouldAttemptCorpusFallback(session: *const Session, gi: *const intent_grounding.GroundedIntent, normalized_message: []const u8) bool {
     _ = session;
-    if (gi.intent_class != .conversation) return false;
     const confidence = intent_grounding.estimateIntentConfidence(gi.normalized_form);
-    if (confidence.strong_heavy_task) return false;
-    return countSearchableTokens(normalized_message) != 0 and !isGreetingOnly(normalized_message);
+    if (confidence.strong_heavy_task and confidence.score > 0.80) return false;
+    if (isContextDependentPrompt(normalized_message)) return false;
+    return countSearchableTokens(normalized_message) != 0;
 }
 
 fn maybeAnswerFromCorpusShard(allocator: std.mem.Allocator, session: *Session, gi: *const intent_grounding.GroundedIntent, project_shard: ?[]const u8) !?[]u8 {
@@ -713,6 +721,7 @@ fn maybeAnswerFromCorpusShard(allocator: std.mem.Allocator, session: *Session, g
     const answer = result.answer_draft orelse return null;
     if (result.status != .answered) return null;
     if (result.evidence_used.len == 0 and !hasHighSimilarityCandidate(result.similar_candidates)) return null;
+    if (!corpusAnswerMatchesQuery(gi.normalized_form, answer)) return null;
 
     try replaceLastResultWithCorpusAnswer(session, answer, result.shard_id);
     return try renderConversationReply(allocator, session, null);
@@ -730,6 +739,18 @@ fn replaceLastResultWithCorpusAnswer(session: *Session, answer: []const u8, shar
     };
 }
 
+fn replaceLastResultWithGreeting(allocator: std.mem.Allocator, session: *Session) ![]u8 {
+    clearLastResult(session);
+    clearCorrectionProjections(session);
+    session.last_result = .{
+        .kind = .draft,
+        .selected_mode = .draft,
+        .stop_reason = .unresolved,
+        .summary = try session.allocator.dupe(u8, "Hello."),
+    };
+    return try renderConversationReply(allocator, session, null);
+}
+
 fn hasHighSimilarityCandidate(candidates: []const corpus_ask.SimilarCandidate) bool {
     for (candidates) |candidate| {
         if (candidate.similarity_score >= 700) return true;
@@ -744,6 +765,50 @@ fn countSearchableTokens(text: []const u8) usize {
         if (token.len >= 3) count += 1;
     }
     return count;
+}
+
+fn isContextDependentPrompt(text: []const u8) bool {
+    const trimmed = std.mem.trim(u8, text, " \r\n\t,.:;!?");
+    return std.mem.startsWith(u8, trimmed, "summarize this") or
+        std.mem.startsWith(u8, trimmed, "summarise this") or
+        std.mem.startsWith(u8, trimmed, "summarize that") or
+        std.mem.startsWith(u8, trimmed, "summarise that") or
+        std.mem.startsWith(u8, trimmed, "summarize the above") or
+        std.mem.startsWith(u8, trimmed, "summarise the above") or
+        std.mem.startsWith(u8, trimmed, "what does my note") or
+        std.mem.startsWith(u8, trimmed, "what do my notes");
+}
+
+fn corpusAnswerMatchesQuery(query: []const u8, answer: []const u8) bool {
+    var key_count: usize = 0;
+    var match_count: usize = 0;
+    var it = std.mem.tokenizeAny(u8, query, " \r\n\t,.:;!?()[]{}\"'");
+    while (it.next()) |token| {
+        if (token.len < 4 or isCorpusQueryStopToken(token)) continue;
+        key_count += 1;
+        if (containsIgnoreCase(answer, token)) match_count += 1;
+    }
+    if (key_count == 0) return false;
+    return if (key_count == 1) match_count == 1 else match_count >= 2;
+}
+
+fn isCorpusQueryStopToken(token: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(token, "what") or
+        std.ascii.eqlIgnoreCase(token, "when") or
+        std.ascii.eqlIgnoreCase(token, "where") or
+        std.ascii.eqlIgnoreCase(token, "which") or
+        std.ascii.eqlIgnoreCase(token, "about") or
+        std.ascii.eqlIgnoreCase(token, "tell") or
+        std.ascii.eqlIgnoreCase(token, "explain") or
+        std.ascii.eqlIgnoreCase(token, "summarize") or
+        std.ascii.eqlIgnoreCase(token, "summarise") or
+        std.ascii.eqlIgnoreCase(token, "this") or
+        std.ascii.eqlIgnoreCase(token, "that") or
+        std.ascii.eqlIgnoreCase(token, "note") or
+        std.ascii.eqlIgnoreCase(token, "notes") or
+        std.ascii.eqlIgnoreCase(token, "does") or
+        std.ascii.eqlIgnoreCase(token, "your") or
+        std.ascii.eqlIgnoreCase(token, "have");
 }
 
 fn isGreetingOnly(text: []const u8) bool {
