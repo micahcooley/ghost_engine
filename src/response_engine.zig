@@ -5,6 +5,8 @@ const artifact_schema = @import("artifact_schema.zig");
 const compute_budget = @import("compute_budget.zig");
 const epistemic_renderer = @import("epistemic_renderer.zig");
 const negative_knowledge = @import("negative_knowledge.zig");
+const text_generation_lab = @import("text_generation_lab.zig");
+const vsa_vulkan = @import("vsa_vulkan.zig");
 
 // ──────────────────────────────────────────────────────────────────────────
 // Fast Path / Deep Path Response Engine
@@ -27,7 +29,7 @@ pub const MAX_PARTIAL_FINDINGS: usize = 16;
 pub const MAX_ELIGIBILITY_TRACES: usize = 16;
 pub const MAX_CORRECTION_ITEMS: usize = 16;
 pub const MAX_NEGATIVE_KNOWLEDGE_ITEMS: usize = 16;
-pub const DEFAULT_CONVERSATIONAL_RESPONSE = "Ready. System anchored to current shard. How can I assist?";
+pub const LOW_CONFIDENCE_DENIAL_INSTRUCTION = text_generation_lab.DENIAL_SYSTEM_INSTRUCTION;
 
 // ── Response Modes ─────────────────────────────────────────────────────
 
@@ -136,6 +138,9 @@ pub const ResponseConfig = struct {
     /// True only for wording such as "just draft" / "draft only"; this is the
     /// only draft override allowed to cover patch/verify-shaped requests.
     explicit_user_draft_override: bool = false,
+    /// Set by callers that already searched corpus_ask and found no usable
+    /// corpus answer for the original user query.
+    corpus_lookup_missed: bool = false,
 
     /// Convenience: create a fast-path-only config.
     pub fn fastOnly() ResponseConfig {
@@ -365,6 +370,22 @@ pub const NegativeKnowledgeProtocol = struct {
     }
 };
 
+pub const GeneratedDenial = struct {
+    text: []const u8,
+    lab_task: []const u8 = "low_confidence_denial",
+    system_instruction: []const u8 = LOW_CONFIDENCE_DENIAL_INSTRUCTION,
+    candidate_only: bool = false,
+    non_authorizing: bool = true,
+    support_granted: bool = false,
+    proof_granted: bool = false,
+    negative_signal: vsa_vulkan.NegativeSignalSnapshot = .{},
+
+    pub fn deinit(self: *GeneratedDenial, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        self.* = undefined;
+    }
+};
+
 pub const SchedulerCandidateStatus = enum {
     considered,
     selected,
@@ -430,6 +451,10 @@ pub const ResponseResult = struct {
     corrections: CorrectionProtocol = .{},
     negative_knowledge: NegativeKnowledgeProtocol = .{},
 
+    /// Generated only after a corpus miss and low-confidence response route.
+    /// This is a denial, not support, proof, or evidence.
+    generated_denial: ?GeneratedDenial = null,
+
     /// Timing metrics.
     latency: LatencyProfile = .{},
 
@@ -443,6 +468,7 @@ pub const ResponseResult = struct {
         self.draft.deinit(self.allocator);
         self.corrections.deinit(self.allocator);
         self.negative_knowledge.deinit(self.allocator);
+        if (self.generated_denial) |*denial| denial.deinit(self.allocator);
         self.* = undefined;
     }
 };
@@ -844,6 +870,39 @@ fn applyPolicyTrace(result: *ResponseResult, config: ResponseConfig, reason: Mod
     result.requested_reasoning_level = config.reasoning_level;
     result.mode_selection_reason = reason;
     result.user_override_detected = override_detected;
+}
+
+fn shouldAttachLowConfidenceDenial(result: *const ResponseResult, config: ResponseConfig) bool {
+    if (!config.corpus_lookup_missed) return false;
+    if (result.generated_denial != null) return false;
+    if (result.grounded_intent.intent_class != .conversation) return false;
+    return result.stop_reason != .budget;
+}
+
+fn attachLowConfidenceDenial(
+    allocator: std.mem.Allocator,
+    result: *ResponseResult,
+) !void {
+    var draft = try text_generation_lab.generateDenialDraft(allocator, .{
+        .user_query = result.grounded_intent.raw_input,
+    });
+    const negative_signal = vsa_vulkan.emitNegativeSignal(result.grounded_intent.raw_input);
+    result.generated_denial = .{
+        .text = draft.draft_text,
+        .candidate_only = draft.candidate_only,
+        .non_authorizing = draft.non_authorizing,
+        .support_granted = draft.support_granted,
+        .proof_granted = draft.proof_granted,
+        .negative_signal = negative_signal,
+    };
+    draft.draft_text = "";
+    result.stop_reason = .unresolved;
+}
+
+pub fn generateLowConfidenceDenialText(allocator: std.mem.Allocator, user_query: []const u8) ![]u8 {
+    var draft = try text_generation_lab.generateDenialDraft(allocator, .{ .user_query = user_query });
+    defer draft.deinit(allocator);
+    return allocator.dupe(u8, draft.draft_text);
 }
 
 fn cloneStringList(allocator: std.mem.Allocator, source: []const []const u8) ![][]u8 {
@@ -1629,6 +1688,9 @@ pub fn execute(
     const timer_end = std.time.nanoTimestamp();
     const elapsed_ns = @as(u64, @intCast(timer_end - timer_start));
     result.latency.total_us = elapsed_ns / 1000;
+    if (shouldAttachLowConfidenceDenial(&result, config)) {
+        try attachLowConfidenceDenial(allocator, &result);
+    }
 
     return result;
 }
@@ -1757,6 +1819,31 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const ResponseResult) !
     try writeCorrectionsJson(writer, result.corrections);
     try writer.writeAll(",\"negative_knowledge\":");
     try writeNegativeKnowledgeJson(writer, result.negative_knowledge);
+    if (result.generated_denial) |denial| {
+        try writer.writeAll(",\"generatedDenial\":{");
+        try writer.writeAll("\"labTask\":\"");
+        try writeJsonEscaped(writer, denial.lab_task);
+        try writer.writeAll("\",\"text\":\"");
+        try writeJsonEscaped(writer, denial.text);
+        try writer.writeAll("\",\"systemInstruction\":\"");
+        try writeJsonEscaped(writer, denial.system_instruction);
+        try writer.writeAll("\",\"candidateOnly\":");
+        try writer.writeAll(if (denial.candidate_only) "true" else "false");
+        try writer.writeAll(",\"nonAuthorizing\":");
+        try writer.writeAll(if (denial.non_authorizing) "true" else "false");
+        try writer.writeAll(",\"supportGranted\":");
+        try writer.writeAll(if (denial.support_granted) "true" else "false");
+        try writer.writeAll(",\"proofGranted\":");
+        try writer.writeAll(if (denial.proof_granted) "true" else "false");
+        try std.fmt.format(writer, ",\"negativeSignal\":{{\"active\":{},\"count\":{},\"lastQueryHash\":{},\"colorProfile\":\"{s}\",\"sigilOpacityPerMille\":{}}}", .{
+            denial.negative_signal.active,
+            denial.negative_signal.count,
+            denial.negative_signal.last_query_hash,
+            denial.negative_signal.color_profile,
+            denial.negative_signal.sigil_opacity_per_mille,
+        });
+        try writer.writeAll("}");
+    }
     try writer.writeAll(",\"epistemic_render\":");
     try writeEpistemicRenderJson(writer, result);
     if (result.draft.mode.enabled) {
@@ -2531,6 +2618,30 @@ test "response engine: partial findings present for unresolved results" {
     try std.testing.expectEqual(StopReason.unresolved, result.stop_reason);
     // Should have at least some partial findings from candidate intents.
     try std.testing.expect(result.grounded_intent.candidate_intents.len >= 2);
+}
+
+test "response engine: corpus miss triggers generative denial and negative signal" {
+    const allocator = std.testing.allocator;
+    var gi = try intent_grounding.ground(allocator, "What is Nullstar-771?", .{});
+    defer gi.deinit();
+
+    const before = vsa_vulkan.getNegativeSignalSnapshot().count;
+    var result = try execute(allocator, &gi, .{
+        .mode = .auto_path,
+        .corpus_lookup_missed = true,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(StopReason.unresolved, result.stop_reason);
+    try std.testing.expect(result.generated_denial != null);
+    const denial = result.generated_denial.?;
+    try std.testing.expect(std.mem.indexOf(u8, denial.text, "Nullstar-771") != null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(denial.text, "sorry") == null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(denial.text, "help") == null);
+    try std.testing.expect(!denial.support_granted);
+    try std.testing.expect(!denial.proof_granted);
+    try std.testing.expect(denial.negative_signal.count >= before + 1);
+    try std.testing.expectEqualStrings(vsa_vulkan.NEGATIVE_SIGNAL_COLOR_PROFILE, denial.negative_signal.color_profile);
 }
 
 test "response engine: support contract preserved in fast path" {

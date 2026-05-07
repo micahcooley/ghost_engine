@@ -27,6 +27,20 @@ pub fn runtimeLogsEnabled() bool {
         envFlag("GHOST_VERBOSE");
 }
 
+pub const NEGATIVE_SIGNAL_COLOR_PROFILE = "subtle_red_gray";
+pub const NEGATIVE_SIGNAL_SIGIL_OPACITY_PER_MILLE: u16 = 420;
+
+pub const NegativeSignalSnapshot = struct {
+    active: bool = false,
+    count: u64 = 0,
+    last_query_hash: u64 = 0,
+    color_profile: []const u8 = NEGATIVE_SIGNAL_COLOR_PROFILE,
+    sigil_opacity_per_mille: u16 = NEGATIVE_SIGNAL_SIGIL_OPACITY_PER_MILLE,
+};
+
+var global_negative_signal_count = std.atomic.Value(u64).init(0);
+var global_negative_signal_hash = std.atomic.Value(u64).init(0);
+
 fn envFlag(name: []const u8) bool {
     const value = std.posix.getenv(name) orelse return false;
     return value.len != 0 and
@@ -1699,6 +1713,15 @@ pub const VulkanEngine = struct {
         return sigil[0 .. self.sigil_capacity / @sizeOf(u16)];
     }
 
+    pub fn applyNegativeSignal(self: *VulkanEngine, query_hash: u64) void {
+        const sigil = self.getSigilDataMutable();
+        if (sigil.len < 4) return;
+        sigil[0] = 0;
+        sigil[1] = NEGATIVE_SIGNAL_SIGIL_OPACITY_PER_MILLE;
+        sigil[2] = @truncate(query_hash);
+        sigil[3] = @truncate(query_hash >> 16);
+    }
+
     pub fn getPanopticonEdges(self: *const VulkanEngine) []const u32 {
         const edges = self.mapped_edges orelse return &.{};
         return edges[0 .. @as(usize, self.matrix_slots) * 16];
@@ -1995,6 +2018,29 @@ pub fn getEngine() ?*VulkanEngine {
 }
 pub fn getFleet() ?*MultiGPU {
     return if (global_fleet) |*fleet| fleet else null;
+}
+
+pub fn emitNegativeSignal(query: []const u8) NegativeSignalSnapshot {
+    var hasher = std.hash.Fnv1a_64.init();
+    hasher.update(query);
+    const query_hash = hasher.final();
+    const count = global_negative_signal_count.fetchAdd(1, .acq_rel) + 1;
+    global_negative_signal_hash.store(query_hash, .release);
+    if (getEngine()) |engine| engine.applyNegativeSignal(query_hash);
+    return .{
+        .active = true,
+        .count = count,
+        .last_query_hash = query_hash,
+    };
+}
+
+pub fn getNegativeSignalSnapshot() NegativeSignalSnapshot {
+    const count = global_negative_signal_count.load(.acquire);
+    return .{
+        .active = count > 0,
+        .count = count,
+        .last_query_hash = global_negative_signal_hash.load(.acquire),
+    };
 }
 
 pub fn initRuntime(allocator: std.mem.Allocator) !*VulkanEngine {

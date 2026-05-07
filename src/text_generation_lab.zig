@@ -43,6 +43,14 @@ pub const CorpusIngestInput = struct {
     limits: CorpusIngestLimits = .{},
 };
 
+pub const DENIAL_SYSTEM_INSTRUCTION =
+    "You are the Ghost Engine. You have searched the internal shards and found zero relevant information for this query. State clearly and concisely that you do not have this information in your current corpus. Do not offer help, do not apologize, and do not use a greeting. Just state the fact of the missing data.";
+
+pub const DenialInput = struct {
+    user_query: []const u8,
+    active_shard: ?[]const u8 = null,
+};
+
 pub const TextGenerationDraft = struct {
     draft_text: []const u8,
     source_artifact_ids: []const []const u8 = &.{},
@@ -229,7 +237,9 @@ pub fn generateDefaultResponderForIntent(
     allocator: std.mem.Allocator,
     intent_class: intent_grounding.IntentClass,
 ) !?TextGenerationDraft {
-    return generateDefaultResponderForShard(allocator, intent_class, "current shard");
+    _ = allocator;
+    _ = intent_class;
+    return null;
 }
 
 pub fn generateDefaultResponderForShard(
@@ -237,15 +247,82 @@ pub fn generateDefaultResponderForShard(
     intent_class: intent_grounding.IntentClass,
     shard_name: []const u8,
 ) !?TextGenerationDraft {
-    if (intent_class != .conversation) return null;
-    return .{
-        .draft_text = try std.fmt.allocPrint(allocator, "Ready. System anchored to {s}. How can I assist?", .{shard_name}),
-        .candidate_only = false,
-        .non_authorizing = false,
-        .support_granted = true,
-        .proof_granted = false,
-        .product_ready = true,
+    _ = allocator;
+    _ = intent_class;
+    _ = shard_name;
+    return null;
+}
+
+pub fn generateDenialDraft(allocator: std.mem.Allocator, input: DenialInput) !TextGenerationDraft {
+    const subject = try denialSubject(allocator, input.user_query);
+    defer allocator.free(subject);
+
+    var hasher = std.hash.Fnv1a_64.init();
+    hasher.update(input.user_query);
+    if (input.active_shard) |shard| hasher.update(shard);
+    const variant = hasher.final() % 3;
+
+    const draft_text = switch (variant) {
+        0 => try std.fmt.allocPrint(allocator, "No corpus evidence found for {s}.", .{subject}),
+        1 => if (input.active_shard) |shard|
+            try std.fmt.allocPrint(allocator, "Information regarding {s} is not present in active shard {s}.", .{ subject, shard })
+        else
+            try std.fmt.allocPrint(allocator, "Information regarding {s} is not present in the active shard.", .{subject}),
+        else => try std.fmt.allocPrint(allocator, "The current corpus contains no relevant information for {s}.", .{subject}),
     };
+
+    return .{
+        .draft_text = draft_text,
+        .candidate_only = false,
+        .non_authorizing = true,
+        .support_granted = false,
+        .proof_granted = false,
+        .product_ready = false,
+        .unknowns = &.{DENIAL_SYSTEM_INSTRUCTION},
+    };
+}
+
+fn denialSubject(allocator: std.mem.Allocator, query: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, query, " \t\r\n\"'`.,;:!?()[]{}");
+    if (trimmed.len == 0) return allocator.dupe(u8, "the requested query");
+
+    var subject = trimmed;
+    const lower = try asciiLowerAlloc(allocator, trimmed);
+    defer allocator.free(lower);
+
+    const prefixes = [_][]const u8{
+        "what is ",
+        "what are ",
+        "who is ",
+        "who are ",
+        "where is ",
+        "where are ",
+        "when is ",
+        "when are ",
+        "explain ",
+        "define ",
+        "tell me about ",
+        "do you know ",
+        "can you find ",
+    };
+    for (prefixes) |prefix| {
+        if (std.mem.startsWith(u8, lower, prefix)) {
+            subject = trimmed[prefix.len..];
+            break;
+        }
+    }
+
+    subject = std.mem.trim(u8, subject, " \t\r\n\"'`.,;:!?()[]{}");
+    if (subject.len == 0) return allocator.dupe(u8, "the requested query");
+    const max_len: usize = 96;
+    if (subject.len <= max_len) return allocator.dupe(u8, subject);
+    return std.fmt.allocPrint(allocator, "{s}...", .{std.mem.trim(u8, subject[0..max_len], " \t\r\n\"'`.,;:!?()[]{}")});
+}
+
+fn asciiLowerAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    const out = try allocator.alloc(u8, text.len);
+    for (text, 0..) |byte, idx| out[idx] = std.ascii.toLower(byte);
+    return out;
 }
 
 fn generateOperatorSummaryDraftInternal(
@@ -260,9 +337,6 @@ fn generateOperatorSummaryDraftInternal(
 
     try writer.writeAll("TEXT GENERATION LAB DRAFT / CANDIDATE ONLY / NON-AUTHORIZING\n");
     try writer.print("Authority: proof_granted=false, support_granted=false, mutates_state=false, training_applied=false, lab_memory_applied={}, product_ready=false.\n\n", .{lab_memory_applied});
-    if (shouldPrependEnglishCoreZenithNotice(input)) {
-        try writer.writeAll("I have found a public definition for 'Zenith', but I do not have Rank 0/Root access to your Zenith project code yet.\n\n");
-    }
 
     if (hasNoSignals(input)) {
         try writer.writeAll("Summary: insufficient inspected signal to draft a substantive operator summary without guessing.\n");
@@ -532,58 +606,6 @@ fn hasNoSignals(input: TextGenerationInput) bool {
         input.detected_obligations.len == 0 and
         input.candidate_inconsistencies.len == 0 and
         input.unknowns.len == 0;
-}
-
-fn shouldPrependEnglishCoreZenithNotice(input: TextGenerationInput) bool {
-    if (!inputMentionsZenith(input)) return false;
-    return allKnownSourcesAreEnglishCore(input);
-}
-
-fn inputMentionsZenith(input: TextGenerationInput) bool {
-    for (input.detected_claims) |signal| {
-        if (std.ascii.indexOfIgnoreCase(signal.text, "zenith") != null) return true;
-    }
-    for (input.detected_obligations) |signal| {
-        if (std.ascii.indexOfIgnoreCase(signal.text, "zenith") != null) return true;
-    }
-    for (input.unknowns) |unknown| {
-        if (std.ascii.indexOfIgnoreCase(unknown, "zenith") != null) return true;
-    }
-    return false;
-}
-
-fn allKnownSourcesAreEnglishCore(input: TextGenerationInput) bool {
-    var source_count: usize = 0;
-    for (input.source_paths) |path| {
-        source_count += 1;
-        if (!isEnglishCoreSource(path)) return false;
-    }
-    for (input.source_artifact_ids) |id| {
-        source_count += 1;
-        if (!isEnglishCoreSource(id)) return false;
-    }
-    for (input.detected_claims) |signal| {
-        source_count += 1;
-        if (!isEnglishCoreSource(signal.source_path)) return false;
-    }
-    for (input.detected_obligations) |signal| {
-        source_count += 1;
-        if (!isEnglishCoreSource(signal.source_path)) return false;
-    }
-    for (input.candidate_inconsistencies) |signal| {
-        for (signal.source_paths) |path| {
-            source_count += 1;
-            if (!isEnglishCoreSource(path)) return false;
-        }
-    }
-    return source_count != 0;
-}
-
-fn isEnglishCoreSource(source: []const u8) bool {
-    return std.ascii.indexOfIgnoreCase(source, "english_core") != null or
-        std.ascii.indexOfIgnoreCase(source, "simple_wiki") != null or
-        std.ascii.indexOfIgnoreCase(source, "simplewiki") != null or
-        std.ascii.indexOfIgnoreCase(source, "@corpus/docs/simplewiki_part_") != null;
 }
 
 fn appendMemoryCandidate(
@@ -990,19 +1012,32 @@ test "english core zenith draft names public source boundary" {
     const draft = try generateOperatorSummaryDraft(allocator, input);
     defer draft.deinit(allocator);
 
-    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "I have found a public definition for 'Zenith'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "Rank 0/Root access to your Zenith project code") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "Zenith is a public astronomy reference point in the sky.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draft.draft_text, "Rank 0/Root access") == null);
 }
 
-test "conversational intent returns default responder" {
+test "conversational intent has no default responder" {
     const allocator = std.testing.allocator;
 
-    const draft = (try generateDefaultResponderForIntent(allocator, .conversation)) orelse return error.TestExpectedDraft;
-    defer draft.deinit(allocator);
+    try std.testing.expect((try generateDefaultResponderForIntent(allocator, .conversation)) == null);
+}
 
-    try std.testing.expectEqualStrings("Ready. System anchored to current shard. How can I assist?", draft.draft_text);
-    try std.testing.expect(draft.support_granted);
-    try std.testing.expect(!draft.non_authorizing);
+test "denial draft is query-shaped and no fluff" {
+    const allocator = std.testing.allocator;
+
+    var one = try generateDenialDraft(allocator, .{ .user_query = "What is Nullstar-771?" });
+    defer one.deinit(allocator);
+    var two = try generateDenialDraft(allocator, .{ .user_query = "What is Voidmarker-992?" });
+    defer two.deinit(allocator);
+
+    try std.testing.expect(!std.mem.eql(u8, one.draft_text, two.draft_text));
+    try std.testing.expect(std.mem.indexOf(u8, one.draft_text, "Nullstar-771") != null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(one.draft_text, "sorry") == null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(one.draft_text, "help") == null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(one.draft_text, "hello") == null);
+    try std.testing.expect(!one.support_granted);
+    try std.testing.expect(!one.proof_granted);
+    try std.testing.expect(one.non_authorizing);
 }
 
 test "corpus signals can become lab memory candidates" {

@@ -299,6 +299,7 @@ pub fn turn(allocator: std.mem.Allocator, options: TurnOptions) !TurnResult {
     });
     defer gi.deinit();
 
+    const corpus_lookup_attempted = shouldAttemptCorpusFallback(&session, &gi, normalized_message);
     if (try maybeAnswerFromCorpusFallback(allocator, &session, &gi, normalized_message)) |reply| {
         errdefer allocator.free(reply);
         try appendMessage(&session, .system, reply, .draft, session.last_result.?.kind);
@@ -307,6 +308,7 @@ pub fn turn(allocator: std.mem.Allocator, options: TurnOptions) !TurnResult {
     }
 
     var config = chooseResponseConfig(&session, &gi, normalized_message, options.compute_budget_request, options.reasoning_level);
+    config.corpus_lookup_missed = corpus_lookup_attempted;
     const deep_blocked_by_ambiguity = wantsDeep(normalized_message) and (session.pending_ambiguities.len > 0 or gi.ambiguity_sets.len > 0);
     if (deep_blocked_by_ambiguity) {
         config = response_engine.ResponseConfig.draftOnly();
@@ -462,6 +464,10 @@ pub fn renderSummary(allocator: std.mem.Allocator, session: *const Session) ![]u
 }
 
 fn renderConversationReply(allocator: std.mem.Allocator, session: *const Session, transition: ?ModeTransition) ![]u8 {
+    if (transition == null and session.last_result != null and !hasReplySections(session)) {
+        return std.fmt.allocPrint(allocator, "{s}\n", .{session.last_result.?.summary});
+    }
+
     var out = std.ArrayList(u8).init(allocator);
     errdefer out.deinit();
     const writer = out.writer();
@@ -568,6 +574,17 @@ fn renderConversationReply(allocator: std.mem.Allocator, session: *const Session
     return out.toOwnedSlice();
 }
 
+fn hasReplySections(session: *const Session) bool {
+    return (session.last_corrections != null and session.last_corrections.?.correction_count > 0) or
+        (session.last_negative_knowledge_influence != null and
+            (session.last_negative_knowledge_influence.?.influence_count > 0 or
+                session.last_negative_knowledge_influence.?.trust_decay_candidate_count > 0 or
+                session.last_negative_knowledge_influence.?.proposed_candidates.len > 0)) or
+        session.pending_ambiguities.len > 0 or
+        session.pending_obligations.len > 0 or
+        session.active_artifacts.len > 0;
+}
+
 fn conversationState(last: LastResult) epistemic_renderer.State {
     return switch (last.kind) {
         .draft => .draft,
@@ -667,16 +684,21 @@ fn clearCorrectionProjections(session: *Session) void {
 }
 
 fn maybeAnswerFromCorpusFallback(allocator: std.mem.Allocator, session: *Session, gi: *const intent_grounding.GroundedIntent, normalized_message: []const u8) !?[]u8 {
-    if (gi.intent_class != .conversation) return null;
-    const confidence = intent_grounding.estimateIntentConfidence(gi.normalized_form);
-    if (confidence.strong_heavy_task) return null;
-    if (countSearchableTokens(normalized_message) == 0 or isGreetingOnly(normalized_message)) return null;
+    if (!shouldAttemptCorpusFallback(session, gi, normalized_message)) return null;
 
     if (try maybeAnswerFromCorpusShard(allocator, session, gi, if (session.shard_kind == .project) session.shard_id else null)) |reply| return reply;
     if (session.shard_kind == .project and std.mem.eql(u8, session.shard_id, shards.DEFAULT_PROJECT_ID)) {
         if (try maybeAnswerFromCorpusShard(allocator, session, gi, PUBLIC_REFERENCE_SHARD)) |reply| return reply;
     }
     return null;
+}
+
+fn shouldAttemptCorpusFallback(session: *const Session, gi: *const intent_grounding.GroundedIntent, normalized_message: []const u8) bool {
+    _ = session;
+    if (gi.intent_class != .conversation) return false;
+    const confidence = intent_grounding.estimateIntentConfidence(gi.normalized_form);
+    if (confidence.strong_heavy_task) return false;
+    return countSearchableTokens(normalized_message) != 0 and !isGreetingOnly(normalized_message);
 }
 
 fn maybeAnswerFromCorpusShard(allocator: std.mem.Allocator, session: *Session, gi: *const intent_grounding.GroundedIntent, project_shard: ?[]const u8) !?[]u8 {
@@ -697,13 +719,14 @@ fn maybeAnswerFromCorpusShard(allocator: std.mem.Allocator, session: *Session, g
 }
 
 fn replaceLastResultWithCorpusAnswer(session: *Session, answer: []const u8, shard_id: []const u8) !void {
+    _ = shard_id;
     clearLastResult(session);
     clearCorrectionProjections(session);
     session.last_result = .{
         .kind = .draft,
         .selected_mode = .draft,
         .stop_reason = .unresolved,
-        .summary = try std.fmt.allocPrint(session.allocator, "corpus_fallback shard={s}: {s}", .{ shard_id, answer }),
+        .summary = try session.allocator.dupe(u8, answer),
     };
 }
 
@@ -735,8 +758,12 @@ fn isGreetingOnly(text: []const u8) bool {
 }
 
 fn summarizeResponse(allocator: std.mem.Allocator, result: *const response_engine.ResponseResult, mode: ConversationMode, deep_blocked_by_ambiguity: bool, shard_id: []const u8) ![]u8 {
+    _ = shard_id;
+    if (result.generated_denial) |denial| {
+        return allocator.dupe(u8, denial.text);
+    }
     if (deep_blocked_by_ambiguity) {
-        return allocator.dupe(u8, "deep execution is blocked until the ambiguity is resolved");
+        return response_engine.generateLowConfidenceDenialText(allocator, result.grounded_intent.raw_input);
     }
     if (result.draft.mode.enabled) {
         return std.fmt.allocPrint(allocator, "unverified {s}; assumptions={d}; alternatives={d}; missing_info={d}", .{
@@ -747,27 +774,12 @@ fn summarizeResponse(allocator: std.mem.Allocator, result: *const response_engin
         });
     }
     if (result.grounded_intent.intent_class == .conversation and result.stop_reason == .supported) {
-        return renderConversationalSummary(allocator, result.grounded_intent.raw_input, shard_id);
+        return response_engine.generateLowConfidenceDenialText(allocator, result.grounded_intent.raw_input);
     }
     switch (result.stop_reason) {
         .supported => return std.fmt.allocPrint(allocator, "{s} result supported by grounded intent and satisfied obligations", .{@tagName(mode)}),
-        .budget => return allocator.dupe(u8, "blocked by compute budget; inspect budgetExhaustions for the hit limit and stage"),
-        .unresolved => return allocator.dupe(u8, "blocked because ambiguity or missing obligations remain unresolved"),
-        .none => return allocator.dupe(u8, "no terminal result was produced"),
+        .budget, .unresolved, .none => return response_engine.generateLowConfidenceDenialText(allocator, result.grounded_intent.raw_input),
     }
-}
-
-fn renderConversationalSummary(allocator: std.mem.Allocator, raw_input: []const u8, shard_id: []const u8) ![]u8 {
-    const normalized = try lowercaseAscii(allocator, raw_input);
-    defer allocator.free(normalized);
-
-    if (std.mem.indexOf(u8, normalized, "audio engine") != null) {
-        return std.fmt.allocPrint(allocator, "The audio engine is on the radar. I can talk through its shape from {s}, and I will ask for a concrete path only when you want proof or code changes.", .{shard_id});
-    }
-    if (std.mem.indexOf(u8, normalized, "whats up") != null or std.mem.indexOf(u8, normalized, "what's up") != null) {
-        return std.fmt.allocPrint(allocator, "System anchored to {s}. How can I assist?", .{shard_id});
-    }
-    return std.fmt.allocPrint(allocator, "Ready. System anchored to {s}. How can I assist?", .{shard_id});
 }
 
 fn chooseResponseConfig(session: *const Session, gi: *const intent_grounding.GroundedIntent, normalized: []const u8, budget_request: compute_budget.Request, reasoning_level: response_engine.ReasoningLevel) response_engine.ResponseConfig {
