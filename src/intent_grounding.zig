@@ -316,6 +316,9 @@ pub const GroundedIntent = struct {
     /// Candidate interpretations for vague requests.
     candidate_intents: []CandidateIntent = &.{},
 
+    /// Abstract primitives consumed by the ontological router.
+    ontological_primitives: []OntologyPrimitive = &.{},
+
     /// Grounding traces for audit.
     traces: []GroundingTrace = &.{},
 
@@ -345,6 +348,7 @@ pub const GroundedIntent = struct {
         self.allocator.free(self.missing_obligations);
         for (self.candidate_intents) |*ci| ci.deinit(self.allocator);
         self.allocator.free(self.candidate_intents);
+        freeOntologicalPrimitives(self.allocator, self.ontological_primitives);
         for (self.traces) |*t| t.deinit(self.allocator);
         self.allocator.free(self.traces);
         self.* = undefined;
@@ -414,6 +418,15 @@ pub const GroundedIntent = struct {
             try candidate_intents.append(try ci.clone(allocator));
         }
 
+        var ontological_primitives = std.ArrayList(OntologyPrimitive).init(allocator);
+        errdefer {
+            for (ontological_primitives.items) |*primitive| primitive.deinit(allocator);
+            ontological_primitives.deinit();
+        }
+        for (self.ontological_primitives) |primitive| {
+            try ontological_primitives.append(try primitive.clone(allocator));
+        }
+
         var traces = std.ArrayList(GroundingTrace).init(allocator);
         errdefer {
             for (traces.items) |*t| t.deinit(allocator);
@@ -438,6 +451,7 @@ pub const GroundedIntent = struct {
             .ambiguity_sets = try ambiguity_sets.toOwnedSlice(),
             .missing_obligations = try missing_obligations.toOwnedSlice(),
             .candidate_intents = try candidate_intents.toOwnedSlice(),
+            .ontological_primitives = try ontological_primitives.toOwnedSlice(),
             .traces = try traces.toOwnedSlice(),
             .fast_path_eligible = self.fast_path_eligible,
         };
@@ -452,6 +466,49 @@ pub const GroundingOptions = struct {
     available_artifacts: []const []const u8 = &.{},
     /// Schema registry for artifact-based constraint extraction.
     schema_registry: ?*const artifact_schema.SchemaRegistry = null,
+};
+
+pub const OntologyRole = enum {
+    target,
+    action,
+    constraint,
+    evidence,
+};
+
+pub const OntologyConcept = enum {
+    target_system_component,
+    target_knowledge_sequence,
+    target_artifact,
+    action_verify_integrity,
+    action_explain,
+    action_transform,
+    action_synthesize,
+    constraint_local_axioms,
+    constraint_chronological_consistency,
+    constraint_no_external_authority,
+    evidence_cpp_component,
+    evidence_omni_codex,
+};
+
+pub const OntologyPrimitive = struct {
+    role: OntologyRole,
+    concept: OntologyConcept,
+    source: []u8,
+    confidence: u16,
+
+    pub fn deinit(self: *OntologyPrimitive, allocator: std.mem.Allocator) void {
+        allocator.free(self.source);
+        self.* = undefined;
+    }
+
+    pub fn clone(self: OntologyPrimitive, allocator: std.mem.Allocator) !OntologyPrimitive {
+        return .{
+            .role = self.role,
+            .concept = self.concept,
+            .source = try allocator.dupe(u8, self.source),
+            .confidence = self.confidence,
+        };
+    }
 };
 
 pub const MAX_SALIENCE_RUNES: usize = 48;
@@ -672,14 +729,186 @@ pub fn lacksSemanticTarget(input: []const u8) bool {
 }
 
 pub fn routeGeneralistIntent(input: []const u8) GeneralistRoute {
-    if (isStrictVerificationPrompt(input)) return .strict_verification;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const primitives = extractOntologicalPrimitives(arena.allocator(), input) catch return .general_chat;
+    if (ontologicalRouteRequiresVerifier(primitives)) return .strict_verification;
     return .general_chat;
 }
 
 pub fn isStrictVerificationPrompt(input: []const u8) bool {
-    if (!hasAnyRouteSignal(input, &.{ "verify", "validate", "check", "test", "compile", "compiler", "inheritance", "inherits", "base class", "derived class" })) return false;
-    if (hasAnyRouteSignal(input, &.{ ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx", ".h:", "c++", "cpp", "class", "struct", "virtual", "override", "namespace", "::" })) return true;
-    return hasAnyRouteSignal(input, &.{ "artifact", "workspace", "source file", "code" });
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const primitives = extractOntologicalPrimitives(arena.allocator(), input) catch return false;
+    return ontologicalRouteRequiresVerifier(primitives);
+}
+
+pub fn extractOntologicalPrimitives(allocator: std.mem.Allocator, input: []const u8) ![]OntologyPrimitive {
+    var primitives = std.ArrayList(OntologyPrimitive).init(allocator);
+    errdefer {
+        for (primitives.items) |*primitive| primitive.deinit(allocator);
+        primitives.deinit();
+    }
+
+    const trimmed = std.mem.trim(u8, input, " \r\n\t");
+    if (trimmed.len == 0) return primitives.toOwnedSlice();
+
+    if (hasVerificationConcept(trimmed)) {
+        try appendOntologyPrimitive(allocator, &primitives, .action, .action_verify_integrity, matchedOntologySource(trimmed, &.{ "verify", "validate", "check", "audit", "test", "prove", "confirm", "logical consistency" }) orelse "verify", 930);
+    }
+    if (hasTransformConcept(trimmed)) {
+        try appendOntologyPrimitive(allocator, &primitives, .action, .action_transform, matchedOntologySource(trimmed, &.{ "make", "improve", "refactor", "fix", "patch", "change", "modify", "optimize" }) orelse "transform", 760);
+    }
+    if (hasExplainConcept(trimmed)) {
+        try appendOntologyPrimitive(allocator, &primitives, .action, .action_explain, matchedOntologySource(trimmed, &.{ "explain", "why", "summarize", "describe" }) orelse "explain", 720);
+    }
+    if (hasSynthesisConcept(trimmed)) {
+        try appendOntologyPrimitive(allocator, &primitives, .action, .action_synthesize, matchedOntologySource(trimmed, &.{ "generate", "write", "create", "draft", "synthesize" }) orelse "synthesize", 720);
+    }
+
+    if (hasSystemComponentConcept(trimmed)) {
+        try appendOntologyPrimitive(allocator, &primitives, .target, .target_system_component, matchedSystemComponentSource(trimmed) orelse "system component", 930);
+        if (hasCppComponentEvidence(trimmed)) {
+            try appendOntologyPrimitive(allocator, &primitives, .evidence, .evidence_cpp_component, matchedOntologySource(trimmed, &.{ ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx", "c++", "cpp" }) orelse "cpp component", 900);
+        }
+    } else if (hasArtifactConcept(trimmed)) {
+        try appendOntologyPrimitive(allocator, &primitives, .target, .target_artifact, matchedOntologySource(trimmed, &.{ "artifact", "workspace", "source file", "file" }) orelse "artifact", 760);
+    }
+
+    if (hasKnowledgeSequenceConcept(trimmed)) {
+        try appendOntologyPrimitive(allocator, &primitives, .target, .target_knowledge_sequence, matchedOntologySource(trimmed, &.{ "timeline", "chronology", "chronological", "historical", "sequence" }) orelse "knowledge sequence", 900);
+    }
+
+    if (hasLocalAxiomConcept(trimmed) or (hasOntologyConcept(primitives.items, .action_verify_integrity) and hasOntologyConcept(primitives.items, .target_system_component))) {
+        try appendOntologyPrimitive(allocator, &primitives, .constraint, .constraint_local_axioms, matchedOntologySource(trimmed, &.{ "local axiom", "local axioms", "axiom", "compiler", "compile", "verifier" }) orelse "local axioms", 880);
+    }
+    if (hasChronologyConcept(trimmed) or (hasOntologyConcept(primitives.items, .action_verify_integrity) and hasOntologyConcept(primitives.items, .target_knowledge_sequence))) {
+        try appendOntologyPrimitive(allocator, &primitives, .constraint, .constraint_chronological_consistency, matchedOntologySource(trimmed, &.{ "timeline", "chronology", "chronological", "logical consistency", "historical" }) orelse "chronological consistency", 900);
+    }
+    if (hasOmniCodexConcept(trimmed)) {
+        try appendOntologyPrimitive(allocator, &primitives, .evidence, .evidence_omni_codex, matchedOntologySource(trimmed, &.{ "omni-codex", "omni codex", "corpus", "codex" }) orelse "omni-codex", 820);
+    }
+    if (hasLocalOnlyConstraint(trimmed)) {
+        try appendOntologyPrimitive(allocator, &primitives, .constraint, .constraint_no_external_authority, matchedOntologySource(trimmed, &.{ "local", "offline", "no network", "no external" }) orelse "local only", 760);
+    }
+
+    return primitives.toOwnedSlice();
+}
+
+pub fn freeOntologicalPrimitives(allocator: std.mem.Allocator, primitives: []OntologyPrimitive) void {
+    if (primitives.len == 0) return;
+    for (primitives) |*primitive| primitive.deinit(allocator);
+    allocator.free(primitives);
+}
+
+pub fn hasOntologyConcept(primitives: []const OntologyPrimitive, concept: OntologyConcept) bool {
+    for (primitives) |primitive| {
+        if (primitive.concept == concept) return true;
+    }
+    return false;
+}
+
+pub fn ontologyConceptName(concept: OntologyConcept) []const u8 {
+    return switch (concept) {
+        .target_system_component => "target.system_component",
+        .target_knowledge_sequence => "target.knowledge_sequence",
+        .target_artifact => "target.artifact",
+        .action_verify_integrity => "action.verify_integrity",
+        .action_explain => "action.explain",
+        .action_transform => "action.transform",
+        .action_synthesize => "action.synthesize",
+        .constraint_local_axioms => "constraint.local_axioms",
+        .constraint_chronological_consistency => "constraint.chronological_consistency",
+        .constraint_no_external_authority => "constraint.no_external_authority",
+        .evidence_cpp_component => "evidence.cpp_component",
+        .evidence_omni_codex => "evidence.omni_codex",
+    };
+}
+
+pub fn ontologyRoleName(role: OntologyRole) []const u8 {
+    return @tagName(role);
+}
+
+pub fn ontologicalRouteRequiresVerifier(primitives: []const OntologyPrimitive) bool {
+    if (!hasOntologyConcept(primitives, .action_verify_integrity)) return false;
+    return hasOntologyConcept(primitives, .constraint_local_axioms) or
+        hasOntologyConcept(primitives, .constraint_chronological_consistency);
+}
+
+fn appendOntologyPrimitive(
+    allocator: std.mem.Allocator,
+    primitives: *std.ArrayList(OntologyPrimitive),
+    role: OntologyRole,
+    concept: OntologyConcept,
+    source: []const u8,
+    confidence: u16,
+) !void {
+    if (hasOntologyConcept(primitives.items, concept)) return;
+    try primitives.append(.{
+        .role = role,
+        .concept = concept,
+        .source = try allocator.dupe(u8, source),
+        .confidence = confidence,
+    });
+}
+
+fn hasVerificationConcept(input: []const u8) bool {
+    return hasAnyRouteSignal(input, &.{ "verify", "validate", "check", "audit", "test", "prove", "confirm", "logical consistency" });
+}
+
+fn hasTransformConcept(input: []const u8) bool {
+    return hasAnyRouteSignal(input, &.{ "make", "improve", "refactor", "fix", "patch", "change", "modify", "optimize" });
+}
+
+fn hasExplainConcept(input: []const u8) bool {
+    return hasAnyRouteSignal(input, &.{ "explain", "why", "summarize", "describe" });
+}
+
+fn hasSynthesisConcept(input: []const u8) bool {
+    return hasAnyRouteSignal(input, &.{ "generate", "write", "create", "draft", "synthesize" });
+}
+
+fn hasSystemComponentConcept(input: []const u8) bool {
+    return hasAnyRouteSignal(input, &.{ ".zig", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx", ".h:", "c++", "cpp", "class", "struct", "virtual", "override", "namespace", "::", "component", "module", "function", "source file" });
+}
+
+fn hasArtifactConcept(input: []const u8) bool {
+    return hasAnyRouteSignal(input, &.{ "artifact", "workspace", "source file", "file" });
+}
+
+fn hasKnowledgeSequenceConcept(input: []const u8) bool {
+    return hasAnyRouteSignal(input, &.{ "timeline", "chronology", "chronological", "historical", "sequence" });
+}
+
+fn hasLocalAxiomConcept(input: []const u8) bool {
+    return hasAnyRouteSignal(input, &.{ "local axiom", "local axioms", "axiom", "compiler", "compile", "verifier" });
+}
+
+fn hasChronologyConcept(input: []const u8) bool {
+    return hasAnyRouteSignal(input, &.{ "timeline", "chronology", "chronological", "logical consistency", "historical" });
+}
+
+fn hasCppComponentEvidence(input: []const u8) bool {
+    return hasAnyRouteSignal(input, &.{ ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx", "c++", "cpp" });
+}
+
+fn hasOmniCodexConcept(input: []const u8) bool {
+    return hasAnyRouteSignal(input, &.{ "omni-codex", "omni codex", "corpus", "codex" });
+}
+
+fn hasLocalOnlyConstraint(input: []const u8) bool {
+    return hasAnyRouteSignal(input, &.{ "local", "offline", "no network", "no external" });
+}
+
+fn matchedSystemComponentSource(input: []const u8) ?[]const u8 {
+    return matchedOntologySource(input, &.{ ".zig", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx", "component", "module", "function", "source file" });
+}
+
+fn matchedOntologySource(input: []const u8, needles: []const []const u8) ?[]const u8 {
+    for (needles) |needle| {
+        if (indexOfIgnoreCaseRoute(input, needle) != null) return needle;
+    }
+    return null;
 }
 
 fn hasAnyRouteSignal(input: []const u8, needles: []const []const u8) bool {
@@ -1293,6 +1522,7 @@ const CLASSIFICATION_PHRASES = [_]ClassificationPhrase{
 
     .{ .phrase = "verify", .class = .verification },
     .{ .phrase = "check", .class = .verification },
+    .{ .phrase = "audit", .class = .verification },
     .{ .phrase = "validate", .class = .verification },
     .{ .phrase = "test", .class = .verification },
     .{ .phrase = "confirm", .class = .verification },
@@ -1383,6 +1613,8 @@ fn finishGrounding(
         for (candidate_intents.items) |*ci| ci.deinit(allocator);
         candidate_intents.deinit();
     }
+    var ontological_primitives: []OntologyPrimitive = &.{};
+    defer freeOntologicalPrimitives(allocator, ontological_primitives);
 
     // Step 2: Classify intent.
     const classification = classifyIntent(normalized_form);
@@ -1463,17 +1695,23 @@ fn finishGrounding(
     try extractGroundedConstraints(allocator, &constraints, &base_task, normalized_form, classification.class);
     try appendTrace(allocator, &traces, "extract_constraints", normalized_form, "extracted", null);
 
-    // Step 6: Intent → Obligation mapping.
+    // Step 6: Ontological primitive extraction.
+    ontological_primitives = try extractOntologicalPrimitives(allocator, normalized_form);
+    const ontology_detail = try std.fmt.allocPrint(allocator, "primitive_count={d}", .{ontological_primitives.len});
+    defer allocator.free(ontology_detail);
+    try appendTrace(allocator, &traces, "extract_ontology", normalized_form, "ontological_primitives", ontology_detail);
+
+    // Step 7: Intent → Obligation mapping.
     try mapObligations(allocator, &obligations, classification.class, &base_task, artifact_bindings.items);
     try appendTrace(allocator, &traces, "map_obligations", normalized_form, "mapped", null);
 
-    // Step 7: Determine scope.
+    // Step 8: Determine scope.
     result.scope = determineScope(artifact_bindings.items);
 
-    // Step 8: Determine action surfaces.
+    // Step 9: Determine action surfaces.
     result.action_surfaces = try determineActionSurfaces(allocator, classification.class, &base_task);
 
-    // Step 9: Finalize status.
+    // Step 10: Finalize status.
     result.artifact_bindings = try artifact_bindings.toOwnedSlice();
     result.constraints = try constraints.toOwnedSlice();
     constraints = std.ArrayList(GroundedConstraint).init(allocator);
@@ -1485,6 +1723,8 @@ fn finishGrounding(
     ambiguity_sets = std.ArrayList(AmbiguitySet).init(allocator);
     result.candidate_intents = try candidate_intents.toOwnedSlice();
     candidate_intents = std.ArrayList(CandidateIntent).init(allocator);
+    result.ontological_primitives = ontological_primitives;
+    ontological_primitives = &.{};
     result.traces = try traces.toOwnedSlice();
     traces = std.ArrayList(GroundingTrace).init(allocator);
 
@@ -1597,6 +1837,19 @@ pub fn renderJson(allocator: std.mem.Allocator, gi: *const GroundedIntent) ![]u8
     }
     try writer.writeAll("]");
 
+    // Ontological primitives
+    try writer.writeAll(",\"ontologicalPrimitives\":[");
+    for (gi.ontological_primitives, 0..) |primitive, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try writer.writeAll("{");
+        try writeJsonFieldString(writer, "role", ontologyRoleName(primitive.role), true);
+        try writeJsonFieldString(writer, "concept", ontologyConceptName(primitive.concept), false);
+        try writeJsonFieldString(writer, "source", primitive.source, false);
+        try writer.print(",\"confidence\":{d}", .{primitive.confidence});
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]");
+
     // Base task status
     try writeJsonFieldString(writer, "baseTaskStatus", task_intent.parseStatusName(gi.base_task.status), false);
 
@@ -1632,7 +1885,9 @@ pub fn intentClassRequiresArtifact(class: IntentClass) bool {
 
 fn classifyIntent(normalized: []const u8) struct { class: IntentClass, ambiguous: bool, matched_phrase: ?[]const u8, latent: LatentIntentMatch } {
     const latent = inferLatentIntent(normalized);
-    if (!latent.strong_heavy_task) {
+    const ontology_verification = hasVerificationConcept(normalized) and
+        (hasSystemComponentConcept(normalized) or hasKnowledgeSequenceConcept(normalized) or hasLocalAxiomConcept(normalized) or hasChronologyConcept(normalized));
+    if (!latent.strong_heavy_task and !ontology_verification) {
         return .{ .class = .conversation, .ambiguous = false, .matched_phrase = "latent_default_conversation", .latent = latent };
     }
 
@@ -1799,10 +2054,10 @@ fn scorePerMille(score: f32) u16 {
 
 fn hasExplicitHeavyTaskSignal(normalized: []const u8) bool {
     const phrases = [_][]const u8{
-        "make",    "improve",  "refactor", "implement", "add",         "fix",     "modify", "change", "patch",    "build",   "create",
-        "migrate", "optimize", "clean",    "clean up",  "restructure", "convert", "write",  "verify", "validate", "test",    "check",
-        "confirm", "prove",    "proof",    "explain",   "why",         "search",  "find",   "show",   "list",     "extract", "summarize",
-        "display", "get",
+        "make",      "improve",  "refactor", "implement", "add",         "fix",     "modify", "change", "patch",    "build", "create",
+        "migrate",   "optimize", "clean",    "clean up",  "restructure", "convert", "write",  "verify", "validate", "test",  "check",
+        "audit",     "confirm",  "prove",    "proof",     "explain",     "why",     "search", "find",   "show",     "list",  "extract",
+        "summarize", "display",  "get",
     };
     for (phrases) |phrase| {
         if (containsBoundedPhrase(normalized, phrase) != null) return true;
@@ -2348,10 +2603,33 @@ test "global rune resonance sees squished sayghost command" {
     try std.testing.expect(imperative.strict_output);
 }
 
-test "generalist router separates world chat from C++ verification" {
+test "generalist router uses ontological primitives across verification domains" {
     try std.testing.expectEqual(GeneralistRoute.general_chat, routeGeneralistIntent("Why is a variable like a bucket?"));
     try std.testing.expectEqual(GeneralistRoute.strict_verification, routeGeneralistIntent("verify src/native/widget.cpp:compute"));
-    try std.testing.expectEqual(GeneralistRoute.strict_verification, routeGeneralistIntent("check the C++ inheritance structure"));
+    try std.testing.expectEqual(GeneralistRoute.strict_verification, routeGeneralistIntent("verify the logical consistency of a historical timeline from the Omni-Codex"));
+}
+
+test "ontology extraction abstracts C++ audit into primitives" {
+    const allocator = std.testing.allocator;
+
+    const primitives = try extractOntologicalPrimitives(allocator, "audit TrackManager.cpp against local axioms");
+    defer freeOntologicalPrimitives(allocator, primitives);
+
+    try std.testing.expect(hasOntologyConcept(primitives, .target_system_component));
+    try std.testing.expect(hasOntologyConcept(primitives, .action_verify_integrity));
+    try std.testing.expect(hasOntologyConcept(primitives, .constraint_local_axioms));
+    try std.testing.expect(hasOntologyConcept(primitives, .evidence_cpp_component));
+}
+
+test "grounded intent exposes ontology primitives" {
+    const allocator = std.testing.allocator;
+
+    var gi = try ground(allocator, "audit TrackManager.cpp against local axioms", .{});
+    defer gi.deinit();
+
+    try std.testing.expect(hasOntologyConcept(gi.ontological_primitives, .target_system_component));
+    try std.testing.expect(hasOntologyConcept(gi.ontological_primitives, .action_verify_integrity));
+    try std.testing.expect(hasOntologyConcept(gi.ontological_primitives, .constraint_local_axioms));
 }
 
 test "imperative ngram shape isolates exact output target" {

@@ -262,6 +262,7 @@ const ACTION_PHRASES = [_]ActionPhrase{
     .{ .phrase = "refactor", .action = .refactor },
     .{ .phrase = "explain", .action = .explain },
     .{ .phrase = "verify", .action = .verify },
+    .{ .phrase = "audit", .action = .verify },
     .{ .phrase = "compare", .action = .compare },
 };
 
@@ -805,18 +806,22 @@ fn makeExplicitTarget(allocator: std.mem.Allocator, spec: []const u8) !Target {
 fn inferTargetKind(spec: []const u8) TargetKind {
     if (std.mem.indexOfScalar(u8, spec, ':')) |_| return .symbol;
     if (std.mem.indexOfScalar(u8, spec, '/')) |_| return .file;
-    if (std.mem.endsWith(u8, spec, ".zig") or std.mem.endsWith(u8, spec, ".md") or std.mem.endsWith(u8, spec, ".txt")) return .file;
+    if (pathHasKnownFileSuffix(spec)) return .file;
     return .concept;
 }
 
 fn looksLikeTargetSpec(token: []const u8) bool {
     return std.mem.indexOfScalar(u8, token, '/') != null or
         std.mem.indexOfScalar(u8, token, ':') != null or
-        std.mem.endsWith(u8, token, ".zig") or
-        std.mem.endsWith(u8, token, ".md") or
-        std.mem.endsWith(u8, token, ".txt") or
-        std.mem.endsWith(u8, token, ".cpp") or
-        std.mem.endsWith(u8, token, ".h");
+        pathHasKnownFileSuffix(token);
+}
+
+fn pathHasKnownFileSuffix(token: []const u8) bool {
+    const suffixes = [_][]const u8{ ".zig", ".md", ".txt", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx", ".h" };
+    for (suffixes) |suffix| {
+        if (std.mem.endsWith(u8, token, suffix)) return true;
+    }
+    return false;
 }
 
 fn appendTrace(

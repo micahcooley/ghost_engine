@@ -37,6 +37,40 @@ pub const FrameRole = enum(usize) {
     result = 7,
 };
 
+pub const OntologySignal = struct {
+    role: []const u8,
+    concept: []const u8,
+    confidence: u16 = 0,
+};
+
+pub const DynamicToolKind = enum {
+    llvm_verifier,
+    chronology_consistency,
+    local_axiom_matrix,
+};
+
+pub const DynamicToolBinding = struct {
+    id: []u8,
+    label: []u8,
+    kind: DynamicToolKind,
+    axiom: []u8,
+    tool_path: []u8,
+    source: []u8,
+    required_concepts: [][]u8,
+    discovered: bool,
+
+    pub fn deinit(self: *DynamicToolBinding, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.label);
+        allocator.free(self.axiom);
+        allocator.free(self.tool_path);
+        allocator.free(self.source);
+        for (self.required_concepts) |concept| allocator.free(concept);
+        allocator.free(self.required_concepts);
+        self.* = undefined;
+    }
+};
+
 pub const RoleBoundVector = struct {
     subject: u64 = 0,
     predicate: u64 = 0,
@@ -95,6 +129,156 @@ pub fn extractFrameVector(text: []const u8) SemanticFrameVector {
 
 pub fn extractSpoVector(text: []const u8) SpoVector {
     return extractFrameVector(text);
+}
+
+pub fn bindDynamicAxioms(allocator: std.mem.Allocator, signals: []const OntologySignal) ![]DynamicToolBinding {
+    var bindings = std.ArrayList(DynamicToolBinding).init(allocator);
+    errdefer {
+        for (bindings.items) |*binding| binding.deinit(allocator);
+        bindings.deinit();
+    }
+
+    const verify_cpp_component = [_][]const u8{
+        "action.verify_integrity",
+        "target.system_component",
+        "constraint.local_axioms",
+        "evidence.cpp_component",
+    };
+    if (hasAllOntologyConcepts(signals, &verify_cpp_component)) {
+        try appendDynamicBinding(allocator, &bindings, .{
+            .kind = .llvm_verifier,
+            .id = "llvm.verifier.dynamic",
+            .label = "LLVM Verifier",
+            .axiom = "axiom.llvm.ir_and_cxx_component_integrity",
+            .required = &verify_cpp_component,
+        });
+    }
+
+    const verify_timeline = [_][]const u8{
+        "action.verify_integrity",
+        "target.knowledge_sequence",
+        "constraint.chronological_consistency",
+    };
+    if (hasAllOntologyConcepts(signals, &verify_timeline)) {
+        try appendDynamicBinding(allocator, &bindings, .{
+            .kind = .chronology_consistency,
+            .id = "chronology.consistency.dynamic",
+            .label = "Chronological Consistency Verifier",
+            .axiom = "axiom.timeline.monotonic_consistency",
+            .required = &verify_timeline,
+        });
+    }
+
+    const local_axiom_matrix = [_][]const u8{
+        "action.verify_integrity",
+        "constraint.local_axioms",
+    };
+    if (bindings.items.len == 0 and hasAllOntologyConcepts(signals, &local_axiom_matrix)) {
+        try appendDynamicBinding(allocator, &bindings, .{
+            .kind = .local_axiom_matrix,
+            .id = "local.axiom_matrix.dynamic",
+            .label = "Local Axiom Matrix",
+            .axiom = "axiom.local.structural_integrity",
+            .required = &local_axiom_matrix,
+        });
+    }
+
+    return bindings.toOwnedSlice();
+}
+
+const DynamicBindingSpec = struct {
+    kind: DynamicToolKind,
+    id: []const u8,
+    label: []const u8,
+    axiom: []const u8,
+    required: []const []const u8,
+};
+
+fn appendDynamicBinding(
+    allocator: std.mem.Allocator,
+    bindings: *std.ArrayList(DynamicToolBinding),
+    spec: DynamicBindingSpec,
+) !void {
+    const resolved = try resolveDynamicToolPath(allocator, spec.kind);
+    errdefer allocator.free(resolved.path);
+    var required = try allocator.alloc([]u8, spec.required.len);
+    errdefer allocator.free(required);
+    var copied: usize = 0;
+    errdefer {
+        for (required[0..copied]) |concept| allocator.free(concept);
+    }
+    for (spec.required, 0..) |concept, idx| {
+        required[idx] = try allocator.dupe(u8, concept);
+        copied += 1;
+    }
+    try bindings.append(.{
+        .id = try allocator.dupe(u8, spec.id),
+        .label = try allocator.dupe(u8, spec.label),
+        .kind = spec.kind,
+        .axiom = try allocator.dupe(u8, spec.axiom),
+        .tool_path = resolved.path,
+        .source = try allocator.dupe(u8, "ontology_rule_registry"),
+        .required_concepts = required,
+        .discovered = resolved.discovered,
+    });
+}
+
+fn hasAllOntologyConcepts(signals: []const OntologySignal, required: []const []const u8) bool {
+    for (required) |concept| {
+        if (!hasOntologyConceptSignal(signals, concept)) return false;
+    }
+    return true;
+}
+
+fn hasOntologyConceptSignal(signals: []const OntologySignal, concept: []const u8) bool {
+    for (signals) |signal| {
+        if (std.mem.eql(u8, signal.concept, concept)) return true;
+    }
+    return false;
+}
+
+fn resolveDynamicToolPath(allocator: std.mem.Allocator, kind: DynamicToolKind) !struct { path: []u8, discovered: bool } {
+    return switch (kind) {
+        .llvm_verifier => blk: {
+            if (try firstEnvPath(allocator, &.{ "GHOST_LLVM_VERIFIER", "LLVM_VERIFIER" })) |path| break :blk .{ .path = path, .discovered = true };
+            if (findExecutableOnPath(allocator, "llvm-verifier")) |path| break :blk .{ .path = path, .discovered = true };
+            if (findExecutableOnPath(allocator, "clang++")) |path| break :blk .{ .path = path, .discovered = true };
+            if (findExecutableOnPath(allocator, "clang")) |path| break :blk .{ .path = path, .discovered = true };
+            break :blk .{ .path = try allocator.dupe(u8, "unresolved:llvm-verifier"), .discovered = false };
+        },
+        .chronology_consistency => .{ .path = try allocator.dupe(u8, "internal:chronology_consistency"), .discovered = true },
+        .local_axiom_matrix => .{ .path = try allocator.dupe(u8, "internal:local_axiom_matrix"), .discovered = true },
+    };
+}
+
+fn firstEnvPath(allocator: std.mem.Allocator, names: []const []const u8) !?[]u8 {
+    for (names) |name| {
+        const value = std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => continue,
+            else => return err,
+        };
+        if (std.mem.trim(u8, value, " \r\n\t").len == 0) {
+            allocator.free(value);
+            continue;
+        }
+        return value;
+    }
+    return null;
+}
+
+fn findExecutableOnPath(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
+    const path_env = std.posix.getenv("PATH") orelse return null;
+    var it = std.mem.splitScalar(u8, path_env, ':');
+    while (it.next()) |dir| {
+        if (dir.len == 0) continue;
+        const candidate = std.fs.path.join(allocator, &.{ dir, name }) catch continue;
+        if (std.fs.cwd().access(candidate, .{})) |_| {
+            return candidate;
+        } else |_| {
+            allocator.free(candidate);
+        }
+    }
+    return null;
 }
 
 pub const ByteBoundary = struct {
@@ -662,4 +846,37 @@ test "graph isomorphism links containment and storage analogy" {
     try std.testing.expect(variable.valid);
     try std.testing.expect(bucket.valid);
     try std.testing.expect(graphIsomorphismScorePerMille(variable, bucket) >= 500);
+}
+
+test "dynamic axiom binding discovers verifier from ontology concepts" {
+    const allocator = std.testing.allocator;
+    const code_signals = [_]OntologySignal{
+        .{ .role = "action", .concept = "action.verify_integrity", .confidence = 930 },
+        .{ .role = "target", .concept = "target.system_component", .confidence = 930 },
+        .{ .role = "constraint", .concept = "constraint.local_axioms", .confidence = 880 },
+        .{ .role = "evidence", .concept = "evidence.cpp_component", .confidence = 900 },
+    };
+    const code_bindings = try bindDynamicAxioms(allocator, &code_signals);
+    defer {
+        for (code_bindings) |*binding| binding.deinit(allocator);
+        allocator.free(code_bindings);
+    }
+    try std.testing.expectEqual(@as(usize, 1), code_bindings.len);
+    try std.testing.expectEqual(DynamicToolKind.llvm_verifier, code_bindings[0].kind);
+    try std.testing.expect(std.mem.indexOf(u8, code_bindings[0].tool_path, "llvm") != null or
+        std.mem.indexOf(u8, code_bindings[0].tool_path, "clang") != null);
+
+    const timeline_signals = [_]OntologySignal{
+        .{ .role = "action", .concept = "action.verify_integrity", .confidence = 930 },
+        .{ .role = "target", .concept = "target.knowledge_sequence", .confidence = 900 },
+        .{ .role = "constraint", .concept = "constraint.chronological_consistency", .confidence = 900 },
+    };
+    const timeline_bindings = try bindDynamicAxioms(allocator, &timeline_signals);
+    defer {
+        for (timeline_bindings) |*binding| binding.deinit(allocator);
+        allocator.free(timeline_bindings);
+    }
+    try std.testing.expectEqual(@as(usize, 1), timeline_bindings.len);
+    try std.testing.expectEqual(DynamicToolKind.chronology_consistency, timeline_bindings[0].kind);
+    try std.testing.expect(std.mem.eql(u8, timeline_bindings[0].tool_path, "internal:chronology_consistency"));
 }

@@ -1407,7 +1407,7 @@ fn renderStrictVerificationUnresolvedResponse(
     workspace: []const u8,
     target: []const u8,
 ) ![]u8 {
-    const draft_text = try std.fmt.allocPrint(allocator, "Strict verification routing matched this as code or C++ work, but verification is unresolved: {s}.", .{reason});
+    const draft_text = try std.fmt.allocPrint(allocator, "Ontological router assembled a verification graph, but verification is unresolved: {s}.", .{reason});
     defer allocator.free(draft_text);
     try resident.session_hot.appendTurn(resident.vulkan, "engine", draft_text);
     const result_json = try renderStrictVerificationCorpusResult(allocator, question, shard_id, draft_text, workspace, target, false, resident);
@@ -1470,9 +1470,9 @@ fn renderStrictVerificationCorpusResult(
     if (supported) {
         try w.writeAll("[]");
     } else {
-        try w.writeAll("[{\"kind\":\"strict_verification_unresolved\",\"reason\":\"code_intel did not reach supported\"}]");
+        try w.writeAll("[{\"kind\":\"ontological_verification_unresolved\",\"reason\":\"bound verifier did not reach supported\"}]");
     }
-    try w.writeAll(",\"candidateFollowups\":[],\"learningCandidates\":[],\"trace\":{\"corpusMutation\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"commandsExecuted\":false,\"verifiersExecuted\":true,\"generalistRoute\":\"strict_verification\",\"workspace\":");
+    try w.writeAll(",\"candidateFollowups\":[],\"learningCandidates\":[],\"trace\":{\"corpusMutation\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"commandsExecuted\":false,\"verifiersExecuted\":true,\"generalistRoute\":\"ontological_router\",\"workspace\":");
     try std.json.stringify(workspace, .{}, w);
     try w.writeAll(",\"target\":");
     try std.json.stringify(target, .{}, w);

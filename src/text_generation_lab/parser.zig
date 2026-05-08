@@ -1,4 +1,5 @@
 const std = @import("std");
+const intent_grounding = @import("../intent_grounding.zig");
 
 pub const IntentKind = enum {
     factual_identity,
@@ -33,11 +34,13 @@ pub const PredicateNode = struct {
 pub const ParsedConcept = struct {
     intent: IntentKind,
     predicate: ?PredicateNode = null,
+    ontological_primitives: []intent_grounding.OntologyPrimitive = &.{},
     source_sentence: []u8,
     confidence_per_mille: u16,
 
     pub fn deinit(self: *ParsedConcept, allocator: std.mem.Allocator) void {
         if (self.predicate) |*predicate| predicate.deinit(allocator);
+        intent_grounding.freeOntologicalPrimitives(allocator, self.ontological_primitives);
         allocator.free(self.source_sentence);
         self.* = undefined;
     }
@@ -76,12 +79,25 @@ pub fn parseConcept(allocator: std.mem.Allocator, query: []const u8, raw_text: [
 
     var predicate = (try extractPredicate(allocator, best_sentence, intent)) orelse return null;
     errdefer predicate.deinit(allocator);
+    const ontological_primitives = try parseOntologyPrimitives(allocator, query, best_sentence);
+    errdefer intent_grounding.freeOntologicalPrimitives(allocator, ontological_primitives);
+
     return .{
         .intent = intent,
         .predicate = predicate,
+        .ontological_primitives = ontological_primitives,
         .source_sentence = try allocator.dupe(u8, best_sentence),
         .confidence_per_mille = confidenceFor(best_score, predicate),
     };
+}
+
+pub fn parseOntologyPrimitives(allocator: std.mem.Allocator, query: []const u8, raw_text: []const u8) ![]intent_grounding.OntologyPrimitive {
+    const combined = if (raw_text.len == 0)
+        try allocator.dupe(u8, query)
+    else
+        try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ query, raw_text });
+    defer allocator.free(combined);
+    return intent_grounding.extractOntologicalPrimitives(allocator, combined);
 }
 
 fn cleanRawText(allocator: std.mem.Allocator, raw_text: []const u8) ![]u8 {
@@ -114,8 +130,8 @@ fn cleanRawText(allocator: std.mem.Allocator, raw_text: []const u8) ![]u8 {
 
 fn isMetadataLine(line: []const u8) bool {
     const prefixes = [_][]const u8{
-        "path=", "source=", "search=", "semantic=", "spo=", "inv_spo=", "concepts=",
-        "title:", "url:", "source:", "redirect:", "category:",
+        "path=",  "source=", "search=", "semantic=", "spo=",      "inv_spo=", "concepts=",
+        "title:", "url:",    "source:", "redirect:", "category:",
     };
     for (prefixes) |prefix| {
         if (std.ascii.startsWithIgnoreCase(line, prefix)) return true;
@@ -133,8 +149,8 @@ fn inferIntent(query: []const u8) IntentKind {
 
 fn extractPredicate(allocator: std.mem.Allocator, sentence: []const u8, intent: IntentKind) !?PredicateNode {
     const verbs = [_][]const u8{
-        " is ", " are ", " was ", " were ", " means ", " refers to ", " describes ",
-        " contains ", " includes ", " uses ", " executes ", " processes ", " stores ", " controls ",
+        " is ",       " are ",      " was ",  " were ",     " means ",     " refers to ", " describes ",
+        " contains ", " includes ", " uses ", " executes ", " processes ", " stores ",    " controls ",
     };
     for (verbs) |verb| {
         const idx = indexOfIgnoreCase(sentence, verb) orelse continue;
@@ -228,4 +244,14 @@ test "parser extracts identity predicate from noisy text" {
     defer parsed.deinit(allocator);
     try std.testing.expect(parsed.predicate != null);
     try std.testing.expect(std.mem.indexOf(u8, parsed.predicate.?.object, "physicist") != null);
+}
+
+test "parser extracts ontological primitives from audit request" {
+    const allocator = std.testing.allocator;
+    const primitives = try parseOntologyPrimitives(allocator, "audit TrackManager.cpp", "");
+    defer intent_grounding.freeOntologicalPrimitives(allocator, primitives);
+
+    try std.testing.expect(intent_grounding.hasOntologyConcept(primitives, .target_system_component));
+    try std.testing.expect(intent_grounding.hasOntologyConcept(primitives, .action_verify_integrity));
+    try std.testing.expect(intent_grounding.hasOntologyConcept(primitives, .constraint_local_axioms));
 }
