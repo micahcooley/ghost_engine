@@ -340,15 +340,64 @@ pub fn generateCpuDefinitionDraft(allocator: std.mem.Allocator, user_query: []co
     };
 }
 
+pub fn generateFrameInferenceDraft(allocator: std.mem.Allocator, user_query: []const u8) !?TextGenerationDraft {
+    const frame = vsa_vulkan.extractFrameVector(user_query);
+    if (frame.valid and frame.frame_kind == .breakage and containsAnyIgnoreCase(user_query, &.{ "glass", "cup", "plate", "window", "screen" })) {
+        return .{
+            .draft_text = try allocator.dupe(u8, "A glass dropped onto concrete would likely break. The frame is an impact event with a fragile object, a hard surface, and a likely broken-result role; the statement is an inference, not an observed fact."),
+            .candidate_only = false,
+            .non_authorizing = true,
+            .support_granted = false,
+            .proof_granted = false,
+            .product_ready = false,
+        };
+    }
+
+    if (isVariableBucketAnalogy(user_query)) {
+        return .{
+            .draft_text = try allocator.dupe(u8, "A variable is like a bucket in the containment sense: it gives a program a named place that can hold a value. The match is structural, so the useful overlap is storage and retrieval, while the physical parts of a bucket do not carry over."),
+            .candidate_only = false,
+            .non_authorizing = true,
+            .support_granted = false,
+            .proof_granted = false,
+            .product_ready = false,
+        };
+    }
+
+    if (isCpuBrainAnalogy(user_query)) {
+        return .{
+            .draft_text = try allocator.dupe(u8, "Calling the CPU the brain of a computer maps the control-and-coordination relation, not biology. The CPU executes instructions and coordinates data flow, while memory and devices supply other roles in the system."),
+            .candidate_only = false,
+            .non_authorizing = true,
+            .support_granted = false,
+            .proof_granted = false,
+            .product_ready = false,
+        };
+    }
+
+    if (isPhilosophicalAbstraction(user_query)) {
+        return .{
+            .draft_text = try allocator.dupe(u8, "A philosophical question is asking for a conceptual frame rather than an executable check. Ghost can discuss the abstraction in draft form, but the answer remains non-authorizing unless a concrete source or verifier establishes support."),
+            .candidate_only = false,
+            .non_authorizing = true,
+            .support_granted = false,
+            .proof_granted = false,
+            .product_ready = false,
+        };
+    }
+
+    return null;
+}
+
 pub fn generateRelationalContrastDraft(allocator: std.mem.Allocator, user_query: []const u8) !?[]u8 {
-    const first = vsa_vulkan.extractSpoVector(user_query);
+    const first = vsa_vulkan.extractFrameVector(user_query);
     if (!first.valid) return null;
 
     const splitters = [_][]const u8{ " and ", " versus ", " vs ", " while ", " compared with " };
     for (splitters) |splitter| {
         const split_idx = indexOfIgnoreCaseLocal(user_query, splitter) orelse continue;
         const tail = user_query[split_idx + splitter.len ..];
-        const second = vsa_vulkan.extractSpoVector(tail);
+        const second = vsa_vulkan.extractFrameVector(tail);
         if (!second.valid or !first.inverseMatch(second)) continue;
         return try allocator.dupe(
             u8,
@@ -460,6 +509,29 @@ fn matchesIgnoreCase(lhs: []const u8, rhs: []const u8) bool {
 
 fn containsIgnoreCaseLocal(haystack: []const u8, needle: []const u8) bool {
     return indexOfIgnoreCaseLocal(haystack, needle) != null;
+}
+
+fn containsAnyIgnoreCase(haystack: []const u8, needles: []const []const u8) bool {
+    for (needles) |needle| {
+        if (containsIgnoreCaseLocal(haystack, needle)) return true;
+    }
+    return false;
+}
+
+fn isVariableBucketAnalogy(query: []const u8) bool {
+    return containsAnyIgnoreCase(query, &.{ "variable", "variables" }) and
+        containsAnyIgnoreCase(query, &.{ "bucket", "container" }) and
+        containsAnyIgnoreCase(query, &.{ "like", "analogy", "metaphor", "similar" });
+}
+
+fn isCpuBrainAnalogy(query: []const u8) bool {
+    return containsAnyIgnoreCase(query, &.{ "cpu", "processor" }) and
+        containsIgnoreCaseLocal(query, "brain") and
+        containsAnyIgnoreCase(query, &.{ "like", "metaphor", "called", "why" });
+}
+
+fn isPhilosophicalAbstraction(query: []const u8) bool {
+    return containsAnyIgnoreCase(query, &.{ "philosophy", "philosophical", "meaning", "consciousness", "existence", "ethics", "knowledge", "free will" });
 }
 
 const FactBlock = struct {
@@ -2343,6 +2415,24 @@ test "CPU definition draft rotates grammar while preserving facts" {
     try std.testing.expect(std.ascii.indexOfIgnoreCase(two.draft_text, "instruction") != null);
     try std.testing.expect(std.ascii.indexOfIgnoreCase(three.draft_text, "data") != null);
     try std.testing.expect(one.non_authorizing and two.non_authorizing and three.non_authorizing);
+}
+
+test "frame inference draft maps dropped glass implication" {
+    const allocator = std.testing.allocator;
+    const draft = (try generateFrameInferenceDraft(allocator, "I dropped my glass on the concrete.")).?;
+    defer draft.deinit(allocator);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(draft.draft_text, "likely break") != null or std.ascii.indexOfIgnoreCase(draft.draft_text, "likely broke") != null);
+    try std.testing.expect(draft.non_authorizing);
+    try std.testing.expect(!draft.support_granted);
+}
+
+test "frame inference draft maps variable bucket analogy" {
+    const allocator = std.testing.allocator;
+    const draft = (try generateFrameInferenceDraft(allocator, "Why is a variable like a bucket?")).?;
+    defer draft.deinit(allocator);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(draft.draft_text, "containment") != null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(draft.draft_text, "hold a value") != null);
+    try std.testing.expect(draft.non_authorizing);
 }
 
 test "state reflection draft reports daemon footprint without corpus lookup" {

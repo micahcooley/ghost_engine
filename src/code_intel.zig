@@ -3232,6 +3232,7 @@ fn sourceFamilyForPath(index: *const RepoIndex, rel_path: []const u8) SourceFami
             .docs, .specs => .docs,
             .configs => .config,
             .symbolic => .other,
+            .axiom => .code,
         };
     }
     if (std.mem.indexOf(u8, rel_path, "/tests") != null or std.mem.endsWith(u8, rel_path, "tests.zig")) return .tests;

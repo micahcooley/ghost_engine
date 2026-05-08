@@ -12,6 +12,7 @@ pub const MAX_PATTERNS: usize = 16;
 pub const MAX_TOKENS: usize = 24;
 pub const MAX_REGION_LINES: u32 = 96;
 pub const MAX_REGION_BYTES: usize = 16 * 1024;
+pub const MAX_CATALOG_BYTES: usize = 64 * 1024 * 1024;
 
 const MAGIC_LINE = "GABS1";
 const REUSE_MAGIC_LINE = "GABR1";
@@ -4358,7 +4359,7 @@ fn loadCatalog(allocator: std.mem.Allocator, abs_path: []const u8) !std.ArrayLis
         return try cloneCatalogRecords(allocator, entry.records);
     }
 
-    const bytes = try readOwnedFile(allocator, abs_path, 1 * 1024 * 1024);
+    const bytes = try readOwnedFile(allocator, abs_path, MAX_CATALOG_BYTES);
     defer allocator.free(bytes);
 
     var lines = std.mem.splitScalar(u8, bytes, '\n');

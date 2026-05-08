@@ -7,6 +7,9 @@ const config = @import("config.zig");
 const sys = @import("sys.zig");
 const vsa_core = @import("vsa_core.zig");
 const sigil_runtime = @import("sigil_runtime.zig");
+const vk_device = @import("vsa_vulkan/device.zig");
+const vk_resonance = @import("vsa_vulkan/resonance.zig");
+const vk_runtime = @import("vsa_vulkan/runtime.zig");
 
 // --- GHOST ENGINE: VULKAN CORE ---
 // Multi-GPU Sovereign Fleet.
@@ -26,6 +29,26 @@ const FENCE_TIMEOUT_NS: u64 = 2_000_000_000;
 const SHUTDOWN_FENCE_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
 const VALIDATION_LAYER_NAME: [*:0]const u8 = "VK_LAYER_KHRONOS_validation";
 const DEBUG_UTILS_EXTENSION_NAME: [*:0]const u8 = "VK_EXT_debug_utils";
+const UPLOAD_STAGING_SLOTS = vk_device.DEFAULT_UPLOAD_STAGING_SLOTS;
+
+pub const OperationalTier = vk_runtime.OperationalTier;
+pub const parseOperationalTierAlias = vk_runtime.parseOperationalTierAlias;
+pub const tierNameFromValue = vk_runtime.tierNameFromValue;
+
+pub const RoleBoundVector = vk_resonance.RoleBoundVector;
+pub const FrameKind = vk_resonance.FrameKind;
+pub const FrameRole = vk_resonance.FrameRole;
+pub const SemanticFrameVector = vk_resonance.SemanticFrameVector;
+pub const FRAME_ROLE_DIMS = vk_resonance.FRAME_ROLE_DIMS;
+pub const SpoVector = vk_resonance.SpoVector;
+pub const extractFrameVector = vk_resonance.extractFrameVector;
+pub const extractSpoVector = vk_resonance.extractSpoVector;
+pub const relationScorePerMille = vk_resonance.relationScorePerMille;
+pub const relationPenaltyPerMille = vk_resonance.relationPenaltyPerMille;
+pub const graphIsomorphismScorePerMille = vk_resonance.graphIsomorphismScorePerMille;
+pub const SPO_DIRECT_MATCH_BONUS = vk_resonance.SPO_DIRECT_MATCH_BONUS;
+pub const SPO_PARTIAL_MATCH_BONUS = vk_resonance.SPO_PARTIAL_MATCH_BONUS;
+pub const SPO_INVERSE_MATCH_PENALTY_PER_MILLE = vk_resonance.SPO_INVERSE_MATCH_PENALTY_PER_MILLE;
 
 pub fn runtimeLogsEnabled() bool {
     return envFlag("GHOST_ENGINE_DEBUG") or
@@ -76,31 +99,6 @@ fn ghostCopy(comptime T: type, dest: []T, source: []const T) void {
     }
 }
 
-pub const OperationalTier = enum(u32) {
-    background = 1,
-    standard = 2,
-    high = 3,
-    max = 4,
-    extreme = 5,
-    ultra = 6,
-    hyper = 7,
-    god = 8,
-
-    pub fn getBatchSize(self: OperationalTier, max_wg: u32) u32 {
-        const base = @max(max_wg, 1024);
-        return switch (self) {
-            .background => base / 8,
-            .standard => base / 4,
-            .high => base / 2,
-            .max => base,
-            .extreme => base * 2,
-            .ultra => base * 4,
-            .hyper => base * 8,
-            .god => if (builtin.os.tag == .linux) base * 24 else base * 16,
-        };
-    }
-};
-
 pub const DiagnosticState = struct {
     dropped_runes: u32 = 0,
     collision_stalls: u32 = 0,
@@ -141,6 +139,7 @@ pub const ResidentBuffer = struct {
     memory: vk.VkDeviceMemory = null,
     size_bytes: usize = 0,
     device_local: bool = false,
+    epoch: vk_device.ResidentEpoch = .{},
 };
 
 pub const CorpusScanEntry = extern struct {
@@ -157,188 +156,6 @@ pub const CorpusScanEntry = extern struct {
     inverse_relation_hash_lo: u32 = 0,
     inverse_relation_hash_hi: u32 = 0,
 };
-
-pub const SPO_DIRECT_MATCH_BONUS: u32 = 4200;
-pub const SPO_PARTIAL_MATCH_BONUS: u32 = 900;
-pub const SPO_INVERSE_MATCH_PENALTY_PER_MILLE: u32 = 125;
-
-pub const SpoVector = struct {
-    subject_hash: u64 = 0,
-    predicate_hash: u64 = 0,
-    object_hash: u64 = 0,
-    forward_hash: u64 = 0,
-    inverse_hash: u64 = 0,
-    valid: bool = false,
-
-    pub fn directMatch(self: SpoVector, other: SpoVector) bool {
-        return self.valid and other.valid and self.forward_hash != 0 and self.forward_hash == other.forward_hash;
-    }
-
-    pub fn inverseMatch(self: SpoVector, other: SpoVector) bool {
-        return self.valid and other.valid and self.forward_hash != 0 and self.forward_hash == other.inverse_hash;
-    }
-};
-
-const SpoToken = struct {
-    text: []const u8,
-    hash: u64,
-    predicate_hash: u64 = 0,
-};
-
-pub fn extractSpoVector(text: []const u8) SpoVector {
-    var tokens: [64]SpoToken = undefined;
-    var count: usize = 0;
-    var start: ?usize = null;
-    var idx: usize = 0;
-    while (idx <= text.len) : (idx += 1) {
-        const at_end = idx == text.len;
-        const byte = if (at_end) 0 else text[idx];
-        if (!at_end and (std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-')) {
-            if (start == null) start = idx;
-            continue;
-        }
-        if (start) |s| {
-            const token = text[s..idx];
-            if (token.len >= 2 and count < tokens.len and !isSpoStopToken(token)) {
-                const predicate_hash = normalizedPredicateHash(token);
-                tokens[count] = .{
-                    .text = token,
-                    .hash = hashLowerAsciiToken(token),
-                    .predicate_hash = predicate_hash,
-                };
-                count += 1;
-            }
-            start = null;
-        }
-    }
-
-    for (tokens[0..count], 0..) |token, token_idx| {
-        if (token.predicate_hash == 0) continue;
-        const subject_idx = previousSpoConcept(tokens[0..count], token_idx) orelse continue;
-        const object_idx = nextSpoConcept(tokens[0..count], token_idx + 1) orelse continue;
-        const subject = tokens[subject_idx];
-        const object = tokens[object_idx];
-        if (subject.hash == object.hash) continue;
-        const forward = hashSpo(subject.hash, token.predicate_hash, object.hash);
-        return .{
-            .subject_hash = subject.hash,
-            .predicate_hash = token.predicate_hash,
-            .object_hash = object.hash,
-            .forward_hash = forward,
-            .inverse_hash = hashSpo(object.hash, token.predicate_hash, subject.hash),
-            .valid = forward != 0,
-        };
-    }
-
-    return .{};
-}
-
-pub fn relationScorePerMille(query: SpoVector, candidate: SpoVector) u16 {
-    if (!query.valid or !candidate.valid) return 0;
-    if (query.directMatch(candidate)) return 1000;
-    if (query.inverseMatch(candidate)) return 0;
-    var score: u16 = 0;
-    if (query.predicate_hash != 0 and query.predicate_hash == candidate.predicate_hash) score += 360;
-    if (query.subject_hash != 0 and query.subject_hash == candidate.subject_hash) score += 320;
-    if (query.object_hash != 0 and query.object_hash == candidate.object_hash) score += 320;
-    return score;
-}
-
-pub fn relationPenaltyPerMille(query: SpoVector, candidate: SpoVector) u16 {
-    if (!query.valid or !candidate.valid) return 0;
-    if (query.inverseMatch(candidate)) return 875;
-    return 0;
-}
-
-fn previousSpoConcept(tokens: []const SpoToken, predicate_idx: usize) ?usize {
-    if (predicate_idx == 0) return null;
-    var idx = predicate_idx;
-    while (idx > 0) {
-        idx -= 1;
-        if (tokens[idx].predicate_hash == 0 and !isSpoConceptStopToken(tokens[idx].text)) return idx;
-    }
-    return null;
-}
-
-fn nextSpoConcept(tokens: []const SpoToken, start_idx: usize) ?usize {
-    var idx = start_idx;
-    while (idx < tokens.len) : (idx += 1) {
-        if (tokens[idx].predicate_hash == 0 and !isSpoConceptStopToken(tokens[idx].text)) return idx;
-    }
-    return null;
-}
-
-fn isSpoStopToken(token: []const u8) bool {
-    const words = [_][]const u8{
-        "a",     "an",     "the",  "to",  "of",    "by",   "for",  "with", "from",  "into", "and", "or",
-        "does",  "do",     "did",  "is",  "are",   "was",  "were", "be",   "being", "been", "can", "could",
-        "would", "should", "must", "may", "might", "then", "than", "that", "this",
-    };
-    for (words) |word| {
-        if (std.ascii.eqlIgnoreCase(token, word)) return true;
-    }
-    return false;
-}
-
-fn isSpoConceptStopToken(token: []const u8) bool {
-    const words = [_][]const u8{
-        "explain", "difference", "between",  "whether", "what",  "when", "where", "why", "how",
-        "logical", "absurdity",  "specific", "vector",  "query",
-    };
-    for (words) |word| {
-        if (std.ascii.eqlIgnoreCase(token, word)) return true;
-    }
-    return false;
-}
-
-fn normalizedPredicateHash(token: []const u8) u64 {
-    if (matchesPredicate(token, &.{ "read", "reads", "reading" })) return hashPredicateName("read");
-    if (matchesPredicate(token, &.{ "control", "controls", "controlled", "controlling" })) return hashPredicateName("control");
-    if (matchesPredicate(token, &.{ "execute", "executes", "executed", "executing" })) return hashPredicateName("execute");
-    if (matchesPredicate(token, &.{ "process", "processes", "processed", "processing" })) return hashPredicateName("process");
-    if (matchesPredicate(token, &.{ "store", "stores", "stored", "storing" })) return hashPredicateName("store");
-    if (matchesPredicate(token, &.{ "use", "uses", "used", "using" })) return hashPredicateName("use");
-    if (matchesPredicate(token, &.{ "contain", "contains", "contained", "containing", "has", "have" })) return hashPredicateName("contain");
-    if (matchesPredicate(token, &.{ "compile", "compiles", "compiled", "compiling" })) return hashPredicateName("compile");
-    if (matchesPredicate(token, &.{ "access", "accesses", "accessed", "accessing" })) return hashPredicateName("access");
-    if (matchesPredicate(token, &.{ "write", "writes", "wrote", "written", "writing" })) return hashPredicateName("write");
-    if (matchesPredicate(token, &.{ "follow", "follows", "followed", "following" })) return hashPredicateName("follow");
-    return 0;
-}
-
-fn matchesPredicate(token: []const u8, forms: []const []const u8) bool {
-    for (forms) |form| {
-        if (std.ascii.eqlIgnoreCase(token, form)) return true;
-    }
-    return false;
-}
-
-fn hashPredicateName(name: []const u8) u64 {
-    return hashLowerAsciiToken(name);
-}
-
-fn hashLowerAsciiToken(token: []const u8) u64 {
-    var hasher = std.hash.Fnv1a_64.init();
-    for (token) |byte| {
-        var lower: [1]u8 = .{std.ascii.toLower(byte)};
-        hasher.update(&lower);
-    }
-    return hasher.final();
-}
-
-fn hashSpo(subject_hash: u64, predicate_hash: u64, object_hash: u64) u64 {
-    var hasher = std.hash.Fnv1a_64.init();
-    updateHashU64(&hasher, subject_hash);
-    updateHashU64(&hasher, predicate_hash);
-    updateHashU64(&hasher, object_hash);
-    return hasher.final();
-}
-
-fn updateHashU64(hasher: *std.hash.Fnv1a_64, value: u64) void {
-    var bytes: [8]u8 = undefined;
-    std.mem.writeInt(u64, &bytes, value, .little);
-    hasher.update(&bytes);
-}
 
 pub const GLOBAL_RUNE_RESONANCE_OVERRIDE_PER_MILLE: u16 = 850;
 
@@ -640,8 +457,7 @@ fn hasInstanceExtension(ctx: *vl.VulkanCtx, allocator: std.mem.Allocator, extens
 }
 
 fn shouldEnableValidation() bool {
-    if (builtin.os.tag == .linux) return false;
-    return config.TEST_MODE or builtin.mode == .Debug;
+    return config.TEST_MODE or builtin.mode == .Debug or envFlag("GHOST_VULKAN_VALIDATION");
 }
 
 fn selectComputeQueueFamily(
@@ -926,6 +742,18 @@ pub const VulkanEngine = struct {
     general_ingest_memory: vk.VkDeviceMemory = null,
     mapped_general_ingest: ?[*]u32 = null,
     general_ingest_size: usize = 0,
+
+    // Immutable publication staging arena. Uploads copy through these
+    // preallocated slots, then publish a new resident epoch via timeline
+    // semaphore. Query-time uploads must fit here instead of allocating memory.
+    upload_staging_buffers: [UPLOAD_STAGING_SLOTS]vk.VkBuffer = [_]vk.VkBuffer{null} ** UPLOAD_STAGING_SLOTS,
+    upload_staging_memories: [UPLOAD_STAGING_SLOTS]vk.VkDeviceMemory = [_]vk.VkDeviceMemory{null} ** UPLOAD_STAGING_SLOTS,
+    mapped_upload_staging: [UPLOAD_STAGING_SLOTS]?[*]u8 = [_]?[*]u8{null} ** UPLOAD_STAGING_SLOTS,
+    upload_staging_slot_bytes: usize = vk_device.DEFAULT_UPLOAD_STAGING_BYTES,
+    upload_staging_flags: vk.VkMemoryPropertyFlags = 0,
+    upload_staging_slot: usize = 0,
+    next_resident_epoch: u64 = 0,
+    upload_arena_telemetry: vk_device.UploadArenaTelemetry = .{},
 
     // Batch Ring Buffers
     rotor_buffers: [FRAME_COUNT]vk.VkBuffer = [_]vk.VkBuffer{null} ** FRAME_COUNT,
@@ -1307,6 +1135,24 @@ pub const VulkanEngine = struct {
         self.general_ingest_size = 16 * 1024 * 1024; // 16MB default
         self.mapped_general_ingest = @ptrCast(@alignCast(try self.createBuffer(self.general_ingest_size, matrix_usage, self.matrix_flags, &self.general_ingest_buffer, &self.general_ingest_memory) orelse return error.VulkanError));
         @memset(std.mem.sliceAsBytes(self.mapped_general_ingest.?[0 .. self.general_ingest_size / 4]), 0);
+
+        self.upload_staging_slot_bytes = vk_device.DEFAULT_UPLOAD_STAGING_BYTES;
+        self.upload_staging_flags = vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        self.upload_arena_telemetry = .{
+            .slots = UPLOAD_STAGING_SLOTS,
+            .slot_bytes = self.upload_staging_slot_bytes,
+            .fallback_allocations = 0,
+        };
+        for (0..UPLOAD_STAGING_SLOTS) |i| {
+            const ptr = try self.createBuffer(
+                self.upload_staging_slot_bytes,
+                vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                self.upload_staging_flags,
+                &self.upload_staging_buffers[i],
+                &self.upload_staging_memories[i],
+            ) orelse return error.VulkanError;
+            self.mapped_upload_staging[i] = @ptrCast(ptr);
+        }
     }
 
     fn createComputePipeline(self: *VulkanEngine, spv: []const u8, spec_info: ?*const vk.VkSpecializationInfo) !vk.VkPipeline {
@@ -1607,6 +1453,7 @@ pub const VulkanEngine = struct {
         try check(self.vk_ctx.vkQueueSubmit.?(self.queue, 1, &submitInfo, self.fences[f]));
         try self.waitForHardwareInterruptWithTimeout(f, SHUTDOWN_FENCE_TIMEOUT_NS);
         self.frame_idx = (self.frame_idx + 1) % FRAME_COUNT;
+        resident.epoch = self.publishResidentEpoch(0);
 
         return resident;
     }
@@ -1625,12 +1472,34 @@ pub const VulkanEngine = struct {
             &resident.buffer,
             &resident.memory,
         );
+        resident.epoch = self.publishResidentEpoch(0);
         return resident;
     }
 
-    pub fn uploadResidentBufferBytes(self: *VulkanEngine, resident: *const ResidentBuffer, offset: usize, bytes: []const u8) !void {
+    fn publishResidentEpoch(self: *VulkanEngine, timeline_ticket: u64) vk_device.ResidentEpoch {
+        self.next_resident_epoch +%= 1;
+        if (self.next_resident_epoch == 0) self.next_resident_epoch = 1;
+        return .{
+            .active_epoch = self.next_resident_epoch,
+            .published_timeline_value = timeline_ticket,
+        };
+    }
+
+    fn flushUploadStagingRange(self: *VulkanEngine, slot: usize) !void {
+        if ((self.upload_staging_flags & vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0) return;
+        const flush_fn = self.vk_ctx.vkFlushMappedMemoryRanges orelse return error.VulkanError;
+        var range = std.mem.zeroes(vk.VkMappedMemoryRange);
+        range.sType = vk.VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+        range.memory = self.upload_staging_memories[slot];
+        range.offset = 0;
+        range.size = vk.VK_WHOLE_SIZE;
+        try check(flush_fn(self.dev, 1, &range));
+    }
+
+    pub fn uploadResidentBufferBytes(self: *VulkanEngine, resident: *ResidentBuffer, offset: usize, bytes: []const u8) !void {
         if (bytes.len == 0) return;
         if (resident.buffer == null or offset > resident.size_bytes or bytes.len > resident.size_bytes - offset) return error.ResidentUploadOutOfBounds;
+        if (bytes.len > self.upload_staging_slot_bytes) return error.UploadExceedsPreallocatedStagingArena;
 
         beginGpuSubmit(self);
         defer endGpuSubmit(self);
@@ -1638,19 +1507,12 @@ pub const VulkanEngine = struct {
         self.dispatch_mutex.lock();
         defer self.dispatch_mutex.unlock();
 
-        var staging_buffer: vk.VkBuffer = null;
-        var staging_memory: vk.VkDeviceMemory = null;
-        const staging_ptr = try self.createBuffer(
-            bytes.len,
-            vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            &staging_buffer,
-            &staging_memory,
-        ) orelse return error.VulkanError;
-        defer self.destroyBuffer(&staging_buffer, &staging_memory, staging_ptr);
-
-        const staging_bytes: [*]u8 = @ptrCast(staging_ptr);
+        const staging_slot = self.upload_staging_slot;
+        self.upload_staging_slot = (self.upload_staging_slot + 1) % UPLOAD_STAGING_SLOTS;
+        const staging_buffer = self.upload_staging_buffers[staging_slot];
+        const staging_bytes = self.mapped_upload_staging[staging_slot] orelse return error.VulkanError;
         @memcpy(staging_bytes[0..bytes.len], bytes);
+        try self.flushUploadStagingRange(staging_slot);
 
         const f = try self.acquireFrameSlot();
         var beginInfo = std.mem.zeroes(vk.VkCommandBufferBeginInfo);
@@ -1688,13 +1550,24 @@ pub const VulkanEngine = struct {
 
         try check(self.vk_ctx.vkEndCommandBuffer.?(self.command_buffers[f]));
 
+        self.timeline_value += 1;
+        const ticket = self.timeline_value;
+        var timeline_submit = std.mem.zeroes(vk.VkTimelineSemaphoreSubmitInfo);
+        timeline_submit.sType = vk.VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+        timeline_submit.signalSemaphoreValueCount = 1;
+        timeline_submit.pSignalSemaphoreValues = &ticket;
+
         var submitInfo = std.mem.zeroes(vk.VkSubmitInfo);
         submitInfo.sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.pNext = &timeline_submit;
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &self.command_buffers[f];
+        submitInfo.signalSemaphoreCount = 1;
+        submitInfo.pSignalSemaphores = &self.timeline_semaphore;
         try check(self.vk_ctx.vkQueueSubmit.?(self.queue, 1, &submitInfo, self.fences[f]));
         self.advanceFrameSlot();
         try self.waitForHardwareInterrupt(f);
+        resident.epoch = self.publishResidentEpoch(ticket);
     }
 
     pub fn destroyResidentBuffer(self: *const VulkanEngine, resident: *ResidentBuffer) void {
@@ -1773,6 +1646,10 @@ pub const VulkanEngine = struct {
         self.destroyBuffer(&self.diag_buffer, &self.diag_memory, self.mapped_diag);
         self.destroyBuffer(&self.lock_mask_buffer, &self.lock_mask_memory, self.mapped_lock_mask);
         self.destroyBuffer(&self.panopticon_buffer, &self.panopticon_memory, self.mapped_edges);
+        self.destroyBuffer(&self.general_ingest_buffer, &self.general_ingest_memory, self.mapped_general_ingest);
+        for (0..UPLOAD_STAGING_SLOTS) |i| {
+            self.destroyBuffer(&self.upload_staging_buffers[i], &self.upload_staging_memories[i], self.mapped_upload_staging[i]);
+        }
         self.destroyBuffer(&self.lattice_buffer, &self.lattice_memory, self.mapped_lattice);
         self.destroyBuffer(&self.tag_buffer, &self.tag_memory, self.mapped_tags);
         self.destroyBuffer(&self.matrix_buffer, &self.matrix_memory, self.mapped_matrix);

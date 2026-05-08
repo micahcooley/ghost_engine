@@ -48,9 +48,12 @@ fn mainImpl() !void {
     var source_label: ?[]const u8 = null;
     var max_file_bytes: usize = corpus_ingest.DEFAULT_MAX_FILE_BYTES;
     var max_files: usize = corpus_ingest.DEFAULT_MAX_FILES;
+    var max_files_explicit = false;
     var allow_partial = false;
     var cursor_after: ?[]const u8 = null;
     var apply_staged = false;
+    var axiom_mode = false;
+    var axiom_language = core.axioms.AxiomLanguage.unknown;
 
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--help")) {
@@ -63,6 +66,14 @@ fn mainImpl() !void {
         }
         if (std.mem.eql(u8, arg, "--allow-partial")) {
             allow_partial = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--axioms")) {
+            axiom_mode = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--axiom-language=")) {
+            axiom_language = core.axioms.parseLanguageName(arg["--axiom-language=".len..]) orelse return error.InvalidArguments;
             continue;
         }
         if (std.mem.startsWith(u8, arg, "--project-shard=")) {
@@ -85,10 +96,12 @@ fn mainImpl() !void {
         }
         if (std.mem.startsWith(u8, arg, "--max-files=")) {
             max_files = try std.fmt.parseUnsigned(usize, arg["--max-files=".len..], 10);
+            max_files_explicit = true;
             continue;
         }
         if (std.mem.startsWith(u8, arg, "--batch-size=")) {
             max_files = try std.fmt.parseUnsigned(usize, arg["--batch-size=".len..], 10);
+            max_files_explicit = true;
             continue;
         }
         if (std.mem.startsWith(u8, arg, "--cursor-after=")) {
@@ -104,7 +117,7 @@ fn mainImpl() !void {
     }
 
     if (apply_staged) {
-        if (corpus_path != null or source_label != null or trust_class != null or max_file_bytes != corpus_ingest.DEFAULT_MAX_FILE_BYTES or max_files != corpus_ingest.DEFAULT_MAX_FILES or allow_partial or cursor_after != null) {
+        if (corpus_path != null or source_label != null or trust_class != null or max_file_bytes != corpus_ingest.DEFAULT_MAX_FILE_BYTES or max_files != corpus_ingest.DEFAULT_MAX_FILES or allow_partial or cursor_after != null or axiom_mode or axiom_language != .unknown) {
             return error.InvalidArguments;
         }
         try applyStaged(allocator, project_shard);
@@ -115,6 +128,12 @@ fn mainImpl() !void {
         printUsage();
         return error.InvalidArguments;
     };
+    if (axiom_mode) {
+        project_shard = null;
+        trust_class = .core;
+        if (source_label == null) source_label = "axioms";
+        if (!max_files_explicit) max_files = corpus_ingest.DEFAULT_AXIOM_MAX_FILES;
+    }
 
     var result = try corpus_ingest.stage(allocator, .{
         .corpus_path = path,
@@ -125,17 +144,21 @@ fn mainImpl() !void {
         .max_files = max_files,
         .allow_partial = allow_partial,
         .cursor_after = cursor_after,
+        .axiom_mode = axiom_mode,
+        .axiom_language = axiom_language,
     });
     defer result.deinit();
 
     const rendered = try corpus_ingest.renderJson(allocator, &result);
     defer allocator.free(rendered);
-    sys.print("{s}\n", .{rendered});
+    const stdout = std.io.getStdOut().writer();
+    try stdout.writeAll(rendered);
+    try stdout.writeByte('\n');
 }
 
 fn printUsage() void {
     sys.print(
-        "Usage: ghost_corpus_ingest <corpus-path> [--project-shard=id] [--trust-class=exploratory|project|promoted|core] [--source-label=name] [--max-file-bytes=N] [--max-files=N|--batch-size=N] [--allow-partial] [--cursor-after=rel-path]\n       ghost_corpus_ingest --apply-staged [--project-shard=id]\n",
+        "Usage: ghost_corpus_ingest <corpus-path> [--project-shard=id] [--trust-class=exploratory|project|promoted|core] [--source-label=name] [--max-file-bytes=N] [--max-files=N|--batch-size=N] [--allow-partial] [--cursor-after=rel-path] [--axioms] [--axiom-language=cpp|zig]\n       ghost_corpus_ingest --apply-staged [--project-shard=id]\n",
         .{},
     );
 }

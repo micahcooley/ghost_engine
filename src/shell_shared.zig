@@ -340,26 +340,12 @@ pub fn jsonWeightMap(allocator: std.mem.Allocator, body: []const u8, key: []cons
 // ── Tier/stop helpers (stateless) ──
 
 pub fn tierValueFromText(flag: []const u8) u32 {
-    return if (std.mem.eql(u8, flag, "--background") or std.mem.eql(u8, flag, "background"))
-        @intFromEnum(vsa_vulkan.OperationalTier.background)
-    else if (std.mem.eql(u8, flag, "--high") or std.mem.eql(u8, flag, "high"))
-        @intFromEnum(vsa_vulkan.OperationalTier.high)
-    else if (std.mem.eql(u8, flag, "--max") or std.mem.eql(u8, flag, "max"))
-        @intFromEnum(vsa_vulkan.OperationalTier.max)
-    else if (std.mem.eql(u8, flag, "extreme"))
-        @intFromEnum(vsa_vulkan.OperationalTier.extreme)
-    else if (std.mem.eql(u8, flag, "ultra"))
-        @intFromEnum(vsa_vulkan.OperationalTier.ultra)
-    else if (std.mem.eql(u8, flag, "hyper"))
-        @intFromEnum(vsa_vulkan.OperationalTier.hyper)
-    else if (std.mem.eql(u8, flag, "god"))
-        @intFromEnum(vsa_vulkan.OperationalTier.god)
-    else
-        @intFromEnum(vsa_vulkan.OperationalTier.standard);
+    const normalized = if (std.mem.startsWith(u8, flag, "--")) flag[2..] else flag;
+    return @intFromEnum(vsa_vulkan.parseOperationalTierAlias(normalized) orelse .standard);
 }
 
 pub fn tierNameFromValue(value: u32) []const u8 {
-    return @tagName(@as(vsa_vulkan.OperationalTier, @enumFromInt(value)));
+    return vsa_vulkan.tierNameFromValue(value);
 }
 
 pub fn stopReasonName(reason: trainer.StopReason) []const u8 {

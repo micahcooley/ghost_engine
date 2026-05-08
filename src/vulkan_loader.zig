@@ -118,6 +118,7 @@ pub const VulkanCtx = struct {
     vkBindBufferMemory: vk.PFN_vkBindBufferMemory = null,
     vkMapMemory: vk.PFN_vkMapMemory = null,
     vkUnmapMemory: vk.PFN_vkUnmapMemory = null,
+    vkFlushMappedMemoryRanges: vk.PFN_vkFlushMappedMemoryRanges = null,
     vkFreeMemory: vk.PFN_vkFreeMemory = null,
     vkDestroyBuffer: vk.PFN_vkDestroyBuffer = null,
 
@@ -217,6 +218,7 @@ const required_instance_fn_names = [_][:0]const u8{
     "vkBindBufferMemory",
     "vkMapMemory",
     "vkUnmapMemory",
+    "vkFlushMappedMemoryRanges",
     "vkFreeMemory",
     "vkDestroyBuffer",
     "vkCreateDescriptorSetLayout",

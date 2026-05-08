@@ -5,6 +5,8 @@ const corpus_sketch = @import("corpus_sketch.zig");
 const external_evidence = @import("external_evidence.zig");
 const ghost_state = @import("ghost_state.zig");
 const hash_acceleration = @import("hash_acceleration.zig");
+const axioms = @import("ghost_code_intel/axioms.zig");
+const cpp_ast = @import("ghost_code_intel/cpp_ast.zig");
 const knowledge_pack_store = @import("knowledge_pack_store.zig");
 const shards = @import("shards.zig");
 const vsa = @import("vsa_core.zig");
@@ -15,6 +17,7 @@ pub const CORPUS_REL_PREFIX = "@corpus";
 pub const CONCEPT_PREFIX = "corpus_ingest__";
 pub const DEFAULT_MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
 pub const DEFAULT_MAX_FILES: usize = 512;
+pub const DEFAULT_AXIOM_MAX_FILES: usize = 8192;
 pub const DEFAULT_MAX_CONCEPT_CANDIDATES: usize = 4096;
 pub const DEFAULT_MAX_CONCEPTS: usize = 1024;
 pub const DEFAULT_INGEST_WORKERS: usize = 24;
@@ -29,6 +32,7 @@ pub const ItemClass = enum {
     specs,
     configs,
     symbolic,
+    axiom,
 };
 
 pub const DedupStatus = enum {
@@ -75,6 +79,8 @@ pub const Options = struct {
     max_concept_candidates: usize = DEFAULT_MAX_CONCEPT_CANDIDATES,
     max_concepts: usize = DEFAULT_MAX_CONCEPTS,
     merge_live: bool = false,
+    axiom_mode: bool = false,
+    axiom_language: axioms.AxiomLanguage = .unknown,
 };
 
 pub const ItemResult = struct {
@@ -120,6 +126,13 @@ pub const StageResult = struct {
     next_cursor: ?[]u8,
     capacity_telemetry: IngestCapacityTelemetry,
     items: []ItemResult,
+    axiom_mode: bool = false,
+    axioms_locked: bool = false,
+    axiom_language: ?[]u8 = null,
+    axiom_vector_count: u32 = 0,
+    l1_index_before_bytes: u64 = 0,
+    l1_index_after_bytes: u64 = 0,
+    l1_index_delta_bytes: u64 = 0,
 
     pub fn deinit(self: *StageResult) void {
         for (self.items) |*item| item.deinit();
@@ -131,6 +144,7 @@ pub const StageResult = struct {
         self.allocator.free(self.staged_manifest_path);
         self.allocator.free(self.staged_files_root);
         if (self.next_cursor) |value| self.allocator.free(value);
+        if (self.axiom_language) |value| self.allocator.free(value);
         self.* = undefined;
     }
 };
@@ -160,6 +174,10 @@ pub const CorpusMeta = struct {
     license_authority_level: u8,
     lineage_id: []u8,
     lineage_version: u32,
+    code_intel_summary: ?[]u8 = null,
+    axiom_locked: bool = false,
+    axiom_language: ?[]u8 = null,
+    axiom_rule: ?[]u8 = null,
 
     pub fn clone(self: CorpusMeta, allocator: std.mem.Allocator) !CorpusMeta {
         return .{
@@ -173,6 +191,10 @@ pub const CorpusMeta = struct {
             .license_authority_level = self.license_authority_level,
             .lineage_id = try allocator.dupe(u8, self.lineage_id),
             .lineage_version = self.lineage_version,
+            .code_intel_summary = if (self.code_intel_summary) |value| try allocator.dupe(u8, value) else null,
+            .axiom_locked = self.axiom_locked,
+            .axiom_language = if (self.axiom_language) |value| try allocator.dupe(u8, value) else null,
+            .axiom_rule = if (self.axiom_rule) |value| try allocator.dupe(u8, value) else null,
         };
     }
 
@@ -182,6 +204,9 @@ pub const CorpusMeta = struct {
         self.allocator.free(self.provenance);
         self.allocator.free(self.license_status);
         self.allocator.free(self.lineage_id);
+        if (self.code_intel_summary) |value| self.allocator.free(value);
+        if (self.axiom_language) |value| self.allocator.free(value);
+        if (self.axiom_rule) |value| self.allocator.free(value);
         self.* = undefined;
     }
 };
@@ -249,6 +274,10 @@ const SourceUnit = struct {
     lower_text: ?[]u8 = null,
     tokens: [][]u8 = &.{},
     patterns: [][]u8 = &.{},
+    code_intel_summary: ?[]u8 = null,
+    axiom_locked: bool = false,
+    axiom_language: ?[]u8 = null,
+    axiom_rule: ?[]u8 = null,
 
     fn deinit(self: *SourceUnit) void {
         self.allocator.free(self.synthetic_rel_path);
@@ -266,6 +295,9 @@ const SourceUnit = struct {
         for (self.patterns) |item| self.allocator.free(item);
         if (self.tokens.len > 0) self.allocator.free(self.tokens);
         if (self.patterns.len > 0) self.allocator.free(self.patterns);
+        if (self.code_intel_summary) |value| self.allocator.free(value);
+        if (self.axiom_language) |value| self.allocator.free(value);
+        if (self.axiom_rule) |value| self.allocator.free(value);
         self.* = undefined;
     }
 };
@@ -430,6 +462,7 @@ pub fn className(class: ItemClass) []const u8 {
         .specs => "specs",
         .configs => "configs",
         .symbolic => "symbolic",
+        .axiom => "axioms",
     };
 }
 
@@ -577,6 +610,10 @@ pub fn collectLiveScanEntries(allocator: std.mem.Allocator, paths: *const shards
                 .license_authority_level = item.license_authority_level,
                 .lineage_id = try allocator.dupe(u8, item.lineage_id),
                 .lineage_version = item.lineage_version,
+                .code_intel_summary = if (item.code_intel_summary) |value| try allocator.dupe(u8, value) else null,
+                .axiom_locked = item.axiom_locked,
+                .axiom_language = if (item.axiom_language) |value| try allocator.dupe(u8, value) else null,
+                .axiom_rule = if (item.axiom_rule) |value| try allocator.dupe(u8, value) else null,
             },
         });
     }
@@ -709,6 +746,10 @@ pub fn collectPackScanEntries(
                 .license_authority_level = item.license_authority_level,
                 .lineage_id = lineage_id,
                 .lineage_version = item.lineage_version,
+                .code_intel_summary = if (item.code_intel_summary) |value| try allocator.dupe(u8, value) else null,
+                .axiom_locked = item.axiom_locked,
+                .axiom_language = if (item.axiom_language) |value| try allocator.dupe(u8, value) else null,
+                .axiom_rule = if (item.axiom_rule) |value| try allocator.dupe(u8, value) else null,
             },
         });
     }
@@ -833,7 +874,9 @@ pub fn stage(allocator: std.mem.Allocator, options: Options) !StageResult {
     var profile_timer: ?std.time.Timer = if (ingestProfileEnabled()) try std.time.Timer.start() else null;
     var profile_last_ns: u64 = 0;
 
-    var shard_metadata = if (options.project_shard) |project_shard|
+    var shard_metadata = if (options.axiom_mode)
+        try shards.resolveCoreMetadata(allocator)
+    else if (options.project_shard) |project_shard|
         try shards.resolveProjectMetadata(allocator, project_shard)
     else
         try shards.resolveCoreMetadata(allocator);
@@ -846,6 +889,7 @@ pub fn stage(allocator: std.mem.Allocator, options: Options) !StageResult {
     const corpus_root = try std.fs.cwd().realpathAlloc(allocator, options.corpus_path);
     errdefer allocator.free(corpus_root);
     const root_kind = try pathKindAbsolute(corpus_root);
+    const axiom_language = if (options.axiom_mode) resolvedAxiomLanguage(options, corpus_root) else .unknown;
     const manifest_root = if (root_kind == .file)
         try allocator.dupe(u8, std.fs.path.dirname(corpus_root) orelse corpus_root)
     else
@@ -854,12 +898,15 @@ pub fn stage(allocator: std.mem.Allocator, options: Options) !StageResult {
 
     const source_label = if (options.source_label) |label|
         try allocator.dupe(u8, label)
+    else if (options.axiom_mode)
+        try std.fmt.allocPrint(allocator, "axioms:{s}", .{axioms.languageName(axiom_language)})
     else
         try allocator.dupe(u8, std.fs.path.basename(corpus_root));
     errdefer allocator.free(source_label);
 
-    const trust_class = options.trust_class orelse defaultTrustForKind(paths.metadata.kind);
+    const trust_class = if (options.axiom_mode) abstractions.TrustClass.core else options.trust_class orelse defaultTrustForKind(paths.metadata.kind);
     try validateTrustClass(paths.metadata.kind, trust_class);
+    const l1_before_bytes = if (options.axiom_mode) fileSizeOrZero(paths.corpus_ingest_live_manifest_abs_path) else 0;
 
     var manifest = try Manifest.init(allocator, manifest_root, source_label);
     defer manifest.deinit();
@@ -881,6 +928,8 @@ pub fn stage(allocator: std.mem.Allocator, options: Options) !StageResult {
 
     try persistStagedState(allocator, &paths, &manifest, options.max_file_bytes);
     ingestProfileMark(&profile_timer, &profile_last_ns, "persist_staged_state");
+    const staged_manifest_bytes = if (options.axiom_mode) fileSizeOrZero(paths.corpus_ingest_staged_manifest_abs_path) else 0;
+    const l1_after_bytes = if (options.axiom_mode) l1_before_bytes + staged_manifest_bytes else 0;
 
     const results = try buildStageItems(allocator, &manifest);
     ingestProfileMark(&profile_timer, &profile_last_ns, "build_stage_items");
@@ -917,12 +966,39 @@ pub fn stage(allocator: std.mem.Allocator, options: Options) !StageResult {
         .next_cursor = if (manifest.next_cursor) |value| try allocator.dupe(u8, value) else null,
         .capacity_telemetry = manifest.capacity_telemetry,
         .items = results,
+        .axiom_mode = options.axiom_mode,
+        .axioms_locked = options.axiom_mode and staged_items != 0 and trust_class == .core,
+        .axiom_language = if (options.axiom_mode) try allocator.dupe(u8, axioms.languageName(axiom_language)) else null,
+        .axiom_vector_count = if (options.axiom_mode) countAxiomUnits(&manifest) else 0,
+        .l1_index_before_bytes = l1_before_bytes,
+        .l1_index_after_bytes = l1_after_bytes,
+        .l1_index_delta_bytes = if (l1_after_bytes >= l1_before_bytes) l1_after_bytes - l1_before_bytes else 0,
     };
 }
 
 fn pathKindAbsolute(path: []const u8) !std.fs.File.Kind {
     const stat = try std.fs.cwd().statFile(path);
     return stat.kind;
+}
+
+fn resolvedAxiomLanguage(options: Options, path: []const u8) axioms.AxiomLanguage {
+    if (options.axiom_language != .unknown) return options.axiom_language;
+    const from_path = axioms.inferLanguageFromPath(path);
+    if (from_path != .unknown) return from_path;
+    return axioms.inferLanguageFromPath(options.corpus_path);
+}
+
+fn fileSizeOrZero(abs_path: []const u8) u64 {
+    const stat = std.fs.cwd().statFile(abs_path) catch return 0;
+    return stat.size;
+}
+
+fn countAxiomUnits(manifest: *const Manifest) u32 {
+    var count: u32 = 0;
+    for (manifest.items.items) |item| {
+        if (item.class == .axiom and item.dedup == .unique) count += 1;
+    }
+    return count;
 }
 
 fn ingestProfileEnabled() bool {
@@ -958,6 +1034,24 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const StageResult) ![]u
     try writeOptionalStringField(writer, "corpusRoot", result.corpus_root);
     try writeOptionalStringField(writer, "sourceLabel", result.source_label);
     try writeOptionalStringField(writer, "trustClass", abstractions.trustClassName(result.trust_class));
+    if (result.axiom_mode) {
+        try writer.writeAll(",\"axioms\":{");
+        try writeJsonFieldString(writer, "status", if (result.axioms_locked) "Axioms Locked" else "Axioms Pending", true);
+        try writeJsonFieldString(writer, "mode", "technical_axiom_matrix", false);
+        try writeJsonFieldString(writer, "authorityTier", axioms.AXIOM_TIER_LABEL, false);
+        try writer.print(",\"authorityLevel\":{d},\"locked\":{s}", .{
+            axioms.AXIOM_AUTHORITY_LEVEL,
+            if (result.axioms_locked) "true" else "false",
+        });
+        if (result.axiom_language) |language| try writeOptionalStringField(writer, "language", language);
+        try writer.print(",\"axiomVectorCount\":{d},\"l1ConceptIndexFootprintBeforeBytes\":{d},\"l1ConceptIndexFootprintAfterBytes\":{d},\"l1ConceptIndexFootprintDeltaBytes\":{d}", .{
+            result.axiom_vector_count,
+            result.l1_index_before_bytes,
+            result.l1_index_after_bytes,
+            result.l1_index_delta_bytes,
+        });
+        try writer.writeAll("}");
+    }
     try writeOptionalStringField(writer, "stagedManifest", result.staged_manifest_path);
     try writeOptionalStringField(writer, "stagedFilesRoot", result.staged_files_root);
     try writer.print(",\"scannedFiles\":{d}", .{result.scanned_files});
@@ -1457,13 +1551,17 @@ fn parseOneFileForIngest(
         } };
     }
 
-    const class = classifyInput(rel_path, root_hint, bytes) orelse {
-        return .{ .rejection = .{
-            .allocator = allocator,
-            .source_rel_path = try allocator.dupe(u8, rel_path),
-            .reason = .unsupported_extension,
-        } };
-    };
+    const axiom_language = resolvedAxiomLanguage(options, rel_path);
+    const class = if (options.axiom_mode and axioms.isAxiomCandidatePath(rel_path, axiom_language))
+        ItemClass.axiom
+    else
+        classifyInput(rel_path, root_hint, bytes) orelse {
+            return .{ .rejection = .{
+                .allocator = allocator,
+                .source_rel_path = try allocator.dupe(u8, rel_path),
+                .reason = .unsupported_extension,
+            } };
+        };
 
     _ = validateRuneBlocks(bytes) catch |err| switch (err) {
         error.InvalidUtf8 => return .{ .rejection = .{
@@ -1483,7 +1581,7 @@ fn parseOneFileForIngest(
     const patterns = try extractOwnedRuneGroups(allocator, lower_text, MAX_PATTERN_COUNT);
     errdefer freeOwnedStringSlice(allocator, patterns);
 
-    if (class != .code and tokens.len < 2 and patterns.len == 0) {
+    if (class != .code and class != .axiom and tokens.len < 2 and patterns.len == 0) {
         allocator.free(lower_text);
         freeOwnedStringSlice(allocator, tokens);
         freeOwnedStringSlice(allocator, patterns);
@@ -1499,9 +1597,39 @@ fn parseOneFileForIngest(
     defer allocator.free(normalized_bytes);
     const normalized_hash = std.hash.Fnv1a_64.hash(normalized_bytes);
     _ = acceleration;
-    const index_text = lower_text[0..@min(lower_text.len, MAX_FILE_READ_INDEX_BYTES)];
+    var code_intel_summary: ?[]u8 = null;
+    errdefer if (code_intel_summary) |value| allocator.free(value);
+    var axiom_rule: ?[]u8 = null;
+    errdefer if (axiom_rule) |value| allocator.free(value);
+    if (class == .axiom) {
+        axiom_rule = try allocator.dupe(u8, axioms.ruleForPath(axiom_language, rel_path));
+        code_intel_summary = try std.fmt.allocPrint(
+            allocator,
+            "axiom_vector|tier={s}|authority_level={d}|locked=true|language={s}|rule={s}",
+            .{ axioms.AXIOM_TIER_LABEL, axioms.AXIOM_AUTHORITY_LEVEL, axioms.languageName(axiom_language), axiom_rule.? },
+        );
+    } else if (try cpp_ast.extract(allocator, manifestRootForCodeIntel(options.corpus_path), rel_path, index_bytes)) |summary| {
+        code_intel_summary = summary.text;
+    }
+    const code_intel_lower = if (code_intel_summary) |summary_text| try asciiLowerDup(allocator, summary_text) else null;
+    defer if (code_intel_lower) |value| allocator.free(value);
+    const merged_index_text = if (code_intel_lower) |summary_lower|
+        try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ lower_text[0..@min(lower_text.len, MAX_FILE_READ_INDEX_BYTES)], summary_lower })
+    else
+        null;
+    defer if (merged_index_text) |value| allocator.free(value);
+    const index_text = if (merged_index_text) |value| value[0..@min(value.len, MAX_FILE_READ_INDEX_BYTES)] else lower_text[0..@min(lower_text.len, MAX_FILE_READ_INDEX_BYTES)];
     const search_sketch = try corpus_sketch.simHash64(allocator, index_text);
-    const spo_vector = vsa_vulkan.extractSpoVector(index_text);
+    const frame_vector = if (class == .axiom)
+        vsa_vulkan.SemanticFrameVector{
+            .forward_hash = raw_hash,
+            .inverse_hash = normalized_hash,
+            .valid = raw_hash != 0,
+        }
+    else if (code_intel_summary == null)
+        vsa_vulkan.extractFrameVector(index_text)
+    else
+        vsa_vulkan.SemanticFrameVector{};
     const synthetic_rel_path = try std.fs.path.join(allocator, &.{ CORPUS_REL_PREFIX, className(class), rel_path });
     errdefer allocator.free(synthetic_rel_path);
     const storage_rel_path = try std.fs.path.join(allocator, &.{ config.CORPUS_INGEST_FILES_DIR_NAME, className(class), rel_path });
@@ -1523,8 +1651,8 @@ fn parseOneFileForIngest(
         .class = class,
         .trust_class = trust_class,
         .source_label = try allocator.dupe(u8, source_label),
-        .license_status = try allocator.dupe(u8, license_status),
-        .license_authority_level = license_authority_level,
+        .license_status = try allocator.dupe(u8, if (class == .axiom) "axiom-locked" else license_status),
+        .license_authority_level = if (class == .axiom) axioms.AXIOM_AUTHORITY_LEVEL else license_authority_level,
         .source_mtime_ns = stat.mtime,
         .size_bytes = stat.size,
         .raw_hash = raw_hash,
@@ -1532,17 +1660,27 @@ fn parseOneFileForIngest(
         .semantic_hash = 0,
         .search_sketch_hash = search_sketch.hash,
         .search_sketch_features = search_sketch.feature_count,
-        .spo_forward_hash = spo_vector.forward_hash,
-        .spo_inverse_hash = spo_vector.inverse_hash,
+        .spo_forward_hash = frame_vector.forward_hash,
+        .spo_inverse_hash = frame_vector.inverse_hash,
         .lineage_id = lineage_id,
         .provenance = provenance,
         .lower_text = lower_text,
         .tokens = tokens,
         .patterns = patterns,
+        .code_intel_summary = code_intel_summary,
+        .axiom_locked = class == .axiom,
+        .axiom_language = if (class == .axiom) try allocator.dupe(u8, axioms.languageName(axiom_language)) else null,
+        .axiom_rule = axiom_rule,
     };
+    code_intel_summary = null;
+    axiom_rule = null;
     errdefer unit.deinit();
 
     return .{ .unit = unit };
+}
+
+fn manifestRootForCodeIntel(corpus_path: []const u8) []const u8 {
+    return corpus_path;
 }
 
 fn appendScannedUnit(manifest: *Manifest, unit: *SourceUnit) !void {
@@ -1575,6 +1713,8 @@ fn buildConceptSpecs(
     max_candidates: usize,
     max_concepts: usize,
 ) !void {
+    try buildAxiomConceptSpecs(manifest, owner_kind, owner_id, max_concepts);
+
     var targets = std.ArrayList(ConceptTarget).init(manifest.allocator);
     defer targets.deinit();
     for (manifest.items.items, 0..) |target, target_index| {
@@ -1587,7 +1727,7 @@ fn buildConceptSpecs(
     }
 
     for (manifest.items.items, 0..) |*source, source_index| {
-        if (source.class == .code or source.dedup != .unique or source.lower_text == null) continue;
+        if (source.class == .code or source.class == .axiom or source.dedup != .unique or source.lower_text == null) continue;
         const full_source_text = source.lower_text.?;
         const source_text = full_source_text[0..@min(full_source_text.len, DEFAULT_MAX_CONCEPT_SOURCE_BYTES)];
         for (targets.items) |target_info| {
@@ -1668,6 +1808,71 @@ fn buildConceptSpecs(
         }
     }
     manifest.capacity_telemetry.concepts_emitted = manifest.concepts.items.len;
+}
+
+fn buildAxiomConceptSpecs(
+    manifest: *Manifest,
+    owner_kind: shards.Kind,
+    owner_id: []const u8,
+    max_concepts: usize,
+) !void {
+    for (manifest.items.items) |source| {
+        if (source.class != .axiom or source.dedup != .unique) continue;
+        if (manifest.concepts.items.len >= max_concepts) {
+            manifest.capacity_telemetry.concept_emit_cap_hit = true;
+            manifest.capacity_telemetry.budget_hits += 1;
+            return;
+        }
+
+        var source_specs = std.ArrayList([]u8).init(manifest.allocator);
+        errdefer {
+            for (source_specs.items) |item| manifest.allocator.free(item);
+            source_specs.deinit();
+        }
+        try source_specs.append(try std.fmt.allocPrint(manifest.allocator, "axiom:{s}", .{source.synthetic_rel_path}));
+
+        var provenance = std.ArrayList([]u8).init(manifest.allocator);
+        errdefer {
+            for (provenance.items) |item| manifest.allocator.free(item);
+            provenance.deinit();
+        }
+        try provenance.append(try manifest.allocator.dupe(u8, source.provenance));
+        try provenance.append(try std.fmt.allocPrint(
+            manifest.allocator,
+            "axiom_vector|tier={s}|authority_level={d}|locked=true|lineage={s}@{d}",
+            .{ axioms.AXIOM_TIER_LABEL, axioms.AXIOM_AUTHORITY_LEVEL, source.lineage_id, source.lineage_version },
+        ));
+
+        const concept_id = try std.fmt.allocPrint(
+            manifest.allocator,
+            "{s}axiom__{s}__{x}",
+            .{ CONCEPT_PREFIX, conceptStem(source.source_rel_path), source.raw_hash },
+        );
+        errdefer manifest.allocator.free(concept_id);
+        const lineage_id = try std.fmt.allocPrint(manifest.allocator, "{s}:{s}:{s}", .{ @tagName(owner_kind), owner_id, concept_id });
+        errdefer manifest.allocator.free(lineage_id);
+
+        try manifest.concepts.append(.{
+            .allocator = manifest.allocator,
+            .concept_id = concept_id,
+            .tier = .contract,
+            .category = .invariant,
+            .trust_class = .core,
+            .lineage_id = lineage_id,
+            .lineage_version = 1,
+            .source_specs = try source_specs.toOwnedSlice(),
+            .tokens = try cloneStringSlice(manifest.allocator, source.tokens),
+            .patterns = if (source.axiom_rule) |rule| try buildConceptPatterns(manifest.allocator, source.patterns, rule) else try cloneStringSlice(manifest.allocator, source.patterns),
+            .provenance = try provenance.toOwnedSlice(),
+            .consensus_hash = conceptConsensusHash(concept_id, source.tokens, source.patterns, source.synthetic_rel_path),
+            .quality_score = 1000,
+            .confidence_score = 1000,
+            .reuse_score = 1000,
+            .support_score = 1000,
+            .promotion_ready = true,
+        });
+        manifest.capacity_telemetry.concepts_emitted = manifest.concepts.items.len;
+    }
 }
 
 fn persistStagedState(allocator: std.mem.Allocator, paths: *const shards.Paths, manifest: *Manifest, max_file_bytes: usize) !void {
@@ -1829,6 +2034,7 @@ fn conceptTierForClass(class: ItemClass) abstractions.Tier {
         .configs => .logic,
         .symbolic => .logic,
         .code => .logic,
+        .axiom => .contract,
     };
 }
 
@@ -1839,6 +2045,7 @@ fn conceptCategoryForClass(class: ItemClass) abstractions.Category {
         .configs => .state,
         .symbolic => .procedural,
         .code => .relational,
+        .axiom => .invariant,
     };
 }
 
@@ -2143,6 +2350,10 @@ fn cloneSourceUnit(allocator: std.mem.Allocator, item: SourceUnit) !SourceUnit {
         .lower_text = if (item.lower_text) |value| try allocator.dupe(u8, value) else null,
         .tokens = try cloneStringSlice(allocator, item.tokens),
         .patterns = try cloneStringSlice(allocator, item.patterns),
+        .code_intel_summary = if (item.code_intel_summary) |value| try allocator.dupe(u8, value) else null,
+        .axiom_locked = item.axiom_locked,
+        .axiom_language = if (item.axiom_language) |value| try allocator.dupe(u8, value) else null,
+        .axiom_rule = if (item.axiom_rule) |value| try allocator.dupe(u8, value) else null,
     };
 }
 
@@ -2300,6 +2511,13 @@ fn serializeManifest(allocator: std.mem.Allocator, manifest: *Manifest) ![]u8 {
             item.spo_forward_hash,
             item.spo_inverse_hash,
         });
+        if (item.code_intel_summary) |summary| try writeOptionalStringField(writer, "codeIntelSummary", summary);
+        if (item.axiom_locked) {
+            try writer.writeAll(",\"axiomLocked\":true");
+            try writeOptionalStringField(writer, "axiomAuthorityTier", axioms.AXIOM_TIER_LABEL);
+            if (item.axiom_language) |value| try writeOptionalStringField(writer, "axiomLanguage", value);
+            if (item.axiom_rule) |value| try writeOptionalStringField(writer, "axiomRule", value);
+        }
         try writeOptionalStringField(writer, "dedup", dedupName(item.dedup));
         if (item.canonical_rel_path) |value| try writeOptionalStringField(writer, "canonicalRelPath", value);
         try writeOptionalStringField(writer, "lineageId", item.lineage_id);
@@ -2373,6 +2591,10 @@ fn loadManifestFromPath(allocator: std.mem.Allocator, abs_path: []const u8) !str
         searchSketchFeatures: ?usize = null,
         spoForwardHash: ?u64 = null,
         spoInverseHash: ?u64 = null,
+        codeIntelSummary: ?[]const u8 = null,
+        axiomLocked: bool = false,
+        axiomLanguage: ?[]const u8 = null,
+        axiomRule: ?[]const u8 = null,
         dedup: []const u8,
         canonicalRelPath: ?[]const u8 = null,
         lineageId: []const u8,
@@ -2470,6 +2692,10 @@ fn loadManifestFromPath(allocator: std.mem.Allocator, abs_path: []const u8) !str
             .search_sketch_features = item.searchSketchFeatures orelse 0,
             .spo_forward_hash = item.spoForwardHash orelse 0,
             .spo_inverse_hash = item.spoInverseHash orelse 0,
+            .code_intel_summary = if (item.codeIntelSummary) |value| try allocator.dupe(u8, value) else null,
+            .axiom_locked = item.axiomLocked,
+            .axiom_language = if (item.axiomLanguage) |value| try allocator.dupe(u8, value) else null,
+            .axiom_rule = if (item.axiomRule) |value| try allocator.dupe(u8, value) else null,
             .dedup = parseDedup(item.dedup) orelse return error.InvalidCorpusManifest,
             .canonical_rel_path = if (item.canonicalRelPath) |value| try allocator.dupe(u8, value) else null,
             .lineage_id = try allocator.dupe(u8, item.lineageId),
@@ -2521,6 +2747,7 @@ fn parseClass(text: []const u8) ?ItemClass {
     if (std.mem.eql(u8, text, "specs")) return .specs;
     if (std.mem.eql(u8, text, "configs")) return .configs;
     if (std.mem.eql(u8, text, "symbolic")) return .symbolic;
+    if (std.mem.eql(u8, text, "axioms") or std.mem.eql(u8, text, "axiom")) return .axiom;
     return null;
 }
 

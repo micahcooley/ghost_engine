@@ -1,11 +1,15 @@
 const std = @import("std");
 const ghost_core = @import("ghost_core");
 const abstractions = ghost_core.abstractions;
+const code_intel = ghost_core.code_intel;
 const corpus_ingest = ghost_core.corpus_ingest;
 const corpus_sketch = ghost_core.corpus_sketch;
+const cpp_ast = ghost_core.cpp_ast;
 const gip = ghost_core.gip;
 const intent_grounding = ghost_core.intent_grounding;
 const shards = ghost_core.shards;
+const task_intent = ghost_core.task_intent;
+const technical_drafts = ghost_core.technical_drafts;
 const text_generation_lab = ghost_core.text_generation_lab;
 const vsa_vulkan = ghost_core.vsa_vulkan;
 
@@ -580,7 +584,9 @@ fn vaultDirPath(allocator: std.mem.Allocator) ![]u8 {
 
 fn isWatchableVaultFile(name: []const u8) bool {
     const ext = std.fs.path.extension(name);
-    return std.ascii.eqlIgnoreCase(ext, ".md") or std.ascii.eqlIgnoreCase(ext, ".zig");
+    return std.ascii.eqlIgnoreCase(ext, ".md") or
+        std.ascii.eqlIgnoreCase(ext, ".zig") or
+        cpp_ast.isCppPath(name);
 }
 
 fn vaultFileIsStable(abs_path: []const u8) bool {
@@ -609,12 +615,20 @@ fn buildVaultLiveShard(
     if (read_len == 0) return error.EmptyLiveVaultFile;
     if (std.mem.indexOfScalar(u8, raw[0..read_len], 0) != null) return error.LiveVaultContainsNul;
 
-    const text = try allocator.dupe(u8, raw[0..read_len]);
+    var text = try allocator.dupe(u8, raw[0..read_len]);
     errdefer allocator.free(text);
+    var code_intel_summary: ?[]u8 = null;
+    errdefer if (code_intel_summary) |value| allocator.free(value);
+    if (try cpp_ast.extract(allocator, std.fs.path.dirname(abs_path) orelse ".", name, text)) |summary| {
+        code_intel_summary = summary.text;
+        const merged = try std.fmt.allocPrint(allocator, "{s}\n\nGhost Code Intel Symbol Graph:\n{s}\n", .{ text, summary.text });
+        allocator.free(text);
+        text = merged;
+    }
     const lower_text = try lowerCopy(allocator, text);
     errdefer allocator.free(lower_text);
     const search_sketch = try corpus_sketch.simHash64(allocator, lower_text);
-    const spo = vsa_vulkan.extractSpoVector(lower_text);
+    const frame = vsa_vulkan.extractFrameVector(lower_text);
     const semantic_hash = std.hash.Fnv1a_64.hash(lower_text);
 
     var entry = corpus_ingest.IndexedEntry{
@@ -626,11 +640,11 @@ fn buildVaultLiveShard(
         .semantic_hash = semantic_hash,
         .search_sketch_hash = search_sketch.hash,
         .search_sketch_features = search_sketch.feature_count,
-        .spo_forward_hash = spo.forward_hash,
-        .spo_inverse_hash = spo.inverse_hash,
+        .spo_forward_hash = frame.forward_hash,
+        .spo_inverse_hash = frame.inverse_hash,
         .corpus_meta = .{
             .allocator = allocator,
-            .class = if (std.ascii.eqlIgnoreCase(std.fs.path.extension(name), ".zig")) .code else .docs,
+            .class = if (std.ascii.eqlIgnoreCase(std.fs.path.extension(name), ".zig") or cpp_ast.isCppPath(name)) .code else .docs,
             .source_rel_path = try allocator.dupe(u8, name),
             .source_label = try allocator.dupe(u8, "live_vault"),
             .provenance = try std.fmt.allocPrint(allocator, "source=live_vault|path={s}|mtime_ns={d}", .{ abs_path, stat.mtime }),
@@ -639,8 +653,10 @@ fn buildVaultLiveShard(
             .license_authority_level = 2,
             .lineage_id = try std.fmt.allocPrint(allocator, "live_vault:{s}:{x}", .{ name, semantic_hash }),
             .lineage_version = 1,
+            .code_intel_summary = code_intel_summary,
         },
     };
+    code_intel_summary = null;
     var entry_owned = true;
     errdefer if (entry_owned) entry.deinit();
 
@@ -737,7 +753,11 @@ fn loadShardImage(allocator: std.mem.Allocator, entries: []const corpus_ingest.I
             lengths[idx] = try appendL1ConceptIndexRecord(&image, entry, lower_texts[idx]);
             continue;
         };
-        texts[idx] = try allocator.dupe(u8, raw[0..read_len]);
+        if (entry.corpus_meta.code_intel_summary) |summary| {
+            texts[idx] = try std.fmt.allocPrint(allocator, "{s}\n\nGhost Code Intel Symbol Graph:\n{s}\n", .{ raw[0..read_len], summary });
+        } else {
+            texts[idx] = try allocator.dupe(u8, raw[0..read_len]);
+        }
         lower_texts[idx] = try lowerCopy(allocator, texts[idx]);
         lengths[idx] = try appendL1ConceptIndexRecord(&image, entry, lower_texts[idx]);
     }
@@ -762,6 +782,9 @@ fn appendL1ConceptIndexRecord(out: *std.ArrayList(u8), entry: corpus_ingest.Inde
         if (emitted != 0) try out.append(',');
         try out.appendSlice(term[0..@min(term.len, 24)]);
         emitted += 1;
+    }
+    if (entry.corpus_meta.code_intel_summary) |summary| {
+        try writer.print("\ncode_intel_summary={s}", .{summary});
     }
     try out.append('\n');
     return out.items.len - start;
@@ -846,6 +869,11 @@ fn dispatchResidentCorpusAsk(allocator: std.mem.Allocator, resident: *ResidentSt
     const previous_output = if (imperative.references_previous_output) try resident.session_hot.extractLastEngineOutput(allocator) else try allocator.dupe(u8, "");
     defer allocator.free(previous_output);
     try resident.session_hot.appendTurn(resident.vulkan, "user", question);
+    if (try dispatchStrictVerificationAsk(allocator, resident, obj, question, request_shard_id)) |strict| return strict;
+    if (try text_generation_lab.generateFrameInferenceDraft(allocator, question)) |draft| {
+        defer draft.deinit(allocator);
+        return try renderFrameInferenceResult(allocator, resident, obj, question, request_shard_id, draft.draft_text);
+    }
     if (try text_generation_lab.generateRelationalContrastDraft(allocator, question)) |draft_text| {
         defer allocator.free(draft_text);
         return try renderRelationalReasoningResult(allocator, resident, obj, question, request_shard_id, draft_text);
@@ -878,7 +906,7 @@ fn dispatchResidentCorpusAsk(allocator: std.mem.Allocator, resident: *ResidentSt
         chooseScoringTerms(terms, context_target);
     const query_hash = try corpus_sketch.simHash64Query(allocator, effective_target);
     const bias_hash = if (context_target.len != 0) try corpus_sketch.simHash64Query(allocator, context_target) else corpus_sketch.Sketch{ .hash = 0, .feature_count = 0 };
-    const relation_query = vsa_vulkan.extractSpoVector(effective_target);
+    const relation_query = vsa_vulkan.extractFrameVector(effective_target);
 
     resident.shards_mutex.lock();
     defer resident.shards_mutex.unlock();
@@ -1058,7 +1086,7 @@ fn hotPageCandidate(
     const lower_page = try lowerCopy(allocator, page);
     defer allocator.free(lower_page);
     const page_relation = blk: {
-        const extracted = vsa_vulkan.extractSpoVector(lower_page);
+        const extracted = vsa_vulkan.extractFrameVector(lower_page);
         if (extracted.valid) break :blk extracted;
         break :blk vsa_vulkan.SpoVector{
             .forward_hash = entry.spo_forward_hash,
@@ -1118,6 +1146,188 @@ fn hotCandidateDistance(entry: corpus_ingest.IndexedEntry, query_hash: corpus_sk
         distance = @min(distance, vsa_vulkan.ghostIndexDistance(query_hash.hash, entry.semantic_hash));
     }
     return distance;
+}
+
+fn dispatchStrictVerificationAsk(
+    allocator: std.mem.Allocator,
+    resident: *ResidentState,
+    obj: std.json.ObjectMap,
+    question: []const u8,
+    shard_id: []const u8,
+) !?[]u8 {
+    if (intent_grounding.routeGeneralistIntent(question) != .strict_verification) return null;
+
+    const workspace = jsonStringField(obj, "workspace") orelse {
+        return try renderStrictVerificationUnresolvedResponse(allocator, resident, obj, question, shard_id, "workspace root missing from daemon ask request", "", "");
+    };
+
+    var intent = try task_intent.parse(allocator, question, .{});
+    defer intent.deinit();
+    if (intent.status != .grounded or intent.dispatch.flow != .code_intel or intent.target.spec == null) {
+        return try renderStrictVerificationUnresolvedResponse(
+            allocator,
+            resident,
+            obj,
+            question,
+            shard_id,
+            intent.unresolved_detail orelse "strict verification target was not grounded",
+            workspace,
+            "",
+        );
+    }
+
+    var result = code_intel.run(allocator, .{
+        .repo_root = workspace,
+        .project_shard = jsonStringField(obj, "projectShard") orelse jsonStringField(obj, "project_shard"),
+        .reasoning_mode = intent.dispatch.reasoning_mode,
+        .query_kind = translateCodeIntelQueryKind(intent.dispatch.query_kind.?),
+        .target = intent.target.spec.?,
+        .other_target = if (intent.other_target.spec) |spec| spec else null,
+        .intent = &intent,
+        .max_items = 8,
+        .persist = true,
+    }) catch |err| {
+        return try renderStrictVerificationUnresolvedResponse(
+            allocator,
+            resident,
+            obj,
+            question,
+            shard_id,
+            @errorName(err),
+            workspace,
+            intent.target.spec.?,
+        );
+    };
+    defer result.deinit();
+
+    const draft_text = try technical_drafts.render(allocator, .{ .code_intel = &result }, .{
+        .draft_type = .proof_backed_explanation,
+        .max_items = 8,
+    });
+    defer allocator.free(draft_text);
+
+    const supported = result.status == .supported and result.stop_reason == .none;
+    try resident.session_hot.appendTurn(resident.vulkan, "engine", draft_text);
+    const result_json = try renderStrictVerificationCorpusResult(
+        allocator,
+        question,
+        shard_id,
+        draft_text,
+        workspace,
+        result.query_target,
+        supported,
+        resident,
+    );
+    defer allocator.free(result_json);
+
+    return try gip.schema.renderResponse(
+        allocator,
+        gip.core.PROTOCOL_VERSION,
+        jsonStringField(obj, "requestId"),
+        gip.core.parseRequestKind("corpus.ask"),
+        if (supported) .ok else .unresolved,
+        strictVerificationState(supported, if (supported) null else result.unresolved_detail orelse "code_intel_unresolved"),
+        result_json,
+        null,
+        null,
+    );
+}
+
+fn translateCodeIntelQueryKind(kind: task_intent.QueryKind) code_intel.QueryKind {
+    return switch (kind) {
+        .impact => .impact,
+        .breaks_if => .breaks_if,
+        .contradicts => .contradicts,
+    };
+}
+
+fn renderStrictVerificationUnresolvedResponse(
+    allocator: std.mem.Allocator,
+    resident: *ResidentState,
+    obj: std.json.ObjectMap,
+    question: []const u8,
+    shard_id: []const u8,
+    reason: []const u8,
+    workspace: []const u8,
+    target: []const u8,
+) ![]u8 {
+    const draft_text = try std.fmt.allocPrint(allocator, "Strict verification routing matched this as code or C++ work, but verification is unresolved: {s}.", .{reason});
+    defer allocator.free(draft_text);
+    try resident.session_hot.appendTurn(resident.vulkan, "engine", draft_text);
+    const result_json = try renderStrictVerificationCorpusResult(allocator, question, shard_id, draft_text, workspace, target, false, resident);
+    defer allocator.free(result_json);
+    return try gip.schema.renderResponse(
+        allocator,
+        gip.core.PROTOCOL_VERSION,
+        jsonStringField(obj, "requestId"),
+        gip.core.parseRequestKind("corpus.ask"),
+        .unresolved,
+        strictVerificationState(false, reason),
+        result_json,
+        null,
+        null,
+    );
+}
+
+fn strictVerificationState(supported: bool, reason: ?[]const u8) gip.schema.ResultState {
+    if (!supported) return gip.schema.unresolvedResultState(reason);
+    return .{
+        .state = .verified,
+        .permission = .supported,
+        .is_draft = false,
+        .verification_state = .verified,
+        .support_minimum_met = true,
+        .stop_reason = .supported,
+        .non_authorization_notice = null,
+    };
+}
+
+fn renderStrictVerificationCorpusResult(
+    allocator: std.mem.Allocator,
+    question: []const u8,
+    shard_id: []const u8,
+    draft_text: []const u8,
+    workspace: []const u8,
+    target: []const u8,
+    supported: bool,
+    resident: *ResidentState,
+) ![]u8 {
+    const telemetry = resident.snapshotTelemetry();
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"corpusAsk\":{\"status\":");
+    try std.json.stringify(if (supported) "supported" else "unresolved", .{}, w);
+    try w.writeAll(",\"state\":");
+    try std.json.stringify(if (supported) "verified" else "unresolved", .{}, w);
+    try w.writeAll(",\"permission\":");
+    try std.json.stringify(if (supported) "supported" else "unresolved", .{}, w);
+    try w.writeAll(",\"nonAuthorizing\":");
+    try w.writeAll(if (supported) "false" else "true");
+    try w.writeAll(",\"voiceSynthesis\":true,\"strictVerification\":true,\"question\":");
+    try std.json.stringify(question, .{}, w);
+    try w.writeAll(",\"shard\":{\"kind\":\"project\",\"id\":");
+    try std.json.stringify(shard_id, .{}, w);
+    try w.writeAll("},\"answerDraft\":");
+    try std.json.stringify(draft_text, .{}, w);
+    try w.writeAll(",\"evidenceUsed\":[],\"unknowns\":");
+    if (supported) {
+        try w.writeAll("[]");
+    } else {
+        try w.writeAll("[{\"kind\":\"strict_verification_unresolved\",\"reason\":\"code_intel did not reach supported\"}]");
+    }
+    try w.writeAll(",\"candidateFollowups\":[],\"learningCandidates\":[],\"trace\":{\"corpusMutation\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"commandsExecuted\":false,\"verifiersExecuted\":true,\"generalistRoute\":\"strict_verification\",\"workspace\":");
+    try std.json.stringify(workspace, .{}, w);
+    try w.writeAll(",\"target\":");
+    try std.json.stringify(target, .{}, w);
+    try w.print(",\"residentDaemon\":true,\"residentShards\":{d},\"vramResidentBytes\":{d},\"sessionHotBytes\":{d},\"vulkanActive\":{s}", .{
+        telemetry.loaded_shards,
+        telemetry.vram_resident_bytes,
+        resident.session_hot.usedBytes(),
+        if (resident.vulkan_active) "true" else "false",
+    });
+    try w.writeAll("}}}");
+    return out.toOwnedSlice();
 }
 
 fn renderImperativeExecutionResult(
@@ -1293,6 +1503,33 @@ fn renderSocialResponseResult(
     );
 }
 
+fn renderFrameInferenceResult(
+    allocator: std.mem.Allocator,
+    resident: *ResidentState,
+    obj: std.json.ObjectMap,
+    question: []const u8,
+    shard_id: []const u8,
+    draft_text: []const u8,
+) ![]u8 {
+    try resident.session_hot.appendTurn(resident.vulkan, "engine", draft_text);
+    const result_json = try renderFrameInferenceCorpusResult(allocator, question, shard_id, draft_text, resident);
+    defer allocator.free(result_json);
+
+    var state = gip.schema.draftResultState();
+    state.non_authorization_notice = "frame inference output is draft/non-authorizing; no verifier was executed";
+    return try gip.schema.renderResponse(
+        allocator,
+        gip.core.PROTOCOL_VERSION,
+        jsonStringField(obj, "requestId"),
+        gip.core.parseRequestKind("corpus.ask"),
+        .ok,
+        state,
+        result_json,
+        null,
+        null,
+    );
+}
+
 fn renderRelationalReasoningResult(
     allocator: std.mem.Allocator,
     resident: *ResidentState,
@@ -1339,6 +1576,38 @@ fn renderSocialCorpusResult(
     try std.json.stringify(draft_text, .{}, w);
     try w.writeAll(",\"evidenceUsed\":[],\"unknowns\":[],\"candidateFollowups\":[],\"learningCandidates\":[],\"trace\":{\"corpusMutation\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false,\"residentGpuScan\":false,\"socialResponse\":true,\"corpusEntriesConsidered\":0,\"residentDaemon\":true,\"residentShards\":");
     try w.print("{d}", .{telemetry.loaded_shards});
+    try w.writeAll("}}}");
+    return out.toOwnedSlice();
+}
+
+fn renderFrameInferenceCorpusResult(
+    allocator: std.mem.Allocator,
+    question: []const u8,
+    shard_id: []const u8,
+    draft_text: []const u8,
+    resident: *ResidentState,
+) ![]u8 {
+    const telemetry = resident.snapshotTelemetry();
+    const frame = vsa_vulkan.extractFrameVector(question);
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"corpusAsk\":{\"status\":\"answered\",\"state\":\"answer\",\"permission\":\"none\",\"nonAuthorizing\":true,\"voiceSynthesis\":true,\"frameInference\":true,\"question\":");
+    try std.json.stringify(question, .{}, w);
+    try w.writeAll(",\"shard\":{\"kind\":\"project\",\"id\":");
+    try std.json.stringify(shard_id, .{}, w);
+    try w.writeAll("},\"answerDraft\":");
+    try std.json.stringify(draft_text, .{}, w);
+    try w.writeAll(",\"evidenceUsed\":[],\"unknowns\":[],\"candidateFollowups\":[{\"kind\":\"verifier_check_candidate\",\"detail\":\"verify the frame inference before treating this answer as supported\",\"executes\":false}],\"learningCandidates\":[],\"trace\":{\"corpusMutation\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false,\"residentGpuScan\":false,\"generalistRoute\":\"general_chat\",\"semanticFrameMatrix\":true,\"frameKind\":");
+    try std.json.stringify(@tagName(frame.frame_kind), .{}, w);
+    try w.print(",\"frameValid\":{s},\"frameForwardHash\":{d},\"corpusEntriesConsidered\":0,\"residentDaemon\":true,\"residentShards\":{d},\"vramResidentBytes\":{d},\"sessionHotBytes\":{d},\"vulkanActive\":{s}", .{
+        if (frame.valid) "true" else "false",
+        frame.forward_hash,
+        telemetry.loaded_shards,
+        telemetry.vram_resident_bytes,
+        resident.session_hot.usedBytes(),
+        if (resident.vulkan_active) "true" else "false",
+    });
     try w.writeAll("}}}");
     return out.toOwnedSlice();
 }
@@ -1617,6 +1886,11 @@ fn renderHotCorpusResult(
 fn writeHotAnswer(writer: anytype, question: []const u8, shard: *const ResidentShard, terms: []const []const u8, candidates: []const HotCandidate) !void {
     var answer = std.ArrayList(u8).init(std.heap.page_allocator);
     defer answer.deinit();
+    if (try codeIntelInheritanceDraft(std.heap.page_allocator, question, shard, candidates)) |draft_text| {
+        defer std.heap.page_allocator.free(draft_text);
+        try std.json.stringify(draft_text, .{}, writer);
+        return;
+    }
     if (isComputerDefinitionQuestion(question) and (termsContain(terms, "computer") or termsContain(terms, "computers"))) {
         try answer.appendSlice("A computer is an electronic machine that stores and processes data by following instructions.");
         try std.json.stringify(answer.items, .{}, writer);
@@ -1670,6 +1944,48 @@ fn writeHotAnswer(writer: anytype, question: []const u8, shard: *const ResidentS
     try std.json.stringify(draft.draft_text, .{}, writer);
 }
 
+fn codeIntelInheritanceDraft(
+    allocator: std.mem.Allocator,
+    question: []const u8,
+    shard: *const ResidentShard,
+    candidates: []const HotCandidate,
+) !?[]u8 {
+    if (indexOfIgnoreCase(question, "inherit") == null and indexOfIgnoreCase(question, "base class") == null) return null;
+    for (candidates) |candidate| {
+        const summary = shard.entries[candidate.index].corpus_meta.code_intel_summary orelse continue;
+        const class_marker = " class ";
+        const inherits_marker = " inherits ";
+        var search_pos: usize = 0;
+        while (std.mem.indexOfPos(u8, summary, search_pos, class_marker)) |class_idx| {
+            const class_start = class_idx + class_marker.len;
+            const class_name = readCodeIntelToken(summary[class_start..]);
+            if (class_name.len == 0) break;
+            const inherit_idx = std.mem.indexOfPos(u8, summary, class_start + class_name.len, inherits_marker) orelse break;
+            const base_start = inherit_idx + inherits_marker.len;
+            const base_name = readCodeIntelToken(summary[base_start..]);
+            if (base_name.len == 0) break;
+            if (indexOfIgnoreCase(question, class_name) != null) {
+                return try std.fmt.allocPrint(
+                    allocator,
+                    "{s} inherits from {s}. Source: Ghost Code Intel symbol graph.",
+                    .{ class_name, base_name },
+                );
+            }
+            search_pos = base_start + base_name.len;
+        }
+    }
+    return null;
+}
+
+fn readCodeIntelToken(text: []const u8) []const u8 {
+    var end: usize = 0;
+    while (end < text.len) : (end += 1) {
+        const byte = text[end];
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '_' or byte == ':' or byte == '~')) break;
+    }
+    return text[0..end];
+}
+
 fn synthesisSnippetForTerms(allocator: std.mem.Allocator, text: []const u8, terms: []const []const u8) ![]u8 {
     var out = std.ArrayList(u8).init(allocator);
     errdefer out.deinit();
@@ -1699,7 +2015,9 @@ fn writeHotEvidence(writer: anytype, shard: *const ResidentShard, terms: []const
     try std.json.stringify(entry.corpus_meta.source_rel_path, .{}, writer);
     try writer.writeAll(",\"sourceLabel\":");
     try std.json.stringify(entry.corpus_meta.source_label, .{}, writer);
-    try writer.writeAll(",\"class\":\"docs\",\"licenseStatus\":");
+    try writer.writeAll(",\"class\":");
+    try std.json.stringify(@tagName(entry.corpus_meta.class), .{}, writer);
+    try writer.writeAll(",\"licenseStatus\":");
     try std.json.stringify(entry.corpus_meta.license_status, .{}, writer);
     try writer.print(",\"authorityLevel\":{d},\"snippet\":", .{entry.corpus_meta.license_authority_level});
     try std.json.stringify(snippetAroundTerms(shard.texts[candidate.index], terms, 320), .{}, writer);

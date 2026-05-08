@@ -415,7 +415,29 @@ pub fn build(b: *std.Build) void {
     run_compute_dominance_tests.step.dependOn(&run_project_autopsy_cli_tests.step);
     const test_compute_dominance_step = b.step("test-compute-dominance", "Run src/bench_compute_dominance.zig tests");
     test_compute_dominance_step.dependOn(&run_compute_dominance_tests.step);
+
+    const crucible_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests/the_crucible.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = test_filters,
+    });
+    crucible_tests.step.dependOn(&compile_corpus_scan_shader.step);
+    crucible_tests.root_module.addImport("ghost_core", ghost_core_test);
+    crucible_tests.root_module.addOptions("build_options", test_core_options);
+    crucible_tests.root_module.linkSystemLibrary("c", .{});
+    if (target.result.os.tag == .linux) {
+        crucible_tests.root_module.linkSystemLibrary("dl", .{});
+        crucible_tests.root_module.linkSystemLibrary("vulkan", .{});
+    }
+    addVulkanIncludes(crucible_tests.root_module, target.result.os, vulkan_sdk, b);
+    const run_crucible_tests = b.addRunArtifact(crucible_tests);
+    const test_crucible_step = b.step("test-crucible", "Run the adversarial Technical Axiom Matrix crucible");
+    test_crucible_step.dependOn(&run_crucible_tests.step);
     test_step.dependOn(&run_compute_dominance_tests.step);
+    test_step.dependOn(&run_crucible_tests.step);
 
     // ── 10. Parity Test ──
     const parity_test = b.addTest(.{

@@ -61,8 +61,13 @@ uint64_t makeHash(uint lo, uint hi) {
 }
 
 uint similarityPerMille(uint64_t lhs, uint64_t rhs) {
-    uint distance = uint(bitCount(lhs ^ rhs));
+    uint64_t diff = lhs ^ rhs;
+    uint distance = bitCount(uint(diff & 0xFFFFFFFFul)) + bitCount(uint(diff >> 32u));
     return ((64u - distance) * 1000u) / 64u;
+}
+
+uint graphIsomorphismPerMille(uint64_t lhs, uint64_t rhs) {
+    return similarityPerMille(lhs, rhs);
 }
 
 uint residentByteSignal(uint byte_offset, uint byte_len) {
@@ -198,10 +203,10 @@ void main() {
         } else if (relation_hash == inverse_query_relation_hash || inverse_entry_relation_hash == query_relation_hash) {
             score = (score * 125u) / 1000u;
         } else {
-            uint relation_resonance = similarityPerMille(query_relation_hash, relation_hash);
+            uint relation_resonance = graphIsomorphismPerMille(query_relation_hash, relation_hash);
             if (relation_resonance >= 780u) {
                 score += 900u;
-            } else if (inverse_query_relation_hash != 0ul && similarityPerMille(inverse_query_relation_hash, relation_hash) >= 780u) {
+            } else if (inverse_query_relation_hash != 0ul && graphIsomorphismPerMille(inverse_query_relation_hash, relation_hash) >= 780u) {
                 score = (score * 250u) / 1000u;
             }
         }

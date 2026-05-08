@@ -43,6 +43,11 @@ pub const IntentClass = enum {
     ambiguous,
 };
 
+pub const GeneralistRoute = enum {
+    general_chat,
+    strict_verification,
+};
+
 pub const LatentConcept = enum {
     conversation,
     modification,
@@ -686,6 +691,33 @@ pub fn isLightSocialPrompt(input: []const u8) bool {
         }
     }
     return token_count != 0 and token_count == social_count;
+}
+
+pub fn routeGeneralistIntent(input: []const u8) GeneralistRoute {
+    if (isStrictVerificationPrompt(input)) return .strict_verification;
+    return .general_chat;
+}
+
+pub fn isStrictVerificationPrompt(input: []const u8) bool {
+    if (!hasAnyRouteSignal(input, &.{ "verify", "validate", "check", "test", "compile", "compiler", "inheritance", "inherits", "base class", "derived class" })) return false;
+    if (hasAnyRouteSignal(input, &.{ ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx", ".h:", "c++", "cpp", "class", "struct", "virtual", "override", "namespace", "::" })) return true;
+    return hasAnyRouteSignal(input, &.{ "artifact", "workspace", "source file", "code" });
+}
+
+fn hasAnyRouteSignal(input: []const u8, needles: []const []const u8) bool {
+    for (needles) |needle| {
+        if (indexOfIgnoreCaseRoute(input, needle) != null) return true;
+    }
+    return false;
+}
+
+fn indexOfIgnoreCaseRoute(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0 or needle.len > haystack.len) return null;
+    var idx: usize = 0;
+    while (idx + needle.len <= haystack.len) : (idx += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[idx .. idx + needle.len], needle)) return idx;
+    }
+    return null;
 }
 
 fn isSemanticSignalRune(token: []const u8) bool {
@@ -2337,6 +2369,12 @@ test "global rune resonance sees squished sayghost command" {
     try std.testing.expectEqual(ImperativeTargetKind.exact, imperative.target_kind);
     try std.testing.expectEqualStrings("ghost", imperative.target);
     try std.testing.expect(imperative.strict_output);
+}
+
+test "generalist router separates world chat from C++ verification" {
+    try std.testing.expectEqual(GeneralistRoute.general_chat, routeGeneralistIntent("Why is a variable like a bucket?"));
+    try std.testing.expectEqual(GeneralistRoute.strict_verification, routeGeneralistIntent("verify src/native/widget.cpp:compute"));
+    try std.testing.expectEqual(GeneralistRoute.strict_verification, routeGeneralistIntent("check the C++ inheritance structure"));
 }
 
 test "imperative ngram shape isolates exact output target" {
