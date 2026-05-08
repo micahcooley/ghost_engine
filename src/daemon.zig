@@ -44,7 +44,16 @@ pub fn main() !void {
 }
 
 pub fn runFromArgs(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    const command = if (args.len > 0) args[0] else "run";
+    var command: []const u8 = "run";
+    var command_set = false;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--debug-vulkan")) {
+            vsa_vulkan.enableDebugValidationForProcess();
+        } else if (!command_set) {
+            command = arg;
+            command_set = true;
+        }
+    }
     if (std.mem.eql(u8, command, "run") or std.mem.eql(u8, command, "start")) {
         try runDaemon(allocator);
         return;

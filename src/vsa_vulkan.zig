@@ -100,6 +100,12 @@ pub fn runtimeLogsEnabled() bool {
         envFlag("GHOST_VERBOSE");
 }
 
+var debug_validation_requested = std.atomic.Value(bool).init(false);
+
+pub fn enableDebugValidationForProcess() void {
+    debug_validation_requested.store(true, .release);
+}
+
 pub const NEGATIVE_SIGNAL_COLOR_PROFILE = "subtle_red_gray";
 pub const NEGATIVE_SIGNAL_SIGIL_OPACITY_PER_MILLE: u16 = 420;
 
@@ -500,7 +506,9 @@ fn hasInstanceExtension(ctx: *vl.VulkanCtx, allocator: std.mem.Allocator, extens
 }
 
 fn shouldEnableValidation() bool {
-    return config.TEST_MODE or builtin.mode == .Debug or envFlag("GHOST_VULKAN_VALIDATION");
+    return debug_validation_requested.load(.acquire) or
+        envFlag("GHOST_VULKAN_VALIDATION") or
+        envFlag("GHOST_DEBUG_VULKAN");
 }
 
 fn selectComputeQueueFamily(

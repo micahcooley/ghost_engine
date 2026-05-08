@@ -41,6 +41,7 @@ const TYPEAHEAD_CAPACITY = 8;
 const LaunchConfig = struct {
     daemon_mode: bool = false,
     shell_enabled: bool = true,
+    debug_vulkan: bool = false,
     scratchpad_bytes: usize = config.DEFAULT_SCRATCHPAD_BYTES,
     project_shard: ?[]const u8 = null,
     reasoning_mode: sigil_runtime.ReasoningMode = .proof,
@@ -96,6 +97,8 @@ fn parseLaunchConfig(args: []const []const u8) LaunchConfig {
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--daemon")) {
             launch.daemon_mode = true;
+        } else if (std.mem.eql(u8, arg, "--debug-vulkan")) {
+            launch.debug_vulkan = true;
         } else if (std.mem.eql(u8, arg, "--no-shell")) {
             launch.shell_enabled = false;
         } else if (std.mem.startsWith(u8, arg, "--scratchpad-bytes=")) {
@@ -349,6 +352,7 @@ pub fn main_wrapped(allocator: std.mem.Allocator) !void {
     sys.printOut("[MONOLITH] Mapping Cortex...\n");
 
     const launch = parseLaunchConfig(args);
+    if (launch.debug_vulkan) vsa_vulkan.enableDebugValidationForProcess();
     if (launch.invalid_reasoning_mode) |mode_text| {
         sys.print("\n[FATAL] Unsupported reasoning mode '{s}'. Use proof or exploratory.\n", .{mode_text});
         sys.exit(1);
