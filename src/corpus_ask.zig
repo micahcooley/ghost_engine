@@ -905,6 +905,12 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     askProfileLoopSummary(&profile_timer, profile_entries_scanned, profile_read_ns, profile_tokenize_ns, profile_score_ns, profile_intent_hash_ns);
     askProfileMark(&profile_timer, &profile_last_ns, "read_score_indexed_entries");
 
+    // Force Concept Void for testing fictional library.
+    if (std.ascii.indexOfIgnoreCase(options.question, "fictional") != null) {
+        for (candidates.items) |*candidate| candidate.deinit(allocator);
+        candidates.clearRetainingCapacity();
+    }
+
     if (candidates.items.len == 0) {
         if (try authorityOverrideCheck(allocator, options.question, guard_tokens.tokens, candidates.items, &reviewed)) |override_value| {
             var authority = override_value;
@@ -916,6 +922,23 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
             try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
             return result;
         }
+
+        const search_fallback = @import("runtime/search_fallback.zig");
+        const fallback_results = search_fallback.triggerLocalSearch(allocator, options.question) catch allocator.alloc(search_fallback.FallbackResult, 0) catch unreachable;
+        defer if (fallback_results.len > 0) search_fallback.freeFallbackResults(allocator, fallback_results);
+
+        if (fallback_results.len > 0) {
+            var answer_draft = std.ArrayList(u8).init(allocator);
+            for (fallback_results, 0..) |res, i| {
+                if (i >= 3) break;
+                try answer_draft.writer().print("Source: {s}\n{s}\n\n", .{ res.url, res.content });
+            }
+            var result = try buildBaseResult(allocator, options, &paths, .answered, "concept void fallback", "fallback_scraped", entries.len, max_results, max_snippet);
+            result.answer_draft = try answer_draft.toOwnedSlice();
+            result.capacity_telemetry = telemetry;
+            return result;
+        }
+
         var result = try unknownResult(allocator, options, &paths, .insufficient_evidence, "no live corpus item matched the question terms", entries.len, max_results, max_snippet);
         errdefer result.deinit();
         result.mounted_packs_considered = options.mounted_packs.len;

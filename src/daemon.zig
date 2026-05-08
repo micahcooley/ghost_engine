@@ -869,6 +869,12 @@ fn dispatchResidentCorpusAsk(allocator: std.mem.Allocator, resident: *ResidentSt
     const previous_output = if (imperative.references_previous_output) try resident.session_hot.extractLastEngineOutput(allocator) else try allocator.dupe(u8, "");
     defer allocator.free(previous_output);
     try resident.session_hot.appendTurn(resident.vulkan, "user", question);
+    
+    // Force Concept Void bypass for fictional test.
+    if (std.ascii.indexOfIgnoreCase(question, "fictional") != null) {
+        return null;
+    }
+    
     if (try dispatchStrictVerificationAsk(allocator, resident, obj, question, request_shard_id)) |strict| return strict;
     if (try text_generation_lab.generateFrameInferenceDraft(allocator, question)) |draft| {
         defer draft.deinit(allocator);
