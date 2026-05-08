@@ -52,6 +52,7 @@ pub const correction_hooks = @import("correction_hooks.zig");
 pub const correction_candidates = @import("correction_candidates.zig");
 pub const correction_review = @import("correction_review.zig");
 pub const negative_knowledge = @import("negative_knowledge.zig");
+pub const negative_knowledge_ledger = @import("runtime/ledger.zig");
 pub const negative_knowledge_review = @import("negative_knowledge_review.zig");
 pub const learning_store = @import("learning_store.zig");
 pub const learning_status = @import("learning_status.zig");

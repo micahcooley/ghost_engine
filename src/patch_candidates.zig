@@ -7,6 +7,7 @@ const execution = @import("execution.zig");
 const feedback = @import("feedback.zig");
 const knowledge_pack_store = @import("knowledge_pack_store.zig");
 const mc = @import("inference.zig");
+const negative_knowledge_ledger = @import("runtime/ledger.zig");
 const panic_dump = @import("panic_dump.zig");
 const shards = @import("shards.zig");
 const sys = @import("sys.zig");
@@ -1517,6 +1518,7 @@ fn verifyCandidates(allocator: std.mem.Allocator, paths: *const shards.Paths, op
             allocator,
             verification_session_root,
             options.repo_root,
+            paths,
             options.verification_path_override,
             workflow,
             result,
@@ -2431,6 +2433,7 @@ fn verifyCandidate(
     allocator: std.mem.Allocator,
     verification_session_root: []const u8,
     repo_root: []const u8,
+    paths: *const shards.Paths,
     path_override: ?[]const u8,
     workflow: VerificationWorkflow,
     result: *Result,
@@ -2503,6 +2506,14 @@ fn verifyCandidate(
         }
         if (!build_capture.succeeded()) {
             noteObservedFailureState(candidate, .build_failed);
+            try recordCandidateVerificationFailure(
+                allocator,
+                paths,
+                candidate,
+                application,
+                execution.Phase.build,
+                &build_capture,
+            );
             if (try maybeQueueRepairPlan(
                 allocator,
                 candidate,
@@ -2558,6 +2569,14 @@ fn verifyCandidate(
             }
             if (!test_capture.succeeded()) {
                 noteObservedFailureState(candidate, .test_failed);
+                try recordCandidateVerificationFailure(
+                    allocator,
+                    paths,
+                    candidate,
+                    application,
+                    execution.Phase.@"test",
+                    &test_capture,
+                );
                 if (try maybeQueueRepairPlan(
                     allocator,
                     candidate,
@@ -2676,6 +2695,14 @@ fn verifyCandidate(
 
             if (!runtime_capture.succeeded()) {
                 noteObservedFailureState(candidate, .runtime_failed);
+                try recordCandidateVerificationFailure(
+                    allocator,
+                    paths,
+                    candidate,
+                    application,
+                    oracle.phase,
+                    &runtime_capture,
+                );
                 if (try maybeQueueRepairPlan(
                     allocator,
                     candidate,
@@ -2733,6 +2760,14 @@ fn verifyCandidate(
             result.profile.verifier_adapter_dispatch_ms += sys.getMilliTick() - dispatch_started;
             if (!runtime_capture.succeeded()) {
                 noteObservedFailureState(candidate, .runtime_failed);
+                try recordCandidateVerificationFailure(
+                    allocator,
+                    paths,
+                    candidate,
+                    application,
+                    execution.Phase.run,
+                    &runtime_capture,
+                );
                 if (try maybeQueueRepairPlan(
                     allocator,
                     candidate,
@@ -2774,6 +2809,69 @@ fn verifyCandidate(
 
     candidate.validation_state = .build_failed;
     return false;
+}
+
+fn recordCandidateVerificationFailure(
+    allocator: std.mem.Allocator,
+    paths: *const shards.Paths,
+    candidate: *const Candidate,
+    application: RepairApplication,
+    phase: execution.Phase,
+    capture: *const execution.Result,
+) !void {
+    const ledger_path = try negative_knowledge_ledger.ledgerPathForShardRoot(allocator, paths.root_abs_path);
+    defer allocator.free(ledger_path);
+    const failed_ast_hash = try candidateFailedAstHash(allocator, candidate, application);
+    defer allocator.free(failed_ast_hash);
+    const axiom_violation = try formatLedgerViolation(allocator, phase, capture);
+    defer allocator.free(axiom_violation);
+    _ = try negative_knowledge_ledger.appendFailureIfNewAtPath(allocator, ledger_path, .{
+        .failed_ast_hash = failed_ast_hash,
+        .axiom_violation = axiom_violation,
+        .project_shard = paths.metadata.id,
+        .source = "patch_candidates",
+        .failure_surface = execution.phaseName(phase),
+        .candidate_id = candidate.id,
+    });
+}
+
+fn candidateFailedAstHash(
+    allocator: std.mem.Allocator,
+    candidate: *const Candidate,
+    application: RepairApplication,
+) ![]u8 {
+    var canonical = std.ArrayList(u8).init(allocator);
+    defer canonical.deinit();
+    for (candidate.hunks, 0..) |hunk, hunk_idx| {
+        if (!application.retainsHunk(candidate, hunk, hunk_idx)) continue;
+        try canonical.appendSlice(hunk.diff);
+    }
+    if (canonical.items.len == 0) {
+        try canonical.appendSlice(candidate.id);
+    }
+    return negative_knowledge_ledger.hashBytes(allocator, canonical.items);
+}
+
+fn formatLedgerViolation(
+    allocator: std.mem.Allocator,
+    phase: execution.Phase,
+    capture: *const execution.Result,
+) ![]u8 {
+    const signal = execution.failureSignalName(capture.failure_signal);
+    const detail = capture.invariant_summary orelse if (capture.stderr.len != 0) capture.stderr else if (capture.stdout.len != 0) capture.stdout else signal;
+    const clipped = detail[0..@min(detail.len, @as(usize, 2048))];
+    if (capture.exit_code) |code| {
+        return std.fmt.allocPrint(
+            allocator,
+            "phase={s}; failure_signal={s}; exit_code={d}; detail={s}",
+            .{ execution.phaseName(phase), signal, code, clipped },
+        );
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "phase={s}; failure_signal={s}; exit_code=null; detail={s}",
+        .{ execution.phaseName(phase), signal, clipped },
+    );
 }
 
 fn boundedVerifierTimeout(effective_budget: compute_budget.Effective, requested_timeout_ms: u32) u32 {

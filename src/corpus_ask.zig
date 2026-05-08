@@ -5,6 +5,7 @@ const corpus_sketch = @import("corpus_sketch.zig");
 const correction_review = @import("correction_review.zig");
 const hash_acceleration = @import("hash_acceleration.zig");
 const intent_grounding = @import("intent_grounding.zig");
+const negative_knowledge_ledger = @import("runtime/ledger.zig");
 const negative_knowledge_review = @import("negative_knowledge_review.zig");
 const learning_store = @import("learning_store.zig");
 const shards = @import("shards.zig");
@@ -26,6 +27,7 @@ const PRIMARY_NOUN_MATCH_THRESHOLD_PERCENT: u8 = 50;
 const PRIMARY_NOUN_SCORE_BONUS: u32 = 12;
 const TITLE_MATCH_SCORE_BONUS: u32 = 80;
 const DEFINITION_MATCH_SCORE_BONUS: u32 = 40;
+const LEDGER_INTERNAL_REJECTION_MESSAGE = "Initial synthesis rejected internally due to historical Axiom violation. Re-routing.";
 
 pub const MountedPackRef = corpus_ingest.MountedPackRef;
 
@@ -327,6 +329,24 @@ pub const NegativeKnowledgeInfluence = struct {
     }
 };
 
+pub const NegativeKnowledgeLedgerRejection = struct {
+    failed_ast_hash: []u8,
+    axiom_violation: []u8,
+    message: []u8,
+    ledger_path: []u8,
+    non_authorizing: bool = true,
+    treated_as_proof: bool = false,
+    used_as_evidence: bool = false,
+
+    fn deinit(self: *NegativeKnowledgeLedgerRejection, allocator: std.mem.Allocator) void {
+        allocator.free(self.failed_ast_hash);
+        allocator.free(self.axiom_violation);
+        allocator.free(self.message);
+        allocator.free(self.ledger_path);
+        self.* = undefined;
+    }
+};
+
 pub const LearningInfluence = struct {
     id: []u8,
     source_reviewed_learning_id: []u8,
@@ -376,6 +396,8 @@ pub const NegativeKnowledgeTelemetry = struct {
     answer_suppressed: bool = false,
     truncated: bool = false,
     same_shard_only: bool = true,
+    ledger_checks: usize = 0,
+    ledger_matches: usize = 0,
     mutation_performed: bool = false,
     commands_executed: bool = false,
     verifiers_executed: bool = false,
@@ -449,6 +471,7 @@ pub const Result = struct {
     correction_influences: []CorrectionInfluence = &.{},
     accepted_negative_knowledge_warnings: []AcceptedNegativeKnowledgeWarning = &.{},
     negative_knowledge_influences: []NegativeKnowledgeInfluence = &.{},
+    negative_knowledge_ledger_rejections: []NegativeKnowledgeLedgerRejection = &.{},
     learning_influences: []LearningInfluence = &.{},
     future_behavior_candidates: []FutureBehaviorCandidate = &.{},
     safety_flags: SafetyFlags = .{},
@@ -499,6 +522,8 @@ pub const Result = struct {
             self.allocator.free(self.accepted_negative_knowledge_warnings);
             for (self.negative_knowledge_influences) |*item| item.deinit(self.allocator);
             self.allocator.free(self.negative_knowledge_influences);
+            for (self.negative_knowledge_ledger_rejections) |*item| item.deinit(self.allocator);
+            self.allocator.free(self.negative_knowledge_ledger_rejections);
             for (self.learning_influences) |*item| item.deinit(self.allocator);
             self.allocator.free(self.learning_influences);
             for (self.future_behavior_candidates) |*item| item.deinit(self.allocator);
@@ -743,7 +768,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         try attachLiveCoverage(aa, &result, live_coverage);
         try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
         try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
-        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning, &paths);
         result.allocator = allocator;
         result.arena = arena;
         return result;
@@ -756,7 +781,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         try attachLiveCoverage(aa, &result, live_coverage);
         try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
         try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
-        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning, &paths);
         result.allocator = allocator;
         result.arena = arena;
         return result;
@@ -949,7 +974,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
             errdefer result.deinit();
             try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
             try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
-            try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+            try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning, &paths);
             result.allocator = allocator;
             result.arena = arena;
             return result;
@@ -969,7 +994,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         try applyCapacityDisclosure(aa, &result);
         try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
         try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
-        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning, &paths);
         result.allocator = allocator;
         result.arena = arena;
         return result;
@@ -987,7 +1012,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         errdefer result.deinit();
         try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
         try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
-        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning, &paths);
         result.allocator = allocator;
         result.arena = arena;
         return result;
@@ -1022,7 +1047,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
             try applyCapacityDisclosure(aa, &result);
             try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
             try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
-            try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+            try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning, &paths);
             result.allocator = allocator;
             result.arena = arena;
             return result;
@@ -1048,7 +1073,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         try applyCapacityDisclosure(aa, &result);
         try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
         try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
-        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning, &paths);
         result.allocator = allocator;
         result.arena = arena;
         return result;
@@ -1099,7 +1124,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
             try applyCapacityDisclosure(aa, &result);
             try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
             try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
-            try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+            try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning, &paths);
             result.allocator = allocator;
             result.arena = arena;
             return result;
@@ -1128,7 +1153,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         try applyCapacityDisclosure(aa, &result);
         try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
         try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
-        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning, &paths);
         result.allocator = allocator;
         result.arena = arena;
         return result;
@@ -1158,7 +1183,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         try applyCapacityDisclosure(aa, &result);
         try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
         try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
-        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning, &paths);
         result.allocator = allocator;
         result.arena = arena;
         return result;
@@ -1189,7 +1214,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         try applyCapacityDisclosure(aa, &result);
         try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
         try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
-        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning, &paths);
         result.allocator = allocator;
         result.arena = arena;
         return result;
@@ -1225,7 +1250,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         try applyCapacityDisclosure(aa, &result);
         try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
         try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
-        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning, &paths);
         result.allocator = allocator;
         result.arena = arena;
         return result;
@@ -1257,7 +1282,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         try applyCapacityDisclosure(aa, &result);
         try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
         try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
-        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning, &paths);
         result.allocator = allocator;
         result.arena = arena;
         return result;
@@ -1281,7 +1306,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         try applyCapacityDisclosure(aa, &result);
         try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
         try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
-        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning, &paths);
         result.allocator = allocator;
         result.arena = arena;
         return result;
@@ -1322,7 +1347,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     try applyCapacityDisclosure(aa, &result);
     try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
     try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
-    try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+    try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning, &paths);
     result.allocator = allocator;
     result.arena = arena;
     return result;
@@ -1448,7 +1473,12 @@ fn applyAcceptedNegativeKnowledgeInfluence(aa: std.mem.Allocator, result: *Resul
     }
 }
 
-fn applyAcceptedLearningInfluence(aa: std.mem.Allocator, result: *Result, reviewed: *const learning_store.ReadResult) !void {
+fn applyAcceptedLearningInfluence(
+    aa: std.mem.Allocator,
+    result: *Result,
+    reviewed: *const learning_store.ReadResult,
+    paths: *const shards.Paths,
+) !void {
     result.learning_influence_telemetry.records_read = reviewed.records_read;
     result.learning_influence_telemetry.accepted_records = reviewed.accepted_records;
     result.learning_influence_telemetry.rejected_records = reviewed.rejected_records;
@@ -1475,6 +1505,7 @@ fn applyAcceptedLearningInfluence(aa: std.mem.Allocator, result: *Result, review
         }
         break;
     }
+    try applyNegativeKnowledgeLedgerGate(aa, paths, result);
 }
 
 fn buildSynthesisEvidenceTexts(aa: std.mem.Allocator, evidence_used: []const EvidenceUsed) ![]const []const u8 {
@@ -1586,6 +1617,7 @@ fn buildAuthorityOverrideResult(
     result.answer_draft = try allocator.dupe(u8, authority.answer_draft);
     result.candidate_followups = try singleFollowup(allocator, "authority_review_audit", "reviewed correction held Authority Rank 0 and contradictory corpus evidence was excluded from answer drafting");
     try applyCapacityDisclosure(allocator, &result);
+    try applyNegativeKnowledgeLedgerGate(allocator, paths, &result);
     return result;
 }
 
@@ -1938,6 +1970,106 @@ fn suppressAnswerDraftForNegativeKnowledge(allocator: std.mem.Allocator, result:
     try appendUnknownToResult(allocator, result, .insufficient_evidence, "accepted reviewed negative knowledge suppressed an exact repeated known-bad answer pattern; stronger evidence or explicit verification is required");
     try appendCandidateFollowup(allocator, result, "verifier_check_candidate", "accepted reviewed negative knowledge requires an explicit check candidate before this repeated pattern can support an answer");
     try appendNegativeKnowledgeFutureBehaviorCandidate(allocator, result, "verifier_check_candidate", "suppressed exact repeated known-bad answer pattern requires explicit verifier/check candidate", influence.source_reviewed_negative_knowledge_id);
+}
+
+fn applyNegativeKnowledgeLedgerGate(allocator: std.mem.Allocator, paths: *const shards.Paths, result: *Result) !void {
+    const answer = result.answer_draft orelse return;
+    if (!draftLooksLikeCode(answer)) return;
+
+    var hashes = std.ArrayList([]u8).init(allocator);
+    defer {
+        for (hashes.items) |hash| allocator.free(hash);
+        hashes.deinit();
+    }
+    try collectDraftCodeHashes(allocator, answer, &hashes);
+    if (hashes.items.len == 0) return;
+
+    const ledger_path = try negative_knowledge_ledger.ledgerPathForShardRoot(allocator, paths.root_abs_path);
+    defer allocator.free(ledger_path);
+
+    for (hashes.items) |hash| {
+        result.negative_knowledge_telemetry.ledger_checks += 1;
+        var lookup = try negative_knowledge_ledger.lookupFailureAtPath(allocator, ledger_path, hash);
+        defer lookup.deinit();
+        if (!lookup.matched) continue;
+        result.negative_knowledge_telemetry.ledger_matches += 1;
+        try suppressAnswerDraftForLedger(allocator, result, &lookup);
+        return;
+    }
+}
+
+fn suppressAnswerDraftForLedger(
+    allocator: std.mem.Allocator,
+    result: *Result,
+    lookup: *const negative_knowledge_ledger.LookupResult,
+) !void {
+    if (result.answer_draft) |answer| {
+        allocator.free(answer);
+        result.answer_draft = null;
+    }
+    result.status = .unknown;
+    allocator.free(result.state);
+    result.state = try allocator.dupe(u8, "unresolved");
+    allocator.free(result.permission);
+    result.permission = try allocator.dupe(u8, "unresolved");
+    try appendLedgerRejection(allocator, result, lookup);
+    try appendUnknownToResult(allocator, result, .insufficient_evidence, LEDGER_INTERNAL_REJECTION_MESSAGE);
+    try appendCandidateFollowup(allocator, result, "synthesis_reroute", "generate a different code draft whose hash is not present in the Negative Knowledge Ledger");
+}
+
+fn appendLedgerRejection(
+    allocator: std.mem.Allocator,
+    result: *Result,
+    lookup: *const negative_knowledge_ledger.LookupResult,
+) !void {
+    const old = result.negative_knowledge_ledger_rejections;
+    var out = try allocator.alloc(NegativeKnowledgeLedgerRejection, old.len + 1);
+    @memcpy(out[0..old.len], old);
+    out[old.len] = .{
+        .failed_ast_hash = try allocator.dupe(u8, lookup.failed_ast_hash),
+        .axiom_violation = try allocator.dupe(u8, lookup.axiom_violation orelse ""),
+        .message = try allocator.dupe(u8, LEDGER_INTERNAL_REJECTION_MESSAGE),
+        .ledger_path = try allocator.dupe(u8, lookup.ledger_path),
+    };
+    allocator.free(old);
+    result.negative_knowledge_ledger_rejections = out;
+}
+
+fn collectDraftCodeHashes(allocator: std.mem.Allocator, draft: []const u8, hashes: *std.ArrayList([]u8)) !void {
+    try appendUniqueDraftHash(allocator, hashes, std.mem.trim(u8, draft, " \r\n\t"));
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, draft, search_from, "```")) |start| {
+        const fence_body_start = std.mem.indexOfScalarPos(u8, draft, start + 3, '\n') orelse break;
+        const content_start = fence_body_start + 1;
+        const close = std.mem.indexOfPos(u8, draft, content_start, "```") orelse break;
+        const block = std.mem.trim(u8, draft[content_start..close], " \r\n\t");
+        if (block.len != 0) try appendUniqueDraftHash(allocator, hashes, block);
+        search_from = close + 3;
+    }
+}
+
+fn appendUniqueDraftHash(allocator: std.mem.Allocator, hashes: *std.ArrayList([]u8), bytes: []const u8) !void {
+    if (bytes.len == 0) return;
+    const hash = try negative_knowledge_ledger.hashBytes(allocator, bytes);
+    for (hashes.items) |existing| {
+        if (std.mem.eql(u8, existing, hash)) {
+            allocator.free(hash);
+            return;
+        }
+    }
+    try hashes.append(hash);
+}
+
+fn draftLooksLikeCode(text: []const u8) bool {
+    return std.mem.indexOf(u8, text, "```") != null or
+        std.mem.indexOf(u8, text, "@@ -") != null or
+        std.mem.indexOf(u8, text, "+++ b/") != null or
+        std.mem.indexOf(u8, text, "--- a/") != null or
+        std.mem.indexOf(u8, text, "#include") != null or
+        std.mem.indexOf(u8, text, "std::") != null or
+        std.mem.indexOf(u8, text, "pub fn ") != null or
+        std.mem.indexOf(u8, text, "fn ") != null or
+        std.mem.indexOf(u8, text, "const ") != null;
 }
 
 fn cloneWarnings(allocator: std.mem.Allocator, warnings: []const correction_review.ReadWarning) ![]AcceptedCorrectionWarning {
@@ -3447,7 +3579,28 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
         try writeCorrectionMutationFlags(w, influence.mutation_flags);
         try w.writeAll("}");
     }
-    try w.writeAll("],\"learningInfluences\":[");
+    try w.writeAll("],\"negativeKnowledgeLedger\":{");
+    try w.print("\"checked\":{s}", .{if (result.negative_knowledge_telemetry.ledger_checks != 0) "true" else "false"});
+    try w.print(",\"matches\":{d}", .{result.negative_knowledge_telemetry.ledger_matches});
+    try w.print(",\"answerSuppressed\":{s}", .{if (result.negative_knowledge_ledger_rejections.len != 0) "true" else "false"});
+    if (result.negative_knowledge_ledger_rejections.len != 0) try writeField(w, "message", LEDGER_INTERNAL_REJECTION_MESSAGE, false);
+    try w.writeAll(",\"rejections\":[");
+    for (result.negative_knowledge_ledger_rejections, 0..) |rejection, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{");
+        try writeField(w, "failedAstHash", rejection.failed_ast_hash, true);
+        try writeField(w, "failed_ast_hash", rejection.failed_ast_hash, false);
+        try writeField(w, "axiomViolation", rejection.axiom_violation, false);
+        try writeField(w, "axiom_violation", rejection.axiom_violation, false);
+        try writeField(w, "message", rejection.message, false);
+        try writeField(w, "ledgerPath", rejection.ledger_path, false);
+        try w.print(",\"nonAuthorizing\":{s}", .{if (rejection.non_authorizing) "true" else "false"});
+        try w.print(",\"treatedAsProof\":{s}", .{if (rejection.treated_as_proof) "true" else "false"});
+        try w.print(",\"usedAsEvidence\":{s}", .{if (rejection.used_as_evidence) "true" else "false"});
+        try w.writeAll("}");
+    }
+    try w.writeAll("]}");
+    try w.writeAll(",\"learningInfluences\":[");
     for (result.learning_influences, 0..) |influence, idx| {
         if (idx != 0) try w.writeByte(',');
         try w.writeAll("{");
@@ -3626,6 +3779,10 @@ fn writeNegativeKnowledgeTelemetry(w: anytype, telemetry: NegativeKnowledgeTelem
         if (telemetry.truncated) "true" else "false",
         if (telemetry.same_shard_only) "true" else "false",
     });
+    try w.print(",\"ledgerChecks\":{d},\"ledgerMatches\":{d}", .{
+        telemetry.ledger_checks,
+        telemetry.ledger_matches,
+    });
     try w.print(",\"mutationPerformed\":{s},\"commandsExecuted\":{s},\"verifiersExecuted\":{s}", .{
         if (telemetry.mutation_performed) "true" else "false",
         if (telemetry.commands_executed) "true" else "false",
@@ -3704,4 +3861,63 @@ fn writeEscaped(w: anytype, s: []const u8) !void {
             },
         }
     }
+}
+
+test "corpus ask ledger gate suppresses code draft with historical axiom hash" {
+    const allocator = std.testing.allocator;
+    const shard_id = "corpus-ask-ledger-gate-test";
+    var metadata = try shards.resolveProjectMetadata(allocator, shard_id);
+    defer metadata.deinit();
+    var paths = try shards.resolvePaths(allocator, metadata.metadata);
+    defer paths.deinit();
+    std.fs.deleteTreeAbsolute(paths.root_abs_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    defer std.fs.deleteTreeAbsolute(paths.root_abs_path) catch {};
+
+    const bad_code =
+        \\std::vector<int> values;
+        \\values.push_front(1);
+    ;
+    const bad_hash = try negative_knowledge_ledger.hashBytes(allocator, bad_code);
+    defer allocator.free(bad_hash);
+    const ledger_path = try negative_knowledge_ledger.ledgerPathForShardRoot(allocator, paths.root_abs_path);
+    defer allocator.free(ledger_path);
+    try negative_knowledge_ledger.appendFailureAtPath(allocator, ledger_path, .{
+        .failed_ast_hash = bad_hash,
+        .axiom_violation = "std::vector does not declare push_front",
+        .timestamp = 321,
+        .project_shard = shard_id,
+        .source = "test",
+        .failure_surface = "build",
+    });
+
+    var result = try buildBaseResult(allocator, .{
+        .question = "draft a C++ patch",
+        .project_shard = shard_id,
+    }, &paths, .answered, "draft", "none", 1, DEFAULT_MAX_RESULTS, DEFAULT_MAX_SNIPPET_BYTES);
+    defer result.deinit();
+    result.answer_draft = try allocator.dupe(u8,
+        \\```cpp
+        \\std::vector<int> values;
+        \\values.push_front(1);
+        \\```
+    );
+
+    try applyNegativeKnowledgeLedgerGate(allocator, &paths, &result);
+
+    try std.testing.expectEqual(AskStatus.unknown, result.status);
+    try std.testing.expect(result.answer_draft == null);
+    try std.testing.expectEqualStrings("unresolved", result.state);
+    try std.testing.expectEqual(@as(usize, 1), result.negative_knowledge_ledger_rejections.len);
+    try std.testing.expectEqual(@as(usize, 1), result.negative_knowledge_telemetry.ledger_matches);
+    try std.testing.expectEqualStrings(LEDGER_INTERNAL_REJECTION_MESSAGE, result.unknowns[result.unknowns.len - 1].reason);
+
+    const rendered = try renderJson(allocator, &result);
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"negativeKnowledgeLedger\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"answerSuppressed\":true") != null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, rendered, .{});
+    defer parsed.deinit();
 }
