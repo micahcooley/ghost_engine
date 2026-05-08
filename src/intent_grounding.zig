@@ -473,6 +473,7 @@ pub const OntologyRole = enum {
     action,
     constraint,
     evidence,
+    primitive,
 };
 
 pub const OntologyConcept = enum {
@@ -488,6 +489,11 @@ pub const OntologyConcept = enum {
     constraint_no_external_authority,
     evidence_cpp_component,
     evidence_omni_codex,
+    evidence_cpp_smart_pointers,
+    constraint_ownership_axioms,
+    primitive_existence,
+    primitive_ownership,
+    primitive_null_state,
 };
 
 pub const OntologyPrimitive = struct {
@@ -766,6 +772,16 @@ pub fn extractOntologicalPrimitives(allocator: std.mem.Allocator, input: []const
         try appendOntologyPrimitive(allocator, &primitives, .action, .action_synthesize, matchedOntologySource(trimmed, &.{ "generate", "write", "create", "draft", "synthesize" }) orelse "synthesize", 720);
     }
 
+    if (hasExistencePrimitive(trimmed)) {
+        try appendOntologyPrimitive(allocator, &primitives, .primitive, .primitive_existence, matchedOntologySource(trimmed, &.{ "existence", "exists", "memory address", "address" }) orelse "existence", 900);
+    }
+    if (hasOwnershipPrimitive(trimmed)) {
+        try appendOntologyPrimitive(allocator, &primitives, .primitive, .primitive_ownership, matchedOntologySource(trimmed, &.{ "ownership", "owner", "owned" }) orelse "ownership", 930);
+    }
+    if (hasNullStatePrimitive(trimmed)) {
+        try appendOntologyPrimitive(allocator, &primitives, .primitive, .primitive_null_state, matchedOntologySource(trimmed, &.{ "null_state", "null state", "without an owner", "dangling" }) orelse "null state", 910);
+    }
+
     if (hasSystemComponentConcept(trimmed)) {
         try appendOntologyPrimitive(allocator, &primitives, .target, .target_system_component, matchedSystemComponentSource(trimmed) orelse "system component", 930);
         if (hasCppComponentEvidence(trimmed)) {
@@ -781,6 +797,13 @@ pub fn extractOntologicalPrimitives(allocator: std.mem.Allocator, input: []const
 
     if (hasLocalAxiomConcept(trimmed) or (hasOntologyConcept(primitives.items, .action_verify_integrity) and hasOntologyConcept(primitives.items, .target_system_component))) {
         try appendOntologyPrimitive(allocator, &primitives, .constraint, .constraint_local_axioms, matchedOntologySource(trimmed, &.{ "local axiom", "local axioms", "axiom", "compiler", "compile", "verifier" }) orelse "local axioms", 880);
+    }
+    if (hasOwnershipAxiomConcept(trimmed)) {
+        try appendOntologyPrimitive(allocator, &primitives, .constraint, .constraint_ownership_axioms, matchedOntologySource(trimmed, &.{ "ownership_axioms", "ownership axioms" }) orelse "ownership axioms", 900);
+    }
+    if (hasCppSmartPointerConcept(trimmed)) {
+        try appendOntologyPrimitive(allocator, &primitives, .evidence, .evidence_cpp_smart_pointers, matchedOntologySource(trimmed, &.{ "c++_smart_pointers", "c++ smart pointers", "smart pointers" }) orelse "c++ smart pointers", 900);
+        try appendOntologyPrimitive(allocator, &primitives, .evidence, .evidence_cpp_component, "c++ smart pointers", 860);
     }
     if (hasChronologyConcept(trimmed) or (hasOntologyConcept(primitives.items, .action_verify_integrity) and hasOntologyConcept(primitives.items, .target_knowledge_sequence))) {
         try appendOntologyPrimitive(allocator, &primitives, .constraint, .constraint_chronological_consistency, matchedOntologySource(trimmed, &.{ "timeline", "chronology", "chronological", "logical consistency", "historical" }) orelse "chronological consistency", 900);
@@ -822,6 +845,11 @@ pub fn ontologyConceptName(concept: OntologyConcept) []const u8 {
         .constraint_no_external_authority => "constraint.no_external_authority",
         .evidence_cpp_component => "evidence.cpp_component",
         .evidence_omni_codex => "evidence.omni_codex",
+        .evidence_cpp_smart_pointers => "evidence.cpp_smart_pointers",
+        .constraint_ownership_axioms => "constraint.ownership_axioms",
+        .primitive_existence => "primitive.existence",
+        .primitive_ownership => "primitive.ownership",
+        .primitive_null_state => "primitive.null_state",
     };
 }
 
@@ -854,6 +882,26 @@ fn appendOntologyPrimitive(
 
 fn hasVerificationConcept(input: []const u8) bool {
     return hasAnyRouteSignal(input, &.{ "verify", "validate", "check", "audit", "test", "prove", "confirm", "logical consistency" });
+}
+
+fn hasExistencePrimitive(input: []const u8) bool {
+    return hasAnyRouteSignal(input, &.{ "existence", "exists", "memory address", "address" });
+}
+
+fn hasOwnershipPrimitive(input: []const u8) bool {
+    return hasAnyRouteSignal(input, &.{ "ownership", "owner", "owned" });
+}
+
+fn hasNullStatePrimitive(input: []const u8) bool {
+    return hasAnyRouteSignal(input, &.{ "null_state", "null state", "without an owner", "dangling" });
+}
+
+fn hasOwnershipAxiomConcept(input: []const u8) bool {
+    return hasAnyRouteSignal(input, &.{ "ownership_axioms", "ownership axioms" });
+}
+
+fn hasCppSmartPointerConcept(input: []const u8) bool {
+    return hasAnyRouteSignal(input, &.{ "c++_smart_pointers", "c++ smart pointers", "smart pointers" });
 }
 
 fn hasTransformConcept(input: []const u8) bool {
@@ -2619,6 +2667,28 @@ test "ontology extraction abstracts C++ audit into primitives" {
     try std.testing.expect(hasOntologyConcept(primitives, .action_verify_integrity));
     try std.testing.expect(hasOntologyConcept(primitives, .constraint_local_axioms));
     try std.testing.expect(hasOntologyConcept(primitives, .evidence_cpp_component));
+}
+
+test "ontology extraction maps sovereign premise primitives" {
+    const allocator = std.testing.allocator;
+    const prompt =
+        \\PROTOCOL_OVERRIDE: [Ontological_Inquiry]
+        \\EXTRACT: Take the English premise: "A memory address that exists without an owner is a ghost in the machine."
+        \\MAP: Deconstruct this into the primitives [Existence], [Ownership], and [Null_State].
+        \\CROSS-VERIFY: Query the Omni-Codex for the intersection of [Ownership_Axioms] and [C++_Smart_Pointers].
+        \\PROVE: Generate a C++ code block that intentionally creates this 'ghost' and pass it to the internal LLVM verifier.
+    ;
+
+    const primitives = try extractOntologicalPrimitives(allocator, prompt);
+    defer freeOntologicalPrimitives(allocator, primitives);
+
+    try std.testing.expect(hasOntologyConcept(primitives, .primitive_existence));
+    try std.testing.expect(hasOntologyConcept(primitives, .primitive_ownership));
+    try std.testing.expect(hasOntologyConcept(primitives, .primitive_null_state));
+    try std.testing.expect(hasOntologyConcept(primitives, .constraint_ownership_axioms));
+    try std.testing.expect(hasOntologyConcept(primitives, .evidence_cpp_smart_pointers));
+    try std.testing.expect(hasOntologyConcept(primitives, .evidence_omni_codex));
+    try std.testing.expect(hasOntologyConcept(primitives, .action_verify_integrity));
 }
 
 test "grounded intent exposes ontology primitives" {

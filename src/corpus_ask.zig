@@ -9,6 +9,7 @@ const negative_knowledge_ledger = @import("runtime/ledger.zig");
 const negative_knowledge_review = @import("negative_knowledge_review.zig");
 const learning_store = @import("learning_store.zig");
 const shards = @import("shards.zig");
+const sovereign_inquiry = @import("sovereign_inquiry.zig");
 const text_generation_lab = @import("text_generation_lab.zig");
 const vsa_vulkan = @import("vsa_vulkan.zig");
 
@@ -708,6 +709,36 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         return result;
     }
 
+    if (sovereign_inquiry.isOntologicalInquiry(options.question)) {
+        const requested_results = options.max_results;
+        const capped_results = @min(requested_results, MAX_RESULTS);
+        const max_results = if (capped_results == 0) DEFAULT_MAX_RESULTS else capped_results;
+        const capped_snippet = @min(options.max_snippet_bytes, MAX_SNIPPET_BYTES);
+        const max_snippet = if (capped_snippet == 0) DEFAULT_MAX_SNIPPET_BYTES else capped_snippet;
+
+        var shard_metadata = if (options.project_shard) |project_shard|
+            try shards.resolveProjectMetadata(aa, project_shard)
+        else
+            try shards.resolveCoreMetadata(aa);
+        defer shard_metadata.deinit();
+
+        var paths = try shards.resolvePaths(aa, shard_metadata.metadata);
+        defer paths.deinit();
+
+        const proof = try sovereign_inquiry.run(aa, options.question, paths.root_abs_path);
+        var result = try buildBaseResult(aa, options, &paths, .answered, "verified", "supported", 0, max_results, max_snippet);
+        result.answer_draft = proof.draft_text;
+        result.safety_flags.verifiers_executed = true;
+        result.safety_flags.negative_knowledge_mutation = proof.ledger_recorded;
+        result.negative_knowledge_telemetry.ledger_checks = 1;
+        result.negative_knowledge_telemetry.mutation_performed = proof.ledger_recorded;
+        result.negative_knowledge_telemetry.verifiers_executed = true;
+        result.negative_knowledge_telemetry.commands_executed = false;
+        result.allocator = allocator;
+        result.arena = arena;
+        return result;
+    }
+
     var salience = try intent_grounding.analyzeSalience(aa, options.question);
     defer salience.deinit(aa);
     const high_noise_request = salience.density_multiplier >= 3 and hasMultiRuneTarget(salience.semantic_target);
@@ -730,6 +761,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     var paths = try shards.resolvePaths(aa, shard_metadata.metadata);
     defer paths.deinit();
     askProfileMark(&profile_timer, &profile_last_ns, "resolve_shard");
+
     var reviewed = try correction_review.readAcceptedInfluences(aa, paths.metadata.id);
     defer reviewed.deinit();
     var reviewed_nk = try negative_knowledge_review.readAcceptedInfluences(aa, paths.metadata.id);
@@ -3453,7 +3485,10 @@ pub fn renderJson(allocator: std.mem.Allocator, result: *const Result) ![]u8 {
     try writeField(w, "status", @tagName(result.status), true);
     try writeField(w, "state", result.state, false);
     try writeField(w, "permission", result.permission, false);
-    try w.writeAll(",\"nonAuthorizing\":true");
+    const non_authorizing = !(std.mem.eql(u8, result.state, "verified") and
+        std.mem.eql(u8, result.permission, "supported") and
+        result.safety_flags.verifiers_executed);
+    try w.print(",\"nonAuthorizing\":{s}", .{if (non_authorizing) "true" else "false"});
     try writeField(w, "question", result.question, false);
     try w.writeAll(",\"shard\":{");
     try writeField(w, "kind", result.shard_kind, true);

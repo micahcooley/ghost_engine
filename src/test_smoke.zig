@@ -41,6 +41,7 @@ const correction_review = @import("correction_review.zig");
 const negative_knowledge = @import("negative_knowledge.zig");
 const negative_knowledge_review = @import("negative_knowledge_review.zig");
 const runtime_session = @import("runtime/session.zig");
+const sovereign_inquiry = @import("sovereign_inquiry.zig");
 const learning_status = @import("learning_status.zig");
 const learning_loop = @import("learning_loop.zig");
 const support_routing = @import("support_routing.zig");
@@ -70,6 +71,7 @@ comptime {
     _ = correction_review;
     _ = learning_status;
     _ = runtime_session;
+    _ = sovereign_inquiry;
     _ = learning_loop;
     _ = negative_knowledge;
     _ = support_routing;

@@ -8,6 +8,7 @@ const cpp_ast = ghost_core.cpp_ast;
 const gip = ghost_core.gip;
 const intent_grounding = ghost_core.intent_grounding;
 const shards = ghost_core.shards;
+const sovereign_inquiry = ghost_core.sovereign_inquiry;
 const task_intent = ghost_core.task_intent;
 const technical_drafts = ghost_core.technical_drafts;
 const text_generation_lab = ghost_core.text_generation_lab;
@@ -888,6 +889,7 @@ fn dispatchResidentCorpusAsk(allocator: std.mem.Allocator, resident: *ResidentSt
         return try renderUnrecognizedIntentResult(allocator, resident, obj, question);
     }
 
+    if (try dispatchSovereignOntologicalAsk(allocator, resident, obj, question, request_shard_id)) |sovereign| return sovereign;
     if (try dispatchStrictVerificationAsk(allocator, resident, obj, question, request_shard_id)) |strict| return strict;
     if (try text_generation_lab.generateFrameInferenceDraft(allocator, question)) |draft| {
         defer draft.deinit(allocator);
@@ -1436,6 +1438,95 @@ fn strictVerificationState(supported: bool, reason: ?[]const u8) gip.schema.Resu
         .stop_reason = .supported,
         .non_authorization_notice = null,
     };
+}
+
+fn dispatchSovereignOntologicalAsk(
+    allocator: std.mem.Allocator,
+    resident: *ResidentState,
+    obj: std.json.ObjectMap,
+    question: []const u8,
+    request_shard_id: []const u8,
+) !?[]u8 {
+    if (!sovereign_inquiry.isOntologicalInquiry(question)) return null;
+
+    var shard_metadata = if (std.mem.eql(u8, request_shard_id, "all"))
+        try shards.resolveCoreMetadata(allocator)
+    else
+        try shards.resolveProjectMetadata(allocator, request_shard_id);
+    defer shard_metadata.deinit();
+
+    var paths = try shards.resolvePaths(allocator, shard_metadata.metadata);
+    defer paths.deinit();
+
+    var proof = try sovereign_inquiry.run(allocator, question, paths.root_abs_path);
+    defer proof.deinit();
+
+    try resident.session_hot.appendTurn(resident.vulkan, "engine", proof.draft_text);
+    const result_json = try renderSovereignOntologicalCorpusResult(
+        allocator,
+        question,
+        @tagName(paths.metadata.kind),
+        paths.metadata.id,
+        proof.draft_text,
+        &proof,
+        resident,
+    );
+    defer allocator.free(result_json);
+
+    return try gip.schema.renderResponse(
+        allocator,
+        gip.core.PROTOCOL_VERSION,
+        jsonStringField(obj, "requestId"),
+        gip.core.parseRequestKind("corpus.ask"),
+        .ok,
+        strictVerificationState(true, null),
+        result_json,
+        null,
+        null,
+    );
+}
+
+fn renderSovereignOntologicalCorpusResult(
+    allocator: std.mem.Allocator,
+    question: []const u8,
+    shard_kind: []const u8,
+    shard_id: []const u8,
+    draft_text: []const u8,
+    proof: *const sovereign_inquiry.InquiryResult,
+    resident: *ResidentState,
+) ![]u8 {
+    const telemetry = resident.snapshotTelemetry();
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"corpusAsk\":{\"status\":\"supported\",\"state\":\"verified\",\"permission\":\"supported\",\"nonAuthorizing\":false,\"voiceSynthesis\":true,\"strictVerification\":true,\"sovereignOntologicalInquiry\":true,\"question\":");
+    try std.json.stringify(question, .{}, w);
+    try w.writeAll(",\"shard\":{\"kind\":");
+    try std.json.stringify(shard_kind, .{}, w);
+    try w.writeAll(",\"id\":");
+    try std.json.stringify(shard_id, .{}, w);
+    try w.writeAll("},\"answerDraft\":");
+    try std.json.stringify(draft_text, .{}, w);
+    try w.writeAll(",\"negativeKnowledgeLedger\":{\"checked\":true,\"answerSuppressed\":false,\"matches\":0,\"rejections\":[],\"mutationPerformed\":");
+    try w.writeAll(if (proof.ledger_recorded) "true" else "false");
+    try w.writeAll(",\"ledgerPath\":");
+    try std.json.stringify(proof.ledger_path, .{}, w);
+    try w.writeAll(",\"failedAstHash\":");
+    try std.json.stringify(proof.code_hash, .{}, w);
+    try w.writeAll(",\"axiomViolation\":");
+    try std.json.stringify(proof.violation, .{}, w);
+    try w.writeAll("},\"evidenceUsed\":[],\"unknowns\":[],\"candidateFollowups\":[],\"learningCandidates\":[],\"trace\":{\"corpusMutation\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":");
+    try w.writeAll(if (proof.ledger_recorded) "true" else "false");
+    try w.writeAll(",\"commandsExecuted\":false,\"verifiersExecuted\":true,\"generalistRoute\":\"ontological_router\",\"dynamicTaskGraph\":true,\"verifier\":");
+    try std.json.stringify(proof.verifier_label, .{}, w);
+    try w.print(",\"residentDaemon\":true,\"residentShards\":{d},\"vramResidentBytes\":{d},\"sessionHotBytes\":{d},\"vulkanActive\":{s}", .{
+        telemetry.loaded_shards,
+        telemetry.vram_resident_bytes,
+        resident.session_hot.usedBytes(),
+        if (resident.vulkan_active) "true" else "false",
+    });
+    try w.writeAll("}}}");
+    return out.toOwnedSlice();
 }
 
 fn renderStrictVerificationCorpusResult(

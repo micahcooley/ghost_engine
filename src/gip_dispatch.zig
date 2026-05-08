@@ -360,11 +360,26 @@ fn dispatchCorpusAsk(allocator: std.mem.Allocator, request_body: ?[]const u8) !D
     const rendered = try corpus_ask.renderJson(allocator, &result);
     errdefer allocator.free(rendered);
 
-    var gip_state = if (result.status == .answered)
+    const supported_verified = result.status == .answered and
+        std.mem.eql(u8, result.state, "verified") and
+        std.mem.eql(u8, result.permission, "supported") and
+        result.safety_flags.verifiers_executed;
+    var gip_state = if (supported_verified)
+        schema.ResultState{
+            .state = .verified,
+            .permission = .supported,
+            .is_draft = false,
+            .verification_state = .verified,
+            .support_minimum_met = true,
+            .stop_reason = .supported,
+        }
+    else if (result.status == .answered)
         schema.draftResultState()
     else
         schema.unresolvedResultState(if (result.unknowns.len > 0) @tagName(result.unknowns[0].kind) else "unknown");
-    gip_state.non_authorization_notice = "corpus.ask output is draft/non-authorizing; cited corpus evidence is not proof and no verifier was executed";
+    if (!supported_verified) {
+        gip_state.non_authorization_notice = "corpus.ask output is draft/non-authorizing; cited corpus evidence is not proof and no verifier was executed";
+    }
 
     return .{
         .status = if (result.status == .answered) .ok else .unresolved,
