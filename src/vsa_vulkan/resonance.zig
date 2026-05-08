@@ -23,6 +23,7 @@ pub const FrameKind = enum(u8) {
     control,
     code_inheritance,
     analogy,
+    system_acknowledgment,
 };
 
 pub const FrameRole = enum(usize) {
@@ -75,8 +76,6 @@ pub const SemanticFrameVector = struct {
     }
 };
 
-// Compatibility name for the manifest and daemon fields that still store the
-// two 64-bit relation hashes. New extraction below is frame-based.
 pub const SpoVector = SemanticFrameVector;
 
 const FrameToken = struct {
@@ -90,12 +89,99 @@ pub fn extractFrameVector(text: []const u8) SemanticFrameVector {
     const count = tokenizeFrame(text, &tokens);
     if (count == 0) return .{};
     const slice = tokens[0..count];
-    if (extractSpecializedFrame(slice)) |frame| return frame;
-    return extractRelationFrame(slice);
+
+    return if (extractSpecializedFrame(slice)) |f| f else extractRelationFrame(slice);
 }
 
 pub fn extractSpoVector(text: []const u8) SpoVector {
     return extractFrameVector(text);
+}
+
+pub const ByteBoundary = struct {
+    start: usize,
+    end: usize,
+    valid: bool,
+};
+
+pub fn paragraphBoundary(bytes: []const u8, offset: usize, len: usize) ByteBoundary {
+    if (bytes.len == 0 or offset >= bytes.len) return .{ .start = 0, .end = 0, .valid = false };
+    const initial_end = @min(bytes.len, offset + @min(len, bytes.len - offset));
+    var start = offset;
+    while (start > 0) : (start -= 1) {
+        if (isParagraphDelimiterBefore(bytes, start)) break;
+    }
+    var end = initial_end;
+    while (end < bytes.len) : (end += 1) {
+        if (isParagraphDelimiterAt(bytes, end)) break;
+    }
+    while (start < end and std.ascii.isWhitespace(bytes[start])) : (start += 1) {}
+    while (end > start and std.ascii.isWhitespace(bytes[end - 1])) : (end -= 1) {}
+    return .{ .start = start, .end = end, .valid = start < end and containsExplicitBoundary(bytes, start, end) };
+}
+
+pub fn isStrictParagraphBounded(bytes: []const u8, offset: usize, len: usize) bool {
+    const boundary = paragraphBoundary(bytes, offset, len);
+    return boundary.valid and boundary.start <= offset and offset + len <= boundary.end;
+}
+
+fn containsExplicitBoundary(bytes: []const u8, start: usize, end: usize) bool {
+    return start == 0 or end == bytes.len or isParagraphDelimiterBefore(bytes, start) or isParagraphDelimiterAt(bytes, end);
+}
+
+fn isParagraphDelimiterBefore(bytes: []const u8, idx: usize) bool {
+    if (idx == 0) return true;
+    return bytes[idx - 1] == '\n' or (idx >= 2 and bytes[idx - 1] == '\n' and bytes[idx - 2] == '\n');
+}
+
+fn isParagraphDelimiterAt(bytes: []const u8, idx: usize) bool {
+    if (idx >= bytes.len) return true;
+    return bytes[idx] == '\n' or (idx + 1 < bytes.len and bytes[idx] == '\n' and bytes[idx + 1] == '\n');
+}
+
+pub fn resonance_scan(query: SemanticFrameVector, candidates: []const SemanticFrameVector, out_scores: []u16) void {
+    if (!query.valid) {
+        @memset(out_scores[0..candidates.len], 0);
+        return;
+    }
+
+    const VLEN = 8;
+    const q_forward: @Vector(VLEN, u64) = @splat(query.forward_hash);
+    const zero_vec: @Vector(VLEN, u64) = @splat(0);
+
+    var i: usize = 0;
+    while (i + VLEN <= candidates.len) : (i += VLEN) {
+        var c_valid_arr: [VLEN]bool = undefined;
+        var c_forward_arr: [VLEN]u64 = undefined;
+        var c_inverse_arr: [VLEN]u64 = undefined;
+
+        inline for (0..VLEN) |j| {
+            c_valid_arr[j] = candidates[i + j].valid;
+            c_forward_arr[j] = candidates[i + j].forward_hash;
+            c_inverse_arr[j] = candidates[i + j].inverse_hash;
+        }
+
+        const c_forward: @Vector(VLEN, u64) = c_forward_arr;
+        const c_inverse: @Vector(VLEN, u64) = c_inverse_arr;
+
+        const direct_match = (q_forward == c_forward) & (q_forward != zero_vec);
+        const inverse_match = (q_forward == c_inverse) & (q_forward != zero_vec);
+
+        inline for (0..VLEN) |j| {
+            if (!c_valid_arr[j]) {
+                out_scores[i + j] = 0;
+            } else if (direct_match[j]) {
+                out_scores[i + j] = 1000;
+            } else if (inverse_match[j]) {
+                out_scores[i + j] = 0;
+            } else {
+                out_scores[i + j] = relationScorePerMille(query, candidates[i + j]);
+            }
+        }
+    }
+
+    while (i < candidates.len) : (i += 1) {
+        out_scores[i] = relationScorePerMille(query, candidates[i]);
+    }
 }
 
 pub fn relationScorePerMille(query: SemanticFrameVector, candidate: SemanticFrameVector) u16 {
@@ -180,6 +266,7 @@ fn tokenizeFrame(text: []const u8, out: *[96]FrameToken) usize {
 }
 
 fn extractSpecializedFrame(tokens: []const FrameToken) ?SemanticFrameVector {
+    if (systemAcknowledgmentIndex(tokens)) |idx| return systemAcknowledgmentFrame(tokens, idx);
     if (commerceVerbIndex(tokens)) |verb_idx| return commerceFrame(tokens, verb_idx);
     if (breakageCueIndex(tokens)) |verb_idx| return breakageFrame(tokens, verb_idx);
     if (codeInheritanceIndex(tokens)) |idx| return codeInheritanceFrame(tokens, idx);
@@ -203,6 +290,7 @@ fn extractRelationFrame(tokens: []const FrameToken) SemanticFrameVector {
         roles[@intFromEnum(FrameRole.property)] = token.predicate_hash;
         return buildFrame(.relation, token.predicate_hash, roles, subject.hash, token.predicate_hash, object.hash);
     }
+
     return .{};
 }
 
@@ -320,6 +408,12 @@ fn updateRoleHash(hasher: *std.hash.Fnv1a_64, slot: FrameRole, role_hash: u64) v
     updateHashU64(hasher, role_hash);
 }
 
+fn updateHashU64(hasher: *std.hash.Fnv1a_64, value: u64) void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, value, .little);
+    hasher.update(&bytes);
+}
+
 fn previousConcept(tokens: []const FrameToken, predicate_idx: usize) ?usize {
     if (predicate_idx == 0) return null;
     var idx = predicate_idx;
@@ -400,6 +494,22 @@ fn commerceVerbIndex(tokens: []const FrameToken) ?usize {
         if (matchesToken(token.text, &.{ "buy", "buys", "bought", "buying", "purchase", "purchases", "purchased", "grab", "grabs", "grabbed", "get", "got", "paid", "pay", "pays" })) return idx;
     }
     return null;
+}
+
+fn systemAcknowledgmentIndex(tokens: []const FrameToken) ?usize {
+    for (tokens, 0..) |token, idx| {
+        if (matchesToken(token.text, &.{ "hi", "hello", "hey", "yo", "morning", "thanks" })) return idx;
+    }
+    return null;
+}
+
+fn systemAcknowledgmentFrame(tokens: []const FrameToken, cue_idx: usize) SemanticFrameVector {
+    _ = tokens;
+    _ = cue_idx;
+    var roles = [_]u64{0} ** FRAME_ROLE_DIMS;
+    roles[@intFromEnum(FrameRole.actor)] = hashPredicateName("user");
+    roles[@intFromEnum(FrameRole.object)] = hashPredicateName("system");
+    return buildFrame(.system_acknowledgment, hashPredicateName("system_acknowledgment"), roles, roles[@intFromEnum(FrameRole.actor)], hashPredicateName("acknowledge"), roles[@intFromEnum(FrameRole.object)]);
 }
 
 fn breakageCueIndex(tokens: []const FrameToken) ?usize {
@@ -512,12 +622,6 @@ fn hashRoleBound(subject_hash: u64, predicate_hash: u64, object_hash: u64) u64 {
     roles[@intFromEnum(FrameRole.object)] = object_hash;
     roles[@intFromEnum(FrameRole.property)] = predicate_hash;
     return hashFrameBound(hashFrameKind(.relation, predicate_hash), roles, false);
-}
-
-fn updateHashU64(hasher: *std.hash.Fnv1a_64, value: u64) void {
-    var bytes: [8]u8 = undefined;
-    std.mem.writeInt(u64, &bytes, value, .little);
-    hasher.update(&bytes);
 }
 
 test "semantic frame vectorization preserves directed inverse relations" {

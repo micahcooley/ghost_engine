@@ -20,6 +20,40 @@ if [ -n "$GHOST_DUMMY_FETCH" ]; then
   exit 0
 fi
 
+# Get number of cores cross-platform
+if command -v nproc &>/dev/null; then
+  CORES=$(nproc)
+elif command -v sysctl &>/dev/null; then
+  CORES=$(sysctl -n hw.ncpu)
+else
+  CORES=4
+fi
+
+download_file() {
+  local url=$1
+  local dest=$2
+  if command -v curl &>/dev/null; then
+    curl -sL -C - "$url" -o "$dest"
+  elif command -v wget &>/dev/null; then
+    wget -q -c "$url" -O "$dest"
+  else
+    echo "[!] Neither curl nor wget found."
+    exit 1
+  fi
+}
+
+download_stream() {
+  local url=$1
+  if command -v curl &>/dev/null; then
+    curl -sL "$url"
+  elif command -v wget &>/dev/null; then
+    wget -qO- "$url"
+  else
+    echo "[!] Neither curl nor wget found."
+    exit 1
+  fi
+}
+
 echo "[*] Starting parallel downloads for Omni-Codex..."
 
 # 1. Wikipedia
@@ -27,11 +61,11 @@ echo "[*] Starting parallel downloads for Omni-Codex..."
   echo "[*] Fetching and extracting Wikipedia dump..."
   # Download and stream directly to wikiextractor (if available) to save disk space
   if command -v python3 &>/dev/null && python3 -c "import wikiextractor" 2>/dev/null; then
-    wget -qO- https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles.xml.bz2 | \
-      python3 -m wikiextractor.WikiExtractor -o "$WIKI_DIR" --processes $(nproc) -q -
+    download_stream "https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles.xml.bz2" | \
+      python3 -m wikiextractor.WikiExtractor -o "$WIKI_DIR" --processes $CORES -q -
   else
     echo "[!] wikiextractor not found. Saving compressed dump..."
-    wget -q -c https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles.xml.bz2 -O "$WIKI_DIR/enwiki-latest-pages-articles.xml.bz2"
+    download_file "https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles.xml.bz2" "$WIKI_DIR/enwiki-latest-pages-articles.xml.bz2"
   fi
 ) &
 
@@ -46,7 +80,7 @@ fetch_dev_doc() {
   if [[ "$url" == *.tar.bz2 ]]; then filename="$name.tar.bz2"; fi
   if [[ "$url" == *.zip ]]; then filename="$name.zip"; fi
   
-  wget -q -c "$url" -O "$DOCS_DIR/$filename" || { echo "[!] Failed to fetch $name"; return 1; }
+  download_file "$url" "$DOCS_DIR/$filename" || { echo "[!] Failed to fetch $name"; return 1; }
   
   echo "[*] Extracting $name..."
   mkdir -p "$DOCS_DIR/$name"

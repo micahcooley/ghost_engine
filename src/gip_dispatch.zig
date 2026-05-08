@@ -344,6 +344,8 @@ fn dispatchCorpusAsk(allocator: std.mem.Allocator, request_body: ?[]const u8) !D
     };
     defer allocator.free(mounted_packs);
 
+    const context = getStr(obj, "context", "context");
+
     var result = try corpus_ask.ask(allocator, .{
         .question = question,
         .project_shard = getStr(obj, "project_shard", "projectShard"),
@@ -351,6 +353,7 @@ fn dispatchCorpusAsk(allocator: std.mem.Allocator, request_body: ?[]const u8) !D
         .max_results = max_results,
         .max_snippet_bytes = max_snippet_bytes,
         .require_citations = getBool(obj, "require_citations", "requireCitations") orelse true,
+        .context = context,
     });
     defer result.deinit();
 

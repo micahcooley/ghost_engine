@@ -46,9 +46,48 @@ pub const extractSpoVector = vk_resonance.extractSpoVector;
 pub const relationScorePerMille = vk_resonance.relationScorePerMille;
 pub const relationPenaltyPerMille = vk_resonance.relationPenaltyPerMille;
 pub const graphIsomorphismScorePerMille = vk_resonance.graphIsomorphismScorePerMille;
+pub const ByteBoundary = vk_resonance.ByteBoundary;
+pub const paragraphBoundary = vk_resonance.paragraphBoundary;
+pub const isStrictParagraphBounded = vk_resonance.isStrictParagraphBounded;
 pub const SPO_DIRECT_MATCH_BONUS = vk_resonance.SPO_DIRECT_MATCH_BONUS;
 pub const SPO_PARTIAL_MATCH_BONUS = vk_resonance.SPO_PARTIAL_MATCH_BONUS;
 pub const SPO_INVERSE_MATCH_PENALTY_PER_MILLE = vk_resonance.SPO_INVERSE_MATCH_PENALTY_PER_MILLE;
+
+pub const SemanticSpace = enum {
+    none,
+    entertainment,
+    computing,
+    biography,
+};
+
+pub fn contextualRelationScorePerMille(query: SpoVector, context: SpoVector, candidate: SpoVector) u16 {
+    const direct = relationScorePerMille(query, candidate);
+    if (direct >= 1000) return direct;
+    const context_score = relationScorePerMille(context, candidate);
+    return @max(direct, context_score);
+}
+
+pub fn detectSemanticSpace(text: []const u8) SemanticSpace {
+    if (containsAsciiFold(text, "simpsons") or containsAsciiFold(text, "television") or containsAsciiFold(text, "episode")) return .entertainment;
+    if (containsAsciiFold(text, "computer") or containsAsciiFold(text, "software") or containsAsciiFold(text, "program")) return .computing;
+    if (containsAsciiFold(text, "born") or containsAsciiFold(text, "physicist") or containsAsciiFold(text, "biography")) return .biography;
+    return .none;
+}
+
+pub fn murmur3Bytes64(bytes: []const u8) u64 {
+    var hasher = std.hash.Fnv1a_64.init();
+    hasher.update(bytes);
+    return hasher.final();
+}
+
+fn containsAsciiFold(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or needle.len > haystack.len) return false;
+    var idx: usize = 0;
+    while (idx + needle.len <= haystack.len) : (idx += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[idx .. idx + needle.len], needle)) return true;
+    }
+    return false;
+}
 
 pub fn runtimeLogsEnabled() bool {
     return envFlag("GHOST_ENGINE_DEBUG") or
@@ -663,6 +702,7 @@ pub const VulkanEngine = struct {
     max_workgroup_invocations: u32 = 0,
     supports_int16: bool = false,
     max_alloc_count: u32 = 0,
+    device_profile: vk_device.DeviceProfile = .{},
 
     // Pipeline Objects
     descriptor_set_layout: vk.VkDescriptorSetLayout = null,
@@ -931,10 +971,30 @@ pub const VulkanEngine = struct {
             }
         }
 
+        var subgroupSize: u32 = 32; // Default fallback
+        if (self.vk_ctx.vkGetPhysicalDeviceProperties2 != null) {
+            var subgroupProps = std.mem.zeroes(vk.VkPhysicalDeviceSubgroupProperties);
+            subgroupProps.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+            var devProps2 = std.mem.zeroes(vk.VkPhysicalDeviceProperties2);
+            devProps2.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            devProps2.pNext = &subgroupProps;
+            self.vk_ctx.vkGetPhysicalDeviceProperties2.?(self.pdev, &devProps2);
+            if (subgroupProps.subgroupSize > 0) {
+                subgroupSize = subgroupProps.subgroupSize;
+            }
+        }
+
+        self.device_profile = .{
+            .max_compute_workgroup_invocations = self.max_workgroup_invocations,
+            .subgroup_size = subgroupSize,
+            .total_memory = self.vram_size,
+        };
+
         if (runtimeLogsEnabled()) {
             std.debug.print("[VULKAN-{d}] Selected Device: {s}\n", .{ self.device_index, trimDeviceName(devProps.deviceName[0..]) });
             std.debug.print("[VULKAN-{d}] VRAM Detect: {d} MB | Parallel Streams: {d}\n", .{ self.device_index, self.vram_size / 1048576, self.num_queues });
             std.debug.print("[VULKAN-{d}] Headless compute mode active. Perf score: {d}\n", .{ self.device_index, self.performance_score });
+            std.debug.print("[VULKAN-{d}] Device Profile: max_wg={d}, subgroup={d}\n", .{ self.device_index, self.device_profile.max_compute_workgroup_invocations, self.device_profile.subgroup_size });
         }
 
         var qfCount: u32 = 0;

@@ -1592,10 +1592,10 @@ fn parseOneFileForIngest(
         } };
     }
 
-    const raw_hash = std.hash.Fnv1a_64.hash(bytes);
+    const raw_hash = vsa_vulkan.murmur3Bytes64(bytes);
     const normalized_bytes = try normalizedDedupBytes(allocator, bytes);
     defer allocator.free(normalized_bytes);
-    const normalized_hash = std.hash.Fnv1a_64.hash(normalized_bytes);
+    const normalized_hash = vsa_vulkan.murmur3Bytes64(normalized_bytes);
     _ = acceleration;
     var code_intel_summary: ?[]u8 = null;
     errdefer if (code_intel_summary) |value| allocator.free(value);

@@ -104,6 +104,7 @@ pub const VulkanCtx = struct {
     // All other functions (loaded via vkGetInstanceProcAddr after instance creation)
     vkEnumeratePhysicalDevices: vk.PFN_vkEnumeratePhysicalDevices = null,
     vkGetPhysicalDeviceProperties: vk.PFN_vkGetPhysicalDeviceProperties = null,
+    vkGetPhysicalDeviceProperties2: vk.PFN_vkGetPhysicalDeviceProperties2 = null,
     vkGetPhysicalDeviceFeatures: vk.PFN_vkGetPhysicalDeviceFeatures = null,
     vkGetPhysicalDeviceQueueFamilyProperties: vk.PFN_vkGetPhysicalDeviceQueueFamilyProperties = null,
     vkGetPhysicalDeviceMemoryProperties: vk.PFN_vkGetPhysicalDeviceMemoryProperties = null,
@@ -258,4 +259,5 @@ const required_instance_fn_names = [_][:0]const u8{
 const optional_instance_fn_names = [_][:0]const u8{
     "vkCreateDebugUtilsMessengerEXT",
     "vkDestroyDebugUtilsMessengerEXT",
+    "vkGetPhysicalDeviceProperties2",
 };

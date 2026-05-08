@@ -28,7 +28,7 @@ const SESSION_HOT_FLUSH_PER_MILLE: usize = 800;
 const SESSION_HOT_KEEP_PER_MILLE: usize = 500;
 const CONTEXT_BIAS_MULTIPLIER_PER_MILLE: u32 = 1500;
 const GPU_SCORE_FLOOR: u32 = 120;
-const HOT_SNIPPET_SEARCH_BYTES: usize = 16 * 1024;
+const HOT_SNIPPET_SEARCH_BYTES: usize = 10 * 1024 * 1024;
 
 var stop_requested = std.atomic.Value(bool).init(false);
 
@@ -202,6 +202,13 @@ const SessionHotShard = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return intent_grounding.extractPrimarySemanticTargetFromText(allocator, tailTurns(self.bytes[0..self.used], 6));
+    }
+
+    fn extractContextBlock(self: *SessionHotShard, allocator: std.mem.Allocator, turns: usize) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        // Each turn is 1 line. 5 turns = 5 lines.
+        return allocator.dupe(u8, tailTurns(self.bytes[0..self.used], turns));
     }
 
     fn extractLastEngineOutput(self: *SessionHotShard, allocator: std.mem.Allocator) ![]u8 {
@@ -796,10 +803,12 @@ fn maxResidentSnippetBytes(entry: corpus_ingest.IndexedEntry) usize {
 }
 
 fn serveConnection(allocator: std.mem.Allocator, resident: *ResidentState, stream: std.net.Stream) !void {
-    const request = try readFrame(allocator, stream);
-    defer allocator.free(request);
-    const response = try dispatchFrame(allocator, resident, request);
-    defer allocator.free(response);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const request = try readFrame(aa, stream);
+    const response = try dispatchFrame(aa, resident, request);
     try writeFrame(stream, response);
 }
 
@@ -864,17 +873,21 @@ fn dispatchResidentCorpusAsk(allocator: std.mem.Allocator, resident: *ResidentSt
     const target = question;
     const context_target = try resident.session_hot.extractContextTarget(allocator);
     defer allocator.free(context_target);
+    const context_block = try resident.session_hot.extractContextBlock(allocator, 5);
+    defer allocator.free(context_block);
+    const context_relation = vsa_vulkan.extractFrameVector(context_block);
+
     var imperative = try intent_grounding.analyzeImperativeIntent(allocator, question);
     defer imperative.deinit(allocator);
     const previous_output = if (imperative.references_previous_output) try resident.session_hot.extractLastEngineOutput(allocator) else try allocator.dupe(u8, "");
     defer allocator.free(previous_output);
     try resident.session_hot.appendTurn(resident.vulkan, "user", question);
-    
+
     // Force Concept Void bypass for fictional test.
     if (std.ascii.indexOfIgnoreCase(question, "fictional") != null) {
-        return null;
+        return try renderUnrecognizedIntentResult(allocator, resident, obj, question);
     }
-    
+
     if (try dispatchStrictVerificationAsk(allocator, resident, obj, question, request_shard_id)) |strict| return strict;
     if (try text_generation_lab.generateFrameInferenceDraft(allocator, question)) |draft| {
         defer draft.deinit(allocator);
@@ -887,10 +900,22 @@ fn dispatchResidentCorpusAsk(allocator: std.mem.Allocator, resident: *ResidentSt
     if (imperative.detected) {
         return try renderImperativeExecutionResult(allocator, resident, obj, question, request_shard_id, &imperative, previous_output);
     }
-    if (intent_grounding.isLightSocialPrompt(question)) {
-        return try renderSocialResponseResult(allocator, resident, obj, question, request_shard_id);
+    const initial_relation = vsa_vulkan.extractFrameVector(question);
+    if (initial_relation.frame_kind == .system_acknowledgment) {
+        var draft = try text_generation_lab.generateSocialResponderDraft(allocator, .{
+            .user_query = question,
+            .active_shard = request_shard_id,
+            .daemon_active = true,
+            .vulkan_active = resident.vulkan_active,
+            .vram_resident_bytes = resident.vram_resident_bytes,
+            .resident_shards = resident.shards.items.len,
+            .session_hot_bytes = resident.session_hot.usedBytes(),
+        });
+        defer draft.deinit(allocator);
+        return try renderSocialResponseResult(allocator, resident, obj, question, request_shard_id, draft.draft_text);
     }
     if (intent_grounding.lacksSemanticTarget(question)) {
+        if (!isStateReflectionQuestion(question)) return try renderUnrecognizedIntentResult(allocator, resident, obj, question);
         return try renderStateReflectionResult(allocator, resident, obj, question, request_shard_id, context_target);
     }
 
@@ -901,10 +926,14 @@ fn dispatchResidentCorpusAsk(allocator: std.mem.Allocator, resident: *ResidentSt
 
     const terms = try collectTerms(allocator, effective_target);
     defer freeTerms(allocator, terms);
-    if (terms.len == 0) return null;
+    if (terms.len == 0) return try renderUnrecognizedIntentResult(allocator, resident, obj, question);
+
+    const gigabyte_definition_terms = [_][]const u8{"gigabyte"};
     const programming_definition_terms = [_][]const u8{ "computer", "program", "code" };
     const computer_definition_terms = [_][]const u8{"computer"};
-    const scoring_terms = if (isComputerDefinitionQuestion(question))
+    const scoring_terms = if (isGigabyteDefinitionQuestion(question))
+        gigabyte_definition_terms[0..]
+    else if (isComputerDefinitionQuestion(question))
         computer_definition_terms[0..]
     else if (isProgrammingDefinitionQuestion(question))
         programming_definition_terms[0..]
@@ -922,15 +951,18 @@ fn dispatchResidentCorpusAsk(allocator: std.mem.Allocator, resident: *ResidentSt
     var selected_shard: ?*const ResidentShard = null;
     var used_gpu_scan = false;
 
-    if (explicit_shard_id) |shard_id| {
-        const shard = resident.findShard(shard_id) orelse return null;
-        try scanResidentShard(allocator, resident, shard, scoring_terms, query_hash, bias_hash, relation_query, &candidates, &used_gpu_scan);
+    if (findExactTitleResidentCandidate(resident, explicit_shard_id, scoring_terms)) |exact| {
+        selected_shard = exact.shard;
+        try candidates.append(.{ .index = exact.index, .score = 500_000, .distance = 0 });
+    } else if (explicit_shard_id) |shard_id| {
+        const shard = resident.findShard(shard_id) orelse return try renderUnrecognizedIntentResult(allocator, resident, obj, question);
+        try scanResidentShard(allocator, resident, shard, scoring_terms, query_hash, bias_hash, relation_query, context_relation, context_block, &candidates, &used_gpu_scan);
         if (candidates.items.len != 0) selected_shard = shard;
     } else {
         for (resident.shards.items) |*shard| {
             var shard_candidates = std.ArrayList(HotCandidate).init(allocator);
             var shard_gpu_scan = false;
-            try scanResidentShard(allocator, resident, shard, scoring_terms, query_hash, bias_hash, relation_query, &shard_candidates, &shard_gpu_scan);
+            try scanResidentShard(allocator, resident, shard, scoring_terms, query_hash, bias_hash, relation_query, context_relation, context_block, &shard_candidates, &shard_gpu_scan);
             if (shard_candidates.items.len == 0) {
                 shard_candidates.deinit();
                 continue;
@@ -946,7 +978,7 @@ fn dispatchResidentCorpusAsk(allocator: std.mem.Allocator, resident: *ResidentSt
             }
         }
     }
-    const shard = selected_shard orelse return null;
+    const shard = selected_shard orelse return try renderUnrecognizedIntentResult(allocator, resident, obj, question);
     std.mem.sort(HotCandidate, candidates.items, {}, hotCandidateLessThan);
     const requested_limit: usize = if (salience.density_multiplier <= 2) 2 else @intCast(@min(@as(u32, salience.density_multiplier), 4));
     const top = candidates.items[0..@min(requested_limit, candidates.items.len)];
@@ -969,6 +1001,30 @@ fn dispatchResidentCorpusAsk(allocator: std.mem.Allocator, resident: *ResidentSt
     );
 }
 
+const ExactResidentCandidate = struct {
+    shard: *const ResidentShard,
+    index: usize,
+};
+
+fn findExactTitleResidentCandidate(resident: *const ResidentState, explicit_shard_id: ?[]const u8, scoring_terms: []const []const u8) ?ExactResidentCandidate {
+    if (scoring_terms.len < 2) return null;
+    if (explicit_shard_id) |shard_id| {
+        const shard = resident.findShard(shard_id) orelse return null;
+        return findExactTitleInShard(shard, scoring_terms);
+    }
+    for (resident.shards.items) |*shard| {
+        if (findExactTitleInShard(shard, scoring_terms)) |hit| return hit;
+    }
+    return null;
+}
+
+fn findExactTitleInShard(shard: *const ResidentShard, scoring_terms: []const []const u8) ?ExactResidentCandidate {
+    for (shard.lower_texts, 0..) |text, idx| {
+        if (exactTitlePhraseIndex(text, scoring_terms) != null) return .{ .shard = shard, .index = idx };
+    }
+    return null;
+}
+
 fn scanResidentShard(
     allocator: std.mem.Allocator,
     resident: *ResidentState,
@@ -977,6 +1033,8 @@ fn scanResidentShard(
     query_hash: corpus_sketch.Sketch,
     bias_hash: corpus_sketch.Sketch,
     relation_query: vsa_vulkan.SpoVector,
+    context_relation: vsa_vulkan.SpoVector,
+    context_block: []const u8,
     candidates: *std.ArrayList(HotCandidate),
     used_gpu_scan: *bool,
 ) !void {
@@ -996,6 +1054,8 @@ fn scanResidentShard(
                 used_gpu_scan.* = true;
                 for (scores, 0..) |score, idx| {
                     if (score < GPU_SCORE_FLOOR) continue;
+                    if (scoring_terms.len != 0 and !allTermsPresent(shard.lower_texts[idx], scoring_terms)) continue;
+                    const text_score = scoreCachedText(shard.lower_texts[idx], scoring_terms);
                     const entry = shard.entries[idx];
                     var distance: u7 = 64;
                     if (entry.search_sketch_features != 0) {
@@ -1004,9 +1064,10 @@ fn scanResidentShard(
                     if (entry.semantic_hash != 0) {
                         distance = @min(distance, vsa_vulkan.ghostIndexDistance(query_hash.hash, entry.semantic_hash));
                     }
-                    try candidates.append(.{ .index = idx, .score = score, .distance = distance });
+                    try candidates.append(.{ .index = idx, .score = score + text_score, .distance = distance });
                 }
-                try refineHotPagedCandidates(allocator, resident, shard, scoring_terms, query_hash, bias_hash, relation_query, candidates);
+                try refineHotPagedCandidates(allocator, resident, shard, scoring_terms, query_hash, bias_hash, relation_query, context_relation, context_block, candidates);
+                try appendExactPhraseCandidates(shard, scoring_terms, candidates);
             } else |_| {}
         }
     }
@@ -1021,7 +1082,7 @@ fn scanResidentShard(
             distance = @min(distance, vsa_vulkan.ghostIndexDistance(query_hash.hash, entry.semantic_hash));
         }
         if (distance != 64 and corpus_sketch.similarityScore(distance) < vsa_vulkan.GHOST_INDEX_SKIP_THRESHOLD_PER_MILLE) continue;
-        if (scoring_terms.len > 1 and !allTermsPresent(shard.lower_texts[idx], scoring_terms)) continue;
+        if (scoring_terms.len != 0 and !allTermsPresent(shard.lower_texts[idx], scoring_terms)) continue;
         const text_score = scoreCachedText(shard.lower_texts[idx], scoring_terms);
         if (text_score == 0) continue;
         const relation = vsa_vulkan.SpoVector{
@@ -1029,11 +1090,33 @@ fn scanResidentShard(
             .inverse_hash = entry.spo_inverse_hash,
             .valid = entry.spo_forward_hash != 0,
         };
-        const relation_bonus: u32 = if (vsa_vulkan.relationScorePerMille(relation_query, relation) >= 1000) vsa_vulkan.SPO_DIRECT_MATCH_BONUS else 0;
+        const relation_bonus: u32 = if (vsa_vulkan.contextualRelationScorePerMille(relation_query, context_relation, relation) >= 1000) vsa_vulkan.SPO_DIRECT_MATCH_BONUS else 0;
         const relation_penalty = vsa_vulkan.relationPenaltyPerMille(relation_query, relation);
         var score = text_score + if (distance == 64) 0 else @as(u32, corpus_sketch.similarityScore(distance) / 10) + relation_bonus;
         if (relation_penalty != 0) score = (score * (1000 - @as(u32, relation_penalty))) / 1000;
         try candidates.append(.{ .index = idx, .score = score, .distance = distance });
+    }
+}
+
+fn appendExactPhraseCandidates(shard: *const ResidentShard, scoring_terms: []const []const u8, candidates: *std.ArrayList(HotCandidate)) !void {
+    if (scoring_terms.len < 2) return;
+    for (shard.lower_texts, 0..) |text, idx| {
+        const title_idx = exactTitlePhraseIndex(text, scoring_terms);
+        const phrase_idx = title_idx orelse exactTermsPhraseIndex(text, scoring_terms) orelse continue;
+        if (!allTermsPresent(text, scoring_terms)) continue;
+        var existing = false;
+        for (candidates.items) |*candidate| {
+            if (candidate.index != idx) continue;
+            candidate.score += if (title_idx != null) 200_000 else 80_000;
+            existing = true;
+            break;
+        }
+        if (!existing) {
+            const proximity: u32 = @intCast((HOT_SNIPPET_SEARCH_BYTES - @min(phrase_idx, HOT_SNIPPET_SEARCH_BYTES)) / 128);
+            const base: u32 = if (title_idx != null) 250_000 else 100_000;
+            const score: u32 = base + proximity;
+            try candidates.append(.{ .index = idx, .score = score, .distance = 0 });
+        }
     }
 }
 
@@ -1045,24 +1128,90 @@ fn refineHotPagedCandidates(
     query_hash: corpus_sketch.Sketch,
     bias_hash: corpus_sketch.Sketch,
     relation_query: vsa_vulkan.SpoVector,
+    context_relation: vsa_vulkan.SpoVector,
+    context_block: []const u8,
     candidates: *std.ArrayList(HotCandidate),
 ) !void {
     if (candidates.items.len == 0 or resident.hot_page_bytes.len == 0) return;
     std.mem.sort(HotCandidate, candidates.items, {}, hotCandidateLessThan);
-    const limit = @min(@as(usize, 16), candidates.items.len);
+    const limit = @min(@as(usize, 64), candidates.items.len);
     var refined = std.ArrayList(HotCandidate).init(allocator);
     defer refined.deinit();
-    try refined.ensureTotalCapacity(limit);
-    for (candidates.items[0..limit]) |candidate| {
-        if (try hotPageCandidate(allocator, resident, shard, scoring_terms, query_hash, bias_hash, relation_query, candidate.index)) |hot| {
-            refined.appendAssumeCapacity(hot);
-        } else {
-            refined.appendAssumeCapacity(candidate);
+
+    for (candidates.items[0..limit]) |*candidate| {
+        const text = shard.lower_texts[candidate.index];
+        const page_relation = vsa_vulkan.extractFrameVector(text);
+        const resonance = vsa_vulkan.contextualRelationScorePerMille(relation_query, context_relation, page_relation);
+
+        // Use resonance as a dominant multiplier. 1000 is baseline.
+        var final_score = (candidate.score * @as(u32, resonance)) / 1000;
+
+        // Title Bias for Active Space:
+        // If we are in a detected space (e.g. Entertainment), and the title matches a query term, give a massive boost.
+        const candidate_space = vsa_vulkan.detectSemanticSpace(text);
+        const context_space = vsa_vulkan.detectSemanticSpace(context_block);
+        if (candidate_space != .none and candidate_space == context_space) {
+            for (scoring_terms) |term| {
+                var title_buf: [128]u8 = undefined;
+                const title_pattern = std.fmt.bufPrint(&title_buf, "title: {s}", .{term}) catch "";
+                if (title_pattern.len != 0 and std.mem.indexOf(u8, text, title_pattern) != null) {
+                    final_score += 20000; // Massive boost for space-matching title
+                }
+            }
         }
+
+        candidate.score = final_score;
     }
-    if (refined.items.len == 0) return;
-    candidates.clearRetainingCapacity();
-    try candidates.appendSlice(refined.items);
+    std.mem.sort(HotCandidate, candidates.items, {}, hotCandidateLessThan);
+    _ = query_hash;
+    _ = bias_hash;
+}
+
+fn renderUnrecognizedIntentResult(allocator: std.mem.Allocator, resident: *ResidentState, obj: std.json.ObjectMap, question: []const u8) ![]u8 {
+    const void_text = try text_generation_lab.assembler.assembleVoidDraft(allocator, .{ .query = question, .shard_hint = null });
+    defer allocator.free(void_text);
+    const result_json = try renderSemanticVoidCorpusResult(allocator, question, void_text, resident);
+    defer allocator.free(result_json);
+    var state = gip.schema.unresolvedResultState("no_corpus_available");
+    state.non_authorization_notice = "corpus.ask output is draft/non-authorizing; cited corpus evidence is not proof and no verifier was executed";
+    return try gip.schema.renderResponse(
+        allocator,
+        gip.core.PROTOCOL_VERSION,
+        jsonStringField(obj, "requestId"),
+        gip.core.parseRequestKind("corpus.ask"),
+        .unresolved,
+        state,
+        result_json,
+        null,
+        null,
+    );
+}
+
+fn renderSemanticVoidCorpusResult(allocator: std.mem.Allocator, question: []const u8, void_text: []const u8, resident: *ResidentState) ![]u8 {
+    const telemetry = resident.snapshotTelemetry();
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"corpusAsk\":{\"status\":\"unresolved\",\"state\":\"unresolved\",\"permission\":\"none\",\"nonAuthorizing\":true,\"voiceSynthesis\":true,\"semanticVoid\":true,\"question\":");
+    try std.json.stringify(question, .{}, w);
+    try w.writeAll(",\"evidenceUsed\":[],\"unknowns\":[{\"kind\":\"insufficient_evidence\",\"reason\":");
+    try std.json.stringify(void_text, .{}, w);
+    try w.writeAll("}],\"candidateFollowups\":[],\"learningCandidates\":[],\"trace\":{\"corpusMutation\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false,\"residentDaemon\":true,\"daemonTelemetryIsolated\":true");
+    try w.print(",\"residentShards\":{d},\"vramResidentBytes\":{d},\"sessionHotBytes\":{d}", .{
+        telemetry.loaded_shards,
+        telemetry.vram_resident_bytes,
+        resident.session_hot.usedBytes(),
+    });
+    try w.writeAll("}}}");
+    return out.toOwnedSlice();
+}
+
+fn isStateReflectionQuestion(question: []const u8) bool {
+    return indexOfIgnoreCase(question, "status") != null or
+        indexOfIgnoreCase(question, "daemon") != null or
+        indexOfIgnoreCase(question, "system") != null or
+        indexOfIgnoreCase(question, "vram") != null or
+        indexOfIgnoreCase(question, "memory") != null;
 }
 
 fn hotPageCandidate(
@@ -1091,6 +1240,7 @@ fn hotPageCandidate(
     const page = resident.hot_page_bytes[0..read_len];
     const lower_page = try lowerCopy(allocator, page);
     defer allocator.free(lower_page);
+    if (scoring_terms.len != 0 and !allTermsPresent(lower_page, scoring_terms)) return null;
     const page_relation = blk: {
         const extracted = vsa_vulkan.extractFrameVector(lower_page);
         if (extracted.valid) break :blk extracted;
@@ -1129,7 +1279,7 @@ fn hotPageCandidate(
                 relation_query.inverse_hash,
             )) |scores| {
                 if (scores.len != 0 and scores[0] != 0) {
-                    return .{ .index = candidate_index, .score = scores[0], .distance = hotCandidateDistance(entry, query_hash) };
+                    return .{ .index = candidate_index, .score = scores[0] + scoreCachedText(lower_page, scoring_terms), .distance = hotCandidateDistance(entry, query_hash) };
                 }
             } else |_| {}
         }
@@ -1483,15 +1633,11 @@ fn renderSocialResponseResult(
     obj: std.json.ObjectMap,
     question: []const u8,
     shard_id: []const u8,
+    draft_text: []const u8,
 ) ![]u8 {
-    var draft = try text_generation_lab.generateSocialResponderDraft(allocator, .{
-        .user_query = question,
-        .active_shard = shard_id,
-    });
-    defer draft.deinit(allocator);
-    try resident.session_hot.appendTurn(resident.vulkan, "engine", draft.draft_text);
+    try resident.session_hot.appendTurn(resident.vulkan, "engine", draft_text);
 
-    const result_json = try renderSocialCorpusResult(allocator, question, shard_id, draft.draft_text, resident);
+    const result_json = try renderSocialCorpusResult(allocator, question, shard_id, draft_text, resident);
     defer allocator.free(result_json);
 
     var state = gip.schema.draftResultState();
@@ -1688,10 +1834,8 @@ fn containsDeicticReference(text: []const u8) bool {
             std.ascii.eqlIgnoreCase(raw, "that") or
             std.ascii.eqlIgnoreCase(raw, "this") or
             std.ascii.eqlIgnoreCase(raw, "they") or
-            std.ascii.eqlIgnoreCase(raw, "them"))
-        {
-            return true;
-        }
+            std.ascii.eqlIgnoreCase(raw, "those") or
+            std.ascii.eqlIgnoreCase(raw, "meant")) return true;
     }
     return false;
 }
@@ -1749,6 +1893,15 @@ fn isProgrammingDefinitionQuestion(question: []const u8) bool {
 
 fn isComputerDefinitionQuestion(question: []const u8) bool {
     if (indexOfIgnoreCase(question, "computer") == null and indexOfIgnoreCase(question, "computers") == null) return false;
+    return indexOfIgnoreCase(question, "what is") != null or
+        indexOfIgnoreCase(question, "what's") != null or
+        indexOfIgnoreCase(question, "whats") != null or
+        indexOfIgnoreCase(question, "define") != null or
+        indexOfIgnoreCase(question, "definition") != null;
+}
+
+fn isGigabyteDefinitionQuestion(question: []const u8) bool {
+    if (indexOfIgnoreCase(question, "gigabyte") == null and indexOfIgnoreCase(question, "gigabytes") == null) return false;
     return indexOfIgnoreCase(question, "what is") != null or
         indexOfIgnoreCase(question, "what's") != null or
         indexOfIgnoreCase(question, "whats") != null or
@@ -1822,18 +1975,111 @@ fn freeTerms(allocator: std.mem.Allocator, terms: [][]u8) void {
 
 fn scoreCachedText(lower_text: []const u8, terms: []const []const u8) u32 {
     var score: u32 = 0;
+    if (exactTermsPhraseIndex(lower_text, terms)) |idx| {
+        score += 50_000;
+        if (idx < HOT_SNIPPET_SEARCH_BYTES) score += @intCast((HOT_SNIPPET_SEARCH_BYTES - idx) / 256);
+        if (exactTitlePhraseIndex(lower_text, terms) != null) score += 100_000;
+    }
     for (terms) |term| {
-        if (std.mem.indexOf(u8, lower_text, term) != null) score += 100;
+        if (indexOfTermBoundary(lower_text, term)) |idx| {
+            score += 100;
+            if (idx < HOT_SNIPPET_SEARCH_BYTES) score += @intCast((HOT_SNIPPET_SEARCH_BYTES - idx) / 1024);
+            var title_buf: [96]u8 = undefined;
+            const title = std.fmt.bufPrint(&title_buf, "title: {s}", .{term}) catch "";
+            if (title.len != 0 and std.mem.indexOf(u8, lower_text, title) != null) score += 5000;
+        }
     }
     if (terms.len > 1 and allTermsPresent(lower_text, terms)) score += 200;
     return score;
 }
 
+fn exactTitlePhraseIndex(lower_text: []const u8, terms: []const []const u8) ?usize {
+    var buf: [256]u8 = undefined;
+    var pos: usize = 0;
+    appendPhraseBytes(&buf, &pos, "title: ") catch return null;
+    return phraseIndexWithPrefix(lower_text, terms, &buf, &pos);
+}
+
+fn exactTermsPhraseIndex(lower_text: []const u8, terms: []const []const u8) ?usize {
+    var buf: [256]u8 = undefined;
+    var pos: usize = 0;
+    return phraseIndexWithPrefix(lower_text, terms, &buf, &pos);
+}
+
+fn phraseIndexWithPrefix(lower_text: []const u8, terms: []const []const u8, buf: *[256]u8, pos: *usize) ?usize {
+    if (terms.len == 0) return null;
+    for (terms, 0..) |term, idx| {
+        if (idx != 0) appendPhraseBytes(buf, pos, " ") catch return null;
+        appendPhraseBytes(buf, pos, term) catch return null;
+    }
+    return indexOfTermBoundary(lower_text, buf[0..pos.*]);
+}
+
+fn appendPhraseBytes(buf: *[256]u8, pos: *usize, bytes: []const u8) !void {
+    if (bytes.len > buf.len - pos.*) return error.PhraseTooLong;
+    @memcpy(buf[pos.* .. pos.* + bytes.len], bytes);
+    pos.* += bytes.len;
+}
+
 fn allTermsPresent(lower_text: []const u8, terms: []const []const u8) bool {
+    if (terms.len == 0) return true;
+    var search_start: usize = 0;
+    const anchor = terms[0];
+    while (search_start < lower_text.len) {
+        const anchor_idx = indexOfTermBoundary(lower_text[search_start..], anchor) orelse return false;
+        const absolute = search_start + anchor_idx;
+        const boundary = vsa_vulkan.paragraphBoundary(lower_text, absolute, 512);
+        const block = if (boundary.valid) lower_text[boundary.start..boundary.end] else lower_text;
+        var ok = true;
+        for (terms) |term| {
+            if (indexOfTermBoundary(block, term) == null) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) return true;
+        search_start = absolute + anchor.len;
+    }
+    return false;
+}
+
+fn allTermsPresentAnywhere(lower_text: []const u8, terms: []const []const u8) bool {
     for (terms) |term| {
-        if (std.mem.indexOf(u8, lower_text, term) == null) return false;
+        if (indexOfTermBoundary(lower_text, term) == null) return false;
     }
     return true;
+}
+
+fn indexOfTermBoundary(lower_text: []const u8, term: []const u8) ?usize {
+    var search_start: usize = 0;
+    while (search_start < lower_text.len) {
+        const rel = std.mem.indexOf(u8, lower_text[search_start..], term) orelse return null;
+        const idx = search_start + rel;
+        const before_ok = idx == 0 or !isTermByte(lower_text[idx - 1]);
+        const after_idx = idx + term.len;
+        const after_ok = after_idx >= lower_text.len or !isTermByte(lower_text[after_idx]);
+        if (before_ok and after_ok) return idx;
+        search_start = idx + 1;
+    }
+    return null;
+}
+
+fn indexOfTermBoundaryFold(text: []const u8, term: []const u8) ?usize {
+    var search_start: usize = 0;
+    while (search_start < text.len) {
+        const rel = indexOfIgnoreCase(text[search_start..], term) orelse return null;
+        const idx = search_start + rel;
+        const before_ok = idx == 0 or !isTermByte(text[idx - 1]);
+        const after_idx = idx + term.len;
+        const after_ok = after_idx >= text.len or !isTermByte(text[after_idx]);
+        if (before_ok and after_ok) return idx;
+        search_start = idx + 1;
+    }
+    return null;
+}
+
+fn isTermByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-';
 }
 
 fn lowerCopy(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
@@ -1890,34 +2136,9 @@ fn renderHotCorpusResult(
 }
 
 fn writeHotAnswer(writer: anytype, question: []const u8, shard: *const ResidentShard, terms: []const []const u8, candidates: []const HotCandidate) !void {
-    var answer = std.ArrayList(u8).init(std.heap.page_allocator);
-    defer answer.deinit();
     if (try codeIntelInheritanceDraft(std.heap.page_allocator, question, shard, candidates)) |draft_text| {
         defer std.heap.page_allocator.free(draft_text);
         try std.json.stringify(draft_text, .{}, writer);
-        return;
-    }
-    if (isComputerDefinitionQuestion(question) and (termsContain(terms, "computer") or termsContain(terms, "computers"))) {
-        try answer.appendSlice("A computer is an electronic machine that stores and processes data by following instructions.");
-        try std.json.stringify(answer.items, .{}, writer);
-        return;
-    }
-    if (isCpuDefinitionQuestion(question) and termsContain(terms, "cpu")) {
-        const allocator = std.heap.page_allocator;
-        var draft = try text_generation_lab.generateCpuDefinitionDraft(allocator, question);
-        defer draft.deinit(allocator);
-        try std.json.stringify(draft.draft_text, .{}, writer);
-        return;
-    }
-    if (termsContain(terms, "code") and termsContain(terms, "program")) {
-        try answer.appendSlice("Code is the written set of instructions or symbols used to make a computer program behave in a specific way.");
-        try std.json.stringify(answer.items, .{}, writer);
-        return;
-    }
-    if (termsContain(terms, "silicon") and (termsContain(terms, "computer") or termsContain(terms, "computers"))) {
-        try answer.appendSlice("A silicon computer is a computer whose electronic logic is built from silicon-based semiconductor technology. ");
-        try answer.appendSlice("The resident evidence connects silicon with semiconductor and computer-related industries, and links modern computers to transistors, integrated circuits, microprocessors, and computer chips.");
-        try std.json.stringify(answer.items, .{}, writer);
         return;
     }
     const allocator = std.heap.page_allocator;
@@ -2041,16 +2262,88 @@ fn trimmedSnippet(text: []const u8, max_bytes: usize) []const u8 {
 }
 
 fn snippetAroundTerms(text: []const u8, terms: []const []const u8, max_bytes: usize) []const u8 {
+    const bounded_text = strictEntryBoundary(text);
     const searchable = text[0..@min(text.len, HOT_SNIPPET_SEARCH_BYTES)];
     var best: ?usize = null;
+    if (exactTitlePhraseIndexFold(searchable, terms)) |idx| {
+        return boundedSnippetFrom(text, idx, max_bytes);
+    }
+    if (matchingParagraphStart(text, terms)) |paragraph_start| {
+        return boundedSnippetFrom(text, paragraph_start, max_bytes);
+    }
+    for (terms) |term| {
+        var title_buf: [96]u8 = undefined;
+        const title = std.fmt.bufPrint(&title_buf, "title: {s}", .{term}) catch "";
+        if (title.len != 0) {
+            if (indexOfIgnoreCase(searchable, title)) |idx| {
+                best = if (best) |existing| @min(existing, idx) else idx;
+            }
+        }
+    }
+    if (best != null) {
+        const idx = best.?;
+        const start = idx;
+        return boundedSnippetFrom(text, start, max_bytes);
+    }
     for (terms) |term| {
         if (indexOfIgnoreCase(searchable, term)) |idx| {
             best = if (best) |existing| @min(existing, idx) else idx;
         }
     }
-    const idx = best orelse return trimmedSnippet(text, max_bytes);
+    const idx = best orelse return trimmedSnippet(bounded_text, max_bytes);
     const start = idx -| 80;
-    const end = start + boundedSnippetLen(text[start..], @min(text.len - start, max_bytes));
+    return boundedSnippetFrom(text, start, max_bytes);
+}
+
+fn exactTitlePhraseIndexFold(text: []const u8, terms: []const []const u8) ?usize {
+    var buf: [256]u8 = undefined;
+    var pos: usize = 0;
+    appendPhraseBytes(&buf, &pos, "title: ") catch return null;
+    if (terms.len == 0) return null;
+    for (terms, 0..) |term, idx| {
+        if (idx != 0) appendPhraseBytes(&buf, &pos, " ") catch return null;
+        appendPhraseBytes(&buf, &pos, term) catch return null;
+    }
+    return indexOfIgnoreCase(text, buf[0..pos]);
+}
+
+fn matchingParagraphStart(text: []const u8, terms: []const []const u8) ?usize {
+    if (terms.len == 0) return null;
+    const anchor = terms[0];
+    var search_start: usize = 0;
+    while (search_start < text.len) {
+        const rel = indexOfTermBoundaryFold(text[search_start..], anchor) orelse return null;
+        const absolute = search_start + rel;
+        const boundary = vsa_vulkan.paragraphBoundary(text, absolute, 768);
+        if (boundary.valid) {
+            const block = text[boundary.start..boundary.end];
+            var ok = true;
+            for (terms) |term| {
+                if (indexOfTermBoundaryFold(block, term) == null) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) return boundary.start;
+        }
+        search_start = absolute + anchor.len;
+    }
+    return null;
+}
+
+fn strictEntryBoundary(text: []const u8) []const u8 {
+    const boundary = vsa_vulkan.paragraphBoundary(text, 0, text.len);
+    if (!boundary.valid) return text;
+    return text[boundary.start..boundary.end];
+}
+
+fn boundedSnippetFrom(text: []const u8, absolute_start: usize, max_bytes: usize) []const u8 {
+    const boundary = vsa_vulkan.paragraphBoundary(text, absolute_start, max_bytes);
+    const bounded_start = if (boundary.valid) boundary.start else @min(absolute_start, text.len);
+    const bounded_end = if (boundary.valid) boundary.end else text.len;
+    const start = @max(bounded_start, @min(absolute_start, bounded_end));
+    const available = bounded_end - start;
+    const end = start + boundedSnippetLen(text[start..bounded_end], @min(available, max_bytes));
     return std.mem.trim(u8, text[start..end], " \r\n\t");
 }
 

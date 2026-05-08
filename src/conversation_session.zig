@@ -313,7 +313,8 @@ pub fn turn(allocator: std.mem.Allocator, options: TurnOptions) !TurnResult {
         return .{ .session = session, .reply = reply };
     }
 
-    if (intent_grounding.isLightSocialPrompt(options.message)) {
+    const initial_relation = vsa_vulkan.extractFrameVector(options.message);
+    if (initial_relation.frame_kind == .system_acknowledgment) {
         const reply = try replaceLastResultWithSocialResponse(allocator, &session);
         errdefer allocator.free(reply);
         try appendMessage(&session, .system, reply, .draft, session.last_result.?.kind);

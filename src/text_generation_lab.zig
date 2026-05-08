@@ -3,6 +3,8 @@ const builtin = @import("builtin");
 const hash_acceleration = @import("hash_acceleration.zig");
 const intent_grounding = @import("intent_grounding.zig");
 const vsa_vulkan = @import("vsa_vulkan.zig");
+pub const parser = @import("text_generation_lab/parser.zig");
+pub const assembler = @import("text_generation_lab/assembler.zig");
 
 // Experimental Ghost text-generation lab.
 //
@@ -46,6 +48,25 @@ pub const CorpusIngestInput = struct {
     limits: CorpusIngestLimits = .{},
 };
 
+pub const MAX_SAFE_CONTEXT_WINDOW_BYTES: usize = 32 * 1024;
+
+pub const EvidenceQuality = enum {
+    strong,
+    weak,
+    sketch,
+};
+
+pub const EvidenceGateStatus = enum {
+    accepted,
+    unknown,
+};
+
+pub const Evidence = struct {
+    bytes: []const u8,
+    quality: EvidenceQuality = .strong,
+    oversized: bool = false,
+};
+
 pub const DENIAL_SYSTEM_INSTRUCTION =
     "You are the Ghost Engine. You have searched the internal shards and found zero relevant information for this query. State clearly and concisely that you do not have this information in your current corpus. Do not offer help, do not apologize, and do not use a greeting. Just state the fact of the missing data.";
 
@@ -59,12 +80,19 @@ pub const CorpusSynthesisInput = struct {
     evidence_text: []const u8,
     evidence_texts: []const []const u8 = &.{},
     evidence_source_ids: []const []const u8 = &.{},
+    evidence: ?Evidence = null,
+    evidence_items: []const Evidence = &.{},
     consensus_gate_authorized: bool = false,
 };
 
 pub const SocialResponderInput = struct {
     user_query: []const u8,
     active_shard: ?[]const u8 = null,
+    daemon_active: bool = true,
+    vulkan_active: bool = false,
+    vram_resident_bytes: usize = 0,
+    resident_shards: usize = 0,
+    session_hot_bytes: usize = 0,
 };
 
 pub const StateReflectionInput = struct {
@@ -294,6 +322,27 @@ pub fn generateDefaultResponderForShard(
 }
 
 pub fn generateCorpusSynthesisDraft(allocator: std.mem.Allocator, input: CorpusSynthesisInput) !TextGenerationDraft {
+    if (corpusSynthesisEvidenceGate(input) == .unknown) {
+        return .{
+            .draft_text = try assembler.assembleVoidDraft(allocator, .{ .query = input.user_query, .shard_hint = null }),
+            .candidate_only = false,
+            .non_authorizing = true,
+            .support_granted = false,
+            .proof_granted = false,
+            .product_ready = false,
+        };
+    }
+    if (try synthesizeWithConceptAst(allocator, input)) |draft_text| {
+        const consensus = input.consensus_gate_authorized and finalConsensusResonance("", if (input.evidence_texts.len == 0) &.{input.evidence_text} else input.evidence_texts) >= 0.8;
+        return .{
+            .draft_text = draft_text,
+            .candidate_only = false,
+            .non_authorizing = !consensus,
+            .support_granted = consensus,
+            .proof_granted = false,
+            .product_ready = consensus,
+        };
+    }
     if (try generateRelationalContrastDraft(allocator, input.user_query)) |contrast_text| {
         return .{
             .draft_text = contrast_text,
@@ -320,6 +369,50 @@ pub fn generateCorpusSynthesisDraft(allocator: std.mem.Allocator, input: CorpusS
         .proof_granted = false,
         .product_ready = consensus,
     };
+}
+
+pub fn evaluateEvidence(evidence: Evidence) EvidenceGateStatus {
+    if (evidence.quality == .weak or evidence.quality == .sketch) return .unknown;
+    if (evidence.oversized or evidence.bytes.len > MAX_SAFE_CONTEXT_WINDOW_BYTES) return .unknown;
+    return .accepted;
+}
+
+pub fn evidenceAllowsSynthesis(evidence: Evidence) bool {
+    return evaluateEvidence(evidence) == .accepted;
+}
+
+fn corpusSynthesisEvidenceGate(input: CorpusSynthesisInput) EvidenceGateStatus {
+    if (input.evidence_items.len != 0) {
+        for (input.evidence_items) |item| {
+            if (evaluateEvidence(item) == .unknown) return .unknown;
+        }
+        return .accepted;
+    }
+    if (input.evidence) |item| return evaluateEvidence(item);
+    const evidence_texts = if (input.evidence_texts.len == 0) &.{input.evidence_text} else input.evidence_texts;
+    for (evidence_texts) |bytes| {
+        if (evaluateEvidence(.{ .bytes = bytes }) == .unknown) return .unknown;
+    }
+    return .accepted;
+}
+
+fn synthesizeWithConceptAst(allocator: std.mem.Allocator, input: CorpusSynthesisInput) !?[]u8 {
+    const evidence_texts = if (input.evidence_texts.len == 0) &.{input.evidence_text} else input.evidence_texts;
+    for (evidence_texts, 0..) |evidence, idx| {
+        var parsed = (try parser.parseConcept(allocator, input.user_query, evidence)) orelse continue;
+        defer parsed.deinit(allocator);
+        return try assembler.assemblePredicateDraft(allocator, .{
+            .query = input.user_query,
+            .concept = parsed,
+            .source_hint = sourceHintForConcept(input, idx),
+        });
+    }
+    return null;
+}
+
+fn sourceHintForConcept(input: CorpusSynthesisInput, idx: usize) ?[]const u8 {
+    if (idx < input.evidence_source_ids.len) return input.evidence_source_ids[idx];
+    return null;
 }
 
 pub fn generateCpuDefinitionDraft(allocator: std.mem.Allocator, user_query: []const u8) !TextGenerationDraft {
@@ -633,6 +726,7 @@ const ProseTone = enum {
 const AstNodeKind = enum {
     sequence,
     text,
+    fact,
     subject,
     action_list,
     clock_tail,
@@ -701,6 +795,7 @@ fn renderAstNodes(out: *std.ArrayList(u8), subject: []const u8, fusion: FactFusi
         switch (node.kind) {
             .sequence => try renderAstNodes(out, subject, fusion, tone, node.children),
             .text => try out.appendSlice(node.text),
+            .fact => try out.appendSlice(node.text),
             .subject => try writeSubjectPhrase(out.writer(), subject),
             .action_list => try appendActionFacts(out, fusion, tone),
             .clock_tail => {
@@ -921,17 +1016,25 @@ fn isAcronymToken(token: []const u8) bool {
 }
 
 pub fn generateSocialResponderDraft(allocator: std.mem.Allocator, input: SocialResponderInput) !TextGenerationDraft {
-    var hasher = std.hash.Fnv1a_64.init();
-    hasher.update(input.user_query);
-    if (input.active_shard) |shard| hasher.update(shard);
-    const variant = hasher.final() % 3;
-    const draft_text = switch (variant) {
-        0 => try allocator.dupe(u8, "I am listening."),
-        1 => try allocator.dupe(u8, "I am here."),
-        else => try allocator.dupe(u8, "Ready."),
+    var raw = std.ArrayList(u8).init(allocator);
+    defer raw.deinit();
+    try raw.writer().print(
+        "session status is conversational; resident shards are {d}; compute residency is {s}; hot memory contains {d} bytes",
+        .{ input.resident_shards, if (input.vulkan_active) "vram" else "cpu", input.session_hot_bytes },
+    );
+    var parsed = (try parser.parseConcept(allocator, input.user_query, raw.items)) orelse {
+        return .{
+            .draft_text = try assembler.assembleVoidDraft(allocator, .{ .query = input.user_query, .shard_hint = input.active_shard }),
+            .candidate_only = false,
+            .non_authorizing = true,
+            .support_granted = false,
+            .proof_granted = false,
+            .product_ready = false,
+        };
     };
+    defer parsed.deinit(allocator);
     return .{
-        .draft_text = draft_text,
+        .draft_text = try assembler.assemblePredicateDraft(allocator, .{ .query = input.user_query, .concept = parsed, .source_hint = input.active_shard }),
         .candidate_only = false,
         .non_authorizing = true,
         .support_granted = false,
@@ -941,25 +1044,8 @@ pub fn generateSocialResponderDraft(allocator: std.mem.Allocator, input: SocialR
 }
 
 pub fn generateDenialDraft(allocator: std.mem.Allocator, input: DenialInput) !TextGenerationDraft {
-    const subject = try denialSubject(allocator, input.user_query);
-    defer allocator.free(subject);
-
-    var hasher = std.hash.Fnv1a_64.init();
-    hasher.update(input.user_query);
-    if (input.active_shard) |shard| hasher.update(shard);
-    const variant = hasher.final() % 3;
-
-    const draft_text = switch (variant) {
-        0 => try std.fmt.allocPrint(allocator, "No corpus evidence found for {s}.", .{subject}),
-        1 => if (input.active_shard) |shard|
-            try std.fmt.allocPrint(allocator, "Information regarding {s} is not present in active shard {s}.", .{ subject, shard })
-        else
-            try std.fmt.allocPrint(allocator, "Information regarding {s} is not present in the active shard.", .{subject}),
-        else => try std.fmt.allocPrint(allocator, "The current corpus contains no relevant information for {s}.", .{subject}),
-    };
-
     return .{
-        .draft_text = draft_text,
+        .draft_text = try assembler.assembleVoidDraft(allocator, .{ .query = input.user_query, .shard_hint = input.active_shard }),
         .candidate_only = false,
         .non_authorizing = true,
         .support_granted = false,

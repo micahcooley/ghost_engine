@@ -1,0 +1,8 @@
+if(NOT TEST_SUITE_BENCHMARKING_ONLY)
+  set(INPUTS parse.y example1.y example2.y example3.y example4.y example5.y lighttpd_configparser.y lighttpd_mod_ssi_exprparser.y wireshark_dtd_grammar.lemon wireshark_grammar.lemon wireshark_mate_grammar.lemon xapian_queryparser.lemony ecmascript.y)
+  set(RUN_OPTIONS ${INPUTS})
+  set(HASH_PROGRAM_OUTPUT 1)
+  llvm_multisource(lemon lemon.c)
+  set_property(TARGET lemon PROPERTY C_STANDARD 17)
+  llvm_test_data(lemon ${INPUTS} lempar.c)
+endif()

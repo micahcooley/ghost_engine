@@ -68,6 +68,7 @@ pub const Options = struct {
     max_results: usize = DEFAULT_MAX_RESULTS,
     max_snippet_bytes: usize = DEFAULT_MAX_SNIPPET_BYTES,
     require_citations: bool = true,
+    context: ?[]const u8 = null,
 };
 
 pub const EvidenceUsed = struct {
@@ -430,6 +431,7 @@ pub const CapacityTelemetry = struct {
 
 pub const Result = struct {
     allocator: std.mem.Allocator,
+    arena: ?*std.heap.ArenaAllocator = null,
     status: AskStatus,
     state: []u8,
     permission: []u8,
@@ -466,37 +468,42 @@ pub const Result = struct {
     primary_noun_match_failure: bool = false,
 
     pub fn deinit(self: *Result) void {
-        self.allocator.free(self.state);
-        self.allocator.free(self.permission);
-        self.allocator.free(self.question);
-        self.allocator.free(self.shard_kind);
-        self.allocator.free(self.shard_id);
-        if (self.corpus_coverage_next_cursor) |value| self.allocator.free(value);
-        if (self.answer_draft) |value| self.allocator.free(value);
-        for (self.evidence_used) |*item| item.deinit(self.allocator);
-        self.allocator.free(self.evidence_used);
-        for (self.suppressed_evidence) |*item| item.deinit(self.allocator);
-        self.allocator.free(self.suppressed_evidence);
-        for (self.unknowns) |*item| item.deinit(self.allocator);
-        self.allocator.free(self.unknowns);
-        for (self.candidate_followups) |*item| item.deinit(self.allocator);
-        self.allocator.free(self.candidate_followups);
-        for (self.learning_candidates) |*item| item.deinit(self.allocator);
-        self.allocator.free(self.learning_candidates);
-        for (self.similar_candidates) |*item| item.deinit(self.allocator);
-        self.allocator.free(self.similar_candidates);
-        for (self.accepted_correction_warnings) |*item| item.deinit(self.allocator);
-        self.allocator.free(self.accepted_correction_warnings);
-        for (self.correction_influences) |*item| item.deinit(self.allocator);
-        self.allocator.free(self.correction_influences);
-        for (self.accepted_negative_knowledge_warnings) |*item| item.deinit(self.allocator);
-        self.allocator.free(self.accepted_negative_knowledge_warnings);
-        for (self.negative_knowledge_influences) |*item| item.deinit(self.allocator);
-        self.allocator.free(self.negative_knowledge_influences);
-        for (self.learning_influences) |*item| item.deinit(self.allocator);
-        self.allocator.free(self.learning_influences);
-        for (self.future_behavior_candidates) |*item| item.deinit(self.allocator);
-        self.allocator.free(self.future_behavior_candidates);
+        if (self.arena) |arena| {
+            arena.deinit();
+            self.allocator.destroy(arena);
+        } else {
+            self.allocator.free(self.state);
+            self.allocator.free(self.permission);
+            self.allocator.free(self.question);
+            self.allocator.free(self.shard_kind);
+            self.allocator.free(self.shard_id);
+            if (self.corpus_coverage_next_cursor) |value| self.allocator.free(value);
+            if (self.answer_draft) |value| self.allocator.free(value);
+            for (self.evidence_used) |*item| item.deinit(self.allocator);
+            self.allocator.free(self.evidence_used);
+            for (self.suppressed_evidence) |*item| item.deinit(self.allocator);
+            self.allocator.free(self.suppressed_evidence);
+            for (self.unknowns) |*item| item.deinit(self.allocator);
+            self.allocator.free(self.unknowns);
+            for (self.candidate_followups) |*item| item.deinit(self.allocator);
+            self.allocator.free(self.candidate_followups);
+            for (self.learning_candidates) |*item| item.deinit(self.allocator);
+            self.allocator.free(self.learning_candidates);
+            for (self.similar_candidates) |*item| item.deinit(self.allocator);
+            self.allocator.free(self.similar_candidates);
+            for (self.accepted_correction_warnings) |*item| item.deinit(self.allocator);
+            self.allocator.free(self.accepted_correction_warnings);
+            for (self.correction_influences) |*item| item.deinit(self.allocator);
+            self.allocator.free(self.correction_influences);
+            for (self.accepted_negative_knowledge_warnings) |*item| item.deinit(self.allocator);
+            self.allocator.free(self.accepted_negative_knowledge_warnings);
+            for (self.negative_knowledge_influences) |*item| item.deinit(self.allocator);
+            self.allocator.free(self.negative_knowledge_influences);
+            for (self.learning_influences) |*item| item.deinit(self.allocator);
+            self.allocator.free(self.learning_influences);
+            for (self.future_behavior_candidates) |*item| item.deinit(self.allocator);
+            self.allocator.free(self.future_behavior_candidates);
+        }
         self.* = undefined;
     }
 };
@@ -526,6 +533,7 @@ const Candidate = struct {
     content_hash: u64,
     polarity: Polarity,
     value_match: bool = false,
+    bounded_read_truncated: bool = false,
     text: []u8,
 
     fn deinit(self: *Candidate, allocator: std.mem.Allocator) void {
@@ -655,15 +663,28 @@ const QueryIntent = enum {
 };
 
 pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    arena.* = std.heap.ArenaAllocator.init(allocator);
+    errdefer {
+        arena.deinit();
+        allocator.destroy(arena);
+    }
+    const aa = arena.allocator();
+
     var profile_timer: ?std.time.Timer = if (askProfileEnabled()) try std.time.Timer.start() else null;
     var profile_last_ns: u64 = 0;
 
     if (std.mem.trim(u8, options.question, " \r\n\t").len == 0) {
-        return malformedResult(allocator, options.question, "question must be non-empty");
+        var result = try malformedResult(aa, options.question, "question must be non-empty");
+        result.allocator = allocator;
+        result.arena = arena;
+        result.allocator = allocator;
+        result.arena = arena;
+        return result;
     }
 
-    var salience = try intent_grounding.analyzeSalience(allocator, options.question);
-    defer salience.deinit(allocator);
+    var salience = try intent_grounding.analyzeSalience(aa, options.question);
+    defer salience.deinit(aa);
     const high_noise_request = salience.density_multiplier >= 3 and hasMultiRuneTarget(salience.semantic_target);
     const search_question = if (high_noise_request and salience.semantic_target.len != 0) salience.semantic_target else options.question;
     const requested_results = if (options.max_results == DEFAULT_MAX_RESULTS and options.max_snippet_bytes == DEFAULT_MAX_SNIPPET_BYTES)
@@ -676,37 +697,37 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     const max_snippet = if (capped_snippet == 0) DEFAULT_MAX_SNIPPET_BYTES else capped_snippet;
 
     var shard_metadata = if (options.project_shard) |project_shard|
-        try shards.resolveProjectMetadata(allocator, project_shard)
+        try shards.resolveProjectMetadata(aa, project_shard)
     else
-        try shards.resolveCoreMetadata(allocator);
+        try shards.resolveCoreMetadata(aa);
     defer shard_metadata.deinit();
 
-    var paths = try shards.resolvePaths(allocator, shard_metadata.metadata);
+    var paths = try shards.resolvePaths(aa, shard_metadata.metadata);
     defer paths.deinit();
     askProfileMark(&profile_timer, &profile_last_ns, "resolve_shard");
-    var reviewed = try correction_review.readAcceptedInfluences(allocator, paths.metadata.id);
+    var reviewed = try correction_review.readAcceptedInfluences(aa, paths.metadata.id);
     defer reviewed.deinit();
-    var reviewed_nk = try negative_knowledge_review.readAcceptedInfluences(allocator, paths.metadata.id);
+    var reviewed_nk = try negative_knowledge_review.readAcceptedInfluences(aa, paths.metadata.id);
     defer reviewed_nk.deinit();
-    var reviewed_learning = try learning_store.readAcceptedInfluences(allocator, paths.metadata.id);
+    var reviewed_learning = try learning_store.readAcceptedInfluences(aa, paths.metadata.id);
     defer reviewed_learning.deinit();
     askProfileMark(&profile_timer, &profile_last_ns, "read_influences");
 
-    const live_entries = try corpus_ingest.collectLiveScanEntries(allocator, &paths);
+    const live_entries = try corpus_ingest.collectLiveScanEntries(aa, &paths);
     const live_entry_count = live_entries.len;
-    corpus_ingest.deinitIndexedEntries(allocator, live_entries);
+    corpus_ingest.deinitIndexedEntries(aa, live_entries);
 
-    const entries = try corpus_ingest.collectComposedLiveScanEntries(allocator, &paths, options.mounted_packs);
-    defer corpus_ingest.deinitIndexedEntries(allocator, entries);
+    const entries = try corpus_ingest.collectComposedLiveScanEntries(aa, &paths, options.mounted_packs);
+    defer corpus_ingest.deinitIndexedEntries(aa, entries);
     const mounted_pack_entry_count = entries.len - live_entry_count;
-    var live_coverage = try corpus_ingest.liveCoverage(allocator, &paths);
-    defer live_coverage.deinit(allocator);
+    var live_coverage = try corpus_ingest.liveCoverage(aa, &paths);
+    defer live_coverage.deinit(aa);
     askProfileMark(&profile_timer, &profile_last_ns, "collect_entries_coverage");
 
-    var guard_tokens = try tokenizeQuery(allocator, options.question);
-    defer guard_tokens.deinit(allocator);
-    var search_tokens = try tokenizeQuery(allocator, search_question);
-    defer search_tokens.deinit(allocator);
+    var guard_tokens = try tokenizeQuery(aa, options.question);
+    defer guard_tokens.deinit(aa);
+    var search_tokens = try tokenizeQuery(aa, search_question);
+    defer search_tokens.deinit(aa);
     const autonomous_salience_scoring = options.max_results == DEFAULT_MAX_RESULTS and
         options.max_snippet_bytes == DEFAULT_MAX_SNIPPET_BYTES and
         high_noise_request;
@@ -715,49 +736,55 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     askProfileMark(&profile_timer, &profile_last_ns, "tokenize_query");
 
     if (entries.len == 0) {
-        var result = try unknownResult(allocator, options, &paths, .no_corpus_available, "no live shard corpus or explicitly mounted Knowledge Pack corpus is available for this ask request", entries.len, max_results, max_snippet);
+        var result = try unknownResult(aa, options, &paths, .no_corpus_available, "no live shard corpus or explicitly mounted Knowledge Pack corpus is available for this ask request", entries.len, max_results, max_snippet);
         errdefer result.deinit();
         result.mounted_packs_considered = options.mounted_packs.len;
         result.mounted_pack_entries_considered = mounted_pack_entry_count;
-        try attachLiveCoverage(allocator, &result, live_coverage);
-        try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
-        try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
-        try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
+        try attachLiveCoverage(aa, &result, live_coverage);
+        try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
+        try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
+        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+        result.allocator = allocator;
+        result.arena = arena;
         return result;
     }
     if (guard_tokens.tokens.len == 0 and scoring_tokens.len == 0) {
-        var result = try unknownResult(allocator, options, &paths, .insufficient_evidence, "question did not contain enough searchable terms", entries.len, max_results, max_snippet);
+        var result = try unknownResult(aa, options, &paths, .insufficient_evidence, "question did not contain enough searchable terms", entries.len, max_results, max_snippet);
         errdefer result.deinit();
         result.mounted_packs_considered = options.mounted_packs.len;
         result.mounted_pack_entries_considered = mounted_pack_entry_count;
-        try attachLiveCoverage(allocator, &result, live_coverage);
-        try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
-        try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
-        try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
+        try attachLiveCoverage(aa, &result, live_coverage);
+        try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
+        try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
+        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+        result.allocator = allocator;
+        result.arena = arena;
         return result;
     }
 
-    var candidates = std.ArrayList(Candidate).init(allocator);
+    var candidates = std.ArrayList(Candidate).init(aa);
     defer {
-        for (candidates.items) |*candidate| candidate.deinit(allocator);
+        for (candidates.items) |*candidate| candidate.deinit(aa);
         candidates.deinit();
     }
-    var sketch_candidates = std.ArrayList(SketchCandidate).init(allocator);
+    var sketch_candidates = std.ArrayList(SketchCandidate).init(aa);
     defer sketch_candidates.deinit();
-    const query_sketch = try corpus_sketch.simHash64Query(allocator, search_question);
-    var acceleration = hash_acceleration.Context.init(allocator, "corpus ask vector search");
+    const query_sketch = try corpus_sketch.simHash64Query(aa, search_question);
+    var acceleration = hash_acceleration.Context.init(aa, "corpus ask vector search");
     defer acceleration.deinit();
-    const query_semantic_hash = try hash_acceleration.semanticHash64(&acceleration, allocator, search_question);
+    const query_semantic_hash = try hash_acceleration.semanticHash64(&acceleration, aa, search_question);
+    const relation_query = vsa_vulkan.extractFrameVector(options.question);
+    const context_relation = if (options.context) |ctx| vsa_vulkan.extractFrameVector(ctx) else vsa_vulkan.SpoVector{};
     var telemetry = CapacityTelemetry{};
     if (!live_coverage.complete) {
         telemetry.skipped_inputs += 1;
         telemetry.budget_hits += 1;
     }
 
-    var index_scan_candidates = std.ArrayList(IndexScanCandidate).init(allocator);
+    var index_scan_candidates = std.ArrayList(IndexScanCandidate).init(aa);
     defer index_scan_candidates.deinit();
-    const scan_entries = try allocator.alloc(bool, entries.len);
-    defer allocator.free(scan_entries);
+    const scan_entries = try aa.alloc(bool, entries.len);
+    defer aa.free(scan_entries);
     @memset(scan_entries, false);
 
     for (entries, 0..) |entry, idx| {
@@ -828,7 +855,7 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         if (!scan_entries[idx]) continue;
         profile_entries_scanned += 1;
         const read_start = askProfileNow(&profile_timer);
-        const read_result = readEntryText(allocator, entry.abs_path, maxReadBytesForEntry(entry)) catch {
+        const read_result = readEntryText(aa, entry.abs_path, maxReadBytesForEntry(entry)) catch {
             askProfileAccumulate(&profile_timer, read_start, &profile_read_ns);
             telemetry.skipped_files += 1;
             telemetry.skipped_inputs += 1;
@@ -837,17 +864,17 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         };
         askProfileAccumulate(&profile_timer, read_start, &profile_read_ns);
         const file_text = read_result.text;
-        errdefer allocator.free(file_text);
+        errdefer aa.free(file_text);
         if (read_result.truncated) {
             telemetry.truncated_inputs += 1;
             telemetry.budget_hits += 1;
         }
         const score_start = askProfileNow(&profile_timer);
-        var scored = try scoreTextDirect(allocator, file_text, scoring_tokens);
+        var scored = try scoreTextDirect(aa, file_text, scoring_tokens);
         askProfileAccumulate(&profile_timer, score_start, &profile_score_ns);
         if (scored.score == 0) {
-            scored.deinit(allocator);
-            allocator.free(file_text);
+            scored.deinit(aa);
+            aa.free(file_text);
             continue;
         }
 
@@ -866,7 +893,9 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         }
         const similarity_score = corpus_sketch.similarityScore(best_distance);
 
-        const base_score = scored.score + value_bonus + primaryNounScoreBonus(scoring_tokens, scored.matched_terms);
+        const candidate_relation = vsa_vulkan.extractFrameVector(file_text);
+        const relation_bonus = vsa_vulkan.contextualRelationScorePerMille(relation_query, context_relation, candidate_relation);
+        const base_score = scored.score + value_bonus + primaryNounScoreBonus(scoring_tokens, scored.matched_terms) + (@as(u32, relation_bonus) * 10);
         const normalized_score = @as(f32, @floatFromInt(base_score)) / 100.0;
         const normalized_vector_score = @as(f32, @floatFromInt(similarity_score)) / 300.0;
 
@@ -896,9 +925,10 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
             .content_hash = content_hash,
             .polarity = detectPolarity(file_text),
             .value_match = value_match,
+            .bounded_read_truncated = read_result.truncated,
             .text = file_text,
         }) catch |err| {
-            scored.deinit(allocator);
+            scored.deinit(aa);
             return err;
         };
     }
@@ -907,53 +937,41 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
 
     // Force Concept Void for testing fictional library.
     if (std.ascii.indexOfIgnoreCase(options.question, "fictional") != null) {
-        for (candidates.items) |*candidate| candidate.deinit(allocator);
+        for (candidates.items) |*candidate| candidate.deinit(aa);
         candidates.clearRetainingCapacity();
     }
 
     if (candidates.items.len == 0) {
-        if (try authorityOverrideCheck(allocator, options.question, guard_tokens.tokens, candidates.items, &reviewed)) |override_value| {
+        if (try authorityOverrideCheck(aa, options.question, guard_tokens.tokens, candidates.items, &reviewed)) |override_value| {
             var authority = override_value;
-            defer authority.deinit(allocator);
-            var result = try buildAuthorityOverrideResult(allocator, options, &paths, entries.len, max_results, max_snippet, authority, candidates.items, entries, &telemetry, live_coverage, mounted_pack_entry_count);
+            defer authority.deinit(aa);
+            var result = try buildAuthorityOverrideResult(aa, options, &paths, entries.len, max_results, max_snippet, authority, candidates.items, entries, &telemetry, live_coverage, mounted_pack_entry_count);
             errdefer result.deinit();
-            try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
-            try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
-            try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
+            try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
+            try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
+            try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+            result.allocator = allocator;
+            result.arena = arena;
             return result;
         }
 
-        const search_fallback = @import("runtime/search_fallback.zig");
-        const fallback_results = search_fallback.triggerLocalSearch(allocator, options.question) catch allocator.alloc(search_fallback.FallbackResult, 0) catch unreachable;
-        defer if (fallback_results.len > 0) search_fallback.freeFallbackResults(allocator, fallback_results);
-
-        if (fallback_results.len > 0) {
-            var answer_draft = std.ArrayList(u8).init(allocator);
-            for (fallback_results, 0..) |res, i| {
-                if (i >= 3) break;
-                try answer_draft.writer().print("Source: {s}\n{s}\n\n", .{ res.url, res.content });
-            }
-            var result = try buildBaseResult(allocator, options, &paths, .answered, "concept void fallback", "fallback_scraped", entries.len, max_results, max_snippet);
-            result.answer_draft = try answer_draft.toOwnedSlice();
-            result.capacity_telemetry = telemetry;
-            return result;
-        }
-
-        var result = try unknownResult(allocator, options, &paths, .insufficient_evidence, "no live corpus item matched the question terms", entries.len, max_results, max_snippet);
+        var result = try unknownResult(aa, options, &paths, .insufficient_evidence, "no live corpus item matched the question terms", entries.len, max_results, max_snippet);
         errdefer result.deinit();
         result.mounted_packs_considered = options.mounted_packs.len;
         result.mounted_pack_entries_considered = mounted_pack_entry_count;
-        result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
+        result.similar_candidates = try buildSimilarCandidates(aa, sketch_candidates.items, entries, max_results);
         telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
         telemetry.max_results_hit = telemetry.sketch_candidate_cap_hit;
         if (telemetry.sketch_candidate_cap_hit) telemetry.budget_hits += 1;
         telemetry.expansion_recommended = telemetry.hasPressure();
         result.capacity_telemetry = telemetry;
-        try attachLiveCoverage(allocator, &result, live_coverage);
-        try applyCapacityDisclosure(allocator, &result);
-        try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
-        try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
-        try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
+        try attachLiveCoverage(aa, &result, live_coverage);
+        try applyCapacityDisclosure(aa, &result);
+        try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
+        try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
+        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+        result.allocator = allocator;
+        result.arena = arena;
         return result;
     }
 
@@ -962,33 +980,35 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     telemetry.exact_candidate_cap_hit = candidates.items.len > top_count;
     telemetry.max_results_hit = telemetry.exact_candidate_cap_hit;
     if (telemetry.exact_candidate_cap_hit) telemetry.budget_hits += 1;
-    if (try authorityOverrideCheck(allocator, options.question, guard_tokens.tokens, candidates.items[0..top_count], &reviewed)) |override_value| {
+    if (try authorityOverrideCheck(aa, options.question, guard_tokens.tokens, candidates.items[0..top_count], &reviewed)) |override_value| {
         var authority = override_value;
-        defer authority.deinit(allocator);
-        var result = try buildAuthorityOverrideResult(allocator, options, &paths, entries.len, max_results, max_snippet, authority, candidates.items[0..top_count], entries, &telemetry, live_coverage, mounted_pack_entry_count);
+        defer authority.deinit(aa);
+        var result = try buildAuthorityOverrideResult(aa, options, &paths, entries.len, max_results, max_snippet, authority, candidates.items[0..top_count], entries, &telemetry, live_coverage, mounted_pack_entry_count);
         errdefer result.deinit();
-        try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
-        try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
-        try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
+        try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
+        try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
+        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+        result.allocator = allocator;
+        result.arena = arena;
         return result;
     }
 
-    var high_rank_candidates = std.ArrayList(Candidate).init(allocator);
+    var high_rank_candidates = std.ArrayList(Candidate).init(aa);
     defer high_rank_candidates.deinit();
-    var shadow_context_candidates = std.ArrayList(Candidate).init(allocator);
+    var shadow_context_candidates = std.ArrayList(Candidate).init(aa);
     defer shadow_context_candidates.deinit();
-    var trash_blocked_candidates = std.ArrayList(Candidate).init(allocator);
+    var trash_blocked_candidates = std.ArrayList(Candidate).init(aa);
     defer trash_blocked_candidates.deinit();
     try splitRankedContextCandidates(&high_rank_candidates, &shadow_context_candidates, &trash_blocked_candidates, candidates.items, entries);
 
     if (high_rank_candidates.items.len == 0) {
         if (trash_blocked_candidates.items.len != 0) {
-            var result = try buildBaseResult(allocator, options, &paths, .rejected_falsehood, "unresolved", "unresolved", entries.len, max_results, max_snippet);
+            var result = try buildBaseResult(aa, options, &paths, .rejected_falsehood, "unresolved", "unresolved", entries.len, max_results, max_snippet);
             errdefer result.deinit();
             result.mounted_packs_considered = options.mounted_packs.len;
             result.mounted_pack_entries_considered = mounted_pack_entry_count;
-            result.suppressed_evidence = try buildTrashSuppressedEvidence(allocator, boundedCandidates(trash_blocked_candidates.items, max_results), entries);
-            result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
+            result.suppressed_evidence = try buildTrashSuppressedEvidence(aa, boundedCandidates(trash_blocked_candidates.items, max_results), entries);
+            result.similar_candidates = try buildSimilarCandidates(aa, sketch_candidates.items, entries, max_results);
             telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
             if (telemetry.sketch_candidate_cap_hit) {
                 telemetry.max_results_hit = true;
@@ -996,21 +1016,23 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
             }
             telemetry.expansion_recommended = true;
             result.capacity_telemetry = telemetry;
-            try attachLiveCoverage(allocator, &result, live_coverage);
-            result.unknowns = try singleUnknown(allocator, .rejected_falsehood, "blacklisted Trash-ranked corpus evidence matched this query; the source was discarded and the falsehood was rejected");
-            result.candidate_followups = try singleFollowup(allocator, "truth_alert", "review the blocked Trash-ranked source only if you intend to reverse its license rank through explicit human audit");
-            try applyCapacityDisclosure(allocator, &result);
-            try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
-            try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
-            try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
+            try attachLiveCoverage(aa, &result, live_coverage);
+            result.unknowns = try singleUnknown(aa, .rejected_falsehood, "blacklisted Trash-ranked corpus evidence matched this query; the source was discarded and the falsehood was rejected");
+            result.candidate_followups = try singleFollowup(aa, "truth_alert", "review the blocked Trash-ranked source only if you intend to reverse its license rank through explicit human audit");
+            try applyCapacityDisclosure(aa, &result);
+            try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
+            try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
+            try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+            result.allocator = allocator;
+            result.arena = arena;
             return result;
         }
-        var result = try buildBaseResult(allocator, options, &paths, .unknown, "unresolved", "unresolved", entries.len, max_results, max_snippet);
+        var result = try buildBaseResult(aa, options, &paths, .unknown, "unresolved", "unresolved", entries.len, max_results, max_snippet);
         errdefer result.deinit();
         result.mounted_packs_considered = options.mounted_packs.len;
         result.mounted_pack_entries_considered = mounted_pack_entry_count;
-        result.evidence_used = try buildEvidence(allocator, candidates.items[0..top_count], entries, max_snippet, "shadow context matched the query but cannot be the sole basis for an answer draft");
-        result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
+        result.evidence_used = try buildEvidence(aa, candidates.items[0..top_count], entries, max_snippet, "shadow context matched the query but cannot be the sole basis for an answer draft");
+        result.similar_candidates = try buildSimilarCandidates(aa, sketch_candidates.items, entries, max_results);
         telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
         if (telemetry.truncated_snippets != 0) telemetry.budget_hits += 1;
         telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
@@ -1020,13 +1042,15 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         }
         telemetry.expansion_recommended = true;
         result.capacity_telemetry = telemetry;
-        try attachLiveCoverage(allocator, &result, live_coverage);
-        result.unknowns = try singleUnknown(allocator, .insufficient_high_rank_evidence, "only shadow-ranked corpus evidence matched; shadow context cannot authorize an answer draft");
-        result.candidate_followups = try singleFollowup(allocator, "evidence_to_collect", "promote or ingest root, verified, or unverified evidence before using shadow context as factual support");
-        try applyCapacityDisclosure(allocator, &result);
-        try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
-        try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
-        try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
+        try attachLiveCoverage(aa, &result, live_coverage);
+        result.unknowns = try singleUnknown(aa, .insufficient_high_rank_evidence, "only shadow-ranked corpus evidence matched; shadow context cannot authorize an answer draft");
+        result.candidate_followups = try singleFollowup(aa, "evidence_to_collect", "promote or ingest root, verified, or unverified evidence before using shadow context as factual support");
+        try applyCapacityDisclosure(aa, &result);
+        try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
+        try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
+        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+        result.allocator = allocator;
+        result.arena = arena;
         return result;
     }
 
@@ -1035,19 +1059,19 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     const trash_blocked = boundedCandidates(trash_blocked_candidates.items, max_results);
     const conflict = hasConflict(selected_candidates);
     if (conflict) {
-        var verified_candidates = std.ArrayList(Candidate).init(allocator);
+        var verified_candidates = std.ArrayList(Candidate).init(aa);
         defer verified_candidates.deinit();
-        var unverified_suppressed = std.ArrayList(Candidate).init(allocator);
+        var unverified_suppressed = std.ArrayList(Candidate).init(aa);
         defer unverified_suppressed.deinit();
         try splitVerifiedDominanceCandidates(&verified_candidates, &unverified_suppressed, selected_candidates, entries);
         if (verified_candidates.items.len != 0 and unverified_suppressed.items.len != 0) {
-            var result = try buildBaseResult(allocator, options, &paths, .answered, "draft", "none", entries.len, max_results, max_snippet);
+            var result = try buildBaseResult(aa, options, &paths, .answered, "draft", "none", entries.len, max_results, max_snippet);
             errdefer result.deinit();
             result.mounted_packs_considered = options.mounted_packs.len;
             result.mounted_pack_entries_considered = mounted_pack_entry_count;
-            result.evidence_used = try buildEvidence(allocator, verified_candidates.items, entries, max_snippet, "selected because verified license evidence contradicted unverified evidence");
-            result.suppressed_evidence = try buildCombinedSuppressedEvidence(allocator, unverified_suppressed.items, shadow_context, trash_blocked, entries);
-            result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
+            result.evidence_used = try buildEvidence(aa, verified_candidates.items, entries, max_snippet, "selected because verified license evidence contradicted unverified evidence");
+            result.suppressed_evidence = try buildCombinedSuppressedEvidence(aa, unverified_suppressed.items, shadow_context, trash_blocked, entries);
+            result.similar_candidates = try buildSimilarCandidates(aa, sketch_candidates.items, entries, max_results);
             telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
             if (telemetry.truncated_snippets != 0) telemetry.budget_hits += 1;
             telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
@@ -1057,34 +1081,36 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
             }
             telemetry.expansion_recommended = telemetry.hasPressure();
             result.capacity_telemetry = telemetry;
-            try attachLiveCoverage(allocator, &result, live_coverage);
-            const evidence_texts = try buildSynthesisEvidenceTexts(allocator, result.evidence_used);
-            defer allocator.free(evidence_texts);
-            const evidence_source_ids = try buildSynthesisEvidenceSourceIds(allocator, result.evidence_used);
-            defer allocator.free(evidence_source_ids);
-            var draft = try text_generation_lab.generateCorpusSynthesisDraft(allocator, .{
+            try attachLiveCoverage(aa, &result, live_coverage);
+            const evidence_texts = try buildSynthesisEvidenceTexts(aa, result.evidence_used);
+            defer aa.free(evidence_texts);
+            const evidence_source_ids = try buildSynthesisEvidenceSourceIds(aa, result.evidence_used);
+            defer aa.free(evidence_source_ids);
+            var draft = try text_generation_lab.generateCorpusSynthesisDraft(aa, .{
                 .user_query = options.question,
                 .evidence_text = result.evidence_used[0].snippet,
                 .evidence_texts = evidence_texts,
                 .evidence_source_ids = evidence_source_ids,
             });
-            defer draft.deinit(allocator);
-            result.answer_draft = try allocator.dupe(u8, draft.draft_text);
-            try applyDraftSafetyNotices(allocator, options, &result);
-            result.candidate_followups = try singleFollowup(allocator, "license_review_candidate", "unverified contradictory evidence was suppressed; review shard licensing before treating this draft as supported");
-            try applyCapacityDisclosure(allocator, &result);
-            try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
-            try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
-            try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
+            defer draft.deinit(aa);
+            result.answer_draft = try aa.dupe(u8, draft.draft_text);
+            try applyDraftSafetyNotices(aa, options, &result);
+            result.candidate_followups = try singleFollowup(aa, "license_review_candidate", "unverified contradictory evidence was suppressed; review shard licensing before treating this draft as supported");
+            try applyCapacityDisclosure(aa, &result);
+            try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
+            try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
+            try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+            result.allocator = allocator;
+            result.arena = arena;
             return result;
         }
-        var result = try buildBaseResult(allocator, options, &paths, .unknown, "unresolved", "unresolved", entries.len, max_results, max_snippet);
+        var result = try buildBaseResult(aa, options, &paths, .unknown, "unresolved", "unresolved", entries.len, max_results, max_snippet);
         errdefer result.deinit();
         result.mounted_packs_considered = options.mounted_packs.len;
         result.mounted_pack_entries_considered = mounted_pack_entry_count;
-        result.evidence_used = try buildEvidence(allocator, selected_candidates, entries, max_snippet, "selected because it matched question terms but conflicts with another selected corpus item");
-        result.suppressed_evidence = try buildCombinedSuppressedEvidence(allocator, &.{}, shadow_context, trash_blocked, entries);
-        result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
+        result.evidence_used = try buildEvidence(aa, selected_candidates, entries, max_snippet, "selected because it matched question terms but conflicts with another selected corpus item");
+        result.suppressed_evidence = try buildCombinedSuppressedEvidence(aa, &.{}, shadow_context, trash_blocked, entries);
+        result.similar_candidates = try buildSimilarCandidates(aa, sketch_candidates.items, entries, max_results);
         telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
         if (telemetry.truncated_snippets != 0) telemetry.budget_hits += 1;
         telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
@@ -1094,15 +1120,17 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         }
         telemetry.expansion_recommended = telemetry.hasPressure();
         result.capacity_telemetry = telemetry;
-        try attachLiveCoverage(allocator, &result, live_coverage);
+        try attachLiveCoverage(aa, &result, live_coverage);
         const conflict_reason = conflictReason(selected_candidates);
-        result.unknowns = try singleUnknown(allocator, .conflicting_evidence, conflict_reason);
-        result.candidate_followups = try singleFollowup(allocator, "evidence_to_collect", "provide or ingest an authoritative corpus item that resolves the conflict");
-        result.learning_candidates = try singleLearningCandidate(allocator, options.project_shard, "correction_candidate", "review the conflicting corpus items and propose a correction or corpus update through an explicit lifecycle", conflict_reason);
-        try applyCapacityDisclosure(allocator, &result);
-        try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
-        try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
-        try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
+        result.unknowns = try singleUnknown(aa, .conflicting_evidence, conflict_reason);
+        result.candidate_followups = try singleFollowup(aa, "evidence_to_collect", "provide or ingest an authoritative corpus item that resolves the conflict");
+        result.learning_candidates = try singleLearningCandidate(aa, options.project_shard, "correction_candidate", "review the conflicting corpus items and propose a correction or corpus update through an explicit lifecycle", conflict_reason);
+        try applyCapacityDisclosure(aa, &result);
+        try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
+        try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
+        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+        result.allocator = allocator;
+        result.arena = arena;
         return result;
     }
 
@@ -1113,12 +1141,12 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     const is_exact_phrase = top.matched_phrase != null;
 
     if (!is_strong_hybrid and !is_perfect_title and !is_exact_phrase) {
-        var result = try unknownResult(allocator, options, &paths, .insufficient_evidence, "matched corpus evidence was too weak to support an answer draft", entries.len, max_results, max_snippet);
+        var result = try unknownResult(aa, options, &paths, .insufficient_evidence, "matched corpus evidence was too weak to support an answer draft", entries.len, max_results, max_snippet);
         errdefer result.deinit();
         result.mounted_packs_considered = options.mounted_packs.len;
         result.mounted_pack_entries_considered = mounted_pack_entry_count;
-        result.suppressed_evidence = try buildCombinedSuppressedEvidence(allocator, &.{}, shadow_context, trash_blocked, entries);
-        result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
+        result.suppressed_evidence = try buildCombinedSuppressedEvidence(aa, &.{}, shadow_context, trash_blocked, entries);
+        result.similar_candidates = try buildSimilarCandidates(aa, sketch_candidates.items, entries, max_results);
         telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
         if (telemetry.sketch_candidate_cap_hit) {
             telemetry.max_results_hit = true;
@@ -1126,23 +1154,25 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         }
         telemetry.expansion_recommended = telemetry.hasPressure();
         result.capacity_telemetry = telemetry;
-        try attachLiveCoverage(allocator, &result, live_coverage);
-        try applyCapacityDisclosure(allocator, &result);
-        try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
-        try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
-        try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
+        try attachLiveCoverage(aa, &result, live_coverage);
+        try applyCapacityDisclosure(aa, &result);
+        try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
+        try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
+        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+        result.allocator = allocator;
+        result.arena = arena;
         return result;
     }
 
     if (!candidatesParameterMatchCheck(guard_tokens.tokens, selected_candidates)) {
-        var result = try buildBaseResult(allocator, options, &paths, .unknown, "unresolved", "unresolved", entries.len, max_results, max_snippet);
+        var result = try buildBaseResult(aa, options, &paths, .unknown, "unresolved", "unresolved", entries.len, max_results, max_snippet);
         errdefer result.deinit();
         result.parameter_match_failure = true;
         result.mounted_packs_considered = options.mounted_packs.len;
         result.mounted_pack_entries_considered = mounted_pack_entry_count;
-        result.evidence_used = try buildEvidence(allocator, selected_candidates, entries, max_snippet, "candidate evidence matched topic terms but failed the exact parameter lock");
-        result.suppressed_evidence = try buildCombinedSuppressedEvidence(allocator, &.{}, shadow_context, trash_blocked, entries);
-        result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
+        result.evidence_used = try buildEvidence(aa, selected_candidates, entries, max_snippet, "candidate evidence matched topic terms but failed the exact parameter lock");
+        result.suppressed_evidence = try buildCombinedSuppressedEvidence(aa, &.{}, shadow_context, trash_blocked, entries);
+        result.similar_candidates = try buildSimilarCandidates(aa, sketch_candidates.items, entries, max_results);
         telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
         if (telemetry.truncated_snippets != 0) telemetry.budget_hits += 1;
         telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
@@ -1152,28 +1182,30 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         }
         telemetry.expansion_recommended = true;
         result.capacity_telemetry = telemetry;
-        try attachLiveCoverage(allocator, &result, live_coverage);
-        result.unknowns = try singleUnknown(allocator, .insufficient_evidence, "parameter_match_failure: selected evidence did not contain the exact parameter requested by the question");
-        result.candidate_followups = try singleFollowup(allocator, "evidence_to_collect", "ingest exact evidence that contains the requested parameter value");
-        result.learning_candidates = try singleLearningCandidate(allocator, options.project_shard, "corpus_update_candidate", "review whether parameter-bearing corpus evidence should be added through an explicit lifecycle", "parameter_match_failure");
-        try applyCapacityDisclosure(allocator, &result);
-        try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
-        try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
-        try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
+        try attachLiveCoverage(aa, &result, live_coverage);
+        result.unknowns = try singleUnknown(aa, .insufficient_evidence, "parameter_match_failure: selected evidence did not contain the exact parameter requested by the question");
+        result.candidate_followups = try singleFollowup(aa, "evidence_to_collect", "ingest exact evidence that contains the requested parameter value");
+        result.learning_candidates = try singleLearningCandidate(aa, options.project_shard, "corpus_update_candidate", "review whether parameter-bearing corpus evidence should be added through an explicit lifecycle", "parameter_match_failure");
+        try applyCapacityDisclosure(aa, &result);
+        try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
+        try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
+        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+        result.allocator = allocator;
+        result.arena = arena;
         return result;
     }
 
-    if (try inferenceBridgeCheck(allocator, options.question, selected_candidates, entries)) |bridge_value| {
+    if (try inferenceBridgeCheck(aa, options.question, selected_candidates, entries)) |bridge_value| {
         var bridge = bridge_value;
-        defer bridge.deinit(allocator);
+        defer bridge.deinit(aa);
         const bridge_candidates = [_]Candidate{bridge.candidate};
-        var result = try buildBaseResult(allocator, options, &paths, .answered, "draft", "none", entries.len, max_results, max_snippet);
+        var result = try buildBaseResult(aa, options, &paths, .answered, "draft", "none", entries.len, max_results, max_snippet);
         errdefer result.deinit();
         result.mounted_packs_considered = options.mounted_packs.len;
         result.mounted_pack_entries_considered = mounted_pack_entry_count;
-        result.evidence_used = try buildEvidence(allocator, bridge_candidates[0..], entries, max_snippet, "selected by deterministic status-equivalence bridge: exact certified status evidence matched the requested HITL requirement");
-        result.suppressed_evidence = try buildCombinedSuppressedEvidence(allocator, &.{}, shadow_context, trash_blocked, entries);
-        result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
+        result.evidence_used = try buildEvidence(aa, bridge_candidates[0..], entries, max_snippet, "selected by deterministic status-equivalence bridge: exact certified status evidence matched the requested HITL requirement");
+        result.suppressed_evidence = try buildCombinedSuppressedEvidence(aa, &.{}, shadow_context, trash_blocked, entries);
+        result.similar_candidates = try buildSimilarCandidates(aa, sketch_candidates.items, entries, max_results);
         telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
         if (telemetry.truncated_snippets != 0) telemetry.budget_hits += 1;
         telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
@@ -1183,30 +1215,32 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         }
         telemetry.expansion_recommended = telemetry.hasPressure();
         result.capacity_telemetry = telemetry;
-        try attachLiveCoverage(allocator, &result, live_coverage);
+        try attachLiveCoverage(aa, &result, live_coverage);
         result.answer_draft = try std.fmt.allocPrint(
-            allocator,
+            aa,
             "Authorized: {s} HITL requirement satisfied by {s} status.",
             .{ bridge.subject, bridge.satisfaction_token },
         );
-        result.candidate_followups = try singleFollowup(allocator, "verifier_check_candidate", "review the cited certified-status evidence before treating this answer as supported");
-        try applyCapacityDisclosure(allocator, &result);
-        try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
-        try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
-        try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
+        result.candidate_followups = try singleFollowup(aa, "verifier_check_candidate", "review the cited certified-status evidence before treating this answer as supported");
+        try applyCapacityDisclosure(aa, &result);
+        try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
+        try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
+        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+        result.allocator = allocator;
+        result.arena = arena;
         return result;
     }
 
     const primary_noun_soft_failure = !candidatesPrimaryNounMatchCheck(scoring_tokens, selected_candidates);
 
     if (query_intent != .general and !top.value_match) {
-        var result = try buildBaseResult(allocator, options, &paths, .unknown, "unresolved", "unresolved", entries.len, max_results, max_snippet);
+        var result = try buildBaseResult(aa, options, &paths, .unknown, "unresolved", "unresolved", entries.len, max_results, max_snippet);
         errdefer result.deinit();
         result.mounted_packs_considered = options.mounted_packs.len;
         result.mounted_pack_entries_considered = mounted_pack_entry_count;
-        result.evidence_used = try buildEvidence(allocator, selected_candidates, entries, max_snippet, "candidate evidence matched topic terms but did not contain the requested value shape");
-        result.suppressed_evidence = try buildCombinedSuppressedEvidence(allocator, &.{}, shadow_context, trash_blocked, entries);
-        result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
+        result.evidence_used = try buildEvidence(aa, selected_candidates, entries, max_snippet, "candidate evidence matched topic terms but did not contain the requested value shape");
+        result.suppressed_evidence = try buildCombinedSuppressedEvidence(aa, &.{}, shadow_context, trash_blocked, entries);
+        result.similar_candidates = try buildSimilarCandidates(aa, sketch_candidates.items, entries, max_results);
         telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
         if (telemetry.truncated_snippets != 0) telemetry.budget_hits += 1;
         telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
@@ -1216,24 +1250,50 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
         }
         telemetry.expansion_recommended = true;
         result.capacity_telemetry = telemetry;
-        try attachLiveCoverage(allocator, &result, live_coverage);
-        result.unknowns = try singleUnknown(allocator, .insufficient_evidence, "matched corpus evidence did not contain the requested exact value");
-        result.candidate_followups = try singleFollowup(allocator, "evidence_to_collect", "ingest exact evidence that contains the requested value, not only related topic words");
-        result.learning_candidates = try singleLearningCandidate(allocator, options.project_shard, "corpus_update_candidate", "review whether a value-bearing corpus item should be added through an explicit lifecycle", "topic overlap without the requested value cannot authorize an answer draft");
-        try applyCapacityDisclosure(allocator, &result);
-        try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
-        try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
-        try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
+        try attachLiveCoverage(aa, &result, live_coverage);
+        result.unknowns = try singleUnknown(aa, .insufficient_evidence, "matched corpus evidence did not contain the requested exact value");
+        result.candidate_followups = try singleFollowup(aa, "evidence_to_collect", "ingest exact evidence that contains the requested value, not only related topic words");
+        result.learning_candidates = try singleLearningCandidate(aa, options.project_shard, "corpus_update_candidate", "review whether a value-bearing corpus item should be added through an explicit lifecycle", "topic overlap without the requested value cannot authorize an answer draft");
+        try applyCapacityDisclosure(aa, &result);
+        try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
+        try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
+        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+        result.allocator = allocator;
+        result.arena = arena;
         return result;
     }
 
-    var result = try buildBaseResult(allocator, options, &paths, .answered, "draft", "none", entries.len, max_results, max_snippet);
+    if (!selectedCandidatesAllowSynthesis(selected_candidates, scoring_tokens, max_snippet)) {
+        var result = try unknownResult(aa, options, &paths, .insufficient_evidence, "retrieved evidence was weak, sketch-only, or oversized; synthesis halted at the epistemic confidence gate", entries.len, max_results, max_snippet);
+        errdefer result.deinit();
+        result.mounted_packs_considered = options.mounted_packs.len;
+        result.mounted_pack_entries_considered = mounted_pack_entry_count;
+        result.suppressed_evidence = try buildCombinedSuppressedEvidence(aa, &.{}, shadow_context, trash_blocked, entries);
+        result.similar_candidates = try buildSimilarCandidates(aa, sketch_candidates.items, entries, max_results);
+        telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
+        if (telemetry.sketch_candidate_cap_hit) {
+            telemetry.max_results_hit = true;
+            telemetry.budget_hits += 1;
+        }
+        telemetry.expansion_recommended = telemetry.hasPressure();
+        result.capacity_telemetry = telemetry;
+        try attachLiveCoverage(aa, &result, live_coverage);
+        try applyCapacityDisclosure(aa, &result);
+        try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
+        try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
+        try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+        result.allocator = allocator;
+        result.arena = arena;
+        return result;
+    }
+
+    var result = try buildBaseResult(aa, options, &paths, .answered, "draft", "none", entries.len, max_results, max_snippet);
     errdefer result.deinit();
     result.mounted_packs_considered = options.mounted_packs.len;
     result.mounted_pack_entries_considered = mounted_pack_entry_count;
-    result.evidence_used = try buildEvidence(allocator, selected_candidates, entries, max_snippet, "selected because it matched bounded question terms");
-    result.suppressed_evidence = try buildCombinedSuppressedEvidence(allocator, &.{}, shadow_context, trash_blocked, entries);
-    result.similar_candidates = try buildSimilarCandidates(allocator, sketch_candidates.items, entries, max_results);
+    result.evidence_used = try buildEvidence(aa, selected_candidates, entries, max_snippet, "selected because it matched bounded question terms");
+    result.suppressed_evidence = try buildCombinedSuppressedEvidence(aa, &.{}, shadow_context, trash_blocked, entries);
+    result.similar_candidates = try buildSimilarCandidates(aa, sketch_candidates.items, entries, max_results);
     telemetry.truncated_snippets += countTruncatedSnippets(result.evidence_used);
     if (telemetry.truncated_snippets != 0) telemetry.budget_hits += 1;
     telemetry.sketch_candidate_cap_hit = sketchCandidatesCapHit(sketch_candidates.items.len, max_results);
@@ -1243,26 +1303,28 @@ pub fn ask(allocator: std.mem.Allocator, options: Options) !Result {
     }
     telemetry.expansion_recommended = telemetry.hasPressure();
     result.capacity_telemetry = telemetry;
-    try attachLiveCoverage(allocator, &result, live_coverage);
-    const evidence_texts = try buildSynthesisEvidenceTexts(allocator, result.evidence_used);
-    defer allocator.free(evidence_texts);
-    const evidence_source_ids = try buildSynthesisEvidenceSourceIds(allocator, result.evidence_used);
-    defer allocator.free(evidence_source_ids);
-    var draft = try text_generation_lab.generateCorpusSynthesisDraft(allocator, .{
+    try attachLiveCoverage(aa, &result, live_coverage);
+    const evidence_texts = try buildSynthesisEvidenceTexts(aa, result.evidence_used);
+    defer aa.free(evidence_texts);
+    const evidence_source_ids = try buildSynthesisEvidenceSourceIds(aa, result.evidence_used);
+    defer aa.free(evidence_source_ids);
+    var draft = try text_generation_lab.generateCorpusSynthesisDraft(aa, .{
         .user_query = options.question,
         .evidence_text = result.evidence_used[0].snippet,
         .evidence_texts = evidence_texts,
         .evidence_source_ids = evidence_source_ids,
     });
-    defer draft.deinit(allocator);
-    result.answer_draft = try allocator.dupe(u8, draft.draft_text);
-    try applyDraftSafetyNotices(allocator, options, &result);
+    defer draft.deinit(aa);
+    result.answer_draft = try aa.dupe(u8, draft.draft_text);
+    try applyDraftSafetyNotices(aa, options, &result);
     result.primary_noun_match_failure = primary_noun_soft_failure;
-    result.candidate_followups = try singleFollowup(allocator, "verifier_check_candidate", "review the cited corpus evidence before treating this answer as supported");
-    try applyCapacityDisclosure(allocator, &result);
-    try applyAcceptedCorrectionInfluence(allocator, &result, &reviewed);
-    try applyAcceptedNegativeKnowledgeInfluence(allocator, &result, &reviewed_nk);
-    try applyAcceptedLearningInfluence(allocator, &result, &reviewed_learning);
+    result.candidate_followups = try singleFollowup(aa, "verifier_check_candidate", "review the cited corpus evidence before treating this answer as supported");
+    try applyCapacityDisclosure(aa, &result);
+    try applyAcceptedCorrectionInfluence(aa, &result, &reviewed);
+    try applyAcceptedNegativeKnowledgeInfluence(aa, &result, &reviewed_nk);
+    try applyAcceptedLearningInfluence(aa, &result, &reviewed_learning);
+    result.allocator = allocator;
+    result.arena = arena;
     return result;
 }
 
@@ -1324,36 +1386,36 @@ fn askProfileLoopSummary(
     }
 }
 
-fn applyAcceptedCorrectionInfluence(allocator: std.mem.Allocator, result: *Result, reviewed: *const correction_review.ReadResult) !void {
+fn applyAcceptedCorrectionInfluence(aa: std.mem.Allocator, result: *Result, reviewed: *const correction_review.ReadResult) !void {
     result.influence_telemetry.reviewed_records_read = reviewed.records_read;
     result.influence_telemetry.accepted_records_read = reviewed.accepted_records;
     result.influence_telemetry.rejected_records_read = reviewed.rejected_records;
     result.influence_telemetry.malformed_lines = reviewed.malformed_lines;
     result.influence_telemetry.warnings = reviewed.warnings.len;
     result.influence_telemetry.bounded_read_truncated = reviewed.truncated;
-    result.accepted_correction_warnings = try cloneWarnings(allocator, reviewed.warnings);
+    result.accepted_correction_warnings = try cloneWarnings(aa, reviewed.warnings);
 
     for (reviewed.influences) |influence| {
         if (!std.mem.eql(u8, influence.applies_to, "corpus.ask")) continue;
         if (!influenceMatchesResult(result, influence)) continue;
-        try appendCorrectionInfluence(allocator, result, influence);
+        try appendCorrectionInfluence(aa, result, influence);
         result.influence_telemetry.matched_influences += 1;
         switch (influence.influence_kind) {
-            .suppress_exact_repeat => try suppressAnswerDraft(allocator, result, influence),
-            .require_stronger_evidence => try appendFutureBehaviorCandidate(allocator, result, "corpus_update_candidate", "accepted bad-evidence correction requires stronger exact evidence before relying on this pattern", influence.source_reviewed_correction_id),
+            .suppress_exact_repeat => try suppressAnswerDraft(aa, result, influence),
+            .require_stronger_evidence => try appendFutureBehaviorCandidate(aa, result, "corpus_update_candidate", "accepted bad-evidence correction requires stronger exact evidence before relying on this pattern", influence.source_reviewed_correction_id),
             .require_verifier_candidate => {
-                try appendFutureBehaviorCandidate(allocator, result, "follow_up_evidence_request", "accepted missing-evidence correction asks for follow-up evidence before support changes", influence.source_reviewed_correction_id);
-                try appendCandidateFollowup(allocator, result, "evidence_to_collect", "accepted reviewed correction says this pattern needs additional evidence before it can support an answer");
+                try appendFutureBehaviorCandidate(aa, result, "follow_up_evidence_request", "accepted missing-evidence correction asks for follow-up evidence before support changes", influence.source_reviewed_correction_id);
+                try appendCandidateFollowup(aa, result, "evidence_to_collect", "accepted reviewed correction says this pattern needs additional evidence before it can support an answer");
             },
-            .propose_negative_knowledge => try appendFutureBehaviorCandidate(allocator, result, "negative_knowledge_candidate", "accepted repeated-failed-pattern correction proposes negative knowledge candidate only", influence.source_reviewed_correction_id),
-            .propose_corpus_update => try appendFutureBehaviorCandidate(allocator, result, "corpus_update_candidate", "accepted reviewed correction proposes a corpus update candidate only", influence.source_reviewed_correction_id),
-            .propose_pack_guidance => try appendFutureBehaviorCandidate(allocator, result, "pack_guidance_candidate", "accepted reviewed correction proposes pack guidance candidate only", influence.source_reviewed_correction_id),
+            .propose_negative_knowledge => try appendFutureBehaviorCandidate(aa, result, "negative_knowledge_candidate", "accepted repeated-failed-pattern correction proposes negative knowledge candidate only", influence.source_reviewed_correction_id),
+            .propose_corpus_update => try appendFutureBehaviorCandidate(aa, result, "corpus_update_candidate", "accepted reviewed correction proposes a corpus update candidate only", influence.source_reviewed_correction_id),
+            .propose_pack_guidance => try appendFutureBehaviorCandidate(aa, result, "pack_guidance_candidate", "accepted reviewed correction proposes pack guidance candidate only", influence.source_reviewed_correction_id),
             .warning, .penalty => {},
         }
     }
 }
 
-fn applyAcceptedNegativeKnowledgeInfluence(allocator: std.mem.Allocator, result: *Result, reviewed: *const negative_knowledge_review.ReadResult) !void {
+fn applyAcceptedNegativeKnowledgeInfluence(aa: std.mem.Allocator, result: *Result, reviewed: *const negative_knowledge_review.ReadResult) !void {
     result.negative_knowledge_telemetry.records_read = reviewed.records_read;
     result.negative_knowledge_telemetry.accepted_records = reviewed.accepted_records;
     result.negative_knowledge_telemetry.rejected_records = reviewed.rejected_records;
@@ -1361,32 +1423,32 @@ fn applyAcceptedNegativeKnowledgeInfluence(allocator: std.mem.Allocator, result:
     result.negative_knowledge_telemetry.warnings = reviewed.warnings.len;
     result.negative_knowledge_telemetry.influences_loaded = reviewed.influences.len;
     result.negative_knowledge_telemetry.truncated = reviewed.truncated;
-    result.accepted_negative_knowledge_warnings = try cloneNegativeKnowledgeWarnings(allocator, reviewed.warnings);
+    result.accepted_negative_knowledge_warnings = try cloneNegativeKnowledgeWarnings(aa, reviewed.warnings);
 
     for (reviewed.influences) |influence| {
         if (!std.mem.eql(u8, influence.applies_to, "corpus.ask")) continue;
         if (!negativeKnowledgeMatchesResult(result, influence)) continue;
-        try appendNegativeKnowledgeInfluence(allocator, result, influence);
+        try appendNegativeKnowledgeInfluence(aa, result, influence);
         result.negative_knowledge_telemetry.influences_applied += 1;
         switch (influence.influence_kind) {
-            .suppress_exact_repeat => try suppressAnswerDraftForNegativeKnowledge(allocator, result, influence),
+            .suppress_exact_repeat => try suppressAnswerDraftForNegativeKnowledge(aa, result, influence),
             .require_stronger_evidence => {
-                try appendNegativeKnowledgeFutureBehaviorCandidate(allocator, result, "corpus_update_candidate", "accepted reviewed negative knowledge requires stronger exact evidence before this corpus pattern can be relied on", influence.source_reviewed_negative_knowledge_id);
-                try appendCandidateFollowup(allocator, result, "evidence_to_collect", "accepted reviewed negative knowledge says this pattern needs stronger exact evidence before support changes");
+                try appendNegativeKnowledgeFutureBehaviorCandidate(aa, result, "corpus_update_candidate", "accepted reviewed negative knowledge requires stronger exact evidence before this corpus pattern can be relied on", influence.source_reviewed_negative_knowledge_id);
+                try appendCandidateFollowup(aa, result, "evidence_to_collect", "accepted reviewed negative knowledge says this pattern needs stronger exact evidence before support changes");
             },
             .require_verifier_candidate => {
-                try appendNegativeKnowledgeFutureBehaviorCandidate(allocator, result, "verifier_check_candidate", "accepted reviewed negative knowledge requires an explicit verifier/check candidate; no verifier was executed", influence.source_reviewed_negative_knowledge_id);
-                try appendCandidateFollowup(allocator, result, "verifier_check_candidate", "accepted reviewed negative knowledge requires explicit checking before this pattern can support an answer");
+                try appendNegativeKnowledgeFutureBehaviorCandidate(aa, result, "verifier_check_candidate", "accepted reviewed negative knowledge requires an explicit verifier/check candidate; no verifier was executed", influence.source_reviewed_negative_knowledge_id);
+                try appendCandidateFollowup(aa, result, "verifier_check_candidate", "accepted reviewed negative knowledge requires explicit checking before this pattern can support an answer");
             },
-            .propose_pack_guidance => try appendNegativeKnowledgeFutureBehaviorCandidate(allocator, result, "pack_guidance_candidate", "accepted reviewed negative knowledge proposes pack guidance candidate only", influence.source_reviewed_negative_knowledge_id),
-            .propose_corpus_update => try appendNegativeKnowledgeFutureBehaviorCandidate(allocator, result, "corpus_update_candidate", "accepted reviewed negative knowledge proposes corpus update candidate only", influence.source_reviewed_negative_knowledge_id),
-            .propose_rule_update => try appendNegativeKnowledgeFutureBehaviorCandidate(allocator, result, "rule_update_candidate", "accepted reviewed negative knowledge proposes rule update candidate only", influence.source_reviewed_negative_knowledge_id),
+            .propose_pack_guidance => try appendNegativeKnowledgeFutureBehaviorCandidate(aa, result, "pack_guidance_candidate", "accepted reviewed negative knowledge proposes pack guidance candidate only", influence.source_reviewed_negative_knowledge_id),
+            .propose_corpus_update => try appendNegativeKnowledgeFutureBehaviorCandidate(aa, result, "corpus_update_candidate", "accepted reviewed negative knowledge proposes corpus update candidate only", influence.source_reviewed_negative_knowledge_id),
+            .propose_rule_update => try appendNegativeKnowledgeFutureBehaviorCandidate(aa, result, "rule_update_candidate", "accepted reviewed negative knowledge proposes rule update candidate only", influence.source_reviewed_negative_knowledge_id),
             .warning, .penalty => {},
         }
     }
 }
 
-fn applyAcceptedLearningInfluence(allocator: std.mem.Allocator, result: *Result, reviewed: *const learning_store.ReadResult) !void {
+fn applyAcceptedLearningInfluence(aa: std.mem.Allocator, result: *Result, reviewed: *const learning_store.ReadResult) !void {
     result.learning_influence_telemetry.records_read = reviewed.records_read;
     result.learning_influence_telemetry.accepted_records = reviewed.accepted_records;
     result.learning_influence_telemetry.rejected_records = reviewed.rejected_records;
@@ -1397,42 +1459,42 @@ fn applyAcceptedLearningInfluence(allocator: std.mem.Allocator, result: *Result,
 
     for (reviewed.influences) |influence| {
         if (!learningInfluenceMatchesResult(result, influence)) continue;
-        try appendLearningInfluence(allocator, result, influence);
+        try appendLearningInfluence(aa, result, influence);
         result.learning_influence_telemetry.influences_applied += 1;
         if (result.status == .unknown and result.answer_draft == null) {
             result.status = .answered;
-            allocator.free(result.state);
-            allocator.free(result.permission);
-            result.state = try allocator.dupe(u8, "draft");
-            result.permission = try allocator.dupe(u8, "none");
-            result.answer_draft = try std.fmt.allocPrint(allocator, "Draft answer from reviewed learning record: {s}", .{influence.draft_signal});
-            for (result.unknowns) |*unknown| unknown.deinit(allocator);
-            allocator.free(result.unknowns);
-            result.unknowns = try allocator.alloc(Unknown, 0);
+            aa.free(result.state);
+            aa.free(result.permission);
+            result.state = try aa.dupe(u8, "draft");
+            result.permission = try aa.dupe(u8, "none");
+            result.answer_draft = try std.fmt.allocPrint(aa, "Draft answer from reviewed learning record: {s}", .{influence.draft_signal});
+            for (result.unknowns) |*unknown| unknown.deinit(aa);
+            aa.free(result.unknowns);
+            result.unknowns = try aa.alloc(Unknown, 0);
             result.learning_influence_telemetry.draft_promoted = true;
         }
         break;
     }
 }
 
-fn buildSynthesisEvidenceTexts(allocator: std.mem.Allocator, evidence_used: []const EvidenceUsed) ![]const []const u8 {
-    const texts = try allocator.alloc([]const u8, evidence_used.len);
+fn buildSynthesisEvidenceTexts(aa: std.mem.Allocator, evidence_used: []const EvidenceUsed) ![]const []const u8 {
+    const texts = try aa.alloc([]const u8, evidence_used.len);
     for (evidence_used, 0..) |evidence, idx| texts[idx] = evidence.snippet;
     return texts;
 }
 
-fn buildSynthesisEvidenceSourceIds(allocator: std.mem.Allocator, evidence_used: []const EvidenceUsed) ![]const []const u8 {
-    const source_ids = try allocator.alloc([]const u8, evidence_used.len);
+fn buildSynthesisEvidenceSourceIds(aa: std.mem.Allocator, evidence_used: []const EvidenceUsed) ![]const []const u8 {
+    const source_ids = try aa.alloc([]const u8, evidence_used.len);
     for (evidence_used, 0..) |evidence, idx| source_ids[idx] = evidence.source_path;
     return source_ids;
 }
 
-fn applyDraftSafetyNotices(allocator: std.mem.Allocator, options: Options, result: *Result) !void {
-    try prependUnverifiedSourceTag(allocator, result);
-    try prependEnglishCoreZenithNoticeIfNeeded(allocator, options, result);
+fn applyDraftSafetyNotices(aa: std.mem.Allocator, options: Options, result: *Result) !void {
+    try prependUnverifiedSourceTag(aa, result);
+    try prependEnglishCoreZenithNoticeIfNeeded(aa, options, result);
 }
 
-fn prependUnverifiedSourceTag(allocator: std.mem.Allocator, result: *Result) !void {
+fn prependUnverifiedSourceTag(aa: std.mem.Allocator, result: *Result) !void {
     const answer = result.answer_draft orelse return;
     if (std.mem.startsWith(u8, answer, "⚠️ Unverified Source")) return;
     var has_unverified = false;
@@ -1443,11 +1505,10 @@ fn prependUnverifiedSourceTag(allocator: std.mem.Allocator, result: *Result) !vo
         }
     }
     if (!has_unverified) return;
-    result.answer_draft = try std.fmt.allocPrint(allocator, "⚠️ Unverified Source: {s}", .{answer});
-    allocator.free(answer);
+    result.answer_draft = try std.fmt.allocPrint(aa, "⚠️ Unverified Source: {s}", .{answer});
 }
 
-fn prependEnglishCoreZenithNoticeIfNeeded(allocator: std.mem.Allocator, options: Options, result: *Result) !void {
+fn prependEnglishCoreZenithNoticeIfNeeded(aa: std.mem.Allocator, options: Options, result: *Result) !void {
     const answer = result.answer_draft orelse return;
     if (options.project_shard == null or !std.mem.eql(u8, options.project_shard.?, "english_core")) return;
     if (indexOfIgnoreCase(options.question, "zenith") == null) return;
@@ -1455,11 +1516,11 @@ fn prependEnglishCoreZenithNoticeIfNeeded(allocator: std.mem.Allocator, options:
     if (!evidenceOnlyFromEnglishCore(result.evidence_used)) return;
 
     result.answer_draft = try std.fmt.allocPrint(
-        allocator,
+        aa,
         "I have found a public definition for 'Zenith', but I do not have Rank 0/Root access to your Zenith project code yet. {s}",
         .{answer},
     );
-    allocator.free(answer);
+    aa.free(answer);
 }
 
 fn evidenceOnlyFromEnglishCore(evidence_used: []const EvidenceUsed) bool {
@@ -2268,6 +2329,34 @@ fn countTruncatedSnippets(evidence: []const EvidenceUsed) usize {
         if (item.snippet_truncated) count += 1;
     }
     return count;
+}
+
+fn selectedCandidatesAllowSynthesis(candidates: []const Candidate, query_tokens: []const []const u8, max_snippet_bytes: usize) bool {
+    for (candidates) |candidate| {
+        if (!text_generation_lab.evidenceAllowsSynthesis(candidateEvidenceForSynthesis(candidate, query_tokens, max_snippet_bytes))) return false;
+    }
+    return true;
+}
+
+fn candidateEvidenceForSynthesis(candidate: Candidate, query_tokens: []const []const u8, max_snippet_bytes: usize) text_generation_lab.Evidence {
+    const start = structuralSnippetStart(candidate.text, candidate.first_match, max_snippet_bytes);
+    const end = @min(candidate.text.len, start + max_snippet_bytes);
+    return .{
+        .bytes = candidate.text[start..end],
+        .quality = candidateEvidenceQuality(candidate, query_tokens),
+        .oversized = candidate.bounded_read_truncated,
+    };
+}
+
+fn candidateEvidenceQuality(candidate: Candidate, query_tokens: []const []const u8) text_generation_lab.EvidenceQuality {
+    if (candidate.matched_phrase != null) return .strong;
+    if (candidate.value_match) return .strong;
+    if (query_tokens.len <= 1 and candidate.matched_terms.len != 0) return .strong;
+    if (candidate.score >= TITLE_MATCH_SCORE_BONUS or candidate.score >= DEFINITION_MATCH_SCORE_BONUS) return .strong;
+    if (query_tokens.len != 0 and candidate.matched_terms.len * 2 < query_tokens.len) return .weak;
+    if (candidate.matched_terms.len < requiredScore(query_tokens.len) and candidate.similarity_score >= vsa_vulkan.GHOST_INDEX_SKIP_THRESHOLD_PER_MILLE) return .sketch;
+    if (candidate.hybrid_score < 0.05) return .weak;
+    return .strong;
 }
 
 fn sketchCandidateLessThan(_: void, lhs: SketchCandidate, rhs: SketchCandidate) bool {

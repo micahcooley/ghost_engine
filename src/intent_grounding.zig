@@ -650,7 +650,6 @@ pub fn analyzeImperativeIntent(allocator: std.mem.Allocator, input: []const u8) 
 }
 
 pub fn lacksSemanticTarget(input: []const u8) bool {
-    if (isLightSocialPrompt(input)) return false;
     if (isDefinitionContentQuery(input) and vsa_vulkan.globalRuneMatch(input).contentOverridesEntropy()) return false;
 
     var meaningful_runes: usize = 0;
@@ -670,27 +669,6 @@ pub fn lacksSemanticTarget(input: []const u8) bool {
         }
     }
     return meaningful_runes == 0;
-}
-
-pub fn isLightSocialPrompt(input: []const u8) bool {
-    const trimmed = std.mem.trim(u8, input, " \r\n\t,.:;!?");
-    if (trimmed.len == 0) return false;
-    var token_count: usize = 0;
-    var social_count: usize = 0;
-    var it = std.mem.tokenizeAny(u8, trimmed, " \r\n\t,.:;!?()[]{}\"'");
-    while (it.next()) |token| {
-        token_count += 1;
-        if (std.ascii.eqlIgnoreCase(token, "hi") or
-            std.ascii.eqlIgnoreCase(token, "hello") or
-            std.ascii.eqlIgnoreCase(token, "hey") or
-            std.ascii.eqlIgnoreCase(token, "yo") or
-            std.ascii.eqlIgnoreCase(token, "thanks") or
-            std.ascii.eqlIgnoreCase(token, "morning"))
-        {
-            social_count += 1;
-        }
-    }
-    return token_count != 0 and token_count == social_count;
 }
 
 pub fn routeGeneralistIntent(input: []const u8) GeneralistRoute {
@@ -2333,8 +2311,7 @@ test "salience mapping isolates semantic target and density" {
 }
 
 test "zero entropy mapper rejects greetings as semantic targets" {
-    try std.testing.expect(isLightSocialPrompt("hello"));
-    try std.testing.expect(!lacksSemanticTarget("hello"));
+    try std.testing.expect(lacksSemanticTarget("hello"));
     try std.testing.expect(lacksSemanticTarget("ok"));
     try std.testing.expect(!lacksSemanticTarget("Explain how a CPU processes data"));
 }

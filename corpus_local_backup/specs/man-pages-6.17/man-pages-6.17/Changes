@@ -1,0 +1,183 @@
+==================== Changes in man-pages-6.17 ====================
+
+Released: 2026-02-11, Aldaya
+
+
+New and rewritten pages
+-----------------------
+
+man1/
+	grepc.1
+	grepc_c.1
+	mansectf.1
+
+man2const/
+	F_GETDELEG.2const
+	IPPROTO_IP.2const			(previously, ip(7))
+	IPPROTO_IPV6.2const			(previously, ipv6(7))
+	IPV6_ADDRFORM.2const			(previously, ipv6(7))
+	IPV6_ADD_MEMBERSHIP.2const		(previously, ipv6(7))
+	IPV6_MTU.2const				(previously, ipv6(7))
+	IPV6_MTU_DISCOVER.2const		(previously, ipv6(7))
+	IPV6_MULTICAST_HOPS.2const		(previously, ipv6(7))
+	IPV6_MULTICAST_IF.2const		(previously, ipv6(7))
+	IPV6_MULTICAST_LOOP.2const		(previously, ipv6(7))
+	IPV6_RECVERR.2const			(previously, ipv6(7))
+	IPV6_RECVPKTINFO.2const			(previously, ipv6(7))
+	IPV6_ROUTER_ALERT.2const		(previously, ipv6(7))
+	IPV6_RTHDR.2const			(previously, ipv6(7))
+	IPV6_UNICAST_HOPS.2const		(previously, ipv6(7))
+	IPV6_V6ONLY.2const			(previously, ipv6(7))
+	IP_ADD_MEMBERSHIP.2constA		(previously, ip(7))
+	IP_ADD_SOURCE_MEMBERSHIP.2const		(previously, ip(7))
+	IP_BIND_ADDRESS_NO_PORT.2const		(previously, ip(7))
+	IP_BLOCK_SOURCE.2const			(previously, ip(7))
+	IP_DROP_MEMBERSHIP.2const		(previously, ip(7))
+	IP_DROP_SOURCE_MEMBERSHIP.2const	(previously, ip(7))
+	IP_FREEBIND.2const			(previously, ip(7))
+	IP_HDRINCL.2const			(previously, ip(7))
+	IP_LOCAL_PORT_RANGE.2const		(previously, ip(7))
+	IP_MSFILTER.2const			(previously, ip(7))
+	IP_MTU.2const				(previously, ip(7))
+	IP_MTU_DISCOVER.2const			(previously, ip(7))
+	IP_MULTICAST_ALL.2const			(previously, ip(7))
+	IP_MULTICAST_IF.2const			(previously, ip(7))
+	IP_MULTICAST_LOOP.2const		(previously, ip(7))
+	IP_MULTICAST_TTL.2const			(previously, ip(7))
+	IP_NODEFRAG.2const			(previously, ip(7))
+	IP_OPTIONS.2const			(previously, ip(7))
+	IP_PASSSEC.2const			(previously, ip(7))
+	IP_PKTINFO.2const			(previously, ip(7))
+	IP_RECVERR.2const			(previously, ip(7))
+	IP_RECVOPTS.2const			(previously, ip(7))
+	IP_RECVORIGDSTADDR.2const		(previously, ip(7))
+	IP_RECVTOS.2const			(previously, ip(7))
+	IP_RECVTTL.2const			(previously, ip(7))
+	IP_RETOPTS.2const			(previously, ip(7))
+	IP_ROUTER_ALERT.2const			(previously, ip(7))
+	IP_TOS.2const				(previously, ip(7))
+	IP_TRANSPARENT.2const			(previously, ip(7))
+	IP_TTL.2const				(previously, ip(7))
+	IP_UNBLOCK_SOURCE.2const		(previously, ip(7))
+	SO_PEERSEC.2const			(previously, ip(7))
+	in_pktinfo.2type			(previously, ip(7))
+	ip_mreq_source.2type			(previously, ip(7))
+	ip_mreqn.2type				(previously, ip(7))
+
+man3/
+	_Maxof.3
+	aligned_alloc.3				(previously, posix_memalign(3))
+	memalign.3				(previously, posix_memalign(3))
+	getopt.3				(split into many pages)
+	getopt_long.3				(previously, getopt(3))
+	getopt_long_only.3			(previously, getopt(3))
+	snprintf.3				(previously, printf(3))
+	sprintf.3				(previously, printf(3))
+	posix_memalign.3			(split into many pages)
+	printf.3				(split into many pages)
+	pvalloc.3				(previously, posix_memalign(3))
+	valloc.3				(previously, posix_memalign(3))
+
+man3attr/
+	gnu::warning.3attr
+
+man5/
+	proc_sys_net_ipv4.5			(previously, ip(7))
+
+man7/
+	ip.7					(split into many pages)
+	ipv6.7					(split into many pages)
+
+
+Newly documented interfaces in existing pages
+---------------------------------------------
+
+man2/
+	clone.2
+		E2BIG
+	madvise.2
+		PR_THP_DISABLE_EXCEPT_ADVISED
+	mount.2
+		ENOSPC
+	ptrace.2
+		PTRACE_SET_SYSCALL_INFO
+		struct ptrace_syscall_info::reserved
+		struct ptrace_syscall_info::flags
+
+man2const/
+	PR_GET_THP_DISABLE.2const
+	PR_SET_THP_DISABLE.2const
+		PR_THP_DISABLE_EXCEPT_ADVISED
+
+man3/
+	timespec_get.3
+		TIME_MONOTONIC
+		TIME_ACTIVE
+		TIME_THREAD_ACTIVE
+
+man7/
+	feature_test_macros.7
+		_ISOC23_SOURCE
+		_ISOC2X_SOURCE
+	operator.7
+		_Maxof(3)
+		_Minof(3)
+	rtnetlink.7
+		.ifi_change
+	standards.7
+		K&R
+		Unix/TS 4
+		C94, C95, C96, C17, C23
+		POSIX.1-2004, POSIX.1-2013, POSIX.1-2024
+		SUSv5
+
+
+New and changed links
+---------------------
+
+man2const/
+	F_SETDELEG.2const			(F_GETDELEG(2const))
+	IPV6_AUTHHDR.2const			(IPV6_RTHDR(2const))
+	IPV6_DROP_MEMBERSHIP.2const		(IPV6_ADD_MEMBERSHIP(2const))
+	IPV6_DSTOPTS.2const			(IPV6_RTHDR(2const))
+	IPV6_FLOWINFO.2const			(IPV6_RTHDR(2const))
+	IPV6_HOPLIMIT.2const			(IPV6_RTHDR(2const))
+	IPV6_HOPOPTS.2const			(IPV6_RTHDR(2const))
+
+man2type/
+	ip_mreq.2type				(ip_mreqn(2type))
+
+man3/
+	_Countof.3				(countof(3))
+	_Minof.3				(_Maxof(3))
+	vsnprintf.3				(snprintf(3))
+	vsprintf.3				(sprintf(3))
+
+
+Global changes
+--------------
+
+-  CONSTRIBUTING.d/
+   -  Add guidelines banning AI for contributing.
+   -  Document guidelines about In-Reply-To: header field.
+   -  Document guidelines about Fixes: trailed field.
+-  README.d/
+   -  Document dependencies of the project.
+-  share/mk/
+   -  Add help-list-* targets.
+-  man/
+   -  HISTORY, STANDARDS
+      -  Document new and old standards with precision.
+-  src/bin/
+   -  grepc, grepc_c, grepc_mk
+      Add new scripts to inspect C source code.
+-  */
+   -  Restore some old copyright notices.
+
+
+Changes to individual files
+---------------------------
+
+The manual pages and other files in the repository have been improved
+beyond what this changelog covers.  To learn more about changes applied
+to individual pages, or the authors of changes, use git(1).

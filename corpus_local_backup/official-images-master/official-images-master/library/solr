@@ -1,0 +1,38 @@
+# this file is generated via https://github.com/apache/solr-docker/blob/c33200c4b1c42b32c80f4e85621438df479a29b5/generate-stackbrew-library.sh
+
+Maintainers: The Apache Solr Project <dev@solr.apache.org> (@asfbot),
+ David Smiley (@dsmiley),
+ Jan Høydahl (@janhoy),
+ Houston Putman (@houstonputman)
+GitRepo: https://github.com/apache/solr-docker.git
+GitFetch: refs/heads/main
+
+Tags: 10.0.0, 10.0, 10, latest
+Architectures: amd64, arm64v8, ppc64le, riscv64, s390x
+GitCommit: 884b2e6692174ea09cdb5183b8dd585760b5e9fb
+Directory: 10.0
+
+Tags: 10.0.0-slim, 10.0-slim, 10-slim, slim
+Architectures: amd64, arm64v8, ppc64le, riscv64, s390x
+GitCommit: 884b2e6692174ea09cdb5183b8dd585760b5e9fb
+Directory: 10.0-slim
+
+Tags: 9.10.1, 9.10, 9
+Architectures: amd64, arm64v8, ppc64le, s390x
+GitCommit: 9c4aa799df40c506a48bc487cc6b4aaed24f9149
+Directory: 9.10
+
+Tags: 9.10.1-slim, 9.10-slim, 9-slim
+Architectures: amd64, arm64v8, ppc64le, s390x
+GitCommit: 9c4aa799df40c506a48bc487cc6b4aaed24f9149
+Directory: 9.10-slim
+
+Tags: 9.9.0, 9.9
+Architectures: amd64, arm64v8, ppc64le, s390x
+GitCommit: aa51c522c3e74cd1b2886209ea249358a34d324a
+Directory: 9.9
+
+Tags: 9.9.0-slim, 9.9-slim
+Architectures: amd64, arm64v8, ppc64le, s390x
+GitCommit: aa51c522c3e74cd1b2886209ea249358a34d324a
+Directory: 9.9-slim
