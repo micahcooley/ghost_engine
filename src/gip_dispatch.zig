@@ -35,6 +35,10 @@ const procedure_pack_candidates = @import("procedure_pack_candidates.zig");
 const sigil_core = @import("sigil_core.zig");
 const artifact_policy = @import("artifact_policy.zig");
 const artifact_autopsy = @import("artifact_autopsy.zig");
+const oracle_auto_fix = @import("oracle/auto_fix.zig");
+const curiosity = @import("ghost/curiosity.zig");
+const hive = @import("net/hive.zig");
+const recursive_boot = @import("ghost/recursive_boot.zig");
 
 pub const DispatchResult = struct {
     status: core.ProtocolStatus,
@@ -113,6 +117,10 @@ pub fn dispatch(
         .@"corpus.ask" => dispatchCorpusAsk(allocator, request_body),
         .@"rule.evaluate" => dispatchRuleEvaluate(allocator, request_body),
         .@"sigil.inspect" => dispatchSigilInspect(allocator, request_body),
+        .@"oracle.auto_fix" => dispatchOracleAutoFix(allocator, request_body),
+        .@"curiosity.status" => dispatchCuriosityStatus(allocator, request_body),
+        .@"hive.status" => dispatchHiveStatus(allocator),
+        .@"recursive_boot.status" => dispatchRecursiveBootStatus(allocator, request_body),
         .@"learning.status" => dispatchLearningStatus(allocator, request_body),
         .@"learning.review" => dispatchLearningReview(allocator, request_body),
         .@"learning.loop.plan" => dispatchLearningLoopPlan(allocator, workspace_root, request_body),
@@ -198,6 +206,114 @@ fn dispatchEngineStatus(allocator: std.mem.Allocator) !DispatchResult {
     return .{
         .status = .ok,
         .result_json = try out.toOwnedSlice(),
+        .allocated_result = true,
+    };
+}
+
+fn dispatchOracleAutoFix(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
+    const body = request_body orelse return .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "body missing" } };
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON" } };
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "oracle.auto_fix request must be a JSON object" } };
+    }
+    const obj = parsed.value.object;
+    const test_file = getStr(obj, "test_file", "testFile");
+    const source = getStr(obj, "source", "source");
+    if (test_file == null and source == null) {
+        return .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "testFile or source is required" } };
+    }
+    const raw_max_cycles = getInt(obj, "max_cycles", "maxCycles") orelse oracle_auto_fix.MAX_CYCLES;
+    const raw_diag_bytes = getInt(obj, "diagnostic_buffer_bytes", "diagnosticBufferBytes") orelse oracle_auto_fix.DEFAULT_DIAGNOSTIC_BUFFER_BYTES;
+    const options = oracle_auto_fix.Options{
+        .cwd = getStr(obj, "cwd", "cwd") orelse ".",
+        .test_file = test_file,
+        .source = source,
+        .max_cycles = if (raw_max_cycles <= 0) 1 else @intCast(@min(raw_max_cycles, oracle_auto_fix.MAX_CYCLES)),
+        .diagnostic_buffer_bytes = if (raw_diag_bytes <= 0) oracle_auto_fix.DEFAULT_DIAGNOSTIC_BUFFER_BYTES else @intCast(@min(raw_diag_bytes, @as(i64, 1024 * 1024))),
+    };
+    return .{
+        .status = .ok,
+        .result_state = schema.draftResultState(),
+        .result_json = try oracle_auto_fix.runAndRenderJson(allocator, options),
+        .allocated_result = true,
+    };
+}
+
+fn dispatchCuriosityStatus(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
+    var parsed_opt: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed_opt) |*parsed| parsed.deinit();
+
+    var concept_storage: ?[]curiosity.Concept = null;
+    defer if (concept_storage) |items| allocator.free(items);
+
+    var guard = curiosity.GuardState{
+        .load_average_1m = curiosity.currentLoadAverage1m(),
+    };
+    var concepts: []const curiosity.Concept = &.{
+        .{ .name = "low pass filter" },
+        .{ .name = "high pass filter" },
+    };
+
+    if (request_body) |body| {
+        parsed_opt = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+            return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON" } };
+        };
+        if (parsed_opt.?.value == .object) {
+            const obj = parsed_opt.?.value.object;
+            if (getBool(obj, "zenith_audio_priority_requested", "zenithAudioPriorityRequested")) |value| guard.zenith_audio_priority_requested = value;
+            if (getBool(obj, "oracle_paused_for_ram", "oraclePausedForRam")) |value| guard.oracle_paused_for_ram = value;
+            if (getInt(obj, "active_zig_tests", "activeZigTests")) |value| guard.active_zig_tests = if (value <= 0) 0 else @intCast(@min(value, 255));
+            if (obj.get("concepts")) |value| {
+                if (value == .array) {
+                    var list = std.ArrayList(curiosity.Concept).init(allocator);
+                    defer list.deinit();
+                    for (value.array.items) |item| {
+                        if (item == .string) try list.append(.{ .name = item.string });
+                    }
+                    concept_storage = try list.toOwnedSlice();
+                    concepts = concept_storage.?;
+                }
+            }
+        }
+    }
+
+    return .{
+        .status = .ok,
+        .result_state = schema.draftResultState(),
+        .result_json = try curiosity.renderStatusJson(allocator, guard, concepts),
+        .allocated_result = true,
+    };
+}
+
+fn dispatchHiveStatus(allocator: std.mem.Allocator) !DispatchResult {
+    return .{
+        .status = .ok,
+        .result_state = schema.draftResultState(),
+        .result_json = try hive.renderStatusJson(allocator),
+        .allocated_result = true,
+    };
+}
+
+fn dispatchRecursiveBootStatus(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
+    var iterations: usize = recursive_boot.DEFAULT_BENCH_ITERATIONS;
+    if (request_body) |body| {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+            return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON" } };
+        };
+        defer parsed.deinit();
+        if (parsed.value == .object) {
+            if (getInt(parsed.value.object, "iterations", "iterations")) |value| {
+                iterations = if (value <= 0) 1 else @intCast(@min(value, @as(i64, 1_000_000)));
+            }
+        }
+    }
+    return .{
+        .status = .ok,
+        .result_state = schema.draftResultState(),
+        .result_json = try recursive_boot.renderStatusJson(allocator, iterations),
         .allocated_result = true,
     };
 }

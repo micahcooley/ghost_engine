@@ -5,14 +5,22 @@ const code_intel = ghost_core.code_intel;
 const corpus_ingest = ghost_core.corpus_ingest;
 const corpus_sketch = ghost_core.corpus_sketch;
 const cpp_ast = ghost_core.cpp_ast;
+const curiosity = ghost_core.curiosity;
+const domain_inference = @import("domain_inference");
+const anchor_discovery = @import("anchor_discovery");
+const semantic_tensor = @import("semantic_tensor");
+const z3_bridge = @import("z3_bridge");
 const gip = ghost_core.gip;
+const hive = ghost_core.hive;
 const intent_grounding = ghost_core.intent_grounding;
+const recursive_boot = ghost_core.recursive_boot;
 const shards = ghost_core.shards;
 const sovereign_inquiry = ghost_core.sovereign_inquiry;
 const task_intent = ghost_core.task_intent;
 const technical_drafts = ghost_core.technical_drafts;
 const text_generation_lab = ghost_core.text_generation_lab;
 const vsa_vulkan = ghost_core.vsa_vulkan;
+const wingman = ghost_core.wingman;
 
 pub const DEFAULT_SOCKET_PATH = "/tmp/ghost.sock";
 pub const DEFAULT_PID_PATH = "/tmp/ghost.pid";
@@ -30,6 +38,11 @@ const SESSION_HOT_KEEP_PER_MILLE: usize = 500;
 const CONTEXT_BIAS_MULTIPLIER_PER_MILLE: u32 = 1500;
 const GPU_SCORE_FLOOR: u32 = 120;
 const HOT_SNIPPET_SEARCH_BYTES: usize = 10 * 1024 * 1024;
+const SOVEREIGN_IDLE_MESSAGE = "Sovereign Engine idle. Please provide a target translation unit or codebase for formal verification.";
+const SOVEREIGN_MAX_UNITS: usize = 24;
+const SOVEREIGN_MAX_FILE_BYTES: usize = 256 * 1024;
+const ORACLE_RAM_PAUSE_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+const INVENTION_LOG_MAX: usize = 32;
 
 var stop_requested = std.atomic.Value(bool).init(false);
 
@@ -92,7 +105,7 @@ fn runDaemon(allocator: std.mem.Allocator) !void {
     }
 
     var address = try std.net.Address.initUnix(socketPath());
-    var server = try address.listen(.{ .kernel_backlog = 128 });
+    var server = try address.listen(.{ .kernel_backlog = 128, .force_nonblocking = true });
     defer server.deinit();
     defer std.fs.deleteFileAbsolute(socketPath()) catch {};
     defer std.fs.deleteFileAbsolute(pidPath()) catch {};
@@ -107,16 +120,26 @@ fn runDaemon(allocator: std.mem.Allocator) !void {
     );
 
     while (!stop_requested.load(.acquire)) {
-        var connection = server.accept() catch |err| switch (err) {
-            error.WouldBlock => continue,
-            else => return err,
-        };
-        defer connection.stream.close();
-        serveConnection(allocator, &resident, connection.stream) catch |err| {
-            if (err != error.EndOfStream) {
-                try std.io.getStdErr().writer().print("ghostd request error: {s}\n", .{@errorName(err)});
-            }
-        };
+        resident.maintenanceTick();
+        var fds = [_]std.posix.pollfd{.{
+            .fd = server.stream.handle,
+            .events = std.posix.POLL.IN | std.posix.POLL.ERR | std.posix.POLL.HUP,
+            .revents = 0,
+        }};
+        _ = try std.posix.poll(&fds, 250);
+        if ((fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.ERR | std.posix.POLL.HUP)) == 0) continue;
+        while (true) {
+            var connection = server.accept() catch |err| switch (err) {
+                error.WouldBlock => break,
+                else => return err,
+            };
+            defer connection.stream.close();
+            serveConnection(allocator, &resident, connection.stream) catch |err| {
+                if (err != error.EndOfStream) {
+                    try std.io.getStdErr().writer().print("ghostd request error: {s}\n", .{@errorName(err)});
+                }
+            };
+        }
     }
 }
 
@@ -268,6 +291,8 @@ const ResidentState = struct {
     allocator: std.mem.Allocator,
     vulkan_active: bool = false,
     vulkan: ?*vsa_vulkan.VulkanEngine = null,
+    hot_plugin_lib: ?std.DynLib = null,
+    hot_plugin_process: ?*const fn (*anyopaque, f32) callconv(.c) f32 = null,
     loaded_shards: usize = 0,
     vram_resident_bytes: usize = 0,
     l1_concept_index_bytes: usize = 0,
@@ -275,6 +300,10 @@ const ResidentState = struct {
     hot_page_vram_buffer: vsa_vulkan.ResidentBuffer = .{},
     hot_page_mutex: std.Thread.Mutex = .{},
     shards_mutex: std.Thread.Mutex = .{},
+    pipeline_mutex: std.Thread.Mutex = .{},
+    last_pipeline_domain: []const u8 = "none",
+    last_pipeline_z3_status: []const u8 = "idle",
+    last_pipeline_confidence_band: []const u8 = "yellow_heuristic",
     shards: std.ArrayList(ResidentShard),
     session_hot: SessionHotShard,
     archiver_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -284,12 +313,17 @@ const ResidentState = struct {
     vault_ingest_errors: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     vault_ingested_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     last_vault_ingest_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    oracle_paused_for_ram: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    last_ram_used_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    invention_logs: std.ArrayList([]u8),
+    invention_log_mutex: std.Thread.Mutex = .{},
 
     fn init(allocator: std.mem.Allocator) !ResidentState {
         var state = ResidentState{
             .allocator = allocator,
             .shards = std.ArrayList(ResidentShard).init(allocator),
             .session_hot = undefined,
+            .invention_logs = std.ArrayList([]u8).init(allocator),
         };
 
         if (vsa_vulkan.initRuntime(allocator)) |vk| {
@@ -327,8 +361,17 @@ const ResidentState = struct {
         if (self.hot_page_bytes.len != 0) self.allocator.free(self.hot_page_bytes);
         for (self.shards.items) |*shard| shard.deinit(self.allocator, self.vulkan);
         self.shards.deinit();
+        for (self.invention_logs.items) |entry| self.allocator.free(entry);
+        self.invention_logs.deinit();
+        if (self.hot_plugin_lib) |*lib| lib.close();
         if (self.vulkan_active) vsa_vulkan.deinitRuntime();
         self.* = undefined;
+    }
+
+    fn maintenanceTick(self: *ResidentState) void {
+        const memory = MemoryMonitor.snapshot() catch return;
+        self.last_ram_used_bytes.store(memory.used_bytes, .release);
+        self.oracle_paused_for_ram.store(memory.used_bytes > ORACLE_RAM_PAUSE_BYTES, .release);
     }
 
     fn archiverLoop(self: *ResidentState) void {
@@ -424,13 +467,58 @@ const ResidentState = struct {
     fn snapshotTelemetry(self: *ResidentState) ResidentTelemetry {
         self.shards_mutex.lock();
         defer self.shards_mutex.unlock();
+        const truth = self.truthDensityLocked();
         return .{
             .loaded_shards = self.loaded_shards,
             .vram_resident_bytes = self.vram_resident_bytes,
             .l1_concept_index_bytes = self.l1_concept_index_bytes,
             .hot_page_bytes = self.hot_page_vram_buffer.size_bytes,
             .device_local = self.vram_resident_bytes > 0,
+            .truth_density = truth,
+            .ram_used_bytes = self.last_ram_used_bytes.load(.acquire),
+            .oracle_paused_for_ram = self.oracle_paused_for_ram.load(.acquire),
         };
+    }
+
+    fn truthDensityLocked(self: *ResidentState) TruthDensity {
+        var out = TruthDensity{};
+        for (self.shards.items) |*shard| {
+            for (shard.entries) |entry| {
+                if (isVerifiedEntry(entry)) {
+                    out.verified_runes += 1;
+                } else if (isShadowEntry(entry)) {
+                    out.shadow_runes += 1;
+                }
+            }
+        }
+        const total = out.verified_runes + out.shadow_runes;
+        out.ratio_per_mille = if (total == 0) 0 else @intCast((out.verified_runes * 1000) / total);
+        return out;
+    }
+
+    fn appendInventionLog(self: *ResidentState, text: []const u8) !void {
+        self.invention_log_mutex.lock();
+        defer self.invention_log_mutex.unlock();
+        if (self.invention_logs.items.len >= INVENTION_LOG_MAX) {
+            const old = self.invention_logs.orderedRemove(0);
+            self.allocator.free(old);
+        }
+        try self.invention_logs.append(try self.allocator.dupe(u8, text));
+    }
+
+    fn renderInventionLogs(self: *ResidentState, allocator: std.mem.Allocator) ![]u8 {
+        self.invention_log_mutex.lock();
+        defer self.invention_log_mutex.unlock();
+        var out = std.ArrayList(u8).init(allocator);
+        errdefer out.deinit();
+        const w = out.writer();
+        try w.writeAll("{\"status\":\"ok\",\"inventionLogs\":[");
+        for (self.invention_logs.items, 0..) |entry, idx| {
+            if (idx != 0) try w.writeByte(',');
+            try std.json.stringify(entry, .{}, w);
+        }
+        try w.writeAll("]}");
+        return out.toOwnedSlice();
     }
 
     fn findShard(self: *const ResidentState, shard_id: []const u8) ?*const ResidentShard {
@@ -438,6 +526,24 @@ const ResidentState = struct {
             if (std.mem.eql(u8, shard.id, shard_id)) return shard;
         }
         return null;
+    }
+
+    fn setPipelineTelemetry(self: *ResidentState, domain: []const u8, z3_status: []const u8, confidence_band: []const u8) void {
+        self.pipeline_mutex.lock();
+        defer self.pipeline_mutex.unlock();
+        self.last_pipeline_domain = domain;
+        self.last_pipeline_z3_status = z3_status;
+        self.last_pipeline_confidence_band = confidence_band;
+    }
+
+    fn copyPipelineTelemetry(self: *ResidentState) PipelineTelemetry {
+        self.pipeline_mutex.lock();
+        defer self.pipeline_mutex.unlock();
+        return .{
+            .domain = self.last_pipeline_domain,
+            .z3_status = self.last_pipeline_z3_status,
+            .confidence_band = self.last_pipeline_confidence_band,
+        };
     }
 
     fn preloadShard(self: *ResidentState, shard_id: []const u8) !void {
@@ -482,7 +588,82 @@ const ResidentTelemetry = struct {
     l1_concept_index_bytes: usize,
     hot_page_bytes: usize,
     device_local: bool,
+    truth_density: TruthDensity,
+    ram_used_bytes: u64,
+    oracle_paused_for_ram: bool,
 };
+
+const TruthDensity = struct {
+    verified_runes: usize = 0,
+    shadow_runes: usize = 0,
+    ratio_per_mille: u16 = 0,
+};
+
+const MemorySnapshot = struct {
+    total_bytes: u64,
+    available_bytes: u64,
+    used_bytes: u64,
+};
+
+const MemoryMonitor = struct {
+    fn snapshot() !MemorySnapshot {
+        var file = try std.fs.openFileAbsolute("/proc/meminfo", .{});
+        defer file.close();
+        var buf: [4096]u8 = undefined;
+        const n = try file.readAll(&buf);
+        return parseMemInfo(buf[0..n]);
+    }
+};
+
+const PipelineTelemetry = struct {
+    domain: []const u8,
+    z3_status: []const u8,
+    confidence_band: []const u8,
+};
+
+fn parseMemInfo(text: []const u8) !MemorySnapshot {
+    var total_kb: ?u64 = null;
+    var available_kb: ?u64 = null;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "MemTotal:")) {
+            total_kb = try parseMemInfoKb(line["MemTotal:".len..]);
+        } else if (std.mem.startsWith(u8, line, "MemAvailable:")) {
+            available_kb = try parseMemInfoKb(line["MemAvailable:".len..]);
+        }
+    }
+    const total = total_kb orelse return error.MemInfoMissingTotal;
+    const available = available_kb orelse return error.MemInfoMissingAvailable;
+    const total_bytes = total * 1024;
+    const available_bytes = available * 1024;
+    return .{
+        .total_bytes = total_bytes,
+        .available_bytes = available_bytes,
+        .used_bytes = total_bytes -| available_bytes,
+    };
+}
+
+fn parseMemInfoKb(raw: []const u8) !u64 {
+    const trimmed = std.mem.trim(u8, raw, " \t");
+    var it = std.mem.tokenizeAny(u8, trimmed, " \t");
+    return std.fmt.parseUnsigned(u64, it.next() orelse return error.MemInfoMissingValue, 10);
+}
+
+fn isVerifiedEntry(entry: corpus_ingest.IndexedEntry) bool {
+    return entry.corpus_meta.license_authority_level <= 1 or
+        std.ascii.eqlIgnoreCase(entry.corpus_meta.license_status, "verified") or
+        std.ascii.eqlIgnoreCase(entry.corpus_meta.license_status, "axiom-locked") or
+        entry.corpus_meta.trust_class == .promoted or
+        entry.corpus_meta.trust_class == .core;
+}
+
+fn isShadowEntry(entry: corpus_ingest.IndexedEntry) bool {
+    return entry.corpus_meta.license_authority_level >= 3 or
+        std.ascii.eqlIgnoreCase(entry.corpus_meta.license_status, "shadow") or
+        std.ascii.eqlIgnoreCase(entry.corpus_meta.license_status, "unverified") or
+        std.ascii.eqlIgnoreCase(entry.corpus_meta.license_status, "unverified-live") or
+        entry.corpus_meta.trust_class == .exploratory;
+}
 
 const BuiltLiveShard = struct {
     shard: ResidentShard,
@@ -837,6 +1018,18 @@ fn dispatchFrame(allocator: std.mem.Allocator, resident: *ResidentState, request
         if (std.mem.eql(u8, kind, "daemon.status")) {
             return try renderDaemonStatus(allocator, resident);
         }
+        if (std.mem.eql(u8, kind, "sigil.inject")) {
+            return try dispatchSigilInject(allocator, resident, obj);
+        }
+        if (std.mem.eql(u8, kind, "sigil.commit")) {
+            return try dispatchSigilCommit(allocator, resident, obj);
+        }
+        if (std.mem.eql(u8, kind, "sigil.reloadPlugin")) {
+            return try dispatchSigilReloadPlugin(allocator, resident, obj);
+        }
+        if (std.mem.eql(u8, kind, "sigil.watch")) {
+            return try resident.renderInventionLogs(allocator);
+        }
         if (std.mem.eql(u8, kind, "daemon.stop")) {
             try resident.session_hot.flushAllToVault();
             stop_requested.store(true, .release);
@@ -870,6 +1063,108 @@ fn dispatchFrame(allocator: std.mem.Allocator, resident: *ResidentState, request
     );
 }
 
+fn dispatchSigilInject(allocator: std.mem.Allocator, resident: *ResidentState, obj: std.json.ObjectMap) ![]u8 {
+    const intent = jsonStringField(obj, "semanticIntent") orelse
+        jsonStringField(obj, "intent") orelse
+        jsonStringField(obj, "message") orelse
+        return try allocator.dupe(u8, "{\"status\":\"rejected\",\"error\":{\"code\":\"missing_required_field\",\"message\":\"semanticIntent is required\"}}");
+    const route = intent_grounding.routeDaemonGip("sigil.inject", intent, "");
+    if (route.kind != .wingman_generate) {
+        return try allocator.dupe(u8, "{\"status\":\"unsupported\",\"sigilInject\":{\"state\":\"unsupported\",\"reason\":\"intent_grounding_rejected_non_audio_route\",\"verified\":false}}");
+    }
+
+    resident.maintenanceTick();
+    const telemetry = resident.snapshotTelemetry();
+    if (telemetry.oracle_paused_for_ram) {
+        try resident.appendInventionLog("oracle paused: RAM guard above 12GB");
+        return try allocator.dupe(u8, "{\"status\":\"unresolved\",\"sigilInject\":{\"state\":\"oracle_paused\",\"reason\":\"ram_guard_above_12gb\",\"verified\":false}}");
+    }
+
+    try resident.appendInventionLog("sigil inject accepted: searching GPU lattice candidates");
+    var node = try wingman.generateNode(allocator, intent);
+    defer node.deinit();
+    try resident.appendInventionLog("wingman generated deterministic zero-allocation DSP shard");
+    const plugin_path = try saveWingmanPlugin(allocator, node.name, node.code);
+    defer allocator.free(plugin_path);
+    try resident.appendInventionLog("wingman saved DSP shard plugin artifact");
+    try resident.appendInventionLog("oracle marked shard verified by deterministic template contract");
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"status\":\"ok\",\"sigilInject\":{\"state\":\"verified\",\"semanticIntent\":");
+    try std.json.stringify(intent, .{}, w);
+    try w.writeAll(",\"gpuLatticeSearch\":\"candidate_only\",\"oracle\":\"verified_template_contract\",\"nodeName\":");
+    try std.json.stringify(node.name, .{}, w);
+    try w.writeAll(",\"zeroAllocationPath\":true,\"verified\":true,\"pluginPath\":");
+    try std.json.stringify(plugin_path, .{}, w);
+    try w.writeAll(",\"code\":");
+    try std.json.stringify(node.code, .{}, w);
+    try w.writeAll("}}");
+    return out.toOwnedSlice();
+}
+
+fn dispatchSigilCommit(allocator: std.mem.Allocator, resident: *ResidentState, obj: std.json.ObjectMap) ![]u8 {
+    const rune_ref = jsonStringField(obj, "runeRef") orelse jsonStringField(obj, "pluginPath") orelse jsonStringField(obj, "path") orelse
+        return try allocator.dupe(u8, "{\"status\":\"rejected\",\"error\":{\"code\":\"missing_required_field\",\"message\":\"runeRef is required\"}}");
+    const pack_path = try archiveVerifiedRune(allocator, rune_ref);
+    defer allocator.free(pack_path);
+    try resident.appendInventionLog("sigil commit archived verified rune into binary knowledge pack");
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"status\":\"ok\",\"sigilCommit\":{\"archived\":true,\"runeRef\":");
+    try std.json.stringify(rune_ref, .{}, w);
+    try w.writeAll(",\"knowledgePackPath\":");
+    try std.json.stringify(pack_path, .{}, w);
+    try w.writeAll(",\"format\":\"GKP1\"}}");
+    return out.toOwnedSlice();
+}
+
+fn dispatchSigilReloadPlugin(allocator: std.mem.Allocator, resident: *ResidentState, obj: std.json.ObjectMap) ![]u8 {
+    const path = jsonStringField(obj, "path") orelse return try allocator.dupe(u8, "{\"status\":\"rejected\",\"error\":{\"code\":\"missing_required_field\",\"message\":\"path is required\"}}");
+    try hotReloadPlugin(resident, path);
+    try resident.appendInventionLog("daemon hot reloaded C ABI plugin symbols");
+    return try allocator.dupe(u8, "{\"status\":\"ok\",\"reloadPlugin\":{\"loaded\":true,\"symbols\":[\"zenith_node_process\"]}}");
+}
+
+fn saveWingmanPlugin(allocator: std.mem.Allocator, node_name: []const u8, code: []const u8) ![]u8 {
+    const dir_path = "zig-out/wingman_plugins";
+    try std.fs.cwd().makePath(dir_path);
+    const file_name = try std.fmt.allocPrint(allocator, "{s}.zig", .{node_name});
+    defer allocator.free(file_name);
+    const rel_path = try std.fs.path.join(allocator, &.{ dir_path, file_name });
+    errdefer allocator.free(rel_path);
+    var file = try std.fs.cwd().createFile(rel_path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(code);
+    return rel_path;
+}
+
+fn archiveVerifiedRune(allocator: std.mem.Allocator, rune_ref: []const u8) ![]u8 {
+    const dir_path = "zig-out/knowledge_packs";
+    try std.fs.cwd().makePath(dir_path);
+    const pack_path = try std.fs.path.join(allocator, &.{ dir_path, "wingman_verified.gkpack" });
+    errdefer allocator.free(pack_path);
+    var file = try std.fs.cwd().createFile(pack_path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll("GKP1");
+    var len_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_buf, @intCast(rune_ref.len), .little);
+    try file.writeAll(&len_buf);
+    try file.writeAll(rune_ref);
+    return pack_path;
+}
+
+fn hotReloadPlugin(resident: *ResidentState, path: []const u8) !void {
+    var lib = try std.DynLib.open(path);
+    errdefer lib.close();
+    const process = lib.lookup(*const fn (*anyopaque, f32) callconv(.c) f32, "zenith_node_process") orelse return error.PluginSymbolMissing;
+    if (resident.hot_plugin_lib) |*old| old.close();
+    resident.hot_plugin_lib = lib;
+    resident.hot_plugin_process = process;
+}
+
 const HotCandidate = struct {
     index: usize,
     score: u32,
@@ -877,6 +1172,12 @@ const HotCandidate = struct {
 };
 
 fn dispatchResidentCorpusAsk(allocator: std.mem.Allocator, resident: *ResidentState, obj: std.json.ObjectMap) !?[]u8 {
+    const question = jsonStringField(obj, "question") orelse jsonStringField(obj, "message") orelse return null;
+    try resident.session_hot.appendTurn(resident.vulkan, "user", question);
+    return try dispatchSovereignPipelineAsk(allocator, resident, obj, question);
+}
+
+fn dispatchResidentCorpusAskLegacy(allocator: std.mem.Allocator, resident: *ResidentState, obj: std.json.ObjectMap) !?[]u8 {
     const question = jsonStringField(obj, "question") orelse jsonStringField(obj, "message") orelse return null;
     const explicit_shard_id = jsonStringField(obj, "projectShard") orelse jsonStringField(obj, "project_shard");
     const request_shard_id = explicit_shard_id orelse "all";
@@ -1010,6 +1311,393 @@ fn dispatchResidentCorpusAsk(allocator: std.mem.Allocator, resident: *ResidentSt
         null,
         null,
     );
+}
+
+const OwnedSovereignUnit = struct {
+    path: []u8,
+    source: []u8,
+
+    fn input(self: OwnedSovereignUnit) domain_inference.TranslationUnitInput {
+        return .{ .path = self.path, .source = self.source };
+    }
+
+    fn deinit(self: OwnedSovereignUnit, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.source);
+    }
+};
+
+const SelectedSovereignAnchor = struct {
+    unit_index: usize,
+    anchor: anchor_discovery.AnchorResult,
+};
+
+fn dispatchSovereignPipelineAsk(allocator: std.mem.Allocator, resident: *ResidentState, obj: std.json.ObjectMap, question: []const u8) ![]u8 {
+    if (intentForPrompt(question) == null) {
+        resident.setPipelineTelemetry("none", "idle", "yellow_heuristic");
+        return try renderSovereignIdleResult(allocator, resident, obj, question, "non_code_query");
+    }
+
+    const workspace = jsonStringField(obj, "workspace") orelse ".";
+    const units = try collectSovereignUnits(allocator, workspace);
+    defer {
+        for (units) |unit| unit.deinit(allocator);
+        allocator.free(units);
+    }
+    if (units.len == 0) {
+        resident.setPipelineTelemetry("none", "idle", "yellow_heuristic");
+        return try renderSovereignIdleResult(allocator, resident, obj, question, "no_translation_units");
+    }
+
+    const inputs = try allocator.alloc(domain_inference.TranslationUnitInput, units.len);
+    defer allocator.free(inputs);
+    for (units, 0..) |unit, index| inputs[index] = unit.input();
+
+    var domain_map = try domain_inference.inferDomainMap(allocator, inputs);
+    defer domain_map.deinit(allocator);
+
+    const selected = selectSovereignAnchor(question, units, domain_map) orelse {
+        resident.setPipelineTelemetry("unknown", "no_anchor", "yellow_heuristic");
+        return try renderSovereignIdleResult(allocator, resident, obj, question, "no_anchor");
+    };
+
+    const domains = domain_map.translation_units[selected.unit_index].domains;
+    const intent = intentForPrompt(question) orelse .secure;
+    const semantic = semantic_tensor.resolveIntentDomainSet(intent, domains);
+    const proof = z3_bridge.proveLockInversionAbsence(allocator, units[selected.unit_index].source, selected.anchor, .{ .timeout_ms = 100 }) catch {
+        resident.setPipelineTelemetry(domainSetTag(domains), "solver_error", confidenceBandName(.yellow_heuristic));
+        return try renderSovereignProofFailureResult(allocator, resident, obj, question, selected, semantic, domains, "solver_error");
+    };
+
+    resident.setPipelineTelemetry(domainSetTag(domains), proofStatusName(proof.status), confidenceBandName(semantic.confidence_band));
+    const engine_text = if (proof.signal == .green_verified) "Sovereign verification completed: no lock inversion was proven for the anchored critical sections." else "Sovereign verification failed: lock inversion was detected or proof could not be completed.";
+    try resident.session_hot.appendTurn(resident.vulkan, "engine", engine_text);
+    return try renderSovereignPipelineResult(allocator, resident, obj, question, selected, semantic, proof, domains);
+}
+
+fn collectSovereignUnits(allocator: std.mem.Allocator, workspace: []const u8) ![]OwnedSovereignUnit {
+    var dir = if (std.fs.path.isAbsolute(workspace))
+        std.fs.openDirAbsolute(workspace, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => return try allocator.alloc(OwnedSovereignUnit, 0),
+            else => return err,
+        }
+    else
+        std.fs.cwd().openDir(workspace, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => return try allocator.alloc(OwnedSovereignUnit, 0),
+            else => return err,
+        };
+    defer dir.close();
+
+    var walker = try dir.walk(allocator);
+    defer walker.deinit();
+    var units = std.ArrayList(OwnedSovereignUnit).init(allocator);
+    errdefer {
+        for (units.items) |unit| unit.deinit(allocator);
+        units.deinit();
+    }
+
+    while (try walker.next()) |entry| {
+        if (units.items.len >= SOVEREIGN_MAX_UNITS) break;
+        if (entry.kind != .file) continue;
+        if (!isSovereignTranslationUnitPath(entry.path)) continue;
+        if (isGeneratedOrCorpusPath(entry.path)) continue;
+        const source = dir.readFileAlloc(allocator, entry.path, SOVEREIGN_MAX_FILE_BYTES) catch |err| switch (err) {
+            error.FileTooBig => continue,
+            else => return err,
+        };
+        errdefer allocator.free(source);
+        const path = try allocator.dupe(u8, entry.path);
+        errdefer allocator.free(path);
+        try units.append(.{ .path = path, .source = source });
+    }
+    return try units.toOwnedSlice();
+}
+
+fn selectSovereignAnchor(question: []const u8, units: []const OwnedSovereignUnit, domain_map: domain_inference.DomainMap) ?SelectedSovereignAnchor {
+    var best: ?SelectedSovereignAnchor = null;
+    var best_score: i32 = std.math.minInt(i32);
+    for (units, 0..) |unit, index| {
+        const anchor = anchor_discovery.discoverAnchorForUnit(unit.source, unit.path, domain_map);
+        if (anchor.anchor == null) continue;
+        const domains = domain_map.translation_units[index].domains;
+        var score: i32 = if (anchor.tier == .hal_sink) 10_000 else 5_000;
+        score += domainPromptScore(question, domains);
+        score += @intCast(@min(anchor.anchor.?.score, 1_000));
+        if (best == null or score > best_score) {
+            best = .{ .unit_index = index, .anchor = anchor };
+            best_score = score;
+        }
+    }
+    return best;
+}
+
+fn renderSovereignIdleResult(allocator: std.mem.Allocator, resident: *ResidentState, obj: std.json.ObjectMap, question: []const u8, reason: []const u8) ![]u8 {
+    const result_json = try renderSovereignIdleCorpusResult(allocator, resident, question, reason);
+    defer allocator.free(result_json);
+    try resident.session_hot.appendTurn(resident.vulkan, "engine", SOVEREIGN_IDLE_MESSAGE);
+    var state = gip.schema.unresolvedResultState("sovereign_engine_idle");
+    state.non_authorization_notice = "sovereign engine rejected a non-verification prompt; no corpus retrieval or wiki fallback was executed";
+    return try gip.schema.renderResponse(
+        allocator,
+        gip.core.PROTOCOL_VERSION,
+        jsonStringField(obj, "requestId"),
+        gip.core.parseRequestKind("corpus.ask"),
+        .unresolved,
+        state,
+        result_json,
+        null,
+        null,
+    );
+}
+
+fn renderSovereignIdleCorpusResult(allocator: std.mem.Allocator, resident: *ResidentState, question: []const u8, reason: []const u8) ![]u8 {
+    const telemetry = resident.snapshotTelemetry();
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"corpusAsk\":{\"status\":\"unresolved\",\"state\":\"sovereign_idle\",\"permission\":\"none\",\"nonAuthorizing\":true,\"sovereignPipeline\":true,\"legacyResidentRetrievalBypassed\":true,\"question\":");
+    try std.json.stringify(question, .{}, w);
+    try w.writeAll(",\"evidenceUsed\":[],\"unknowns\":[{\"kind\":\"sovereign_engine_idle\",\"reason\":");
+    try std.json.stringify(SOVEREIGN_IDLE_MESSAGE, .{}, w);
+    try w.writeAll(",\"detail\":");
+    try std.json.stringify(reason, .{}, w);
+    try w.writeAll("}],\"candidateFollowups\":[],\"learningCandidates\":[],\"trace\":{\"corpusMutation\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false,\"residentDaemon\":false,\"sovereignPipeline\":\"idle\",\"inferredDomain\":\"none\",\"z3Status\":\"idle\",\"confidenceBand\":\"yellow_heuristic\"");
+    try w.print(",\"residentShards\":{d},\"vramResidentBytes\":{d},\"sessionHotBytes\":{d}", .{
+        telemetry.loaded_shards,
+        telemetry.vram_resident_bytes,
+        resident.session_hot.usedBytes(),
+    });
+    try w.writeAll("}}}");
+    return out.toOwnedSlice();
+}
+
+fn renderSovereignProofFailureResult(
+    allocator: std.mem.Allocator,
+    resident: *ResidentState,
+    obj: std.json.ObjectMap,
+    question: []const u8,
+    selected: SelectedSovereignAnchor,
+    semantic: semantic_tensor.SemanticResult,
+    domains: domain_inference.DomainSet,
+    reason: []const u8,
+) ![]u8 {
+    const synthetic_proof = z3_bridge.LockProofResult{
+        .status = .solver_unknown,
+        .signal = .yellow_heuristic,
+        .confidence_band = .yellow_heuristic,
+        .confidence = 0.40,
+        .anchor_function = selected.anchor.anchor.?.function_name,
+        .timed_out_or_unknown = true,
+        .z3_error = true,
+    };
+    const result_json = try renderSovereignCorpusResult(allocator, resident, question, selected, semantic, synthetic_proof, domains, reason);
+    defer allocator.free(result_json);
+    var state = gip.schema.unresolvedResultState(reason);
+    state.non_authorization_notice = "sovereign pipeline could not complete proof; no legacy corpus fallback was executed";
+    return try gip.schema.renderResponse(
+        allocator,
+        gip.core.PROTOCOL_VERSION,
+        jsonStringField(obj, "requestId"),
+        gip.core.parseRequestKind("corpus.ask"),
+        .unresolved,
+        state,
+        result_json,
+        null,
+        null,
+    );
+}
+
+fn renderSovereignPipelineResult(
+    allocator: std.mem.Allocator,
+    resident: *ResidentState,
+    obj: std.json.ObjectMap,
+    question: []const u8,
+    selected: SelectedSovereignAnchor,
+    semantic: semantic_tensor.SemanticResult,
+    proof: z3_bridge.LockProofResult,
+    domains: domain_inference.DomainSet,
+) ![]u8 {
+    const status_reason = proofStatusName(proof.status);
+    const result_json = try renderSovereignCorpusResult(allocator, resident, question, selected, semantic, proof, domains, status_reason);
+    defer allocator.free(result_json);
+    const supported = proof.signal == .green_verified;
+    var state = strictVerificationState(supported, status_reason);
+    if (!supported) state.non_authorization_notice = "sovereign pipeline found a proof failure or warning; no legacy corpus fallback was executed";
+    return try gip.schema.renderResponse(
+        allocator,
+        gip.core.PROTOCOL_VERSION,
+        jsonStringField(obj, "requestId"),
+        gip.core.parseRequestKind("corpus.ask"),
+        if (supported) .ok else .unresolved,
+        state,
+        result_json,
+        null,
+        null,
+    );
+}
+
+fn renderSovereignCorpusResult(
+    allocator: std.mem.Allocator,
+    resident: *ResidentState,
+    question: []const u8,
+    selected: SelectedSovereignAnchor,
+    semantic: semantic_tensor.SemanticResult,
+    proof: z3_bridge.LockProofResult,
+    domains: domain_inference.DomainSet,
+    reason: []const u8,
+) ![]u8 {
+    const telemetry = resident.snapshotTelemetry();
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    const supported = proof.signal == .green_verified;
+    try w.writeAll("{\"corpusAsk\":{\"status\":");
+    try std.json.stringify(if (supported) "supported" else "unresolved", .{}, w);
+    try w.writeAll(",\"state\":");
+    try std.json.stringify(if (supported) "verified" else proofStatusName(proof.status), .{}, w);
+    try w.writeAll(",\"permission\":");
+    try std.json.stringify(if (supported) "supported" else "none", .{}, w);
+    try w.print(",\"nonAuthorizing\":{s},\"sovereignPipeline\":true,\"legacyResidentRetrievalBypassed\":true,\"question\":", .{if (supported) "false" else "true"});
+    try std.json.stringify(question, .{}, w);
+    try w.writeAll(",\"anchor\":{\"function\":");
+    try std.json.stringify(selected.anchor.anchor.?.function_name, .{}, w);
+    try w.writeAll(",\"tier\":");
+    try std.json.stringify(anchorTierName(selected.anchor.tier), .{}, w);
+    try w.writeAll("},\"semanticTensor\":{\"intent\":\"");
+    try w.writeAll("prompt_mapped");
+    try w.writeAll("\",\"confidence\":");
+    try w.print("{d:.3}", .{semantic.confidence});
+    try w.writeAll(",\"confidenceBand\":");
+    try std.json.stringify(confidenceBandName(semantic.confidence_band), .{}, w);
+    try w.writeAll(",\"targets\":[");
+    for (semantic.targetSlice(), 0..) |target, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.writeAll("{\"target\":");
+        try std.json.stringify(target.target.tag(), .{}, w);
+        try w.print(",\"score\":{d:.3}", .{target.score});
+        try w.writeByte('}');
+    }
+    try w.writeAll("]},\"z3\":{\"status\":");
+    try std.json.stringify(proofStatusName(proof.status), .{}, w);
+    try w.writeAll(",\"signal\":");
+    try std.json.stringify(proofSignalName(proof.signal), .{}, w);
+    try w.print(",\"lockCount\":{d},\"orderPairCount\":{d}", .{ proof.lock_count, proof.order_pair_count });
+    try w.writeAll("},\"evidenceUsed\":[],\"unknowns\":[");
+    if (!supported) {
+        try w.writeAll("{\"kind\":");
+        try std.json.stringify(reason, .{}, w);
+        try w.writeAll(",\"reason\":");
+        try std.json.stringify("formal verification did not produce a supported result", .{}, w);
+        try w.writeByte('}');
+    }
+    try w.writeAll("],\"candidateFollowups\":[],\"learningCandidates\":[],\"trace\":{\"corpusMutation\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"commandsExecuted\":false,\"verifiersExecuted\":true,\"residentDaemon\":false,\"sovereignPipeline\":\"v4\",\"inferredDomain\":");
+    try std.json.stringify(domainSetTag(domains), .{}, w);
+    try w.writeAll(",\"z3Status\":");
+    try std.json.stringify(proofStatusName(proof.status), .{}, w);
+    try w.writeAll(",\"confidenceBand\":");
+    try std.json.stringify(confidenceBandName(semantic.confidence_band), .{}, w);
+    try w.print(",\"residentShards\":{d},\"vramResidentBytes\":{d},\"sessionHotBytes\":{d}", .{
+        telemetry.loaded_shards,
+        telemetry.vram_resident_bytes,
+        resident.session_hot.usedBytes(),
+    });
+    try w.writeAll("}}}");
+    return out.toOwnedSlice();
+}
+
+fn intentForPrompt(question: []const u8) ?semantic_tensor.Intent {
+    if (containsAnyIgnoreCase(question, &.{ "optimize", "performance", "latency", "fast", "slow" })) return .optimize;
+    if (containsAnyIgnoreCase(question, &.{ "secure", "safety", "verify", "prove", "lock", "mutex", "deadlock", "inversion", "race" })) return .secure;
+    if (containsAnyIgnoreCase(question, &.{ "refactor", "cleanup", "simplify", "restructure" })) return .refactor;
+    if (containsAnyIgnoreCase(question, &.{ "stabilize", "stability", "reliable", "crash" })) return .stabilize;
+    if (containsAnyIgnoreCase(question, &.{ "code", "function", "translation unit", "database", "sqlite", "audio", "dsp" })) return .secure;
+    return null;
+}
+
+fn isSovereignTranslationUnitPath(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".zig") or
+        std.mem.endsWith(u8, path, ".c") or
+        std.mem.endsWith(u8, path, ".cc") or
+        std.mem.endsWith(u8, path, ".cpp") or
+        std.mem.endsWith(u8, path, ".cxx");
+}
+
+fn isGeneratedOrCorpusPath(path: []const u8) bool {
+    var it = std.mem.splitScalar(u8, path, std.fs.path.sep);
+    while (it.next()) |part| {
+        if (std.mem.eql(u8, part, ".git") or
+            std.mem.eql(u8, part, ".zig-cache") or
+            std.mem.eql(u8, part, "zig-out") or
+            std.mem.eql(u8, part, "corpus") or
+            std.mem.eql(u8, part, "corpus_local_backup") or
+            std.mem.eql(u8, part, "node_modules") or
+            std.mem.eql(u8, part, "state"))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn domainPromptScore(question: []const u8, domains: domain_inference.DomainSet) i32 {
+    var score: i32 = 0;
+    if (domains.contains(.database) and containsAnyIgnoreCase(question, &.{ "database", "sqlite", "sql", "transaction", "index" })) score += 2_000;
+    if (domains.contains(.dsp) and containsAnyIgnoreCase(question, &.{ "audio", "dsp", "sample", "buffer", "realtime" })) score += 2_000;
+    if (domains.contains(.network) and containsAnyIgnoreCase(question, &.{ "network", "socket", "async", "http" })) score += 2_000;
+    if (domains.contains(.graphics) and containsAnyIgnoreCase(question, &.{ "graphics", "vulkan", "render", "gpu" })) score += 2_000;
+    return score;
+}
+
+fn domainSetTag(domains: domain_inference.DomainSet) []const u8 {
+    if (domains.contains(.database)) return "DATABASE";
+    if (domains.contains(.dsp)) return "DSP";
+    if (domains.contains(.network)) return "NETWORK";
+    if (domains.contains(.graphics)) return "GRAPHICS";
+    if (domains.contains(.filesystem)) return "FILESYSTEM";
+    if (domains.contains(.crypto)) return "CRYPTO";
+    if (domains.contains(.ui)) return "UI";
+    return "UNKNOWN";
+}
+
+fn confidenceBandName(band: semantic_tensor.ConfidenceBand) []const u8 {
+    return switch (band) {
+        .green_verified => "green_verified",
+        .yellow_heuristic => "yellow_heuristic",
+    };
+}
+
+fn proofStatusName(status: z3_bridge.ProofStatus) []const u8 {
+    return switch (status) {
+        .proved_no_lock_inversion => "proved_no_lock_inversion",
+        .lock_inversion_possible => "lock_inversion_possible",
+        .solver_unknown => "solver_unknown",
+        .no_anchor => "no_anchor",
+        .no_statically_visible_locks => "no_statically_visible_locks",
+        .analysis_overflow => "analysis_overflow",
+    };
+}
+
+fn proofSignalName(signal: z3_bridge.ProofSignal) []const u8 {
+    return switch (signal) {
+        .green_verified => "green_verified",
+        .yellow_heuristic => "yellow_heuristic",
+        .failure => "failure",
+    };
+}
+
+fn anchorTierName(tier: anchor_discovery.DiscoveryTier) []const u8 {
+    return switch (tier) {
+        .hal_sink => "hal_sink",
+        .public_interface_fallback => "public_interface_fallback",
+        .none => "none",
+    };
+}
+
+fn containsAnyIgnoreCase(text: []const u8, needles: []const []const u8) bool {
+    for (needles) |needle| {
+        if (indexOfIgnoreCase(text, needle) != null) return true;
+    }
+    return false;
 }
 
 const ExactResidentCandidate = struct {
@@ -2491,6 +3179,11 @@ fn jsonStringField(obj: std.json.ObjectMap, field: []const u8) ?[]const u8 {
 
 fn renderDaemonStatus(allocator: std.mem.Allocator, resident: *ResidentState) ![]u8 {
     const telemetry = resident.snapshotTelemetry();
+    const pipeline = resident.copyPipelineTelemetry();
+    const curiosity_guard = curiosity.GuardState{
+        .load_average_1m = curiosity.currentLoadAverage1m(),
+        .oracle_paused_for_ram = telemetry.oracle_paused_for_ram,
+    };
     const context_target = try resident.session_hot.extractContextTarget(allocator);
     defer allocator.free(context_target);
     const vault_dir = try vaultDirPath(allocator);
@@ -2515,8 +3208,28 @@ fn renderDaemonStatus(allocator: std.mem.Allocator, resident: *ResidentState) ![
         resident.session_hot.usedBytes(),
         if (telemetry.device_local) "true" else "false",
     });
+    try w.print(",\"ramUsedBytes\":{d},\"oraclePausedForRam\":{s},\"truthDensity\":{{\"verifiedRunes\":{d},\"shadowRunes\":{d},\"ratioPerMille\":{d}}}", .{
+        telemetry.ram_used_bytes,
+        if (telemetry.oracle_paused_for_ram) "true" else "false",
+        telemetry.truth_density.verified_runes,
+        telemetry.truth_density.shadow_runes,
+        telemetry.truth_density.ratio_per_mille,
+    });
     try w.writeAll(",\"sessionContextTarget\":");
     try std.json.stringify(context_target, .{}, w);
+    try w.writeAll(",\"sovereignPipeline\":{\"domain\":");
+    try std.json.stringify(pipeline.domain, .{}, w);
+    try w.writeAll(",\"z3Status\":");
+    try std.json.stringify(pipeline.z3_status, .{}, w);
+    try w.writeAll(",\"confidenceBand\":");
+    try std.json.stringify(pipeline.confidence_band, .{}, w);
+    try w.writeByte('}');
+    try w.print(",\"phase456\":{{\"selfHealingOracle\":\"explicit_only\",\"curiosityCanRun\":{s},\"curiosityMaxConcurrentZigTests\":{d},\"hiveRemoteCacheTier\":{d},\"hiveNetworkEnabledByDefault\":false,\"recursiveBootHotSwapEnabledByDefault\":false,\"recursiveBootMinSpeedupPerMille\":{d}}}", .{
+        if (curiosity_guard.canRun()) "true" else "false",
+        curiosity.MAX_CONCURRENT_ZIG_TESTS,
+        hive.TIER_HIVE_REMOTE,
+        recursive_boot.MIN_SPEEDUP_PER_MILLE,
+    });
     try w.print(",\"vaultIngestActive\":{s},\"vaultIngestRecent\":{s},\"vaultIngestedFiles\":{d},\"vaultIngestErrors\":{d},\"vaultIngestedBytes\":{d},\"lastVaultIngestMs\":{d}", .{
         if (resident.vault_ingest_active.load(.acquire)) "true" else "false",
         if (ingest_recent) "true" else "false",

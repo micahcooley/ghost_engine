@@ -69,6 +69,10 @@ ghost_config.json
 # Artifact sinks stay local-only
 /logs/*
 !/logs/.gitkeep
+/.venv-grounding/
+/.ghost/knowledge/
+__pycache__/
+*.pyc
 /scratch/*.log
 /scratch/*.json
 /scratch/*.out

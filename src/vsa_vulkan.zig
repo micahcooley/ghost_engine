@@ -7,6 +7,7 @@ const config = @import("config.zig");
 const sys = @import("sys.zig");
 const vsa_core = @import("vsa_core.zig");
 const sigil_runtime = @import("sigil_runtime.zig");
+const gpu_lattice = @import("gpu/vulkan_init.zig");
 const vk_device = @import("vsa_vulkan/device.zig");
 const vk_resonance = @import("vsa_vulkan/resonance.zig");
 const vk_runtime = @import("vsa_vulkan/runtime.zig");
@@ -24,6 +25,7 @@ pub const GHOST_INDEX_SKIP_THRESHOLD_PER_MILLE: u16 = 100;
 pub const CORPUS_SCAN_MAX_ENTRIES: usize = 65_536;
 pub const CORPUS_SCAN_MAX_TERMS: usize = 4;
 pub const CORPUS_SCAN_TERM_BYTES: usize = 16;
+pub const LatticeQueryRune = gpu_lattice.GreRune;
 const DESCRIPTOR_BINDING_COUNT: u32 = 14;
 const FENCE_TIMEOUT_NS: u64 = 2_000_000_000;
 const SHUTDOWN_FENCE_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
@@ -725,6 +727,7 @@ pub const VulkanEngine = struct {
     contradiction_filter_pipeline: vk.VkPipeline = null,
     semantic_hash_pipeline: vk.VkPipeline = null,
     corpus_scan_pipeline: vk.VkPipeline = null,
+    lattice_query_pipeline: vk.VkPipeline = null,
     etch_pipeline: vk.VkPipeline = null,
     prune_pipeline: vk.VkPipeline = null,
     lookahead_pipeline: vk.VkPipeline = null,
@@ -1292,6 +1295,9 @@ pub const VulkanEngine = struct {
         const corpus_scan_spv = try std.fs.cwd().readFileAlloc(self.allocator, build_options.corpus_scan_spv_path, 1024 * 1024);
         defer self.allocator.free(corpus_scan_spv);
         self.corpus_scan_pipeline = try self.createComputePipeline(corpus_scan_spv, null);
+        const lattice_query_spv = try std.fs.cwd().readFileAlloc(self.allocator, build_options.lattice_query_spv_path, 1024 * 1024);
+        defer self.allocator.free(lattice_query_spv);
+        self.lattice_query_pipeline = try self.createComputePipeline(lattice_query_spv, null);
 
         var etch_wg_size: u32 = @min(1024, self.max_workgroup_invocations);
         var spec_map = vk.VkSpecializationMapEntry{ .constantID = 0, .offset = 0, .size = @sizeOf(u32) };
@@ -1706,6 +1712,7 @@ pub const VulkanEngine = struct {
             &self.contradiction_filter_pipeline,
             &self.semantic_hash_pipeline,
             &self.corpus_scan_pipeline,
+            &self.lattice_query_pipeline,
             &self.lattice_pipeline,
         };
         for (pipelines) |p| if (p.* != null) self.vk_ctx.vkDestroyPipeline.?(self.dev, p.*, null);
@@ -2060,6 +2067,53 @@ pub const VulkanEngine = struct {
         const word_count = block_seeds.len * 2;
         ghostCopy(u32, self.result_buffer[0..word_count], self.mapped_energy[f].?[0..word_count]);
         return self.result_buffer[0..word_count];
+    }
+
+    pub fn dispatchLatticeQuery(self: *VulkanEngine, query_words: [gpu_lattice.VECTOR_WORDS]u32, runes: []const LatticeQueryRune) ![]const u32 {
+        // LATTICE_QUERY is a routing primitive only. The shader returns raw
+        // Hamming distances; proof, support, and answer authority stay in the
+        // caller's CPU-side verifier.
+        beginGpuSubmit(self);
+        defer endGpuSubmit(self);
+
+        if (runes.len == 0) return self.result_buffer[0..0];
+        if (runes.len > self.result_buffer.len) return error.TooManyLatticeRunes;
+        if (runes.len * @sizeOf(LatticeQueryRune) > self.general_ingest_size) return error.TooManyLatticeRunes;
+
+        self.dispatch_mutex.lock();
+        defer self.dispatch_mutex.unlock();
+
+        const f = try self.acquireFrameSlot();
+        const query_dst: [*]u32 = @ptrCast(@alignCast(self.mapped_rotors[f].?));
+        ghostCopy(u32, query_dst[0..gpu_lattice.VECTOR_WORDS], query_words[0..]);
+
+        const rune_dst: [*]LatticeQueryRune = @ptrCast(@alignCast(self.mapped_general_ingest.?));
+        ghostCopy(LatticeQueryRune, rune_dst[0..runes.len], runes);
+        self.mapped_config[f].?.* = .{ .rotor_stride = 0, .rotor_offset = 0, .batch_size = @intCast(runes.len) };
+
+        var beginInfo = std.mem.zeroes(vk.VkCommandBufferBeginInfo);
+        beginInfo.sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        try check(self.vk_ctx.vkBeginCommandBuffer.?(self.command_buffers[f], &beginInfo));
+
+        self.vk_ctx.vkCmdBindPipeline.?(self.command_buffers[f], vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.lattice_query_pipeline);
+        self.vk_ctx.vkCmdBindDescriptorSets.?(self.command_buffers[f], vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &self.descriptor_sets[f], 0, null);
+        const pc = [_]u32{ @intCast(runes.len), 0, self.matrix_slots - 1, self.lattice_quarter };
+        self.vk_ctx.vkCmdPushConstants.?(self.command_buffers[f], self.pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &pc);
+
+        const wg_size: u32 = 64;
+        self.vk_ctx.vkCmdDispatch.?(self.command_buffers[f], (@as(u32, @intCast(runes.len)) + (wg_size - 1)) / wg_size, 1, 1);
+        try check(self.vk_ctx.vkEndCommandBuffer.?(self.command_buffers[f]));
+
+        var submitInfo = std.mem.zeroes(vk.VkSubmitInfo);
+        submitInfo.sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &self.command_buffers[f];
+        try check(self.vk_ctx.vkQueueSubmit.?(self.queue, 1, &submitInfo, self.fences[f]));
+        self.advanceFrameSlot();
+        try self.waitForHardwareInterrupt(f);
+
+        ghostCopy(u32, self.result_buffer[0..runes.len], self.mapped_energy[f].?[0..runes.len]);
+        return self.result_buffer[0..runes.len];
     }
 
     pub fn dispatchCorpusScan(

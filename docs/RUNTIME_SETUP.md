@@ -13,12 +13,27 @@ This document covers the current Linux-first build and runtime path.
 - Zig
 - `shaderc` for `glslc` when rebuilding compute shaders
 - `libvulkan-dev` for Linux Vulkan builds and parity tests
+- `libz3-dev` for current solver-backed engine/daemon builds
 
 ```bash
-sudo apt install shaderc libvulkan-dev
+sudo apt install shaderc libvulkan-dev libz3-dev
 zig build seed
 zig build -Doptimize=ReleaseFast
 ```
+
+## Zig Build Profiles
+
+Default local builds target Linux x86_64 and specialize for the host CPU. Pass
+`-Dtarget` and `-Dcpu` explicitly when building a portable artifact.
+
+- Edit/invention loop: use `zig build --watch -fincremental --cache-dir .zig-cache --global-cache-dir ~/.cache/zig`. The full Ghost VSA build stays on LLVM by default because Zig 0.14.1's native backend cannot lower all vector operations used by `src/vsa_memory.zig`.
+- Native scalar parser check: use `zig build check-native-gip-parser` for a compile-only `-fno-llvm -fno-emit-bin` sentinel on `src/compiler/gip_parser.zig`.
+- Scalar snippet checks: use `zig build -Ddev-native-backend=true` only for bounded code that does not touch unsupported vector lowering paths.
+- Hardened shard/release: use `zig build release`. The release artifact is built with `ReleaseFast`, host CPU specialization, strip, omitted frame pointers, and LTO by default.
+- 16GB memory guardrail: add `--maxrss <bytes> --skip-oom-steps` for long invention sessions instead of letting the compiler consume the whole machine.
+
+See `docs/HETEROGENEOUS_MEMORY.md` for the CPU/RAM/VRAM movement contract used
+by the VSA and Vulkan paths.
 
 ## Installed Binaries
 
@@ -26,6 +41,9 @@ zig build -Doptimize=ReleaseFast
 - `ohl_trainer`
 - `probe_inference`
 - `sigil_core`
+- `sigil`
+- `lattice_view`
+- `ghostd`
 - `ghost_code_intel`
 - `ghost_patch_candidates`
 - `ghost_panic_dump`
@@ -45,6 +63,40 @@ zig build -Doptimize=ReleaseFast
 - `zig build corpus`
 - `zig build bench-serious-workflows`
 - `zig build repo-hygiene`
+- `zig build test-phase2-core`
+- `zig build test-phase3-integration`
+
+## Daemon And Sigil
+
+`ghostd run` starts the long-running daemon on the Unix socket from
+`GHOSTD_SOCKET_PATH` or `/tmp/ghost.sock`. The listener is non-blocking and uses a
+manual `poll()` tick so maintenance work can update memory/oracle telemetry even
+when no client is connected.
+
+`sigil status` sends `daemon.status` over the socket and prints raw JSON.
+`sigil inject "warm tape saturation"` sends a `sigil.inject` request to the
+daemon-backed Wingman path. `sigil watch` polls the daemon invention log stream
+until interrupted.
+`sigil commit zig-out/wingman_plugins/WarmTapeSaturationNode.zig` archives the
+verified rune/plugin reference into a binary `GKP1` knowledge-pack shard.
+`sigil reload-plugin zig-out/lib/libzenith_wingman_bridge.so` validates the C ABI
+bridge symbols through daemon hot reload.
+
+The daemon reports RAM usage, `oraclePausedForRam`, resident VRAM bytes, and
+Truth Density. See `docs/METRICS.md`.
+
+## Lattice And Bridge Tools
+
+`lattice_view` exports the top 100 projected VSA lattice points as JSON. Pass
+`--csv` for a compact coordinate map that can be plotted externally.
+
+The Zenith bridge is installed as `libzenith_wingman_bridge.so` in `zig-out/lib`.
+It exports a C ABI suitable for JUCE/C++ hosts:
+
+- `zenith_node_init`
+- `zenith_node_process`
+- `zenith_node_process_buffer`
+- `zenith_node_name`
 
 ## Clean Regeneration
 

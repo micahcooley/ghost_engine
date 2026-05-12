@@ -2,6 +2,7 @@ const std = @import("std");
 const task_intent = @import("task_intent.zig");
 const artifact_schema = @import("artifact_schema.zig");
 const vsa_vulkan = @import("vsa_vulkan.zig");
+const gip_parser = @import("compiler/gip_parser.zig");
 
 // ──────────────────────────────────────────────────────────────────────────
 // Intent Grounding v2
@@ -48,6 +49,20 @@ pub const GeneralistRoute = enum {
     strict_verification,
 };
 
+pub const DaemonGipRouteKind = enum {
+    wingman_generate,
+    corpus_ask,
+    strict_verification,
+    status,
+    unsupported,
+};
+
+pub const DaemonGipRoute = struct {
+    kind: DaemonGipRouteKind,
+    semantic_intent: []const u8 = "",
+    reason: []const u8,
+};
+
 pub const LatentConcept = enum {
     conversation,
     modification,
@@ -67,6 +82,37 @@ pub const IntentConfidence = struct {
     score: f32,
     strong_heavy_task: bool,
 };
+
+pub fn routeDaemonGip(kind: ?[]const u8, semantic_intent: ?[]const u8, raw_request: []const u8) DaemonGipRoute {
+    if (kind) |value| {
+        if (std.mem.eql(u8, value, "daemon.status")) return .{ .kind = .status, .reason = "daemon status request" };
+        if (std.mem.eql(u8, value, "corpus.ask")) return .{ .kind = .corpus_ask, .reason = "corpus.ask request" };
+        if (std.mem.eql(u8, value, "sigil.inject")) {
+            const intent = semantic_intent orelse "";
+            if (isWingmanAudioIntent(intent)) return .{ .kind = .wingman_generate, .semantic_intent = intent, .reason = "GIP sigil.inject routed to Wingman audio generator" };
+            return .{ .kind = .unsupported, .semantic_intent = intent, .reason = "sigil.inject requires an audio/DSP semantic intent" };
+        }
+    }
+    if (std.mem.indexOf(u8, raw_request, "GCL: ") != null) {
+        const command = gip_parser.parse(raw_request) catch return .{ .kind = .unsupported, .reason = "GCL request failed parser validation" };
+        return switch (command.intent) {
+            .VERIFY => .{ .kind = .strict_verification, .semantic_intent = command.target, .reason = "GCL VERIFY routed to strict verification" },
+            .OPTIMIZE, .SECURE, .REFACTOR => .{ .kind = .corpus_ask, .semantic_intent = command.target, .reason = "GCL request routed to corpus/code-intel path" },
+        };
+    }
+    return .{ .kind = .unsupported, .reason = "no daemon GIP route matched" };
+}
+
+fn isWingmanAudioIntent(intent: []const u8) bool {
+    return indexOfIgnoreCaseRoute(intent, "tape") != null or
+        indexOfIgnoreCaseRoute(intent, "saturation") != null or
+        indexOfIgnoreCaseRoute(intent, "distortion") != null or
+        indexOfIgnoreCaseRoute(intent, "clip") != null or
+        indexOfIgnoreCaseRoute(intent, "audio") != null or
+        indexOfIgnoreCaseRoute(intent, "dsp") != null or
+        indexOfIgnoreCaseRoute(intent, "filter") != null or
+        indexOfIgnoreCaseRoute(intent, "warm") != null;
+}
 
 /// Scope of the intent — how wide its effect surface is.
 pub const IntentScope = enum {
@@ -1401,7 +1447,9 @@ fn joinSelectedSalienceRunes(allocator: std.mem.Allocator, runes: []const Salien
 fn densityMultiplier(noise_count: usize, avg_noise: u16) u8 {
     if (noise_count == 0) return 1;
     const count_component = noise_count / 2 + @min(noise_count % 2, 1);
-    const raw = 1 + @min(@as(usize, 7), count_component + @as(usize, avg_noise) / 350);
+    const noise_component = @as(usize, avg_noise) / 350;
+    const capped = @min(@as(usize, 7), count_component +| noise_component);
+    const raw: usize = if (capped >= 7) 8 else 1 + capped;
     return @intCast(@min(@as(usize, 8), raw));
 }
 
@@ -2571,6 +2619,16 @@ fn isWordByte(byte: u8) bool {
     return std.ascii.isAlphabetic(byte) or std.ascii.isDigit(byte) or byte == '_' or byte == '/' or byte == '.' or byte == ':';
 }
 
+test "daemon GIP router sends audio injects to Wingman" {
+    const route = routeDaemonGip("sigil.inject", "warm tape saturation", "");
+    try std.testing.expectEqual(DaemonGipRouteKind.wingman_generate, route.kind);
+}
+
+test "daemon GIP router rejects non-audio injects" {
+    const route = routeDaemonGip("sigil.inject", "summarize the repo", "");
+    try std.testing.expectEqual(DaemonGipRouteKind.unsupported, route.kind);
+}
+
 test "intent grounding: latent conversation bypasses artifact obligations" {
     const allocator = std.testing.allocator;
 
@@ -2611,6 +2669,24 @@ test "salience mapping isolates semantic target and density" {
     try std.testing.expectEqualStrings("silicon computers", salience.semantic_target);
     try std.testing.expect(std.mem.indexOf(u8, salience.structural_noise, "exhaustive") != null);
     try std.testing.expect(salience.density_multiplier > 1);
+}
+
+test "salience density handles adversarial proof language without overflow" {
+    const allocator = std.testing.allocator;
+
+    const inputs = [_][]const u8{
+        "What does a convergence score from 2.0 to below 5.0 mean?",
+        "Does the corpus say GUE inverse axioms are already formally verified for all AP types?",
+        "Resolve the pronoun: The lock and the mutex were both acquired. It was released first.",
+    };
+
+    for (inputs) |input| {
+        var salience = try analyzeSalience(allocator, input);
+        defer salience.deinit(allocator);
+
+        try std.testing.expect(salience.density_multiplier >= 1);
+        try std.testing.expect(salience.density_multiplier <= 8);
+    }
 }
 
 test "zero entropy mapper rejects greetings as semantic targets" {

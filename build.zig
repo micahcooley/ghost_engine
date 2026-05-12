@@ -6,6 +6,7 @@ fn addCoreOptions(
     target: std.Build.ResolvedTarget,
     test_mode: bool,
     corpus_scan_spv_path: []const u8,
+    lattice_query_spv_path: []const u8,
 ) *std.Build.Step.Options {
     const arch = target.result.cpu.arch;
     const features = target.result.cpu.features;
@@ -22,14 +23,46 @@ fn addCoreOptions(
     core_options.addOption(bool, "use_avx2", is_x86_64 and std.Target.x86.featureSetHas(features, .avx2));
     core_options.addOption(bool, "use_neon", arch == .aarch64 or arch == .arm);
     core_options.addOption([]const u8, "corpus_scan_spv_path", corpus_scan_spv_path);
+    core_options.addOption([]const u8, "lattice_query_spv_path", lattice_query_spv_path);
     return core_options;
 }
 
 pub fn build(b: *std.Build) void {
-    // Linux is the primary documented target. `zig build` uses the host target
-    // by default, or an explicit target such as `-Dtarget=x86_64-linux`.
-    const target = b.standardTargetOptions(.{});
+    // Linux/x86_64 is the primary Ghost target. The default build specializes
+    // for the local CPU; pass -Dtarget/-Dcpu to produce portable artifacts.
+    const target = b.standardTargetOptions(.{
+        .default_target = .{
+            .cpu_arch = .x86_64,
+            .os_tag = .linux,
+            .abi = .gnu,
+            .cpu_model = .native,
+        },
+    });
     const optimize = b.standardOptimizeOption(.{});
+    const dev_native_backend = b.option(
+        bool,
+        "dev-native-backend",
+        "Opt into Zig native codegen for scalar Debug checks; full Ghost VSA builds need LLVM on Zig 0.14.1",
+    ) orelse false;
+    const release_lto = b.option(
+        bool,
+        "release-lto",
+        "Enable LTO for ReleaseFast builds when LLVM is active",
+    ) orelse true;
+    const strip_release = b.option(
+        bool,
+        "strip-release",
+        "Strip ReleaseFast artifacts",
+    ) orelse (optimize == .ReleaseFast);
+    const omit_release_frame_pointer = b.option(
+        bool,
+        "omit-release-frame-pointer",
+        "Omit frame pointers for ReleaseFast artifacts",
+    ) orelse (optimize == .ReleaseFast);
+    const use_llvm: ?bool = if (dev_native_backend) false else null;
+    const use_lto = optimize == .ReleaseFast and release_lto and use_llvm != false;
+    const release_strip: ?bool = if (strip_release) true else null;
+    const release_omit_frame_pointer: ?bool = if (omit_release_frame_pointer) true else null;
     const test_filter = b.option([]const u8, "test-filter", "Run only tests whose name contains this text");
     const test_filters: []const []const u8 = if (test_filter) |filter| &.{filter} else &.{};
     const generated_shader_dir = b.pathFromRoot(".zig-cache/ghost_shaders");
@@ -42,8 +75,32 @@ pub fn build(b: *std.Build) void {
         corpus_scan_spv_path,
     });
     compile_corpus_scan_shader.step.dependOn(&mkdir_generated_shaders.step);
+    const phase2_search_spv_path = b.pathJoin(&.{ generated_shader_dir, "phase2_search.spv" });
+    const compile_phase2_search_shader = b.addSystemCommand(&.{
+        "glslc",
+        b.pathFromRoot("src/gpu/search.comp"),
+        "-o",
+        phase2_search_spv_path,
+    });
+    compile_phase2_search_shader.step.dependOn(&mkdir_generated_shaders.step);
+    compile_corpus_scan_shader.step.dependOn(&compile_phase2_search_shader.step);
 
-    const core_options = addCoreOptions(b, target, false, corpus_scan_spv_path);
+    const native_gip_parser_check = b.addSystemCommand(&.{
+        b.graph.zig_exe,
+        "test",
+        b.pathFromRoot("src/compiler/gip_parser.zig"),
+        "-fno-llvm",
+        "-fno-emit-bin",
+        "--cache-dir",
+        b.pathFromRoot(".zig-cache"),
+    });
+    const native_gip_parser_step = b.step(
+        "check-native-gip-parser",
+        "Compile-check the scalar GIP parser with Zig native codegen and no emitted binary",
+    );
+    native_gip_parser_step.dependOn(&native_gip_parser_check.step);
+
+    const core_options = addCoreOptions(b, target, false, corpus_scan_spv_path, phase2_search_spv_path);
 
     // ── 1. External Dependencies (Vulkan headers only) ──
     // NOTE: We do NOT link against vulkan-1.dll at build time.
@@ -65,6 +122,58 @@ pub fn build(b: *std.Build) void {
         ghost_core.addSystemIncludePath(.{ .cwd_relative = "/usr/include/x86_64-linux-gnu" });
     }
 
+    const domain_inference_module = b.createModule(.{
+        .root_source_file = b.path("src/domain/inference.zig"),
+        .target = target,
+        .optimize = optimize,
+        .code_model = .small,
+        .strip = release_strip,
+        .omit_frame_pointer = release_omit_frame_pointer,
+    });
+    const anchor_discovery_module = b.createModule(.{
+        .root_source_file = b.path("src/analysis/anchors.zig"),
+        .target = target,
+        .optimize = optimize,
+        .code_model = .small,
+        .strip = release_strip,
+        .omit_frame_pointer = release_omit_frame_pointer,
+    });
+    anchor_discovery_module.addImport("domain_inference", domain_inference_module);
+    const semantic_tensor_module = b.createModule(.{
+        .root_source_file = b.path("src/semantics/tensor.zig"),
+        .target = target,
+        .optimize = optimize,
+        .code_model = .small,
+        .strip = release_strip,
+        .omit_frame_pointer = release_omit_frame_pointer,
+    });
+    semantic_tensor_module.addImport("domain_inference", domain_inference_module);
+    const z3_bridge_module = b.createModule(.{
+        .root_source_file = b.path("src/verification/z3_bridge.zig"),
+        .target = target,
+        .optimize = optimize,
+        .code_model = .small,
+        .strip = release_strip,
+        .omit_frame_pointer = release_omit_frame_pointer,
+    });
+    if (target.result.os.tag == .linux) {
+        z3_bridge_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
+        z3_bridge_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include/x86_64-linux-gnu" });
+        z3_bridge_module.addLibraryPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
+    }
+    const proof_session_module = b.createModule(.{
+        .root_source_file = b.path("src/core/proof_session.zig"),
+        .target = target,
+        .optimize = optimize,
+        .code_model = .small,
+        .strip = release_strip,
+        .omit_frame_pointer = release_omit_frame_pointer,
+    });
+    ghost_core.addImport("proof_session", proof_session_module);
+    z3_bridge_module.addImport("anchor_discovery", anchor_discovery_module);
+    z3_bridge_module.addImport("semantic_tensor", semantic_tensor_module);
+    z3_bridge_module.addImport("proof_session", proof_session_module);
+
     // Helper: add Vulkan include path to any module that imports ghost_core
     // (needed because @cImport in vulkan_loader.zig resolves headers at the root_module level)
     const addVulkanIncludes = struct {
@@ -76,6 +185,7 @@ pub fn build(b: *std.Build) void {
             } else if (os.tag == .linux) {
                 mod.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
                 mod.addSystemIncludePath(.{ .cwd_relative = "/usr/include/x86_64-linux-gnu" });
+                mod.addLibraryPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
             }
         }
     }.add;
@@ -91,17 +201,26 @@ pub fn build(b: *std.Build) void {
             options: *std.Build.Step.Options,
             os: std.Target.Os,
             sdk_opt: ?[]const u8,
+            exe_use_llvm: ?bool,
+            exe_use_lto: bool,
+            exe_strip: ?bool,
+            exe_omit_frame_pointer: ?bool,
             add_vulkan_includes: *const fn (*std.Build.Module, std.Target.Os, ?[]const u8, *std.Build) void,
             shader_step: *std.Build.Step.Run,
         ) *std.Build.Step.Compile {
             const exe = builder.addExecutable(.{
                 .name = exe_name,
+                .use_llvm = exe_use_llvm,
                 .root_module = builder.createModule(.{
                     .root_source_file = builder.path(root),
                     .target = exe_target,
                     .optimize = exe_optimize,
+                    .code_model = .small,
+                    .strip = exe_strip,
+                    .omit_frame_pointer = exe_omit_frame_pointer,
                 }),
             });
+            exe.want_lto = exe_use_lto;
             exe.root_module.addImport("ghost_core", core_module);
             exe.root_module.addOptions("build_options", options);
             exe.root_module.linkSystemLibrary("c", .{});
@@ -116,6 +235,213 @@ pub fn build(b: *std.Build) void {
             return exe;
         }
     }.add;
+
+    const phase2_hypervector_tests = b.addTest(.{
+        .use_llvm = use_llvm,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/vsa/hypervector.zig"),
+            .target = target,
+            .optimize = optimize,
+            .code_model = .small,
+            .strip = release_strip,
+            .omit_frame_pointer = release_omit_frame_pointer,
+        }),
+        .filters = test_filters,
+    });
+    phase2_hypervector_tests.want_lto = use_lto;
+    const run_phase2_hypervector_tests = b.addRunArtifact(phase2_hypervector_tests);
+
+    const phase2_vulkan_tests = b.addTest(.{
+        .use_llvm = use_llvm,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/vulkan_init.zig"),
+            .target = target,
+            .optimize = optimize,
+            .code_model = .small,
+            .strip = release_strip,
+            .omit_frame_pointer = release_omit_frame_pointer,
+        }),
+        .filters = test_filters,
+    });
+    phase2_vulkan_tests.want_lto = use_lto;
+    phase2_vulkan_tests.step.dependOn(&compile_phase2_search_shader.step);
+    phase2_vulkan_tests.root_module.linkSystemLibrary("c", .{});
+    if (target.result.os.tag == .linux) {
+        phase2_vulkan_tests.root_module.linkSystemLibrary("dl", .{});
+    }
+    addVulkanIncludes(phase2_vulkan_tests.root_module, target.result.os, vulkan_sdk, b);
+    const run_phase2_vulkan_tests = b.addRunArtifact(phase2_vulkan_tests);
+
+    const phase2_oracle_tests = b.addTest(.{
+        .use_llvm = use_llvm,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/oracle/compiler_loop.zig"),
+            .target = target,
+            .optimize = optimize,
+            .code_model = .small,
+            .strip = release_strip,
+            .omit_frame_pointer = release_omit_frame_pointer,
+        }),
+        .filters = test_filters,
+    });
+    phase2_oracle_tests.want_lto = use_lto;
+    const run_phase2_oracle_tests = b.addRunArtifact(phase2_oracle_tests);
+
+    const swe_harness_tests = b.addTest(.{
+        .use_llvm = use_llvm,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_swe_harness.zig"),
+            .target = target,
+            .optimize = optimize,
+            .code_model = .small,
+            .strip = release_strip,
+            .omit_frame_pointer = release_omit_frame_pointer,
+        }),
+        .filters = test_filters,
+    });
+    swe_harness_tests.want_lto = use_lto;
+    const run_swe_harness_tests = b.addRunArtifact(swe_harness_tests);
+
+    const phase3_ipc_tests = b.addTest(.{
+        .use_llvm = use_llvm,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/ipc/protocol.zig"),
+            .target = target,
+            .optimize = optimize,
+            .code_model = .small,
+            .strip = release_strip,
+            .omit_frame_pointer = release_omit_frame_pointer,
+        }),
+        .filters = test_filters,
+    });
+    phase3_ipc_tests.want_lto = use_lto;
+    const run_phase3_ipc_tests = b.addRunArtifact(phase3_ipc_tests);
+
+    const phase3_wingman_tests = b.addTest(.{
+        .use_llvm = use_llvm,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/zenith/wingman.zig"),
+            .target = target,
+            .optimize = optimize,
+            .code_model = .small,
+            .strip = release_strip,
+            .omit_frame_pointer = release_omit_frame_pointer,
+        }),
+        .filters = test_filters,
+    });
+    phase3_wingman_tests.want_lto = use_lto;
+    const run_phase3_wingman_tests = b.addRunArtifact(phase3_wingman_tests);
+
+    const zenith_bridge_tests = b.addTest(.{
+        .use_llvm = use_llvm,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/zenith/bridge.zig"),
+            .target = target,
+            .optimize = optimize,
+            .code_model = .small,
+            .strip = release_strip,
+            .omit_frame_pointer = release_omit_frame_pointer,
+        }),
+        .filters = test_filters,
+    });
+    zenith_bridge_tests.want_lto = use_lto;
+    const run_zenith_bridge_tests = b.addRunArtifact(zenith_bridge_tests);
+
+    const lattice_view_tests = b.addTest(.{
+        .use_llvm = use_llvm,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/ui/lattice_view.zig"),
+            .target = target,
+            .optimize = optimize,
+            .code_model = .small,
+            .strip = release_strip,
+            .omit_frame_pointer = release_omit_frame_pointer,
+        }),
+        .filters = test_filters,
+    });
+    lattice_view_tests.root_module.addImport("ghost_core", ghost_core);
+    lattice_view_tests.want_lto = use_lto;
+    const run_lattice_view_tests = b.addRunArtifact(lattice_view_tests);
+
+    const phase4_auto_fix_tests = b.addTest(.{
+        .use_llvm = use_llvm,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/oracle/auto_fix.zig"),
+            .target = target,
+            .optimize = optimize,
+            .code_model = .small,
+            .strip = release_strip,
+            .omit_frame_pointer = release_omit_frame_pointer,
+        }),
+        .filters = test_filters,
+    });
+    phase4_auto_fix_tests.want_lto = use_lto;
+    const run_phase4_auto_fix_tests = b.addRunArtifact(phase4_auto_fix_tests);
+
+    const phase4_curiosity_tests = b.addTest(.{
+        .use_llvm = use_llvm,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/ghost/curiosity.zig"),
+            .target = target,
+            .optimize = optimize,
+            .code_model = .small,
+            .strip = release_strip,
+            .omit_frame_pointer = release_omit_frame_pointer,
+        }),
+        .filters = test_filters,
+    });
+    phase4_curiosity_tests.want_lto = use_lto;
+    const run_phase4_curiosity_tests = b.addRunArtifact(phase4_curiosity_tests);
+
+    const phase5_hive_tests = b.addTest(.{
+        .use_llvm = use_llvm,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/net/hive.zig"),
+            .target = target,
+            .optimize = optimize,
+            .code_model = .small,
+            .strip = release_strip,
+            .omit_frame_pointer = release_omit_frame_pointer,
+        }),
+        .filters = test_filters,
+    });
+    phase5_hive_tests.want_lto = use_lto;
+    const run_phase5_hive_tests = b.addRunArtifact(phase5_hive_tests);
+
+    const phase6_recursive_boot_tests = b.addTest(.{
+        .use_llvm = use_llvm,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/ghost/recursive_boot.zig"),
+            .target = target,
+            .optimize = optimize,
+            .code_model = .small,
+            .strip = release_strip,
+            .omit_frame_pointer = release_omit_frame_pointer,
+        }),
+        .filters = test_filters,
+    });
+    phase6_recursive_boot_tests.want_lto = use_lto;
+    const run_phase6_recursive_boot_tests = b.addRunArtifact(phase6_recursive_boot_tests);
+
+    const phase2_step = b.step("test-phase2-core", "Run Phase 2 VSA, Vulkan stage-gate, and Reality Oracle tests");
+    phase2_step.dependOn(&run_phase2_hypervector_tests.step);
+    phase2_step.dependOn(&run_phase2_vulkan_tests.step);
+    phase2_step.dependOn(&run_phase2_oracle_tests.step);
+
+    const swe_harness_step = b.step("test-swe-harness", "Run native SWE provisioning harness tests");
+    swe_harness_step.dependOn(&run_swe_harness_tests.step);
+
+    const phase3_step = b.step("test-phase3-integration", "Run Phase 3 IPC and Wingman integration tests");
+    phase3_step.dependOn(&run_phase3_ipc_tests.step);
+    phase3_step.dependOn(&run_phase3_wingman_tests.step);
+    phase3_step.dependOn(&run_zenith_bridge_tests.step);
+    phase3_step.dependOn(&run_lattice_view_tests.step);
+
+    const phase456_step = b.step("test-phase456", "Run explicit Phase 4/5/6 oracle, curiosity, hive, and recursive boot tests");
+    phase456_step.dependOn(&run_phase4_auto_fix_tests.step);
+    phase456_step.dependOn(&run_phase4_curiosity_tests.step);
+    phase456_step.dependOn(&run_phase5_hive_tests.step);
+    phase456_step.dependOn(&run_phase6_recursive_boot_tests.step);
 
     // ── 3. Shader SPIR-V ──
     const shader_names = [_][]const u8{
@@ -149,9 +475,18 @@ pub fn build(b: *std.Build) void {
         core_options,
         target.result.os,
         vulkan_sdk,
+        use_llvm,
+        use_lto,
+        release_strip,
+        release_omit_frame_pointer,
         addVulkanIncludes,
         compile_corpus_scan_shader,
     );
+    monolith.root_module.addImport("domain_inference", domain_inference_module);
+    monolith.root_module.addImport("anchor_discovery", anchor_discovery_module);
+    monolith.root_module.addImport("semantic_tensor", semantic_tensor_module);
+    monolith.root_module.addImport("z3_bridge", z3_bridge_module);
+    monolith.root_module.linkSystemLibrary("z3", .{});
     b.installArtifact(monolith);
 
     const exes = [_]ExeConfig{
@@ -167,6 +502,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "ghost_intent_grounding", .root = "src/intent_grounding_cli.zig" },
         .{ .name = "ghost_knowledge_pack", .root = "src/knowledge_packs.zig" },
         .{ .name = "ghost_gip", .root = "src/gip_cli.zig" },
+        .{ .name = "ghost_swe_harness", .root = "src/swe_harness_cli.zig" },
+        .{ .name = "sigil", .root = "src/ui/sigil.zig" },
+        .{ .name = "lattice_view", .root = "src/ui/lattice_view.zig" },
         .{ .name = "ghostd", .root = "src/daemon.zig" },
         .{ .name = "ghost_project_autopsy", .root = "src/project_autopsy_cli.zig" },
     };
@@ -182,11 +520,38 @@ pub fn build(b: *std.Build) void {
             core_options,
             target.result.os,
             vulkan_sdk,
+            use_llvm,
+            use_lto,
+            release_strip,
+            release_omit_frame_pointer,
             addVulkanIncludes,
             compile_corpus_scan_shader,
         );
+        if (std.mem.eql(u8, cfg.name, "ghostd")) {
+            exe.root_module.addImport("domain_inference", domain_inference_module);
+            exe.root_module.addImport("anchor_discovery", anchor_discovery_module);
+            exe.root_module.addImport("semantic_tensor", semantic_tensor_module);
+            exe.root_module.addImport("z3_bridge", z3_bridge_module);
+            exe.root_module.linkSystemLibrary("z3", .{});
+        }
         b.installArtifact(exe);
     }
+
+    const zenith_bridge_lib = b.addLibrary(.{
+        .name = "zenith_wingman_bridge",
+        .linkage = .dynamic,
+        .use_llvm = use_llvm,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/zenith/bridge.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .code_model = .small,
+            .strip = true,
+            .omit_frame_pointer = true,
+        }),
+    });
+    zenith_bridge_lib.want_lto = use_llvm != false;
+    b.installArtifact(zenith_bridge_lib);
 
     // ── 8. Run Step ──
     const run_cmd = b.addRunArtifact(monolith);
@@ -204,6 +569,10 @@ pub fn build(b: *std.Build) void {
         core_options,
         target.result.os,
         vulkan_sdk,
+        use_llvm,
+        use_lto,
+        release_strip,
+        release_omit_frame_pointer,
         addVulkanIncludes,
         compile_corpus_scan_shader,
     );
@@ -217,6 +586,10 @@ pub fn build(b: *std.Build) void {
         core_options,
         target.result.os,
         vulkan_sdk,
+        use_llvm,
+        use_lto,
+        release_strip,
+        release_omit_frame_pointer,
         addVulkanIncludes,
         compile_corpus_scan_shader,
     );
@@ -252,15 +625,20 @@ pub fn build(b: *std.Build) void {
     artifact_autopsy_smoke_step.dependOn(&artifact_autopsy_smoke_cmd.step);
 
     const text_generation_lab_tests = b.addTest(.{
+        .use_llvm = use_llvm,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/text_generation_lab.zig"),
             .target = target,
             .optimize = optimize,
+            .code_model = .small,
+            .strip = release_strip,
+            .omit_frame_pointer = release_omit_frame_pointer,
         }),
         .filters = test_filters,
     });
+    text_generation_lab_tests.want_lto = use_lto;
     text_generation_lab_tests.step.dependOn(&compile_corpus_scan_shader.step);
-    const text_generation_lab_options = addCoreOptions(b, target, true, corpus_scan_spv_path);
+    const text_generation_lab_options = addCoreOptions(b, target, true, corpus_scan_spv_path, phase2_search_spv_path);
     text_generation_lab_tests.root_module.addOptions("build_options", text_generation_lab_options);
     text_generation_lab_tests.root_module.linkSystemLibrary("c", .{});
     if (target.result.os.tag == .linux) {
@@ -274,18 +652,31 @@ pub fn build(b: *std.Build) void {
 
     // ── 9. Unit & Integration Tests ──
     const main_tests = b.addTest(.{
+        .use_llvm = use_llvm,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/test_smoke.zig"),
             .target = target,
             .optimize = optimize,
+            .code_model = .small,
+            .strip = release_strip,
+            .omit_frame_pointer = release_omit_frame_pointer,
         }),
         .filters = test_filters,
     });
+    main_tests.want_lto = use_lto;
     main_tests.step.dependOn(&compile_corpus_scan_shader.step);
-    const test_core_options = addCoreOptions(b, target, true, corpus_scan_spv_path);
+    const test_core_options = addCoreOptions(b, target, true, corpus_scan_spv_path, phase2_search_spv_path);
+    swe_harness_tests.root_module.addOptions("build_options", test_core_options);
+    swe_harness_tests.root_module.linkSystemLibrary("c", .{});
+    if (target.result.os.tag == .linux) {
+        swe_harness_tests.root_module.linkSystemLibrary("dl", .{});
+        swe_harness_tests.root_module.linkSystemLibrary("vulkan", .{});
+    }
+    addVulkanIncludes(swe_harness_tests.root_module, target.result.os, vulkan_sdk, b);
     const ghost_core_test = b.createModule(.{
         .root_source_file = b.path("src/ghost.zig"),
     });
+    ghost_core_test.addImport("proof_session", proof_session_module);
     ghost_core_test.addOptions("build_options", test_core_options);
     if (target.result.os.tag == .windows) {
         if (vulkan_sdk) |sdk| {
@@ -307,16 +698,25 @@ pub fn build(b: *std.Build) void {
     const test_smoke_step = b.step("test-smoke", "Run src/test_smoke.zig tests");
     test_smoke_step.dependOn(&run_main_tests.step);
     const test_step = b.step("test", "Run all tests");
+    test_step.dependOn(phase2_step);
+    test_step.dependOn(phase3_step);
+    test_step.dependOn(phase456_step);
+    test_step.dependOn(swe_harness_step);
     run_text_generation_lab_tests.step.dependOn(&run_main_tests.step);
 
     const lifecycle_tests = b.addTest(.{
+        .use_llvm = use_llvm,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/test_verifier_lifecycle.zig"),
             .target = target,
             .optimize = optimize,
+            .code_model = .small,
+            .strip = release_strip,
+            .omit_frame_pointer = release_omit_frame_pointer,
         }),
         .filters = test_filters,
     });
+    lifecycle_tests.want_lto = use_lto;
     lifecycle_tests.step.dependOn(&compile_corpus_scan_shader.step);
     lifecycle_tests.root_module.addOptions("build_options", test_core_options);
     lifecycle_tests.root_module.linkSystemLibrary("c", .{});
@@ -324,19 +724,25 @@ pub fn build(b: *std.Build) void {
         lifecycle_tests.root_module.linkSystemLibrary("dl", .{});
         lifecycle_tests.root_module.linkSystemLibrary("vulkan", .{});
     }
+    addVulkanIncludes(lifecycle_tests.root_module, target.result.os, vulkan_sdk, b);
     const run_lifecycle_tests = b.addRunArtifact(lifecycle_tests);
     run_lifecycle_tests.step.dependOn(&run_text_generation_lab_tests.step);
     const test_lifecycle_step = b.step("test-lifecycle", "Run src/test_verifier_lifecycle.zig tests");
     test_lifecycle_step.dependOn(&run_lifecycle_tests.step);
 
     const gip_cli_tests = b.addTest(.{
+        .use_llvm = use_llvm,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/gip_cli.zig"),
             .target = target,
             .optimize = optimize,
+            .code_model = .small,
+            .strip = release_strip,
+            .omit_frame_pointer = release_omit_frame_pointer,
         }),
         .filters = test_filters,
     });
+    gip_cli_tests.want_lto = use_lto;
     gip_cli_tests.step.dependOn(&compile_corpus_scan_shader.step);
     gip_cli_tests.root_module.addImport("ghost_core", ghost_core_test);
     gip_cli_tests.root_module.addOptions("build_options", test_core_options);
@@ -352,13 +758,18 @@ pub fn build(b: *std.Build) void {
     test_gip_cli_step.dependOn(&run_gip_cli_tests.step);
 
     const knowledge_pack_cli_tests = b.addTest(.{
+        .use_llvm = use_llvm,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/knowledge_packs.zig"),
             .target = target,
             .optimize = optimize,
+            .code_model = .small,
+            .strip = release_strip,
+            .omit_frame_pointer = release_omit_frame_pointer,
         }),
         .filters = test_filters,
     });
+    knowledge_pack_cli_tests.want_lto = use_lto;
     knowledge_pack_cli_tests.step.dependOn(&compile_corpus_scan_shader.step);
     knowledge_pack_cli_tests.root_module.addOptions("build_options", test_core_options);
     knowledge_pack_cli_tests.root_module.linkSystemLibrary("c", .{});
@@ -373,13 +784,18 @@ pub fn build(b: *std.Build) void {
     test_knowledge_packs_step.dependOn(&run_knowledge_pack_cli_tests.step);
 
     const project_autopsy_cli_tests = b.addTest(.{
+        .use_llvm = use_llvm,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/project_autopsy_cli.zig"),
             .target = target,
             .optimize = optimize,
+            .code_model = .small,
+            .strip = release_strip,
+            .omit_frame_pointer = release_omit_frame_pointer,
         }),
         .filters = test_filters,
     });
+    project_autopsy_cli_tests.want_lto = use_lto;
     project_autopsy_cli_tests.step.dependOn(&compile_corpus_scan_shader.step);
     project_autopsy_cli_tests.root_module.addImport("ghost_core", ghost_core_test);
     project_autopsy_cli_tests.root_module.addOptions("build_options", test_core_options);
@@ -395,13 +811,18 @@ pub fn build(b: *std.Build) void {
     test_project_autopsy_step.dependOn(&run_project_autopsy_cli_tests.step);
 
     const compute_dominance_tests = b.addTest(.{
+        .use_llvm = use_llvm,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench_compute_dominance.zig"),
             .target = target,
             .optimize = optimize,
+            .code_model = .small,
+            .strip = release_strip,
+            .omit_frame_pointer = release_omit_frame_pointer,
         }),
         .filters = test_filters,
     });
+    compute_dominance_tests.want_lto = use_lto;
     compute_dominance_tests.step.dependOn(&compile_corpus_scan_shader.step);
     compute_dominance_tests.root_module.addImport("ghost_core", ghost_core_test);
     compute_dominance_tests.root_module.addOptions("build_options", test_core_options);
@@ -417,13 +838,18 @@ pub fn build(b: *std.Build) void {
     test_compute_dominance_step.dependOn(&run_compute_dominance_tests.step);
 
     const crucible_tests = b.addTest(.{
+        .use_llvm = use_llvm,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/tests/the_crucible.zig"),
             .target = target,
             .optimize = optimize,
+            .code_model = .small,
+            .strip = release_strip,
+            .omit_frame_pointer = release_omit_frame_pointer,
         }),
         .filters = test_filters,
     });
+    crucible_tests.want_lto = use_lto;
     crucible_tests.step.dependOn(&compile_corpus_scan_shader.step);
     crucible_tests.root_module.addImport("ghost_core", ghost_core_test);
     crucible_tests.root_module.addOptions("build_options", test_core_options);
@@ -441,16 +867,21 @@ pub fn build(b: *std.Build) void {
 
     // ── 10. Parity Test ──
     const parity_test = b.addTest(.{
+        .use_llvm = use_llvm,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/test_parity.zig"),
             .target = target,
             .optimize = optimize,
+            .code_model = .small,
+            .strip = release_strip,
+            .omit_frame_pointer = release_omit_frame_pointer,
         }),
         .test_runner = .{
             .path = b.path("src/parity_test_runner.zig"),
             .mode = .simple,
         },
     });
+    parity_test.want_lto = use_lto;
     parity_test.step.dependOn(&compile_corpus_scan_shader.step);
     parity_test.root_module.addImport("ghost_core", ghost_core);
     parity_test.root_module.addOptions("build_options", core_options);
@@ -472,20 +903,94 @@ pub fn build(b: *std.Build) void {
     // ── 11. Release Packaging ──
     // Creates a clean distributable folder with the selected target layout.
     const release_step = b.step("release", "Build and package a distributable release");
+    const release_core_options = addCoreOptions(b, target, false, corpus_scan_spv_path, phase2_search_spv_path);
+    const release_proof_session_module = b.createModule(.{
+        .root_source_file = b.path("src/core/proof_session.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .code_model = .small,
+        .strip = true,
+        .omit_frame_pointer = true,
+    });
+    const release_domain_inference_module = b.createModule(.{
+        .root_source_file = b.path("src/domain/inference.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .code_model = .small,
+        .strip = true,
+        .omit_frame_pointer = true,
+    });
+    const release_anchor_discovery_module = b.createModule(.{
+        .root_source_file = b.path("src/analysis/anchors.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .code_model = .small,
+        .strip = true,
+        .omit_frame_pointer = true,
+    });
+    release_anchor_discovery_module.addImport("domain_inference", release_domain_inference_module);
+    const release_semantic_tensor_module = b.createModule(.{
+        .root_source_file = b.path("src/semantics/tensor.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .code_model = .small,
+        .strip = true,
+        .omit_frame_pointer = true,
+    });
+    release_semantic_tensor_module.addImport("domain_inference", release_domain_inference_module);
+    const release_z3_bridge_module = b.createModule(.{
+        .root_source_file = b.path("src/verification/z3_bridge.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .code_model = .small,
+        .strip = true,
+        .omit_frame_pointer = true,
+    });
+    release_z3_bridge_module.addImport("anchor_discovery", release_anchor_discovery_module);
+    release_z3_bridge_module.addImport("semantic_tensor", release_semantic_tensor_module);
+    release_z3_bridge_module.addImport("proof_session", release_proof_session_module);
+    const release_ghost_core = b.createModule(.{
+        .root_source_file = b.path("src/ghost.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .code_model = .small,
+        .strip = true,
+        .omit_frame_pointer = true,
+    });
+    release_ghost_core.addImport("proof_session", release_proof_session_module);
+    release_ghost_core.addOptions("build_options", release_core_options);
+    if (target.result.os.tag == .windows) {
+        if (vulkan_sdk) |sdk| {
+            release_ghost_core.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "Include" }) });
+        }
+    } else if (target.result.os.tag == .linux) {
+        release_ghost_core.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
+        release_ghost_core.addSystemIncludePath(.{ .cwd_relative = "/usr/include/x86_64-linux-gnu" });
+    }
+
     const release_exe = b.addExecutable(.{
         .name = "ghost_sovereign",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = .ReleaseFast,
+            .code_model = .small,
+            .strip = true,
+            .omit_frame_pointer = true,
         }),
     });
+    release_exe.want_lto = release_lto;
     release_exe.step.dependOn(&compile_corpus_scan_shader.step);
-    release_exe.root_module.addImport("ghost_core", ghost_core);
-    release_exe.root_module.addOptions("build_options", core_options);
+    release_exe.root_module.addImport("ghost_core", release_ghost_core);
+    release_exe.root_module.addImport("domain_inference", release_domain_inference_module);
+    release_exe.root_module.addImport("anchor_discovery", release_anchor_discovery_module);
+    release_exe.root_module.addImport("semantic_tensor", release_semantic_tensor_module);
+    release_exe.root_module.addImport("z3_bridge", release_z3_bridge_module);
+    release_exe.root_module.addOptions("build_options", release_core_options);
     release_exe.root_module.linkSystemLibrary("c", .{});
     if (target.result.os.tag == .linux) {
         release_exe.root_module.linkSystemLibrary("dl", .{});
+        release_exe.root_module.linkSystemLibrary("z3", .{});
     }
     addVulkanIncludes(release_exe.root_module, target.result.os, vulkan_sdk, b);
     if (target.result.os.tag == .windows) {
@@ -502,12 +1007,17 @@ pub fn build(b: *std.Build) void {
     // ── 12. Unicode Resonance Probe ──
     const unicode_probe = b.addExecutable(.{
         .name = "unicode_probe",
+        .use_llvm = use_llvm,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/unicode_test.zig"),
             .target = target,
             .optimize = optimize,
+            .code_model = .small,
+            .strip = release_strip,
+            .omit_frame_pointer = release_omit_frame_pointer,
         }),
     });
+    unicode_probe.want_lto = use_lto;
     unicode_probe.step.dependOn(&compile_corpus_scan_shader.step);
     unicode_probe.root_module.addImport("ghost_core", ghost_core);
     unicode_probe.root_module.linkSystemLibrary("c", .{});
@@ -521,12 +1031,17 @@ pub fn build(b: *std.Build) void {
     // ── 13. Tools: Seed Lattice & Generate Corpus ──
     const seed_exe = b.addExecutable(.{
         .name = "seed_lattice",
+        .use_llvm = use_llvm,
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/seed_lattice.zig"),
             .target = target,
             .optimize = optimize,
+            .code_model = .small,
+            .strip = release_strip,
+            .omit_frame_pointer = release_omit_frame_pointer,
         }),
     });
+    seed_exe.want_lto = use_lto;
     seed_exe.step.dependOn(&compile_corpus_scan_shader.step);
     seed_exe.root_module.addImport("ghost_core", ghost_core);
     seed_exe.root_module.linkSystemLibrary("c", .{});
@@ -539,12 +1054,17 @@ pub fn build(b: *std.Build) void {
 
     const corpus_exe = b.addExecutable(.{
         .name = "gen_corpus",
+        .use_llvm = use_llvm,
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/gen_corpus.zig"),
             .target = target,
             .optimize = optimize,
+            .code_model = .small,
+            .strip = release_strip,
+            .omit_frame_pointer = release_omit_frame_pointer,
         }),
     });
+    corpus_exe.want_lto = use_lto;
     corpus_exe.step.dependOn(&compile_corpus_scan_shader.step);
     corpus_exe.root_module.addImport("ghost_core", ghost_core);
     corpus_exe.root_module.linkSystemLibrary("c", .{});

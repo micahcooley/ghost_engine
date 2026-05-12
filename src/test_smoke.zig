@@ -32,6 +32,7 @@ const artifact_schema = @import("artifact_schema.zig");
 const compute_budget = @import("compute_budget.zig");
 const conversation_session = @import("conversation_session.zig");
 const intent_grounding = @import("intent_grounding.zig");
+const grpe_classifier = @import("grpe_classifier.zig");
 const response_engine = @import("response_engine.zig");
 const verifier_adapter = @import("verifier_adapter.zig");
 const verifier_execution = @import("verifier_execution.zig");
@@ -54,6 +55,10 @@ const context_inputs = @import("context_inputs.zig");
 const gip = @import("gip.zig");
 const artifact_policy = @import("artifact_policy.zig");
 const artifact_autopsy = @import("artifact_autopsy.zig");
+const oracle_auto_fix = @import("oracle/auto_fix.zig");
+const curiosity = @import("ghost/curiosity.zig");
+const hive = @import("net/hive.zig");
+const recursive_boot = @import("ghost/recursive_boot.zig");
 
 comptime {
     _ = context_autopsy;
@@ -77,6 +82,10 @@ comptime {
     _ = support_routing;
     _ = artifact_policy;
     _ = artifact_autopsy;
+    _ = oracle_auto_fix;
+    _ = curiosity;
+    _ = hive;
+    _ = recursive_boot;
 }
 
 test "smoke: correction proposal remains candidate-only and non-mutating" {
@@ -12157,4 +12166,100 @@ test "nk application: unknown vs negative evidence distinction is explicit" {
     try std.testing.expect(negative_influence.trace_entries.len > 0);
     // The trace entry explicitly labels the influence kind
     try std.testing.expect(negative_influence.trace_entries[0].influence_kind == .triage_penalty);
+}
+
+test "grpe classifier clear cases hit expected axiom type with high confidence" {
+    const allocator = std.testing.allocator;
+    const Case = struct {
+        sentence: []const u8,
+        expected: grpe_classifier.RelationshipType,
+    };
+    const cases = [_]Case{
+        .{ .sentence = "A mutex is a synchronization primitive", .expected = .Identity },
+        .{ .sentence = "A mutex differs from a semaphore in ownership", .expected = .Distinction },
+        .{ .sentence = "A mutex combined with a thread creates ownership", .expected = .Composition },
+        .{ .sentence = "A mutex prevents concurrent thread access", .expected = .Constraint },
+        .{ .sentence = "Acquiring a mutex implies entering a critical section", .expected = .Implication },
+    };
+
+    for (cases) |case| {
+        const result = try grpe_classifier.classify(allocator, case.sentence);
+        try std.testing.expectEqual(case.expected, result.relationship);
+        try std.testing.expect(result.confidence >= 4);
+        try std.testing.expectEqual(grpe_classifier.ConfidenceBand.high, result.confidence_band);
+        try std.testing.expect(!result.uncertain);
+    }
+}
+
+test "grpe classifier hard language is low confidence or unresolved" {
+    const allocator = std.testing.allocator;
+
+    const failed_lock = try grpe_classifier.classify(allocator, "The lock failed");
+    try std.testing.expect(failed_lock.relationship == .Unresolved or failed_lock.relationship == .Identity);
+    try std.testing.expect(failed_lock.confidence <= 1);
+
+    const calls = try grpe_classifier.classify(allocator, "Functions call functions");
+    try std.testing.expect(calls.relationship == .Unresolved or calls.relationship == .Composition);
+    try std.testing.expect(calls.confidence <= 3);
+
+    const shared = try grpe_classifier.classify(allocator, "Memory is shared between threads");
+    try std.testing.expectEqual(grpe_classifier.RelationshipType.Constraint, shared.relationship);
+    try std.testing.expectEqual(grpe_classifier.ConfidenceBand.medium, shared.confidence_band);
+    try std.testing.expect(shared.uncertain);
+
+    const negation = try grpe_classifier.classify(allocator, "Not all functions that acquire locks release them");
+    try std.testing.expect(negation.relationship == .Constraint or negation.relationship == .Unresolved);
+    try std.testing.expect(negation.negation_detected);
+}
+
+test "grpe classifier adversarial input remains unresolved and does not crash" {
+    const allocator = std.testing.allocator;
+
+    const cases = [_][]const u8{
+        "Purple Tuesday recursive elephant",
+        "The",
+        "",
+    };
+
+    for (cases) |sentence| {
+        const result = try grpe_classifier.classify(allocator, sentence);
+        try std.testing.expectEqual(grpe_classifier.RelationshipType.Unresolved, result.relationship);
+        try std.testing.expectEqual(@as(u8, 0), result.confidence);
+        try std.testing.expectEqual(@as(u8, 0), result.signals_found);
+    }
+}
+
+test "phase 4 5 6 GIP status surfaces are explicit and non-authorizing" {
+    const allocator = std.testing.allocator;
+
+    var curiosity_result = try gip.dispatch.dispatch(allocator, "curiosity.status", gip.PROTOCOL_VERSION, null, null,
+        \\{"gipVersion":"gip.v0.1","kind":"curiosity.status","concepts":["low pass filter","high pass filter"],"zenithAudioPriorityRequested":true}
+    );
+    defer curiosity_result.deinit(allocator);
+    try std.testing.expectEqual(gip.ProtocolStatus.ok, curiosity_result.status);
+    try std.testing.expect(std.mem.indexOf(u8, curiosity_result.result_json.?, "\"nonAuthorizing\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, curiosity_result.result_json.?, "invent:audio.band_pass_filter") != null);
+
+    var hive_result = try gip.dispatch.dispatch(allocator, "hive.status", gip.PROTOCOL_VERSION, null, null,
+        \\{"gipVersion":"gip.v0.1","kind":"hive.status"}
+    );
+    defer hive_result.deinit(allocator);
+    try std.testing.expectEqual(gip.ProtocolStatus.ok, hive_result.status);
+    try std.testing.expect(std.mem.indexOf(u8, hive_result.result_json.?, "\"networkEnabledByDefault\":false") != null);
+
+    var recursive_result = try gip.dispatch.dispatch(allocator, "recursive_boot.status", gip.PROTOCOL_VERSION, null, null,
+        \\{"gipVersion":"gip.v0.1","kind":"recursive_boot.status","iterations":8}
+    );
+    defer recursive_result.deinit(allocator);
+    try std.testing.expectEqual(gip.ProtocolStatus.ok, recursive_result.status);
+    try std.testing.expect(std.mem.indexOf(u8, recursive_result.result_json.?, "\"hotSwapEnabledByDefault\":false") != null);
+}
+
+test "oracle auto fix GIP rejects missing target" {
+    const allocator = std.testing.allocator;
+    var result = try gip.dispatch.dispatch(allocator, "oracle.auto_fix", gip.PROTOCOL_VERSION, null, null,
+        \\{"gipVersion":"gip.v0.1","kind":"oracle.auto_fix"}
+    );
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(gip.ProtocolStatus.rejected, result.status);
 }
