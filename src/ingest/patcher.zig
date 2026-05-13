@@ -203,6 +203,11 @@ fn shorten(text: []const u8) []const u8 {
     return trimmed[0..@min(trimmed.len, 1000)];
 }
 
+pub fn normalizeTestSelector(allocator: std.mem.Allocator, selector: []const u8) ![]u8 {
+    const cut = std.mem.indexOfScalar(u8, selector, '[') orelse selector.len;
+    return allocator.dupe(u8, selector[0..cut]);
+}
+
 test "normalized patch writer removes CRLF" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -217,4 +222,11 @@ test "normalized patch writer removes CRLF" {
     const contents = try std.fs.cwd().readFileAlloc(allocator, path, 1024);
     defer allocator.free(contents);
     try std.testing.expectEqualStrings("a\nb\n", contents);
+}
+
+test "test selector normalization strips pytest parameter suffixes" {
+    const allocator = std.testing.allocator;
+    const normalized = try normalizeTestSelector(allocator, "tests/test_a.py::test_one[param-value]");
+    defer allocator.free(normalized);
+    try std.testing.expectEqualStrings("tests/test_a.py::test_one", normalized);
 }

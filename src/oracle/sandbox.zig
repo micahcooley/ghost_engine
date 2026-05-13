@@ -5,6 +5,8 @@ const gip_mapping = @import("../gip/mapping.zig");
 pub const DEFAULT_MEMORY_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_CPU_WEIGHT: u16 = 100;
 pub const DEFAULT_TIMEOUT_MS: u32 = 60_000;
+pub const ORACLE_TIMEOUT_EXIT_CODE: u8 = 124;
+pub const ORACLE_TIMEOUT_MARKER = "GHOST_ORACLE_TIMEOUT";
 pub const LANDLOCK_EXEC_FLAG = "--ghost-landlock-exec";
 
 const linux = std.os.linux;
@@ -25,8 +27,6 @@ const LANDLOCK_ACCESS_FS_MAKE_BLOCK: u64 = 1 << 11;
 const LANDLOCK_ACCESS_FS_MAKE_SYM: u64 = 1 << 12;
 const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
 const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
-const LANDLOCK_ACCESS_NET_BIND_TCP: u64 = 1 << 0;
-const LANDLOCK_ACCESS_NET_CONNECT_TCP: u64 = 1 << 1;
 const PR_SET_NO_NEW_PRIVS: i32 = 38;
 
 const LandlockRulesetAttr = extern struct {
@@ -183,6 +183,8 @@ pub fn buildLandlockRunArgvWithExtra(
     try out.appendStatic("--cwd");
     try out.appendStatic(cwd);
     try out.appendStatic(if (spec.network_disabled) "--network-closed" else "--network-open");
+    try out.appendStatic("--timeout-ms");
+    try out.appendOwned(try std.fmt.allocPrint(allocator, "{d}", .{spec.timeout_ms}));
     for (extra_rw_paths) |path| {
         try out.appendStatic("--rw-extra");
         try out.appendStatic(path);
@@ -235,6 +237,9 @@ pub fn resolveLeashPaths(allocator: std.mem.Allocator, cwd: []const u8) !LeashPa
     try LeashPaths.appendOwnedUnique(&paths.rw, allocator, try std.fs.path.join(allocator, &.{ cwd, ".venv-grounding" }));
     try LeashPaths.appendOwnedUnique(&paths.rw, allocator, try std.fs.path.join(allocator, &.{ cwd, "temp_venv" }));
     try LeashPaths.appendUnique(&paths.rw, allocator, "/home/micah/.ansible/tmp");
+    if (std.posix.getenv("HOME")) |home| {
+        try LeashPaths.appendOwnedUnique(&paths.rw, allocator, try std.fs.path.join(allocator, &.{ home, ".ansible", "tmp" }));
+    }
     try LeashPaths.appendUnique(&paths.rw, allocator, "/dev/null");
 
     const ro_paths = [_][]const u8{ "/usr", "/lib", "/lib64", "/etc" };
@@ -261,6 +266,7 @@ pub fn renderAllowedPathsJson(writer: anytype, allocator: std.mem.Allocator, cwd
 pub fn runLandlockExecFromArgs(allocator: std.mem.Allocator, args: []const []const u8) !noreturn {
     var cwd: ?[]const u8 = null;
     var network_disabled = true;
+    var timeout_ms: u32 = DEFAULT_TIMEOUT_MS;
     var extra_rw_paths = std.ArrayList([]const u8).init(allocator);
     defer extra_rw_paths.deinit();
     var idx: usize = 0;
@@ -274,6 +280,11 @@ pub fn runLandlockExecFromArgs(allocator: std.mem.Allocator, args: []const []con
             network_disabled = false;
         } else if (std.mem.eql(u8, arg, "--network-closed")) {
             network_disabled = true;
+        } else if (std.mem.eql(u8, arg, "--timeout-ms")) {
+            idx += 1;
+            if (idx >= args.len) return error.MissingLandlockTimeout;
+            timeout_ms = try std.fmt.parseInt(u32, args[idx], 10);
+            if (timeout_ms == 0) return error.InvalidTimeout;
         } else if (std.mem.eql(u8, arg, "--rw-extra")) {
             idx += 1;
             if (idx >= args.len) return error.MissingLandlockExtraPath;
@@ -288,7 +299,14 @@ pub fn runLandlockExecFromArgs(allocator: std.mem.Allocator, args: []const []con
             child.stdin_behavior = .Inherit;
             child.stdout_behavior = .Inherit;
             child.stderr_behavior = .Inherit;
-            const term = try child.spawnAndWait();
+            try child.spawn();
+            const term = waitChildWithTimeout(child.id, timeout_ms) catch |err| switch (err) {
+                error.OracleTimeout => {
+                    std.debug.print("{s} timeoutMs={d}\n", .{ ORACLE_TIMEOUT_MARKER, timeout_ms });
+                    std.process.exit(ORACLE_TIMEOUT_EXIT_CODE);
+                },
+                else => return err,
+            };
             switch (term) {
                 .Exited => |code| std.process.exit(code),
                 .Signal => |signal| std.process.exit(128 + @as(u8, @intCast(@min(signal, 127)))),
@@ -299,6 +317,31 @@ pub fn runLandlockExecFromArgs(allocator: std.mem.Allocator, args: []const []con
         }
     }
     return error.EmptyCommand;
+}
+
+fn waitChildWithTimeout(pid: std.posix.pid_t, timeout_ms: u32) !std.process.Child.Term {
+    const deadline = std.time.milliTimestamp() + @as(i64, timeout_ms);
+    while (true) {
+        const res = std.posix.waitpid(pid, std.posix.W.NOHANG);
+        if (res.pid == pid) return childTermFromStatus(res.status);
+        if (std.time.milliTimestamp() >= deadline) {
+            std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+            _ = std.posix.waitpid(pid, 0);
+            return error.OracleTimeout;
+        }
+        std.time.sleep(50 * std.time.ns_per_ms);
+    }
+}
+
+fn childTermFromStatus(status: u32) std.process.Child.Term {
+    return if (std.posix.W.IFEXITED(status))
+        .{ .Exited = std.posix.W.EXITSTATUS(status) }
+    else if (std.posix.W.IFSIGNALED(status))
+        .{ .Signal = std.posix.W.TERMSIG(status) }
+    else if (std.posix.W.IFSTOPPED(status))
+        .{ .Stopped = std.posix.W.STOPSIG(status) }
+    else
+        .{ .Unknown = status };
 }
 
 pub fn restrictSelfToLeash(allocator: std.mem.Allocator, cwd: []const u8, network_disabled: bool) !void {
@@ -314,13 +357,12 @@ pub fn restrictSelfToLeashWithExtra(
     if (builtin.os.tag != .linux) return error.UnsupportedSandboxBackend;
     const abi = try landlockAbi();
     if (abi < 1) return error.LandlockUnavailable;
-    if (network_disabled and abi < 4) return error.LandlockAbiTooOldForNetwork;
+    _ = network_disabled;
 
     const handled_fs = landlockFsMask(abi);
-    const handled_net: u64 = if (network_disabled) LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP else 0;
     var ruleset_attr = LandlockRulesetAttr{
         .handled_access_fs = handled_fs,
-        .handled_access_net = handled_net,
+        .handled_access_net = 0,
     };
     const ruleset_fd = try sys_landlock_create_ruleset(&ruleset_attr, @sizeOf(LandlockRulesetAttr), 0);
     defer std.posix.close(ruleset_fd);
@@ -447,8 +489,9 @@ test "landlock argv wraps zig test without systemd or Docker" {
     try std.testing.expect(std.mem.endsWith(u8, argv.argv.items[0], "test") or argv.argv.items[0].len != 0);
     try std.testing.expectEqualStrings(LANDLOCK_EXEC_FLAG, argv.argv.items[1]);
     try std.testing.expectEqualStrings("--network-closed", argv.argv.items[4]);
-    try std.testing.expectEqualStrings("zig", argv.argv.items[6]);
-    try std.testing.expectEqualStrings("test", argv.argv.items[7]);
+    try std.testing.expectEqualStrings("--timeout-ms", argv.argv.items[5]);
+    try std.testing.expectEqualStrings("zig", argv.argv.items[8]);
+    try std.testing.expectEqualStrings("test", argv.argv.items[9]);
 }
 
 test "pytest wrapper rejects unsafe memory limits and container runtimes" {

@@ -23,6 +23,8 @@ pub const GipOpCode = enum(u8) {
     GIP_OP_LATTICE_QUERY = 0x86,
     GIP_OP_PATCH_INTEGRITY = 0x87,
     GIP_OP_LANDLOCK_STRICT = 0x89,
+    GIP_OP_ORACLE_TIMEOUT = 0x8A,
+    GIP_OP_REPAIR_ENV = 0x8B,
 
     GIP_OP_ORACLE_PROVE = 0xA0,
     GIP_OP_AUTO_FIX = 0xA1,
@@ -284,6 +286,8 @@ test "GIP opcode values match deterministic neural bus contract" {
     try std.testing.expectEqual(@as(u8, 0x86), @intFromEnum(GipOpCode.GIP_OP_LATTICE_QUERY));
     try std.testing.expectEqual(@as(u8, 0x87), @intFromEnum(GipOpCode.GIP_OP_PATCH_INTEGRITY));
     try std.testing.expectEqual(@as(u8, 0x89), @intFromEnum(GipOpCode.GIP_OP_LANDLOCK_STRICT));
+    try std.testing.expectEqual(@as(u8, 0x8A), @intFromEnum(GipOpCode.GIP_OP_ORACLE_TIMEOUT));
+    try std.testing.expectEqual(@as(u8, 0x8B), @intFromEnum(GipOpCode.GIP_OP_REPAIR_ENV));
     try std.testing.expectEqual(@as(u8, 0xA0), @intFromEnum(GipOpCode.GIP_OP_ORACLE_PROVE));
     try std.testing.expectEqual(@as(u8, 0xA1), @intFromEnum(GipOpCode.GIP_OP_AUTO_FIX));
     try std.testing.expectEqual(@as(u8, 0xAF), @intFromEnum(GipOpCode.GIP_OP_RECURSIVE_BOOT));

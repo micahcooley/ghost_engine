@@ -53,6 +53,7 @@ pub const ProofStatus = enum {
     failed_pass_to_pass,
     cleanup_failed,
     false_positive,
+    oracle_timeout,
 
     pub fn name(self: ProofStatus) []const u8 {
         return @tagName(self);
@@ -76,6 +77,7 @@ pub fn gipOpForStatus(status: ProofStatus) gip_mapping.GipOpCode {
         .cleanup_failed,
         .false_positive,
         => .GIP_OP_SEC_FAULT,
+        .oracle_timeout => .GIP_OP_ORACLE_TIMEOUT,
     };
 }
 
@@ -114,6 +116,7 @@ pub const Options = struct {
     rows_path: []const u8 = DEFAULT_ROWS_PATH,
     workspace_root: []const u8 = DEFAULT_WORKSPACE_ROOT,
     knowledge_dir: []const u8 = DEFAULT_KNOWLEDGE_DIR,
+    corpus_dir: ?[]const u8 = null,
     python_exe: []const u8 = "python3",
     pip_exe: []const u8 = "pip3",
     limit: usize = 5,
@@ -127,8 +130,9 @@ pub const Options = struct {
     focus_supported_languages: bool = true,
     cluster_seed: ?[]const u8 = "qutebrowser",
     max_environment_attempts: u8 = 3,
+    max_repair_attempts: u8 = 3,
     max_output_bytes: usize = DEFAULT_MAX_OUTPUT_BYTES,
-    sandbox_spec: sandbox.SandboxSpec = .{ .timeout_ms = 180_000, .network_disabled = true },
+    sandbox_spec: sandbox.SandboxSpec = .{ .timeout_ms = 300_000, .network_disabled = true },
 };
 
 pub const CommandResult = struct {
@@ -156,6 +160,7 @@ const RuntimeEnv = struct {
     pip_exe: []u8,
     venv_path: ?[]u8 = null,
     preflight_dependency_install: bool = false,
+    commit_year: ?u16 = null,
 
     fn deinit(self: *RuntimeEnv) void {
         self.allocator.free(self.python_exe);
@@ -206,6 +211,10 @@ pub const ProofResult = struct {
     landlock_gip_opcode: gip_mapping.GipOpCode = .GIP_OP_LANDLOCK_STRICT,
     landlock_allowed_paths: ?[]u8 = null,
     landlock_retry_path: ?[]u8 = null,
+    oracle_timeout: bool = false,
+    oracle_timeout_gip_opcode: gip_mapping.GipOpCode = .GIP_OP_ORACLE_TIMEOUT,
+    repair_attempts: u8 = 0,
+    repair_gip_opcode: gip_mapping.GipOpCode = .GIP_OP_REPAIR_ENV,
     ephemeral_venv_path: ?[]u8 = null,
     preflight_dependency_install: bool = false,
     patch_integrity_gip_opcode: gip_mapping.GipOpCode = .GIP_OP_PATCH_INTEGRITY,
@@ -377,6 +386,90 @@ fn instanceFailure(allocator: std.mem.Allocator, instance: Instance, err: anyerr
     };
 }
 
+const CloneSource = struct {
+    allocator: std.mem.Allocator,
+    url: []u8,
+    offline: bool,
+
+    fn deinit(self: *CloneSource) void {
+        self.allocator.free(self.url);
+        self.* = undefined;
+    }
+};
+
+fn resolveCloneSource(allocator: std.mem.Allocator, repo: []const u8, corpus_dir: ?[]const u8) !CloneSource {
+    if (corpus_dir) |dir| {
+        const mirror_path = try resolveLocalMirrorPath(allocator, dir, repo) orelse return error.OfflineMirrorMissing;
+        defer allocator.free(mirror_path);
+        return .{
+            .allocator = allocator,
+            .url = try fileUrlFromAbsolutePath(allocator, mirror_path),
+            .offline = true,
+        };
+    }
+    return .{
+        .allocator = allocator,
+        .url = try std.fmt.allocPrint(allocator, "https://github.com/{s}.git", .{repo}),
+        .offline = false,
+    };
+}
+
+fn resolveLocalMirrorPath(allocator: std.mem.Allocator, corpus_dir: []const u8, repo: []const u8) !?[]u8 {
+    if (!isSafeRepoName(repo)) return error.InvalidRepoName;
+    const leaf = std.fs.path.basename(repo);
+    const owner_repo = try ownerRepoMirrorName(allocator, repo);
+    defer allocator.free(owner_repo);
+    const candidates = [_][]const u8{ leaf, repo, owner_repo };
+    for (candidates) |candidate| {
+        const path = try std.fs.path.join(allocator, &.{ corpus_dir, candidate });
+        defer allocator.free(path);
+        if (dirExists(path)) return try std.fs.cwd().realpathAlloc(allocator, path);
+    }
+    return null;
+}
+
+fn ownerRepoMirrorName(allocator: std.mem.Allocator, repo: []const u8) ![]u8 {
+    const slash = std.mem.indexOfScalar(u8, repo, '/') orelse return allocator.dupe(u8, repo);
+    return std.fmt.allocPrint(allocator, "{s}__{s}", .{ repo[0..slash], repo[slash + 1 ..] });
+}
+
+fn isSafeRepoName(repo: []const u8) bool {
+    if (repo.len == 0 or std.mem.indexOf(u8, repo, "..") != null) return false;
+    for (repo) |ch| {
+        if (std.ascii.isAlphanumeric(ch) or ch == '/' or ch == '-' or ch == '_' or ch == '.') continue;
+        return false;
+    }
+    return true;
+}
+
+fn dirExists(path: []const u8) bool {
+    var dir = if (std.fs.path.isAbsolute(path))
+        std.fs.openDirAbsolute(path, .{})
+    else
+        std.fs.cwd().openDir(path, .{});
+    if (dir) |*opened| {
+        opened.close();
+        return true;
+    } else |_| {
+        return false;
+    }
+}
+
+fn fileUrlFromAbsolutePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (!std.fs.path.isAbsolute(path)) return error.ExpectedAbsolutePath;
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try out.appendSlice("file://");
+    for (path) |ch| {
+        if (std.ascii.isAlphanumeric(ch) or ch == '/' or ch == '-' or ch == '_' or ch == '.' or ch == '~') {
+            try out.append(ch);
+        } else {
+            try out.writer().print("%{X:0>2}", .{ch});
+        }
+    }
+    return out.toOwnedSlice();
+}
+
 pub fn proveInstance(allocator: std.mem.Allocator, instance: Instance, options: Options, reprioritization_distance: ?u16) !ProofResult {
     const workspace_path = try std.fs.path.join(allocator, &.{ options.workspace_root, instance.instance_id });
     errdefer allocator.free(workspace_path);
@@ -400,9 +493,22 @@ pub fn proveInstance(allocator: std.mem.Allocator, instance: Instance, options: 
     _ = std.fs.deleteTreeAbsolute(workspace_path) catch {};
     try std.fs.cwd().makePath(options.workspace_root);
 
-    const repo_url = try std.fmt.allocPrint(allocator, "https://github.com/{s}.git", .{instance.repo});
-    defer allocator.free(repo_url);
-    var clone = try runCapture(allocator, null, &.{ "git", "clone", "--filter=blob:none", "--recurse-submodules", "--shallow-submodules", repo_url, workspace_path }, options.max_output_bytes);
+    var clone_source = resolveCloneSource(allocator, instance.repo, options.corpus_dir) catch |err| switch (err) {
+        error.OfflineMirrorMissing => {
+            const reason = try std.fmt.allocPrint(allocator, "offline mirror not found for {s} under {s}", .{ instance.repo, options.corpus_dir orelse "" });
+            defer allocator.free(reason);
+            return finish(&result, .failed_clone, reason, options.cleanup);
+        },
+        else => return err,
+    };
+    defer clone_source.deinit();
+    var clone = if (clone_source.offline) blk: {
+        const clone_argv = [_][]const u8{ "git", "clone", "--recurse-submodules", "--shallow-submodules", clone_source.url, workspace_path };
+        break :blk try runCapture(allocator, null, &clone_argv, options.max_output_bytes);
+    } else blk: {
+        const clone_argv = [_][]const u8{ "git", "clone", "--filter=blob:none", "--recurse-submodules", "--shallow-submodules", clone_source.url, workspace_path };
+        break :blk try runCapture(allocator, null, &clone_argv, options.max_output_bytes);
+    };
     defer clone.deinit(allocator);
     if (!clone.exitedOk()) return finish(&result, .failed_clone, commandDiagnostic(clone), options.cleanup);
 
@@ -434,7 +540,9 @@ pub fn proveInstance(allocator: std.mem.Allocator, instance: Instance, options: 
     try setBuildRoot(allocator, &result, build_root);
     try setLandlockTelemetry(allocator, &result, build_root.root_path);
 
-    var runtime = prepareRuntimeEnv(allocator, workspace_path, build_root.root_path, instance, options) catch |err| {
+    const commit_year = resolveBaseCommitYear(allocator, workspace_path, instance.base_commit, options.max_output_bytes) catch null;
+
+    var runtime = prepareRuntimeEnv(allocator, workspace_path, build_root.root_path, instance, options, commit_year) catch |err| {
         return finish(&result, .invalid_environment, @errorName(err), options.cleanup);
     };
     defer runtime.deinit();
@@ -444,6 +552,7 @@ pub fn proveInstance(allocator: std.mem.Allocator, instance: Instance, options: 
     while (true) {
         var base_fail = try runTestSet(allocator, &result, workspace_path, build_root.root_path, build_root.root_relative, runtime, instance, instance.fail_to_pass, options);
         defer base_fail.deinit(allocator);
+        if (result.oracle_timeout) return finish(&result, .oracle_timeout, commandDiagnostic(base_fail), options.cleanup);
         if (base_fail.exitedOk()) return finish(&result, .false_positive, "fail_to_pass tests passed before patch; false positive discarded", options.cleanup);
         if (looksLikeEnvironmentFailure(base_fail.stderr) or looksLikeEnvironmentFailure(base_fail.stdout)) {
             const diagnostic = commandDiagnostic(base_fail);
@@ -467,6 +576,7 @@ pub fn proveInstance(allocator: std.mem.Allocator, instance: Instance, options: 
     while (true) {
         var fail_after = try runTestSet(allocator, &result, workspace_path, build_root.root_path, build_root.root_relative, runtime, instance, instance.fail_to_pass, options);
         defer fail_after.deinit(allocator);
+        if (result.oracle_timeout) return finish(&result, .oracle_timeout, commandDiagnostic(fail_after), options.cleanup);
         if (!fail_after.exitedOk()) {
             if (looksLikeEnvironmentFailure(fail_after.stderr) or looksLikeEnvironmentFailure(fail_after.stdout)) {
                 const diagnostic = commandDiagnostic(fail_after);
@@ -482,6 +592,7 @@ pub fn proveInstance(allocator: std.mem.Allocator, instance: Instance, options: 
     while (true) {
         var pass_after = try runTestSet(allocator, &result, workspace_path, build_root.root_path, build_root.root_relative, runtime, instance, instance.pass_to_pass, options);
         defer pass_after.deinit(allocator);
+        if (result.oracle_timeout) return finish(&result, .oracle_timeout, commandDiagnostic(pass_after), options.cleanup);
         if (!pass_after.exitedOk()) {
             if (looksLikeEnvironmentFailure(pass_after.stderr) or looksLikeEnvironmentFailure(pass_after.stdout)) {
                 const diagnostic = commandDiagnostic(pass_after);
@@ -539,6 +650,7 @@ fn bootstrapOrLogGap(
         .instance_id = instance.instance_id,
         .repo = instance.repo,
         .base_commit = instance.base_commit,
+        .commit_year = runtime.commit_year,
         .repo_language = @tagName(instance.repo_language),
         .pip_exe = runtime.pip_exe,
         .sandbox_spec = options.sandbox_spec,
@@ -683,18 +795,42 @@ fn recordPatchTelemetry(allocator: std.mem.Allocator, result: *ProofResult, slot
     }
 }
 
+fn resolveBaseCommitYear(
+    allocator: std.mem.Allocator,
+    workspace_path: []const u8,
+    base_commit: []const u8,
+    max_output_bytes: usize,
+) !?u16 {
+    var result = try runCapture(allocator, workspace_path, &.{ "git", "show", "-s", "--format=%cI", base_commit }, max_output_bytes);
+    defer result.deinit(allocator);
+    if (!result.exitedOk()) return null;
+    const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
+    if (trimmed.len < 4) return null;
+    return std.fmt.parseInt(u16, trimmed[0..4], 10) catch null;
+}
+
+fn ensureAnsibleTmp(allocator: std.mem.Allocator) !void {
+    const home = std.posix.getenv("HOME") orelse "/home/micah";
+    const path = try std.fs.path.join(allocator, &.{ home, ".ansible", "tmp" });
+    defer allocator.free(path);
+    try std.fs.cwd().makePath(path);
+}
+
 fn prepareRuntimeEnv(
     allocator: std.mem.Allocator,
     workspace_path: []const u8,
     build_root_path: []const u8,
     instance: Instance,
     options: Options,
+    commit_year: ?u16,
 ) !RuntimeEnv {
+    try ensureAnsibleTmp(allocator);
     if (instance.repo_language == .javascript) {
         var runtime = RuntimeEnv{
             .allocator = allocator,
             .python_exe = try allocator.dupe(u8, options.python_exe),
             .pip_exe = try allocator.dupe(u8, options.pip_exe),
+            .commit_year = commit_year,
         };
         errdefer runtime.deinit();
         if (options.enable_preflight_npm) {
@@ -713,6 +849,7 @@ fn prepareRuntimeEnv(
             .allocator = allocator,
             .python_exe = try allocator.dupe(u8, options.python_exe),
             .pip_exe = try allocator.dupe(u8, options.pip_exe),
+            .commit_year = commit_year,
         };
     }
 
@@ -732,6 +869,7 @@ fn prepareRuntimeEnv(
         .python_exe = python_exe,
         .pip_exe = pip_exe,
         .venv_path = venv_path,
+        .commit_year = commit_year,
     };
     errdefer runtime.deinit();
 
@@ -790,7 +928,24 @@ fn preflightNpmInstall(
     var result = try runCapture(allocator, null, argv.argv.items, options.max_output_bytes);
     defer result.deinit(allocator);
     if (!result.exitedOk()) return error.PreflightNpmInstallFailed;
-    return true;
+
+    const runner = detectNodeTestRunner(allocator, build_root_path);
+    return try npmInstallLocalRunner(allocator, build_root_path, runner, preflight_spec, options.max_output_bytes);
+}
+
+fn npmInstallLocalRunner(
+    allocator: std.mem.Allocator,
+    build_root_path: []const u8,
+    runner: []const u8,
+    preflight_spec: sandbox.SandboxSpec,
+    max_output_bytes: usize,
+) !bool {
+    if (!isSafeNpmRunner(runner)) return error.UnsafeNodeRunner;
+    var argv = try sandbox.buildLandlockRunArgv(allocator, preflight_spec, build_root_path, &.{ "npm", "install", "--no-save", runner });
+    defer argv.deinit();
+    var result = try runCapture(allocator, null, argv.argv.items, max_output_bytes);
+    defer result.deinit(allocator);
+    return result.exitedOk();
 }
 
 fn verifyNodeEngines(
@@ -1010,6 +1165,7 @@ fn runTestSet(
     }
     switch (instance.repo_language) {
         .python => {
+            try appendPythonPathEnv(allocator, &inner, &owned_args, build_root_path);
             try inner.append(runtime.python_exe);
             try inner.append("-m");
             try inner.append("pytest");
@@ -1025,9 +1181,7 @@ fn runTestSet(
                 try inner.append("test");
                 try inner.append("--");
             } else {
-                try inner.append("npx");
-                try inner.append("--yes");
-                try inner.append(detectNodeTestRunner(allocator, build_root_path));
+                try appendLocalNodeRunner(allocator, &inner, &owned_args, build_root_path, detectNodeTestRunner(allocator, build_root_path));
             }
             if (tests.len == 0) {
                 for (instance.selected_test_files) |file| try appendRebasedSelector(allocator, &inner, &owned_args, workspace_path, build_root_path, build_root_relative, file);
@@ -1047,24 +1201,130 @@ fn runTestSet(
         .unknown => unreachable,
     }
 
-    var sandbox_argv = try sandbox.buildLandlockRunArgv(allocator, options.sandbox_spec, build_root_path, inner.items);
-    defer sandbox_argv.deinit();
-    var first = try runCapture(allocator, null, sandbox_argv.argv.items, options.max_output_bytes);
-    errdefer first.deinit(allocator);
-    if (first.exitedOk()) return first;
+    var extra_rw_paths = std.ArrayList([]const u8).init(allocator);
+    defer extra_rw_paths.deinit();
 
-    const denied_path = try safeScratchpadFromDeniedOutput(allocator, commandDiagnostic(first));
-    if (denied_path) |path| {
-        defer allocator.free(path);
-        if (result.landlock_retry_path == null) {
-            result.landlock_retry_path = try allocator.dupe(u8, path);
-            first.deinit(allocator);
-            var retry_argv = try sandbox.buildLandlockRunArgvWithExtra(allocator, options.sandbox_spec, build_root_path, inner.items, &.{path});
-            defer retry_argv.deinit();
-            return runCapture(allocator, null, retry_argv.argv.items, options.max_output_bytes);
+    var attempts: u8 = 0;
+    while (true) {
+        var current = try runLeashedCommand(allocator, build_root_path, inner.items, options, extra_rw_paths.items);
+        errdefer current.deinit(allocator);
+        if (isOracleTimeout(current)) {
+            result.oracle_timeout = true;
+            return current;
         }
+        if (current.exitedOk()) return current;
+
+        const diagnostic = commandDiagnostic(current);
+        if (try safeScratchpadFromDeniedOutput(allocator, diagnostic)) |path| {
+            defer allocator.free(path);
+            if (result.landlock_retry_path == null) {
+                result.landlock_retry_path = try allocator.dupe(u8, path);
+                try extra_rw_paths.append(result.landlock_retry_path.?);
+                current.deinit(allocator);
+                continue;
+            }
+        }
+
+        if (attempts < options.max_repair_attempts) {
+            if (try repairEnvironmentFromDiagnostic(allocator, result, build_root_path, runtime, instance.repo_language, options, diagnostic)) {
+                attempts += 1;
+                current.deinit(allocator);
+                continue;
+            }
+        }
+        return current;
     }
-    return first;
+}
+
+fn isOracleTimeout(result: CommandResult) bool {
+    if (std.mem.indexOf(u8, result.stderr, sandbox.ORACLE_TIMEOUT_MARKER) != null) return true;
+    return switch (result.term) {
+        .Exited => |code| code == sandbox.ORACLE_TIMEOUT_EXIT_CODE,
+        else => false,
+    };
+}
+
+fn runLeashedCommand(
+    allocator: std.mem.Allocator,
+    build_root_path: []const u8,
+    inner_argv: []const []const u8,
+    options: Options,
+    extra_rw_paths: []const []const u8,
+) !CommandResult {
+    var sandbox_argv = try sandbox.buildLandlockRunArgvWithExtra(allocator, options.sandbox_spec, build_root_path, inner_argv, extra_rw_paths);
+    defer sandbox_argv.deinit();
+    return runCapture(allocator, null, sandbox_argv.argv.items, options.max_output_bytes);
+}
+
+fn repairEnvironmentFromDiagnostic(
+    allocator: std.mem.Allocator,
+    result: *ProofResult,
+    build_root_path: []const u8,
+    runtime: RuntimeEnv,
+    language: Language,
+    options: Options,
+    diagnostic: []const u8,
+) !bool {
+    const package = try repairPackageFromDiagnostic(allocator, language, diagnostic) orelse return false;
+    defer allocator.free(package);
+    if (!isSafeRepairPackage(package)) return false;
+
+    result.repair_attempts +|= 1;
+    result.gip_opcode = .GIP_OP_REPAIR_ENV;
+    if (vsa_vulkan.runtimeLogsEnabled()) {
+        std.debug.print("[SWE] repair env 0x8B: {s}\n", .{package});
+    }
+
+    const repair_argv = switch (language) {
+        .python => &[_][]const u8{ runtime.pip_exe, "install", package },
+        .javascript => &[_][]const u8{ "npm", "install", "--no-save", package },
+        else => return false,
+    };
+    var sandbox_argv = try sandbox.buildLandlockRunArgv(allocator, options.sandbox_spec, build_root_path, repair_argv);
+    defer sandbox_argv.deinit();
+    var repair = try runCapture(allocator, null, sandbox_argv.argv.items, options.max_output_bytes);
+    defer repair.deinit(allocator);
+    return repair.exitedOk();
+}
+
+fn repairPackageFromDiagnostic(allocator: std.mem.Allocator, language: Language, diagnostic: []const u8) !?[]u8 {
+    return switch (language) {
+        .python => blk: {
+            const raw = extractBetween(diagnostic, "ModuleNotFoundError: No module named '", "'") orelse break :blk null;
+            break :blk try allocator.dupe(u8, pythonRepairPackage(raw));
+        },
+        .javascript => blk: {
+            if (extractBetween(diagnostic, "Cannot find module '", "'")) |module| {
+                break :blk try allocator.dupe(u8, module);
+            }
+            if (extractBetween(diagnostic, "npm error Missing script: \"", "\"")) |script| {
+                break :blk try allocator.dupe(u8, script);
+            }
+            break :blk null;
+        },
+        else => null,
+    };
+}
+
+fn extractBetween(text: []const u8, prefix: []const u8, suffix: []const u8) ?[]const u8 {
+    const start = std.mem.indexOf(u8, text, prefix) orelse return null;
+    const value_start = start + prefix.len;
+    const end_rel = std.mem.indexOf(u8, text[value_start..], suffix) orelse return null;
+    return text[value_start .. value_start + end_rel];
+}
+
+fn pythonRepairPackage(module: []const u8) []const u8 {
+    if (std.mem.eql(u8, module, "yaml")) return "PyYAML";
+    return module;
+}
+
+fn isSafeRepairPackage(package: []const u8) bool {
+    if (package.len == 0 or package.len > 128) return false;
+    for (package) |ch| {
+        if (std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_' or ch == '.' or ch == '/' or ch == '@') continue;
+        return false;
+    }
+    return true;
 }
 
 fn appendRebasedSelector(
@@ -1076,10 +1336,42 @@ fn appendRebasedSelector(
     build_root_relative: []const u8,
     selector: []const u8,
 ) !void {
-    const adjusted = try selectorRelativeToBuildRoot(allocator, workspace_path, build_root_path, build_root_relative, selector);
+    const normalized = try patcher.normalizeTestSelector(allocator, selector);
+    defer allocator.free(normalized);
+    const adjusted = try selectorRelativeToBuildRoot(allocator, workspace_path, build_root_path, build_root_relative, normalized);
     errdefer allocator.free(adjusted);
     try owned_args.append(adjusted);
     try argv.append(adjusted);
+}
+
+fn appendPythonPathEnv(
+    allocator: std.mem.Allocator,
+    argv: *std.ArrayList([]const u8),
+    owned_args: *std.ArrayList([]u8),
+    build_root_path: []const u8,
+) !void {
+    try argv.append("env");
+    const py_path = if (std.posix.getenv("PYTHONPATH")) |existing|
+        try std.fmt.allocPrint(allocator, "PYTHONPATH={s}:{s}", .{ existing, build_root_path })
+    else
+        try std.fmt.allocPrint(allocator, "PYTHONPATH={s}", .{build_root_path});
+    errdefer allocator.free(py_path);
+    try owned_args.append(py_path);
+    try argv.append(py_path);
+}
+
+fn appendLocalNodeRunner(
+    allocator: std.mem.Allocator,
+    argv: *std.ArrayList([]const u8),
+    owned_args: *std.ArrayList([]u8),
+    build_root_path: []const u8,
+    runner: []const u8,
+) !void {
+    if (!isSafeNpmRunner(runner)) return error.UnsafeNodeRunner;
+    const local = try std.fs.path.join(allocator, &.{ build_root_path, "node_modules", ".bin", runner });
+    errdefer allocator.free(local);
+    try owned_args.append(local);
+    try argv.append(local);
 }
 
 fn selectorRelativeToBuildRoot(
@@ -1218,6 +1510,15 @@ fn detectNodeTestRunner(allocator: std.mem.Allocator, build_root_path: []const u
     if (std.mem.indexOf(u8, bytes, "\"ava\"") != null) return "ava";
     if (std.mem.indexOf(u8, bytes, "\"jest\"") != null) return "jest";
     return "jest";
+}
+
+fn isSafeNpmRunner(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64) return false;
+    for (name) |ch| {
+        if (std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_' or ch == '.') continue;
+        return false;
+    }
+    return true;
 }
 
 fn runCapture(
@@ -1636,6 +1937,9 @@ pub fn renderSummaryJson(writer: anytype, summary: Summary) !void {
         if (result.landlock_allowed_paths) |paths_json| try writer.writeAll(paths_json) else try writer.writeAll("null");
         try writer.writeAll(",\"landlockRetryPath\":");
         if (result.landlock_retry_path) |path| try std.json.stringify(path, .{}, writer) else try writer.writeAll("null");
+        try writer.print(",\"oracleTimeout\":{}", .{result.oracle_timeout});
+        try writer.writeAll(",\"oracleTimeoutGipOpCode\":");
+        try std.json.stringify(@tagName(result.oracle_timeout_gip_opcode), .{}, writer);
         try writer.writeAll(",\"ephemeralVenvPath\":");
         if (result.ephemeral_venv_path) |path| try std.json.stringify(path, .{}, writer) else try writer.writeAll("null");
         try writer.print(",\"preflightDependencyInstall\":{}", .{result.preflight_dependency_install});
@@ -1651,13 +1955,16 @@ pub fn renderSummaryJson(writer: anytype, summary: Summary) !void {
         if (result.gold_patch_diff_stat) |stat| try std.json.stringify(stat, .{}, writer) else try writer.writeAll("null");
         try writer.writeAll(",\"reprioritizationDistance\":");
         if (result.reprioritization_distance) |distance| try writer.print("{d}", .{distance}) else try writer.writeAll("null");
-        try writer.print(",\"reproducedBaseFailure\":{},\"failToPassPassed\":{},\"passToPassPassed\":{},\"runeWritten\":{},\"cleanupDone\":{},\"environmentAttempts\":{d},\"gapLogged\":{}", .{
+        try writer.writeAll(",\"repairGipOpCode\":");
+        try std.json.stringify(@tagName(result.repair_gip_opcode), .{}, writer);
+        try writer.print(",\"reproducedBaseFailure\":{},\"failToPassPassed\":{},\"passToPassPassed\":{},\"runeWritten\":{},\"cleanupDone\":{},\"environmentAttempts\":{d},\"repairAttempts\":{d},\"gapLogged\":{}", .{
             result.reproduced_base_failure,
             result.fail_to_pass_passed,
             result.pass_to_pass_passed,
             result.rune_written,
             result.cleanup_done,
             result.environment_attempts,
+            result.repair_attempts,
             result.gap_logged,
         });
         try writer.writeAll(",\"reason\":");
@@ -1680,10 +1987,42 @@ test "SWE row parser handles Python-style test lists and selected files" {
     try std.testing.expectEqualStrings("tests/a.py", instance.root_hint_path);
 }
 
+test "offline corpus mirror rewrites clone source to file URL" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("mirrors/qutebrowser");
+    const root = try tmp.dir.realpathAlloc(allocator, "mirrors");
+    defer allocator.free(root);
+
+    var source = try resolveCloneSource(allocator, "qutebrowser/qutebrowser", root);
+    defer source.deinit();
+    try std.testing.expect(source.offline);
+    try std.testing.expect(std.mem.startsWith(u8, source.url, "file://"));
+    try std.testing.expect(std.mem.endsWith(u8, source.url, "/qutebrowser"));
+}
+
+test "offline corpus mirror fails before network when repo mirror is absent" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    try std.testing.expectError(error.OfflineMirrorMissing, resolveCloneSource(allocator, "owner/missing", root));
+}
+
+test "offline corpus file URLs escape spaces" {
+    const allocator = std.testing.allocator;
+    const url = try fileUrlFromAbsolutePath(allocator, "/tmp/ghost mirror/qutebrowser");
+    defer allocator.free(url);
+    try std.testing.expectEqualStrings("file:///tmp/ghost%20mirror/qutebrowser", url);
+}
+
 test "proof status maps to deterministic GIP opcodes" {
     try std.testing.expectEqual(gip_mapping.GipOpCode.GIP_OP_ORACLE_PROVE, gipOpForStatus(.base_reproduced));
     try std.testing.expectEqual(gip_mapping.GipOpCode.GIP_OP_TRUTH_SYNC, gipOpForStatus(.verified));
     try std.testing.expectEqual(gip_mapping.GipOpCode.GIP_OP_SEC_FAULT, gipOpForStatus(.invalid_environment));
+    try std.testing.expectEqual(gip_mapping.GipOpCode.GIP_OP_ORACLE_TIMEOUT, gipOpForStatus(.oracle_timeout));
 }
 
 test "environment failure classifier catches missing native dependencies" {

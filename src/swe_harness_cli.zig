@@ -33,6 +33,10 @@ pub fn main() !void {
             idx += 1;
             if (idx >= args.len) return error.MissingKnowledgeDir;
             options.knowledge_dir = args[idx];
+        } else if (std.mem.eql(u8, arg, "--corpus-dir")) {
+            idx += 1;
+            if (idx >= args.len) return error.MissingCorpusDir;
+            options.corpus_dir = args[idx];
         } else if (std.mem.eql(u8, arg, "--python")) {
             idx += 1;
             if (idx >= args.len) return error.MissingPythonPath;
@@ -57,6 +61,10 @@ pub fn main() !void {
             idx += 1;
             if (idx >= args.len) return error.MissingEnvironmentAttemptLimit;
             options.max_environment_attempts = try std.fmt.parseInt(u8, args[idx], 10);
+        } else if (std.mem.eql(u8, arg, "--max-repair-attempts")) {
+            idx += 1;
+            if (idx >= args.len) return error.MissingRepairAttemptLimit;
+            options.max_repair_attempts = try std.fmt.parseInt(u8, args[idx], 10);
         } else if (std.mem.eql(u8, arg, "--linear")) {
             options.enable_reprioritization = false;
             options.cluster_seed = null;
@@ -109,10 +117,12 @@ fn printUsage() !void {
         \\  --batch-size <n>          alias for --limit; useful for cluster batches
         \\  --workspace-root <path>   native clone root, default /tmp/ghost/swe
         \\  --knowledge-dir <path>    grounding output directory
+        \\  --corpus-dir <path>       offline mirror root; clones file://<path>/<repo-leaf>
         \\  --python <path>           Python executable used to create temp_venv
         \\  --pip <path>              Pip executable for non-ephemeral fallback repairs
         \\  --cluster-seed <text>     prioritize rows by VSA Hamming distance to seed
         \\  --max-environment-attempts <n>
+        \\  --max-repair-attempts <n> retry missing dependency repairs, default 3
         \\  --linear                  preserve input row order
         \\  --no-gpu-lattice          keep LATTICE_QUERY reprioritization on CPU
         \\  --include-unsupported-languages

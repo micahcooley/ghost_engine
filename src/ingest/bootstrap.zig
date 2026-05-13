@@ -19,6 +19,7 @@ pub const FixContext = struct {
     instance_id: []const u8,
     repo: []const u8,
     base_commit: []const u8,
+    commit_year: ?u16 = null,
     repo_language: []const u8,
     pip_exe: []const u8,
     sandbox_spec: sandbox.SandboxSpec,
@@ -257,11 +258,11 @@ fn pipInstallWithDiscovery(
     if (direct.status == .fixed or !context.enable_live_discovery) return direct;
     defer direct.deinit();
 
-    const discovered = (try search_client.discoverPipRequirement(allocator, module_name, diagnostic)) orelse {
+    const discovered = (try search_client.discoverPipRequirementForYear(allocator, module_name, diagnostic, context.commit_year)) orelse {
         return .{
             .allocator = allocator,
             .status = .attempted,
-            .detail = try std.fmt.allocPrint(allocator, "{s}; local SearXNG produced no safe pip candidate", .{direct.detail}),
+            .detail = try std.fmt.allocPrint(allocator, "{s}; local SearXNG produced no safe pip candidate{s}", .{ direct.detail, timeConstraintDetail(context.commit_year) }),
         };
     };
     defer allocator.free(discovered);
@@ -269,7 +270,7 @@ fn pipInstallWithDiscovery(
     const discovered_requirements = [_][]const u8{discovered};
     var resolved = try pipInstall(allocator, context, &discovered_requirements);
     if (resolved.status == .fixed) {
-        const detail = try std.fmt.allocPrint(allocator, "{s}; local SearXNG mapped missing module {s} to pip requirement {s}", .{ resolved.detail, module_name, discovered });
+        const detail = try std.fmt.allocPrint(allocator, "{s}; local SearXNG mapped missing module {s} to pip requirement {s}{s}", .{ resolved.detail, module_name, discovered, timeConstraintDetail(context.commit_year) });
         allocator.free(resolved.detail);
         resolved.detail = detail;
     }
@@ -281,6 +282,7 @@ fn npmInstall(allocator: std.mem.Allocator, context: FixContext, packages: []con
     defer inner.deinit();
     try inner.append("npm");
     try inner.append("install");
+    try inner.append("--no-save");
     for (packages) |package| {
         if (!isSafeNpmPackage(package)) {
             return .{
@@ -324,11 +326,11 @@ fn installNodeModuleWithDiscovery(
     if (direct.status == .fixed or !context.enable_live_discovery) return direct;
     defer direct.deinit();
 
-    const discovered = (try search_client.discoverNpmPackage(allocator, module_name, diagnostic)) orelse {
+    const discovered = (try search_client.discoverNpmPackageForYear(allocator, module_name, diagnostic, context.commit_year)) orelse {
         return .{
             .allocator = allocator,
             .status = .attempted,
-            .detail = try std.fmt.allocPrint(allocator, "{s}; local SearXNG produced no safe npm candidate", .{direct.detail}),
+            .detail = try std.fmt.allocPrint(allocator, "{s}; local SearXNG produced no safe npm candidate{s}", .{ direct.detail, timeConstraintDetail(context.commit_year) }),
         };
     };
     defer allocator.free(discovered);
@@ -336,11 +338,18 @@ fn installNodeModuleWithDiscovery(
     const discovered_packages = [_][]const u8{discovered};
     var resolved = try npmInstall(allocator, context, &discovered_packages);
     if (resolved.status == .fixed) {
-        const detail = try std.fmt.allocPrint(allocator, "{s}; local SearXNG mapped missing module {s} to npm package {s}", .{ resolved.detail, module_name, discovered });
+        const detail = try std.fmt.allocPrint(allocator, "{s}; local SearXNG mapped missing module {s} to npm package {s}{s}", .{ resolved.detail, module_name, discovered, timeConstraintDetail(context.commit_year) });
         allocator.free(resolved.detail);
         resolved.detail = detail;
     }
     return resolved;
+}
+
+fn timeConstraintDetail(commit_year: ?u16) []const u8 {
+    return if (commit_year) |year| switch (year) {
+        0 => "",
+        else => " using commit-year bounded search",
+    } else "";
 }
 
 fn buildBootstrapArgv(
