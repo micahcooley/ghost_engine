@@ -1,1 +1,0 @@
-../run-swipl-in-container.sh

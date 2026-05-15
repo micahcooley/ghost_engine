@@ -32,12 +32,15 @@ cimport.zig
 
 # Model state / weights (regeneratable via ohl_trainer)
 *.bin
+/weights/*.gguf
+/weights/*.safetensors
 
 # Local development toolchain (sandboxed Zig/Vulkan)
 .toolchain/
 
 # Large training datasets (too large for GitHub LFS free tier)
 /corpus/**
+/corpus_local_backup/**
 !/corpus/.gitkeep
 **/corpus/wikitext_train.txt
 

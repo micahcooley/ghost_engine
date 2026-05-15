@@ -18,9 +18,7 @@ pub const DeviceProfile = struct {
     total_memory: usize = 8 * 1024 * 1024 * 1024,
 
     pub fn calculateL1IndexShardSize(self: DeviceProfile) usize {
-        // Dynamically calculate L1 Index Shard Size based on available VRAM
-        // Assuming 8GB gave whatever default, we scale linearly based on VRAM
-        // Using a conservative fraction (e.g., 10%) or similar
-        return self.total_memory / 8;
+        // Reduce to 5% (1/20) to ensure we stay within BAR limits on non-Resizable BAR systems
+        return self.total_memory / 20;
     }
 };

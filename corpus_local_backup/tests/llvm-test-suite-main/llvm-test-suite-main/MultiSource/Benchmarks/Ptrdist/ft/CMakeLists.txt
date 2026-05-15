@@ -1,8 +1,0 @@
-if(LARGE_PROBLEM_SIZE)
-  list(APPEND RUN_OPTIONS 6000 100000)
-else()
-  list(APPEND RUN_OPTIONS 1500 100000)
-endif()
-list(APPEND CFLAGS -Wno-implicit-int)
-set(HASH_PROGRAM_OUTPUT 1)
-llvm_multisource(ft)

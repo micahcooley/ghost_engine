@@ -1,6 +1,0 @@
-add_subdirectory(cholesky)
-add_subdirectory(durbin)
-add_subdirectory(gramschmidt)
-add_subdirectory(lu)
-add_subdirectory(ludcmp)
-add_subdirectory(trisolv)

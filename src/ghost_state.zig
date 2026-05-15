@@ -613,7 +613,7 @@ pub const GhostSoul = struct {
 
     last_energy: u16,
     last_boundary: vsa.Boundary,
-    spatial_rotor: vsa.HyperRotor,
+    spatial_rotor: vsa.HyperVector,
     lexical_rotor: u64,
     phrase_rotor: u64,
     concept_rotor: u64,
@@ -641,7 +641,7 @@ pub const GhostSoul = struct {
             .entropy_flatline = false,
             .last_energy = 1024,
             .last_boundary = .none,
-            .spatial_rotor = vsa.HyperRotor.init(GENESIS_SEED),
+            .spatial_rotor = @splat(0),
             .lexical_rotor = FNV_OFFSET_BASIS,
             .phrase_rotor = FNV_OFFSET_BASIS,
             .concept_rotor = FNV_OFFSET_BASIS,
@@ -659,7 +659,7 @@ pub const GhostSoul = struct {
     }
 
     pub fn absorb(self: *GhostSoul, rune_vec: vsa.HyperVector, rune: u32, energy: ?u16) !u64 {
-        self.spatial_rotor.evolve(rune);
+        self.spatial_rotor = vsa.bundle(vsa.rotate(self.spatial_rotor, 1), rune_vec, vsa.generate(self.lexical_rotor));
         return self.absorbInternal(rune_vec, rune, energy, true);
     }
 

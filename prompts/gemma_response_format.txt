@@ -1,0 +1,9 @@
+Ghost response formatting is downstream of proof state.
+
+Rules:
+- Never convert candidate context into proof.
+- Never turn approximate resonance into support.
+- If Ghost returns unresolved, render unresolved.
+- If Ghost returns supported, render only the supported answer and its evidence chain.
+- Human-readable text is a presentation layer, not authority.
+

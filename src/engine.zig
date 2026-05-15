@@ -9,6 +9,10 @@ const panic_dump = @import("panic_dump.zig");
 const config = @import("config.zig");
 const sigil_runtime = @import("sigil_runtime.zig");
 
+// ── Ghost Engine v2: Rune-Native Triad ──
+const triad = @import("triad.zig");
+const forge_mod = @import("forge.zig");
+
 pub const REASON_DEPTH: u32 = 8;
 pub const REASON_TOP_K: u32 = 3;
 
@@ -114,6 +118,12 @@ pub const SingularityEngine = struct {
     ema: ResonanceEMA = .{},
     last_layer2a_metrics: mc.Layer2aInstrumentation = .{},
 
+    // ── v2 Triad Integration ──
+    // Optional: when attached, the Scout monitors state variance during inference
+    // and the Forge records observations for rank-based training.
+    forge: ?*forge_mod.ForgeEngine = null,
+    triad_byte_offset: u64 = 0,
+
     fn layer3Config(self: *const SingularityEngine) mc.Layer3Config {
         const reasoning_mode = if (sigil_runtime.getActiveControl()) |control|
             control.snapshot().reasoning_mode
@@ -191,16 +201,19 @@ pub const SingularityEngine = struct {
         var gpu_success: bool = false;
         if (!config.force_cpu_inference and self.vulkan != null) {
             const vulkan = self.vulkan.?;
-            if (vulkan.dispatchResonance(self.soul.lexical_rotor, self.soul.semantic_rotor)) |energies| {
-                gpu_success = true;
-                const boredom = self.soul.getBoredomPenalty();
-                for (energies, 0..) |raw_e, i| {
-                    const cb: u32 = @intCast(i);
-                    if (!isAllowed(cb)) continue;
-                    var energy = raw_e;
-                    if (cb == prev1 and cb == prev2 and cb == prev3) energy = energy -| 50;
-                    energy = energy -| boredom;
-                    insertTopK(&top_chars, &top_energies, cb, energy);
+            if (vulkan.dispatchResonance(self.soul.lexical_rotor, self.soul.semantic_rotor)) |job| {
+                if (vulkan.pollHardwareInterrupt(job.frame_idx) catch false) {
+                    const energies = vulkan.waitResonance(job) catch &.{};
+                    gpu_success = energies.len != 0;
+                    const boredom = self.soul.getBoredomPenalty();
+                    for (energies, 0..) |raw_e, i| {
+                        const cb: u32 = @intCast(i);
+                        if (!isAllowed(cb)) continue;
+                        var energy = raw_e;
+                        if (cb == prev1 and cb == prev2 and cb == prev3) energy = energy -| 50;
+                        energy = energy -| boredom;
+                        insertTopK(&top_chars, &top_energies, cb, energy);
+                    }
                 }
             } else |err| {
                 sys.print("\n[VULKAN WARNING] Resonance Query Failed: {any}. Falling back to Silicon Heuristics...\n", .{err});
@@ -261,7 +274,10 @@ pub const SingularityEngine = struct {
         self.rune_counter += 1;
         if (self.rune_counter % 10000 == 0 and gpu_success) {
             if (self.vulkan) |vulkan| {
-                const gpu_energies = vulkan.dispatchResonance(self.soul.lexical_rotor, self.soul.semantic_rotor) catch return layer3_decision;
+                const audit_job = vulkan.dispatchResonance(self.soul.lexical_rotor, self.soul.semantic_rotor) catch return layer3_decision;
+                if (!(vulkan.pollHardwareInterrupt(audit_job.frame_idx) catch false)) return layer3_decision;
+                const gpu_energies = vulkan.waitResonance(audit_job) catch return layer3_decision;
+                if (gpu_energies.len <= @as(usize, @intCast(chosen))) return layer3_decision;
                 const gpu_energy = gpu_energies[@as(usize, @intCast(chosen))];
 
                 // Independent CPU computation
@@ -297,6 +313,17 @@ pub const SingularityEngine = struct {
 
         // V32: Update the noise floor EMA with the chosen rune's resonance
         self.ema.update(@intCast(chosen_energy));
+
+        // ── v2: Forge Observation ──
+        // After the existing pipeline selects a rune, we feed it to the Forge
+        // so the Rune Lattice can track patterns and build rank history.
+        // This runs in parallel with the existing v1 pipeline (Option A: Overlay).
+        if (self.forge) |forge_engine| {
+            const context_hash = ghost_state.wyhash(self.soul.lexical_rotor, self.soul.semantic_rotor);
+            const now_ms = @as(u64, @intCast(sys.getMilliTick()));
+            _ = forge_engine.observe(chosen_vec, context_hash, now_ms);
+            self.triad_byte_offset += len_fin;
+        }
 
         layer3_decision.output = chosen;
         layer3_decision.confidence = chosen_energy;

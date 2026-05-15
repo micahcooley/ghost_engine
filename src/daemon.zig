@@ -19,6 +19,7 @@ const sovereign_inquiry = ghost_core.sovereign_inquiry;
 const task_intent = ghost_core.task_intent;
 const technical_drafts = ghost_core.technical_drafts;
 const text_generation_lab = ghost_core.text_generation_lab;
+const vsa_math = ghost_core.vsa.math;
 const vsa_vulkan = ghost_core.vsa_vulkan;
 const wingman = ghost_core.wingman;
 
@@ -1173,8 +1174,212 @@ const HotCandidate = struct {
 
 fn dispatchResidentCorpusAsk(allocator: std.mem.Allocator, resident: *ResidentState, obj: std.json.ObjectMap) !?[]u8 {
     const question = jsonStringField(obj, "question") orelse jsonStringField(obj, "message") orelse return null;
-    try resident.session_hot.appendTurn(resident.vulkan, "user", question);
-    return try dispatchSovereignPipelineAsk(allocator, resident, obj, question);
+
+    // --- NEURO-SYMBOLIC ROUTING (MAMBA-3 FRONT END) ---
+    // In a resident deployment, the router has direct access to the model weights.
+    // For now, we reuse the gip_dispatch logic to unify the architecture.
+    const packet = try gip.dispatch.neuralRouter(allocator, question);
+
+    switch (packet.route) {
+        .z3_route => {
+            if (try z3_bridge.proveArithmeticExpression(packet.formula.?, .{ .timeout_ms = 100 })) |proof| {
+                resident.setPipelineTelemetry("LOGIC", "active", "green_verified");
+                try resident.session_hot.appendTurn(resident.vulkan, "user", question);
+                try resident.session_hot.appendTurn(resident.vulkan, "engine", "Z3 arithmetic route verified the expression.");
+                return try renderArithmeticCorpusAskResult(allocator, resident, obj, question, proof);
+            }
+        },
+        .vsa_route => {
+            if (resident.vulkan) |vk| {
+                const query = vsa_math.generate(vsa_vulkan.murmur3Bytes64(question));
+                const job = vk.dispatchRuneSearchAsync(query, 5, 1024) catch |err| switch (err) {
+                    error.GpuBusy => return try renderVsaPendingCorpusAskResult(allocator, obj, question, null, true),
+                    else => null,
+                };
+                if (job) |gpu_job| {
+                    return try renderVsaPendingCorpusAskResult(allocator, obj, question, gpu_job, false);
+                }
+            }
+            // Contextual Awareness enforced via Neural context hint
+            if (std.mem.eql(u8, packet.context_hint, "zenith_vulkan_zig")) {
+                try resident.session_hot.appendTurn(resident.vulkan, "user", question);
+                return try dispatchSovereignPipelineAsk(allocator, resident, obj, question);
+            }
+            if (isBareSingleConceptQuery(question)) {
+                return try renderUnrecognizedIntentResult(allocator, resident, obj, question);
+            }
+        },
+        .scalar_route => {
+            return try renderScalarReadyCorpusAskResult(allocator, obj, question, packet.scalar_response.?);
+        },
+    }
+    // --------------------------------------------------
+
+    return try dispatchResidentCorpusAskLegacy(allocator, resident, obj);
+}
+
+fn isBareSingleConceptQuery(question: []const u8) bool {
+    const trimmed = std.mem.trim(u8, question, " \t\r\n.!?,;:\"'");
+    if (trimmed.len < 3) return false;
+    var token_count: usize = 0;
+    var in_token = false;
+    for (trimmed) |byte| {
+        const token_byte = std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_';
+        if (token_byte) {
+            if (!in_token) {
+                token_count += 1;
+                in_token = true;
+            }
+            continue;
+        }
+        if (!std.ascii.isWhitespace(byte)) return false;
+        in_token = false;
+    }
+    return token_count == 1;
+}
+
+fn renderVsaPendingCorpusAskResult(
+    allocator: std.mem.Allocator,
+    obj: std.json.ObjectMap,
+    question: []const u8,
+    job: ?vsa_vulkan.VulkanEngine.GpuJob,
+    gpu_busy: bool,
+) ![]u8 {
+    var body = std.ArrayList(u8).init(allocator);
+    errdefer body.deinit();
+    const w = body.writer();
+    try w.writeAll("{\"corpusAsk\":{\"status\":\"pending\",\"state\":\"pending\",\"permission\":\"unresolved\",\"nonAuthorizing\":true,\"vsaGpu\":{\"state\":\"PENDING\",\"fenceModel\":\"vkGetFenceStatus\",\"blockingWait\":false,\"gpuBusy\":");
+    try w.writeAll(if (gpu_busy) "true" else "false");
+    if (job) |j| {
+        try w.writeAll(",\"job\":{\"frameIndex\":");
+        try w.print("{d}", .{j.frame_idx});
+        try w.writeAll(",\"kind\":\"");
+        try w.writeAll(@tagName(j.kind));
+        try w.writeAll("\"}");
+    }
+    try w.writeAll("},\"question\":");
+    try std.json.stringify(question, .{}, w);
+    try w.writeAll(",\"evidenceUsed\":[],\"unknowns\":[{\"kind\":\"vsa_gpu_pending\",\"reason\":\"GPU fence not signaled yet; caller must poll status before reading results\"}],\"candidateFollowups\":[],\"learningCandidates\":[],\"trace\":{\"commandsExecuted\":false,\"verifiersExecuted\":false,\"residentDaemon\":true,\"vulkanPending\":true,\"audioThreadBlocked\":false}}}");
+    const result_json = try body.toOwnedSlice();
+    defer allocator.free(result_json);
+
+    var state = gip.schema.unresolvedResultState("vsa_gpu_pending");
+    state.state = .unresolved;
+    state.permission = .unresolved;
+    state.is_draft = false;
+    state.verification_state = .unverified;
+    state.support_minimum_met = false;
+    state.non_authorization_notice = "VSA GPU work is pending; no supported answer is available until the fence reports VK_SUCCESS.";
+    return try gip.schema.renderResponse(
+        allocator,
+        gip.core.PROTOCOL_VERSION,
+        jsonStringField(obj, "requestId"),
+        gip.core.parseRequestKind("corpus.ask"),
+        .accepted,
+        state,
+        result_json,
+        null,
+        null,
+    );
+}
+
+fn renderScalarReadyCorpusAskResult(
+    allocator: std.mem.Allocator,
+    obj: std.json.ObjectMap,
+    question: []const u8,
+    response: []const u8,
+) ![]u8 {
+    var body = std.ArrayList(u8).init(allocator);
+    errdefer body.deinit();
+    const w = body.writer();
+    try w.writeAll("{\"corpusAsk\":{\"status\":\"supported\",\"state\":\"verified\",\"permission\":\"supported\",\"answerDraft\":");
+    try std.json.stringify(response, .{}, w);
+    try w.writeAll(",\"voiceSynthesis\":true,\"nonAuthorizing\":false,\"question\":");
+    try std.json.stringify(question, .{}, w);
+    try w.writeAll(",\"evidenceUsed\":[],\"unknowns\":[],\"candidateFollowups\":[],\"learningCandidates\":[],\"trace\":{\"commandsExecuted\":false,\"verifiersExecuted\":false,\"residentDaemon\":true,\"scalarResolver\":true}}}");
+    const result_json = try body.toOwnedSlice();
+    defer allocator.free(result_json);
+
+    var state = gip.schema.draftResultState();
+    state.state = .verified;
+    state.permission = .supported;
+    state.is_draft = false;
+    state.verification_state = .verified;
+    state.support_minimum_met = true;
+    state.stop_reason = .none;
+    state.non_authorization_notice = null;
+    return try gip.schema.renderResponse(
+        allocator,
+        gip.core.PROTOCOL_VERSION,
+        jsonStringField(obj, "requestId"),
+        gip.core.parseRequestKind("corpus.ask"),
+        .ok,
+        state,
+        result_json,
+        null,
+        null,
+    );
+}
+
+fn renderArithmeticCorpusAskResult(
+    allocator: std.mem.Allocator,
+    resident: *ResidentState,
+    obj: std.json.ObjectMap,
+    question: []const u8,
+    proof: z3_bridge.ArithmeticProof,
+) ![]u8 {
+    const result_json = try renderArithmeticCorpusResult(allocator, resident, question, proof);
+    defer allocator.free(result_json);
+    var state = gip.schema.draftResultState();
+    state.state = .verified;
+    state.permission = .supported;
+    state.is_draft = false;
+    state.verification_state = .verified;
+    state.support_minimum_met = true;
+    state.stop_reason = .none;
+    state.non_authorization_notice = null;
+    return try gip.schema.renderResponse(
+        allocator,
+        gip.core.PROTOCOL_VERSION,
+        jsonStringField(obj, "requestId"),
+        gip.core.parseRequestKind("corpus.ask"),
+        .ok,
+        state,
+        result_json,
+        null,
+        null,
+    );
+}
+
+fn renderArithmeticCorpusResult(allocator: std.mem.Allocator, resident: *ResidentState, question: []const u8, proof: z3_bridge.ArithmeticProof) ![]u8 {
+    const telemetry = resident.snapshotTelemetry();
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("{\"corpusAsk\":{\"status\":\"supported\",\"state\":\"verified\",\"permission\":\"supported\",\"answerDraft\":");
+    try w.writeByte('"');
+    try w.print("{d}", .{proof.result});
+    try w.writeByte('"');
+    try w.writeAll(",\"voiceSynthesis\":true,\"nonAuthorizing\":false,\"sovereignPipeline\":true,\"legacyResidentRetrievalBypassed\":true,\"question\":");
+    try std.json.stringify(question, .{}, w);
+    try w.writeAll(",\"logicalReasoning\":{\"route\":\"z3\",\"z3Status\":\"active\",\"status\":\"verified\",\"lhs\":");
+    try w.print("{d}", .{proof.lhs});
+    try w.writeAll(",\"operator\":");
+    try std.json.stringify(&[_]u8{proof.op}, .{}, w);
+    try w.writeAll(",\"rhs\":");
+    try w.print("{d}", .{proof.rhs});
+    try w.writeAll(",\"result\":");
+    try w.print("{d}", .{proof.result});
+    try w.writeAll(",\"signal\":");
+    try std.json.stringify(proof.signal.tag(), .{}, w);
+    try w.writeAll("},\"evidenceUsed\":[{\"source\":\"Z3_PROOF\",\"detail\":\"bounded integer arithmetic constraint solved by z3_bridge\"}],\"unknowns\":[],\"candidateFollowups\":[],\"learningCandidates\":[],\"trace\":{\"corpusMutation\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"commandsExecuted\":false,\"verifiersExecuted\":true,\"residentDaemon\":true,\"sovereignPipeline\":\"z3_arithmetic\",\"inferredDomain\":\"LOGIC\",\"z3Status\":\"active\",\"confidenceBand\":\"green_verified\"");
+    try w.print(",\"residentShards\":{d},\"vramResidentBytes\":{d},\"sessionHotBytes\":{d}", .{
+        telemetry.loaded_shards,
+        telemetry.vram_resident_bytes,
+        resident.session_hot.usedBytes(),
+    });
+    try w.writeAll("}}}");
+    return out.toOwnedSlice();
 }
 
 fn dispatchResidentCorpusAskLegacy(allocator: std.mem.Allocator, resident: *ResidentState, obj: std.json.ObjectMap) !?[]u8 {

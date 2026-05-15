@@ -2,3 +2,23 @@
 acceleration = "vulkan"
 # Set to "cpu" if GPU-side crashes occur during Zenith DAW use.
 logical_verification = "cpu"
+
+[gemma]
+weights_path = "weights/gemma-4-E2B-it-Q8_0.gguf"
+system_prompt_path = "prompts/gemma_system.txt"
+response_format_path = "prompts/gemma_response_format.txt"
+architecture = "gemma4"
+tensor_count = 601
+num_layers = 35
+d_model = 1536
+num_query_heads = 8
+num_kv_heads = 1
+attention_key_length = 512
+attention_key_length_swa = 256
+attention_value_length = 512
+attention_value_length_swa = 256
+embedding_length_per_layer_input = 256
+ffn_dim_by_layer = [6144, 6144, 6144, 6144, 6144, 6144, 6144, 6144, 6144, 6144, 6144, 6144, 6144, 6144, 6144, 12288, 12288, 12288, 12288, 12288, 12288, 12288, 12288, 12288, 12288, 12288, 12288, 12288, 12288, 12288, 12288, 12288, 12288, 12288, 12288]
+attention_top_k = 32
+projection_lr = 0.0001
+rune_etch_threshold = 0.4

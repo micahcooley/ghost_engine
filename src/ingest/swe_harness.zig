@@ -1835,7 +1835,8 @@ fn dispatchVulkanLatticeQuery(
     };
     defer if (owns_runtime) vsa_vulkan.deinitRuntime();
 
-    const distances = engine.dispatchLatticeQuery(query_words, runes) catch return false;
+    const job = engine.dispatchLatticeQuery(query_words, runes) catch return false;
+    const distances = engine.waitLatticeQuery(job) catch return false;
     if (distances.len != runes.len) return false;
     std.mem.copyForwards(u32, out[0..runes.len], distances);
     return true;

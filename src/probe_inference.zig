@@ -66,7 +66,8 @@ pub fn main() !void {
     var i: usize = 0;
     while (i < 40) : (i += 1) {
         // Fast-path: get top-5 from GPU resonance
-        const energies = try vk_engine.dispatchResonance(soul.lexical_rotor, soul.semantic_rotor);
+        const resonance_job = try vk_engine.dispatchResonance(soul.lexical_rotor, soul.semantic_rotor);
+        const energies = try vk_engine.waitResonance(resonance_job);
         if (energies.len == 0) break;
 
         var top_chars: [5]u32 = [_]u32{0} ** 5;

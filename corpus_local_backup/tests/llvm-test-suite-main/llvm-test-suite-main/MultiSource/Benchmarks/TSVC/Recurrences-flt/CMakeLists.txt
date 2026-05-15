@@ -1,5 +1,0 @@
-list(APPEND LDFLAGS -lm)
-list(APPEND CFLAGS -Wno-int-conversion)
-set(RUN_OPTIONS 20000 5)
-llvm_multisource(Recurrences-flt)
-set_property(TARGET Recurrences-flt PROPERTY C_STANDARD 99)

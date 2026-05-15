@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 const config = @import("config.zig");
 const sys = @import("sys.zig");
 const vsa_core = @import("vsa_core.zig");
+const gemma_config = @import("gemma/config.zig");
 const sigil_runtime = @import("sigil_runtime.zig");
 const gpu_lattice = @import("gpu/vulkan_init.zig");
 const vk_device = @import("vsa_vulkan/device.zig");
@@ -21,12 +22,13 @@ pub const ROTOR_STRIDE = 18; // 16x u64 spatial + 2x u64 (lexical, semantic)
 pub const LAYER2A_MAX_CANDIDATES = config.BEAM_NUM_LANES;
 pub const LAYER2A_NO_WINNER: u32 = 0xFFFFFFFF;
 pub const GHOST_INDEX_BLOCK_BYTES: usize = 1024 * 1024;
-pub const GHOST_INDEX_SKIP_THRESHOLD_PER_MILLE: u16 = 100;
+pub const GHOST_INDEX_SKIP_THRESHOLD_PER_MILLE: u16 = 750;
 pub const CORPUS_SCAN_MAX_ENTRIES: usize = 65_536;
 pub const CORPUS_SCAN_MAX_TERMS: usize = 4;
 pub const CORPUS_SCAN_TERM_BYTES: usize = 16;
 pub const LatticeQueryRune = gpu_lattice.GreRune;
-const DESCRIPTOR_BINDING_COUNT: u32 = 14;
+pub const GEMMA_FORWARD_STAGES_PER_BLOCK: u32 = 14;
+const DESCRIPTOR_BINDING_COUNT: u32 = 15;
 const FENCE_TIMEOUT_NS: u64 = 2_000_000_000;
 const SHUTDOWN_FENCE_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
 const VALIDATION_LAYER_NAME: [*:0]const u8 = "VK_LAYER_KHRONOS_validation";
@@ -117,6 +119,30 @@ pub const NegativeSignalSnapshot = struct {
     last_query_hash: u64 = 0,
     color_profile: []const u8 = NEGATIVE_SIGNAL_COLOR_PROFILE,
     sigil_opacity_per_mille: u16 = NEGATIVE_SIGNAL_SIGIL_OPACITY_PER_MILLE,
+};
+
+pub const GemmaForwardScheduleConfig = struct {
+    block_count: u32 = @intCast(gemma_config.default_block_count),
+    embedding_len: u32 = @intCast(gemma_config.default_embedding_length),
+    rune_count: u32 = 1,
+    top_k: u32 = @intCast(gemma_config.default_attention_top_k),
+    attention_head_count: u32 = @intCast(gemma_config.default_attention_head_count),
+    attention_head_count_kv: u32 = @intCast(gemma_config.default_attention_head_count_kv),
+    attention_key_length: u32 = @intCast(gemma_config.default_attention_key_length),
+    attention_key_length_swa: u32 = @intCast(gemma_config.default_attention_key_length_swa),
+    attention_value_length: u32 = @intCast(gemma_config.default_attention_value_length),
+    attention_value_length_swa: u32 = @intCast(gemma_config.default_attention_value_length_swa),
+
+    pub fn ffnDim(self: GemmaForwardScheduleConfig, layer_idx: u32) !u32 {
+        _ = self;
+        if (layer_idx >= gemma_config.default_ffn_dim_by_layer.len) return error.GemmaLayerOutOfRange;
+        return @intCast(gemma_config.default_ffn_dim_by_layer[layer_idx]);
+    }
+
+    pub fn fullAttention(self: GemmaForwardScheduleConfig, layer_idx: u32) bool {
+        _ = self;
+        return layer_idx % 5 == 4;
+    }
 };
 
 var global_negative_signal_count = std.atomic.Value(u64).init(0);
@@ -732,6 +758,14 @@ pub const VulkanEngine = struct {
     prune_pipeline: vk.VkPipeline = null,
     lookahead_pipeline: vk.VkPipeline = null,
     lattice_pipeline: vk.VkPipeline = null,
+    rune_search_pipeline: vk.VkPipeline = null, // v2: Rune Lattice XOR search
+    gemma_rune_embed_pipeline: vk.VkPipeline = null,
+    gemma_matmul_q4k_pipeline: vk.VkPipeline = null,
+    gemma_matmul_q8_0_pipeline: vk.VkPipeline = null,
+    gemma_rms_norm_pipeline: vk.VkPipeline = null,
+    gemma_swiglu_pipeline: vk.VkPipeline = null,
+    gemma_attention_pipeline: vk.VkPipeline = null,
+    gemma_rune_project_pipeline: vk.VkPipeline = null,
 
     // Synchronization
     timeline_semaphore: vk.VkSemaphore = null,
@@ -769,6 +803,10 @@ pub const VulkanEngine = struct {
     mapped_lattice: ?[*]u16 = null,
     gpu_lattice_size: usize = 0,
     lattice_quarter: u32 = 0,
+
+    rune_rank_buffer: vk.VkBuffer = null,
+    rune_rank_memory: vk.VkDeviceMemory = null,
+    mapped_rune_ranks: ?[*]u8 = null,
 
     // Phantom Lobe (Sigil Cartridge)
     sigil_buffer: vk.VkBuffer = null,
@@ -843,6 +881,7 @@ pub const VulkanEngine = struct {
     // Multi-GPU Shared States (cached to avoid re-sync)
     host_matrix: ?[]u32 = null,
     host_tags: ?[]u64 = null,
+    host_ranks: ?[]u8 = null,
     host_lattice: ?[]u16 = null,
 
     result_buffer: []u32,
@@ -1180,6 +1219,9 @@ pub const VulkanEngine = struct {
         self.mapped_tags = @ptrCast(@alignCast(try self.createBuffer(@as(usize, self.matrix_slots) * 8, matrix_usage, self.matrix_flags, &self.tag_buffer, &self.tag_memory) orelse return error.VulkanError));
         self.mapped_lattice = @ptrCast(@alignCast(try self.createBuffer(self.gpu_lattice_size, matrix_usage, self.matrix_flags, &self.lattice_buffer, &self.lattice_memory) orelse return error.VulkanError));
 
+        self.mapped_rune_ranks = @ptrCast(try self.createBuffer(self.matrix_slots, matrix_usage, self.matrix_flags, &self.rune_rank_buffer, &self.rune_rank_memory) orelse return error.VulkanError);
+        @memset(self.mapped_rune_ranks.?[0..self.matrix_slots], @intFromEnum(@import("triad.zig").RuneRank.noise));
+
         for (0..FRAME_COUNT) |i| {
             self.mapped_rotors[i] = @ptrCast(@alignCast(try self.createBuffer(20480 * 144, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, self.batch_flags, &self.rotor_buffers[i], &self.rotor_memories[i]) orelse return error.VulkanError));
             self.mapped_chars[i] = @ptrCast(@alignCast(try self.createBuffer(config.MAX_STREAMS * 4, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, self.batch_flags, &self.char_buffers[i], &self.char_memories[i]) orelse return error.VulkanError));
@@ -1260,6 +1302,12 @@ pub const VulkanEngine = struct {
         return pipeline;
     }
 
+    fn createComputePipelineFromPath(self: *VulkanEngine, path: []const u8) !vk.VkPipeline {
+        const spv = try std.fs.cwd().readFileAlloc(self.allocator, path, 4 * 1024 * 1024);
+        defer self.allocator.free(spv);
+        return self.createComputePipeline(spv, null);
+    }
+
     fn setupPipelines(self: *VulkanEngine) !void {
         var pcRange = std.mem.zeroes(vk.VkPushConstantRange);
         pcRange.stageFlags = vk.VK_SHADER_STAGE_COMPUTE_BIT;
@@ -1310,6 +1358,20 @@ pub const VulkanEngine = struct {
         var lattice_wg_size: u32 = @min(1024, self.max_workgroup_invocations);
         var lattice_spec = vk.VkSpecializationInfo{ .mapEntryCount = 1, .pMapEntries = &spec_map, .dataSize = @sizeOf(u32), .pData = &lattice_wg_size };
         self.lattice_pipeline = try self.createComputePipeline(@embedFile("shaders/lattice_etch.spv"), &lattice_spec);
+
+        // v2: Rune Search pipeline — GPU-accelerated XOR Hamming distance search.
+        // Uses the same descriptor set layout; the shader accesses matrix_buffer
+        // (binding 0) as the Rune vector store, rotor_buffer (binding 1) as the
+        // query vector, and energy_buffer (binding 6) for results.
+        self.rune_search_pipeline = try self.createComputePipeline(@embedFile("shaders/rune_search.spv"), null);
+
+        self.gemma_rune_embed_pipeline = try self.createComputePipelineFromPath(build_options.gemma_rune_embed_spv_path);
+        self.gemma_matmul_q4k_pipeline = try self.createComputePipelineFromPath(build_options.gemma_matmul_q4k_spv_path);
+        self.gemma_matmul_q8_0_pipeline = try self.createComputePipelineFromPath(build_options.gemma_matmul_q8_0_spv_path);
+        self.gemma_rms_norm_pipeline = try self.createComputePipelineFromPath(build_options.gemma_rms_norm_spv_path);
+        self.gemma_swiglu_pipeline = try self.createComputePipelineFromPath(build_options.gemma_swiglu_spv_path);
+        self.gemma_attention_pipeline = try self.createComputePipelineFromPath(build_options.gemma_attention_spv_path);
+        self.gemma_rune_project_pipeline = try self.createComputePipelineFromPath(build_options.gemma_rune_project_spv_path);
     }
 
     fn updateDescriptorSets(self: *VulkanEngine, f: u32) void {
@@ -1328,6 +1390,7 @@ pub const VulkanEngine = struct {
         info[11] = .{ .buffer = self.lock_mask_buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE };
         info[12] = .{ .buffer = self.general_ingest_buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE };
         info[13] = .{ .buffer = self.corpus_entry_buffers[f], .offset = 0, .range = vk.VK_WHOLE_SIZE };
+        info[14] = .{ .buffer = self.rune_rank_buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE };
 
         var write = std.mem.zeroes(vk.VkWriteDescriptorSet);
         write.sType = vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1592,7 +1655,7 @@ pub const VulkanEngine = struct {
         @memcpy(staging_bytes[0..bytes.len], bytes);
         try self.flushUploadStagingRange(staging_slot);
 
-        const f = try self.acquireFrameSlot();
+        const f = try self.acquireFrameSlotNonBlocking() orelse return error.GpuBusy;
         var beginInfo = std.mem.zeroes(vk.VkCommandBufferBeginInfo);
         beginInfo.sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         beginInfo.flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -1665,13 +1728,6 @@ pub const VulkanEngine = struct {
                 sys.print("[WARN] Final inference drain before deinit failed on lane {d}: {any}\n", .{ i, err });
             };
         }
-        if (self.dev != null and self.vk_ctx.vkDeviceWaitIdle != null) {
-            const idle_res = self.vk_ctx.vkDeviceWaitIdle.?(self.dev);
-            if (idle_res != vk.VK_SUCCESS) {
-                sys.print("[WARN] vkDeviceWaitIdle failed during deinit: {d}\n", .{idle_res});
-            }
-        }
-
         if (self.has_dedicated_transfer) {
             for (0..FRAME_COUNT) |i| {
                 if (self.transfer_fences[i] != null) self.vk_ctx.vkDestroyFence.?(self.dev, self.transfer_fences[i], null);
@@ -1714,6 +1770,14 @@ pub const VulkanEngine = struct {
             &self.corpus_scan_pipeline,
             &self.lattice_query_pipeline,
             &self.lattice_pipeline,
+            &self.rune_search_pipeline,
+            &self.gemma_rune_embed_pipeline,
+            &self.gemma_matmul_q4k_pipeline,
+            &self.gemma_matmul_q8_0_pipeline,
+            &self.gemma_rms_norm_pipeline,
+            &self.gemma_swiglu_pipeline,
+            &self.gemma_attention_pipeline,
+            &self.gemma_rune_project_pipeline,
         };
         for (pipelines) |p| if (p.* != null) self.vk_ctx.vkDestroyPipeline.?(self.dev, p.*, null);
 
@@ -1729,8 +1793,9 @@ pub const VulkanEngine = struct {
         for (0..UPLOAD_STAGING_SLOTS) |i| {
             self.destroyBuffer(&self.upload_staging_buffers[i], &self.upload_staging_memories[i], self.mapped_upload_staging[i]);
         }
-        self.destroyBuffer(&self.lattice_buffer, &self.lattice_memory, self.mapped_lattice);
+        self.destroyBuffer(&self.lattice_buffer, &self.lattice_memory, @ptrCast(self.mapped_lattice));
         self.destroyBuffer(&self.tag_buffer, &self.tag_memory, self.mapped_tags);
+        self.destroyBuffer(&self.rune_rank_buffer, &self.rune_rank_memory, self.mapped_rune_ranks);
         self.destroyBuffer(&self.matrix_buffer, &self.matrix_memory, self.mapped_matrix);
 
         if (self.dev != null) self.vk_ctx.vkDestroyDevice.?(self.dev, null);
@@ -1740,20 +1805,20 @@ pub const VulkanEngine = struct {
         if (self.instance != null) self.vk_ctx.vkDestroyInstance.?(self.instance, null);
     }
 
-    pub fn dispatchBatch(self: *VulkanEngine, batch_size: u32) ![]u32 {
+    pub fn dispatchBatch(self: *VulkanEngine, batch_size: u32) !GpuJob {
         beginGpuSubmit(self);
         defer endGpuSubmit(self);
 
         self.dispatch_mutex.lock();
         defer self.dispatch_mutex.unlock();
 
-        const f = try self.acquireFrameSlot();
+        const f = try self.acquireFrameSlotNonBlocking() orelse return error.GpuBusy;
 
         var beginInfo = std.mem.zeroes(vk.VkCommandBufferBeginInfo);
         beginInfo.sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         check(self.vk_ctx.vkBeginCommandBuffer.?(self.command_buffers[f], &beginInfo)) catch |err| {
             sys.print("[VULKAN] Error beginning command buffer: {any}\n", .{err});
-            return self.result_buffer[0..0];
+            return error.VulkanError;
         };
 
         self.vk_ctx.vkCmdBindPipeline.?(self.command_buffers[f], vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.compute_pipeline);
@@ -1767,7 +1832,7 @@ pub const VulkanEngine = struct {
         self.vk_ctx.vkCmdDispatch.?(self.command_buffers[f], (batch_size + (wg_size - 1)) / wg_size, 1, 1);
         check(self.vk_ctx.vkEndCommandBuffer.?(self.command_buffers[f])) catch |err| {
             sys.print("[VULKAN] Error ending command buffer: {any}\n", .{err});
-            return self.result_buffer[0..0];
+            return error.VulkanError;
         };
 
         var submitInfo = std.mem.zeroes(vk.VkSubmitInfo);
@@ -1776,23 +1841,26 @@ pub const VulkanEngine = struct {
         submitInfo.pCommandBuffers = &self.command_buffers[f];
         check(self.vk_ctx.vkQueueSubmit.?(self.queue, 1, &submitInfo, self.fences[f])) catch |err| {
             sys.print("[VULKAN] Error submitting queue: {any}\n", .{err});
-            return self.result_buffer[0..0];
+            return error.VulkanError;
         };
         self.advanceFrameSlot();
-        try self.waitForHardwareInterrupt(f);
+        return GpuJob{ .frame_idx = f, .kind = .batch, .result_len = batch_size };
+    }
 
-        ghostCopy(u32, self.result_buffer[0..batch_size], self.mapped_energy[f].?[0..batch_size]);
+    pub fn waitBatch(self: *VulkanEngine, job: GpuJob, batch_size: u32) ![]u32 {
+        try self.waitForHardwareInterrupt(job.frame_idx);
+        ghostCopy(u32, self.result_buffer[0..batch_size], self.mapped_energy[job.frame_idx].?[0..batch_size]);
         return self.result_buffer[0..batch_size];
     }
 
-    pub fn dispatchResonance(self: *VulkanEngine, lexical_rotor: u64, semantic_rotor: u64) ![]u32 {
+    pub fn dispatchResonance(self: *VulkanEngine, lexical_rotor: u64, semantic_rotor: u64) !GpuJob {
         beginGpuSubmit(self);
         defer endGpuSubmit(self);
 
         self.dispatch_mutex.lock();
         defer self.dispatch_mutex.unlock();
 
-        const f = try self.acquireFrameSlot();
+        const f = try self.acquireFrameSlotNonBlocking() orelse return error.GpuBusy;
 
         self.mapped_rotors[f].?[0] = lexical_rotor;
         self.mapped_rotors[f].?[1] = semantic_rotor;
@@ -1802,7 +1870,7 @@ pub const VulkanEngine = struct {
         beginInfo.sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         check(self.vk_ctx.vkBeginCommandBuffer.?(self.command_buffers[f], &beginInfo)) catch |err| {
             sys.print("[VULKAN] Error beginning command buffer in dispatchResonance: {any}\n", .{err});
-            return self.result_buffer[0..0];
+            return error.VulkanError;
         };
 
         self.vk_ctx.vkCmdBindPipeline.?(self.command_buffers[f], vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.compute_pipeline);
@@ -1814,7 +1882,7 @@ pub const VulkanEngine = struct {
         self.vk_ctx.vkCmdDispatch.?(self.command_buffers[f], (256 + (wg_size - 1)) / wg_size, 1, 1);
         check(self.vk_ctx.vkEndCommandBuffer.?(self.command_buffers[f])) catch |err| {
             sys.print("[VULKAN] Error ending command buffer in dispatchResonance: {any}\n", .{err});
-            return self.result_buffer[0..0];
+            return error.VulkanError;
         };
 
         var submitInfo = std.mem.zeroes(vk.VkSubmitInfo);
@@ -1823,16 +1891,133 @@ pub const VulkanEngine = struct {
         submitInfo.pCommandBuffers = &self.command_buffers[f];
         check(self.vk_ctx.vkQueueSubmit.?(self.queue, 1, &submitInfo, self.fences[f])) catch |err| {
             sys.print("[VULKAN] Error submitting queue in dispatchResonance: {any}\n", .{err});
-            return self.result_buffer[0..0];
+            return error.VulkanError;
         };
         self.advanceFrameSlot();
-        try self.waitForHardwareInterrupt(f);
+        return GpuJob{ .frame_idx = f, .kind = .resonance, .result_len = 256 };
+    }
 
-        ghostCopy(u32, self.result_buffer[0..256], self.mapped_energy[f].?[0..256]);
+    pub fn waitResonance(self: *VulkanEngine, job: GpuJob) ![]u32 {
+        try self.waitForHardwareInterrupt(job.frame_idx);
+        ghostCopy(u32, self.result_buffer[0..256], self.mapped_energy[job.frame_idx].?[0..256]);
         return self.result_buffer[0..256];
     }
 
-    pub fn dispatchResonanceBatched(self: *VulkanEngine, num_lanes: u32, rotor_pairs: []const u64) ![]u32 {
+    pub fn gemmaPipelinesReady(self: *const VulkanEngine) bool {
+        return self.gemma_rune_embed_pipeline != null and
+            self.gemma_matmul_q8_0_pipeline != null and
+            self.gemma_rms_norm_pipeline != null and
+            self.gemma_swiglu_pipeline != null and
+            self.gemma_attention_pipeline != null and
+            self.gemma_rune_project_pipeline != null;
+    }
+
+    pub fn recordGemmaForwardSchedule(
+        self: *VulkanEngine,
+        command_buffer: vk.VkCommandBuffer,
+        descriptor_set: vk.VkDescriptorSet,
+        schedule_config: GemmaForwardScheduleConfig,
+    ) !u32 {
+        if (!self.gemmaPipelinesReady()) return error.GemmaPipelinesUnavailable;
+        if (schedule_config.block_count != gemma_config.default_block_count) return error.UnsupportedGemmaBlockCount;
+        if (schedule_config.embedding_len != gemma_config.default_embedding_length) return error.UnsupportedGemmaEmbeddingLength;
+
+        var recorded: u32 = 0;
+        try self.cmdGemmaDispatchInvocations(
+            command_buffer,
+            descriptor_set,
+            self.gemma_rune_embed_pipeline,
+            .{ schedule_config.rune_count, schedule_config.embedding_len, self.matrix_slots - 1, schedule_config.embedding_len },
+            schedule_config.rune_count * schedule_config.embedding_len,
+            64,
+        );
+        recorded += 1;
+
+        var layer: u32 = 0;
+        while (layer < schedule_config.block_count) : (layer += 1) {
+            const ffn_dim = try schedule_config.ffnDim(layer);
+            const head_width = if (schedule_config.fullAttention(layer)) schedule_config.attention_key_length else schedule_config.attention_key_length_swa;
+            const value_width = if (schedule_config.fullAttention(layer)) schedule_config.attention_value_length else schedule_config.attention_value_length_swa;
+            const q_width = schedule_config.attention_head_count * head_width;
+            const kv_width = schedule_config.attention_head_count_kv * value_width;
+
+            try self.cmdGemmaDispatchGroups(command_buffer, descriptor_set, self.gemma_rms_norm_pipeline, .{ 1, schedule_config.embedding_len, 0, layer }, 1);
+            try self.cmdGemmaDispatchInvocations(command_buffer, descriptor_set, self.gemma_matmul_q8_0_pipeline, .{ q_width, schedule_config.embedding_len, 0, layer }, q_width, 64);
+            try self.cmdGemmaDispatchInvocations(command_buffer, descriptor_set, self.gemma_matmul_q8_0_pipeline, .{ kv_width, schedule_config.embedding_len, 0, layer }, kv_width, 64);
+            try self.cmdGemmaDispatchInvocations(command_buffer, descriptor_set, self.gemma_matmul_q8_0_pipeline, .{ kv_width, schedule_config.embedding_len, 0, layer }, kv_width, 64);
+            try self.cmdGemmaDispatchInvocations(command_buffer, descriptor_set, self.gemma_attention_pipeline, .{ schedule_config.top_k, schedule_config.embedding_len, 0, layer }, schedule_config.embedding_len, 64);
+            try self.cmdGemmaDispatchInvocations(command_buffer, descriptor_set, self.gemma_matmul_q8_0_pipeline, .{ schedule_config.embedding_len, q_width, 0, layer }, schedule_config.embedding_len, 64);
+            try self.cmdGemmaDispatchGroups(command_buffer, descriptor_set, self.gemma_rms_norm_pipeline, .{ 1, schedule_config.embedding_len, 0, layer }, 1);
+            try self.cmdGemmaDispatchGroups(command_buffer, descriptor_set, self.gemma_rms_norm_pipeline, .{ 1, schedule_config.embedding_len, 0, layer }, 1);
+            try self.cmdGemmaDispatchInvocations(command_buffer, descriptor_set, self.gemma_matmul_q8_0_pipeline, .{ ffn_dim, schedule_config.embedding_len, 0, layer }, ffn_dim, 64);
+            try self.cmdGemmaDispatchInvocations(command_buffer, descriptor_set, self.gemma_matmul_q8_0_pipeline, .{ ffn_dim, schedule_config.embedding_len, 0, layer }, ffn_dim, 64);
+            try self.cmdGemmaDispatchInvocations(command_buffer, descriptor_set, self.gemma_swiglu_pipeline, .{ ffn_dim, 0, 0, layer }, ffn_dim, 64);
+            try self.cmdGemmaDispatchInvocations(command_buffer, descriptor_set, self.gemma_matmul_q8_0_pipeline, .{ schedule_config.embedding_len, ffn_dim, 0, layer }, schedule_config.embedding_len, 64);
+            try self.cmdGemmaDispatchGroups(command_buffer, descriptor_set, self.gemma_rms_norm_pipeline, .{ 1, schedule_config.embedding_len, 0, layer }, 1);
+            try self.cmdGemmaDispatchGroups(command_buffer, descriptor_set, self.gemma_rms_norm_pipeline, .{ 1, schedule_config.embedding_len, 0, layer }, 1);
+            recorded += GEMMA_FORWARD_STAGES_PER_BLOCK;
+        }
+
+        const head_seed: u64 = 0x6765_6d6d_615f_6864;
+        try self.cmdGemmaDispatchGroups(command_buffer, descriptor_set, self.gemma_rune_project_pipeline, .{
+            schedule_config.embedding_len,
+            16,
+            @truncate(head_seed),
+            @intCast(head_seed >> 32),
+        }, 1);
+        recorded += 1;
+        return recorded;
+    }
+
+    fn cmdGemmaDispatchInvocations(
+        self: *VulkanEngine,
+        command_buffer: vk.VkCommandBuffer,
+        descriptor_set: vk.VkDescriptorSet,
+        pipeline: vk.VkPipeline,
+        pc: [4]u32,
+        invocations: u32,
+        local_size: u32,
+    ) !void {
+        const groups = (invocations + (local_size - 1)) / local_size;
+        try self.cmdGemmaDispatchGroups(command_buffer, descriptor_set, pipeline, pc, groups);
+    }
+
+    fn cmdGemmaDispatchGroups(
+        self: *VulkanEngine,
+        command_buffer: vk.VkCommandBuffer,
+        descriptor_set: vk.VkDescriptorSet,
+        pipeline: vk.VkPipeline,
+        pc: [4]u32,
+        groups: u32,
+    ) !void {
+        if (pipeline == null) return error.GemmaPipelinesUnavailable;
+        self.vk_ctx.vkCmdBindPipeline.?(command_buffer, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        self.vk_ctx.vkCmdBindDescriptorSets.?(command_buffer, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &descriptor_set, 0, null);
+        self.vk_ctx.vkCmdPushConstants.?(command_buffer, self.pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &pc);
+        self.vk_ctx.vkCmdDispatch.?(command_buffer, @max(groups, 1), 1, 1);
+        self.cmdGemmaBarrier(command_buffer);
+    }
+
+    fn cmdGemmaBarrier(self: *VulkanEngine, command_buffer: vk.VkCommandBuffer) void {
+        var barrier = std.mem.zeroes(vk.VkMemoryBarrier);
+        barrier.sType = vk.VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        barrier.srcAccessMask = vk.VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = vk.VK_ACCESS_SHADER_READ_BIT | vk.VK_ACCESS_SHADER_WRITE_BIT;
+        self.vk_ctx.vkCmdPipelineBarrier.?(
+            command_buffer,
+            vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0,
+            1,
+            &barrier,
+            0,
+            null,
+            0,
+            null,
+        );
+    }
+
+    pub fn dispatchResonanceBatched(self: *VulkanEngine, num_lanes: u32, rotor_pairs: []const u64) !GpuJob {
         beginGpuSubmit(self);
         defer endGpuSubmit(self);
 
@@ -1871,6 +2056,11 @@ pub const VulkanEngine = struct {
             }
         }
 
+        return GpuJob{ .frame_idx = 0, .kind = .inference_batch, .result_len = actual };
+    }
+
+    pub fn waitResonanceBatched(self: *VulkanEngine, job: GpuJob) ![]u32 {
+        const actual = @as(u32, @intCast(job.result_len));
         for (0..actual) |lane| try self.waitForInferenceInterrupt(lane);
         for (0..actual) |lane| ghostCopy(u32, self.result_buffer[lane * 256 .. (lane + 1) * 256], self.inf_mapped_energy[lane].?[0..256]);
 
@@ -1882,7 +2072,7 @@ pub const VulkanEngine = struct {
         lexical_rotor: u64,
         semantic_rotor: u64,
         candidates: []const u32,
-    ) ![]const u32 {
+    ) !GpuJob {
         // Layer 2a kernels only accelerate bounded scoring/filter sub-operations.
         // CPU Layer 2b remains authoritative for branch-heavy reasoning and all
         // final decisions, so callers must treat this as an accelerator only.
@@ -1919,10 +2109,13 @@ pub const VulkanEngine = struct {
         submitInfo.pCommandBuffers = &self.command_buffers[f];
         try check(self.vk_ctx.vkQueueSubmit.?(self.queue, 1, &submitInfo, self.fences[f]));
         self.advanceFrameSlot();
-        try self.waitForHardwareInterrupt(f);
+        return GpuJob{ .frame_idx = f, .kind = .layer2a_score, .result_len = candidates.len };
+    }
 
-        ghostCopy(u32, self.result_buffer[0..candidates.len], self.mapped_energy[f].?[0..candidates.len]);
-        return self.result_buffer[0..candidates.len];
+    pub fn waitLayer2aCandidateScores(self: *VulkanEngine, job: GpuJob) ![]const u32 {
+        try self.waitForHardwareInterrupt(job.frame_idx);
+        ghostCopy(u32, self.result_buffer[0..job.result_len], self.mapped_energy[job.frame_idx].?[0..job.result_len]);
+        return self.result_buffer[0..job.result_len];
     }
 
     pub fn dispatchLayer2aNeighborhoodScores(
@@ -2026,14 +2219,14 @@ pub const VulkanEngine = struct {
         };
     }
 
-    pub fn dispatchSemanticHashBatch(self: *VulkanEngine, block_seeds: []const u64) ![]const u32 {
+    pub fn dispatchSemanticHashBatch(self: *VulkanEngine, block_seeds: []const u64) !GpuJob {
         // Hash acceleration is metadata-only helper work for ingest/search
         // indexing. CPU verification and final corpus authority remain outside
         // this Vulkan dispatch.
         beginGpuSubmit(self);
         defer endGpuSubmit(self);
 
-        if (block_seeds.len == 0) return self.result_buffer[0..0];
+        if (block_seeds.len == 0) return GpuJob{ .frame_idx = std.math.maxInt(usize), .kind = .empty };
         if (block_seeds.len * 2 > self.result_buffer.len) return error.TooManyHashBlocks;
 
         self.dispatch_mutex.lock();
@@ -2062,21 +2255,24 @@ pub const VulkanEngine = struct {
         submitInfo.pCommandBuffers = &self.command_buffers[f];
         try check(self.vk_ctx.vkQueueSubmit.?(self.queue, 1, &submitInfo, self.fences[f]));
         self.advanceFrameSlot();
-        try self.waitForHardwareInterrupt(f);
-
-        const word_count = block_seeds.len * 2;
-        ghostCopy(u32, self.result_buffer[0..word_count], self.mapped_energy[f].?[0..word_count]);
-        return self.result_buffer[0..word_count];
+        return GpuJob{ .frame_idx = f, .kind = .semantic_hash, .result_len = block_seeds.len * 2 };
     }
 
-    pub fn dispatchLatticeQuery(self: *VulkanEngine, query_words: [gpu_lattice.VECTOR_WORDS]u32, runes: []const LatticeQueryRune) ![]const u32 {
+    pub fn waitSemanticHashBatch(self: *VulkanEngine, job: GpuJob) ![]const u32 {
+        if (job.frame_idx == std.math.maxInt(usize)) return self.result_buffer[0..0];
+        try self.waitForHardwareInterrupt(job.frame_idx);
+        ghostCopy(u32, self.result_buffer[0..job.result_len], self.mapped_energy[job.frame_idx].?[0..job.result_len]);
+        return self.result_buffer[0..job.result_len];
+    }
+
+    pub fn dispatchLatticeQuery(self: *VulkanEngine, query_words: [gpu_lattice.VECTOR_WORDS]u32, runes: []const LatticeQueryRune) !GpuJob {
         // LATTICE_QUERY is a routing primitive only. The shader returns raw
         // Hamming distances; proof, support, and answer authority stay in the
         // caller's CPU-side verifier.
         beginGpuSubmit(self);
         defer endGpuSubmit(self);
 
-        if (runes.len == 0) return self.result_buffer[0..0];
+        if (runes.len == 0) return GpuJob{ .frame_idx = std.math.maxInt(usize), .kind = .empty };
         if (runes.len > self.result_buffer.len) return error.TooManyLatticeRunes;
         if (runes.len * @sizeOf(LatticeQueryRune) > self.general_ingest_size) return error.TooManyLatticeRunes;
 
@@ -2110,13 +2306,145 @@ pub const VulkanEngine = struct {
         submitInfo.pCommandBuffers = &self.command_buffers[f];
         try check(self.vk_ctx.vkQueueSubmit.?(self.queue, 1, &submitInfo, self.fences[f]));
         self.advanceFrameSlot();
-        try self.waitForHardwareInterrupt(f);
-
-        ghostCopy(u32, self.result_buffer[0..runes.len], self.mapped_energy[f].?[0..runes.len]);
-        return self.result_buffer[0..runes.len];
+        return GpuJob{ .frame_idx = f, .kind = .lattice_query, .result_len = runes.len };
     }
 
-    pub fn dispatchCorpusScan(
+    pub fn waitLatticeQuery(self: *VulkanEngine, job: GpuJob) ![]const u32 {
+        if (job.frame_idx == std.math.maxInt(usize)) return self.result_buffer[0..0];
+        try self.waitForHardwareInterrupt(job.frame_idx);
+        ghostCopy(u32, self.result_buffer[0..job.result_len], self.mapped_energy[job.frame_idx].?[0..job.result_len]);
+        return self.result_buffer[0..job.result_len];
+    }
+
+    pub const GpuJob = struct {
+        frame_idx: usize,
+        kind: GpuJobKind = .unknown,
+        result_len: usize = 0,
+    };
+
+    pub const GpuJobKind = enum {
+        unknown,
+        empty,
+        batch,
+        resonance,
+        resonance_batched,
+        inference_batch,
+        semantic_hash,
+        lattice_query,
+        rune_search,
+        corpus_scan,
+        layer2a_score,
+    };
+
+    pub const RuneSearchResult = struct {
+        slot: u32,
+        distance: u32,
+        candidates_checked: u32,
+    };
+
+    pub const GpuState = union(enum) {
+        Pending,
+        Empty,
+        RuneSearchReady: RuneSearchResult,
+        CorpusScanReady: []const u32,
+    };
+
+    pub fn dispatchRuneSearchAsync(self: *VulkanEngine, query: vsa_core.HyperVector, min_rank: u32, distance_threshold: u32) !GpuJob {
+        beginGpuSubmit(self);
+        defer endGpuSubmit(self);
+
+        self.dispatch_mutex.lock();
+        defer self.dispatch_mutex.unlock();
+
+        const f = try self.acquireFrameSlotNonBlocking() orelse return error.GpuBusy;
+
+        // 1. Write query vector to rotor_buffers[f] (Binding 1)
+        const query_dst: [*]u32 = @ptrCast(@alignCast(self.mapped_rotors[f].?));
+        ghostCopy(u32, query_dst[0..32], @as([*]const u32, @ptrCast(&query))[0..32]);
+
+        // 2. Clear index_buffers[f] (Binding 3) for results
+        // Results struct: best_slot, best_distance, candidates_checked
+        const result_dst: [*]u32 = @ptrCast(@alignCast(self.mapped_index[f].?));
+        result_dst[0] = 0xFFFFFFFF; // best_slot
+        result_dst[1] = 0xFFFFFFFF; // best_distance
+        result_dst[2] = 0; // candidates_checked
+
+        var beginInfo = std.mem.zeroes(vk.VkCommandBufferBeginInfo);
+        beginInfo.sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        try check(self.vk_ctx.vkBeginCommandBuffer.?(self.command_buffers[f], &beginInfo));
+
+        self.vk_ctx.vkCmdBindPipeline.?(self.command_buffers[f], vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.rune_search_pipeline);
+        self.vk_ctx.vkCmdBindDescriptorSets.?(self.command_buffers[f], vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &self.descriptor_sets[f], 0, null);
+
+        // Push constants: start_slot, slot_count, min_rank, distance_threshold
+        const pc = [_]u32{ 0, self.matrix_slots, min_rank, distance_threshold };
+        self.vk_ctx.vkCmdPushConstants.?(self.command_buffers[f], self.pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &pc);
+
+        // Dispatch (256 threads per workgroup)
+        const wg_size: u32 = 256;
+        self.vk_ctx.vkCmdDispatch.?(self.command_buffers[f], (self.matrix_slots + (wg_size - 1)) / wg_size, 1, 1);
+        try check(self.vk_ctx.vkEndCommandBuffer.?(self.command_buffers[f]));
+
+        var submitInfo = std.mem.zeroes(vk.VkSubmitInfo);
+        submitInfo.sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &self.command_buffers[f];
+        try check(self.vk_ctx.vkQueueSubmit.?(self.queue, 1, &submitInfo, self.fences[f]));
+        self.advanceFrameSlot();
+
+        return GpuJob{ .frame_idx = f, .kind = .rune_search, .result_len = 3 };
+    }
+
+    pub fn waitRuneSearch(self: *VulkanEngine, job: GpuJob) !RuneSearchResult {
+        try self.waitForHardwareInterrupt(job.frame_idx);
+
+        const result_dst: [*]u32 = @ptrCast(@alignCast(self.mapped_index[job.frame_idx].?));
+        return RuneSearchResult{
+            .slot = result_dst[0],
+            .distance = result_dst[1],
+            .candidates_checked = result_dst[2],
+        };
+    }
+
+    pub fn pollRuneSearch(self: *VulkanEngine, job: GpuJob) !?RuneSearchResult {
+        return switch (try self.checkGpuStatus(job)) {
+            .Pending, .Empty, .CorpusScanReady => null,
+            .RuneSearchReady => |result| result,
+        };
+    }
+
+    pub fn checkGpuStatus(self: *VulkanEngine, job: GpuJob) !GpuState {
+        if (job.kind == .empty or job.frame_idx == std.math.maxInt(usize)) return .Empty;
+        if (job.frame_idx >= FRAME_COUNT) return error.InvalidGpuJob;
+
+        const status = self.vk_ctx.vkGetFenceStatus.?(self.dev, self.fences[job.frame_idx]);
+        if (status == vk.VK_NOT_READY) return .Pending;
+        if (status != vk.VK_SUCCESS) return error.HardwareSyncFailed;
+
+        return switch (job.kind) {
+            .rune_search => blk: {
+                const result_dst: [*]u32 = @ptrCast(@alignCast(self.mapped_index[job.frame_idx].?));
+                break :blk GpuState{ .RuneSearchReady = .{
+                    .slot = result_dst[0],
+                    .distance = result_dst[1],
+                    .candidates_checked = result_dst[2],
+                } };
+            },
+            .corpus_scan => blk: {
+                ghostCopy(u32, self.result_buffer[0..job.result_len], self.mapped_energy[job.frame_idx].?[0..job.result_len]);
+                self.updateDescriptorSets(@intCast(job.frame_idx));
+                break :blk GpuState{ .CorpusScanReady = self.result_buffer[0..job.result_len] };
+            },
+            .empty => .Empty,
+            .batch, .resonance, .resonance_batched, .inference_batch, .layer2a_score, .semantic_hash, .lattice_query, .unknown => error.InvalidGpuJob,
+        };
+    }
+
+    pub fn dispatchRuneSearch(self: *VulkanEngine, query: vsa_core.HyperVector, min_rank: u32, distance_threshold: u32) !GpuJob {
+        return try self.dispatchRuneSearchAsync(query, min_rank, distance_threshold);
+    }
+
+    pub fn dispatchCorpusScanAsync(
         self: *VulkanEngine,
         resident: *const ResidentBuffer,
         entries: []const CorpusScanEntry,
@@ -2126,7 +2454,7 @@ pub const VulkanEngine = struct {
         bias_multiplier_per_mille: u32,
         query_relation_hash: u64,
         inverse_relation_hash: u64,
-    ) ![]const u32 {
+    ) !GpuJob {
         // GPU corpus scan ranks resident shard entries by deterministic
         // SimHash resonance. CPU callers may render snippets and enforce
         // policy, but should not perform the hot full-shard scoring loop.
@@ -2134,14 +2462,14 @@ pub const VulkanEngine = struct {
         defer endGpuSubmit(self);
 
         if (resident.buffer == null or resident.size_bytes == 0) return error.EmptyResidentCorpus;
-        if (entries.len == 0) return self.result_buffer[0..0];
+        if (entries.len == 0) return GpuJob{ .frame_idx = std.math.maxInt(usize), .kind = .empty };
         if (entries.len > CORPUS_SCAN_MAX_ENTRIES) return error.TooManyCorpusEntries;
         if (entries.len > self.result_buffer.len) return error.TooManyCorpusEntries;
 
         self.dispatch_mutex.lock();
         defer self.dispatch_mutex.unlock();
 
-        const f = try self.acquireFrameSlot();
+        const f = try self.acquireFrameSlotNonBlocking() orelse return error.GpuBusy;
         ghostCopy(CorpusScanEntry, self.mapped_corpus_entries[f].?[0..entries.len], entries);
         var term_lens = [_]u32{0} ** CORPUS_SCAN_MAX_TERMS;
         const query_word_count = (CORPUS_SCAN_MAX_TERMS * CORPUS_SCAN_TERM_BYTES + @sizeOf(u64) - 1) / @sizeOf(u64);
@@ -2205,11 +2533,42 @@ pub const VulkanEngine = struct {
         submitInfo.pCommandBuffers = &self.command_buffers[f];
         try check(self.vk_ctx.vkQueueSubmit.?(self.queue, 1, &submitInfo, self.fences[f]));
         self.advanceFrameSlot();
-        try self.waitForHardwareInterrupt(f);
 
-        ghostCopy(u32, self.result_buffer[0..entries.len], self.mapped_energy[f].?[0..entries.len]);
-        self.updateDescriptorSets(@intCast(f));
-        return self.result_buffer[0..entries.len];
+        return GpuJob{ .frame_idx = f, .kind = .corpus_scan, .result_len = entries.len };
+    }
+
+    pub fn waitCorpusScan(self: *VulkanEngine, job: GpuJob, entries_len: usize) ![]const u32 {
+        if (job.frame_idx == std.math.maxInt(usize)) return self.result_buffer[0..0];
+        try self.waitForHardwareInterrupt(job.frame_idx);
+
+        ghostCopy(u32, self.result_buffer[0..entries_len], self.mapped_energy[job.frame_idx].?[0..entries_len]);
+        self.updateDescriptorSets(@intCast(job.frame_idx));
+        return self.result_buffer[0..entries_len];
+    }
+
+    pub fn pollCorpusScan(self: *VulkanEngine, job: GpuJob, entries_len: usize) !?[]const u32 {
+        if (job.frame_idx == std.math.maxInt(usize)) return self.result_buffer[0..0];
+        const is_ready = try self.pollHardwareInterrupt(job.frame_idx);
+        if (!is_ready) return null;
+
+        ghostCopy(u32, self.result_buffer[0..entries_len], self.mapped_energy[job.frame_idx].?[0..entries_len]);
+        self.updateDescriptorSets(@intCast(job.frame_idx));
+        return self.result_buffer[0..entries_len];
+    }
+
+    pub fn dispatchCorpusScan(
+        self: *VulkanEngine,
+        resident: *const ResidentBuffer,
+        entries: []const CorpusScanEntry,
+        terms: []const []const u8,
+        query_hash: u64,
+        bias_hash: u64,
+        bias_multiplier_per_mille: u32,
+        query_relation_hash: u64,
+        inverse_relation_hash: u64,
+    ) ![]const u32 {
+        const job = try self.dispatchCorpusScanAsync(resident, entries, terms, query_hash, bias_hash, bias_multiplier_per_mille, query_relation_hash, inverse_relation_hash);
+        return self.waitCorpusScan(job, entries.len);
     }
 
     pub fn dispatchEtch(self: *VulkanEngine, batch_size: u32) !void {
@@ -2389,6 +2748,10 @@ pub const VulkanEngine = struct {
         return self.mapped_tags.?[0..self.matrix_slots];
     }
 
+    pub fn getRanksData(self: *VulkanEngine) []u8 {
+        return self.mapped_rune_ranks.?[0..self.matrix_slots];
+    }
+
     pub fn getLatticeData(self: *VulkanEngine) []u16 {
         return self.mapped_lattice.?[0 .. self.gpu_lattice_size / @sizeOf(u16)];
     }
@@ -2422,10 +2785,16 @@ pub const VulkanEngine = struct {
         return edges[0 .. @as(usize, self.matrix_slots) * 16];
     }
 
-    pub fn bindHostState(self: *VulkanEngine, host_matrix: []u32, host_tags: []u64, host_lattice: []u16) void {
+    pub fn bindHostState(self: *VulkanEngine, host_matrix: []u32, host_tags: []u64, host_ranks: []u8, host_lattice: []u16) void {
         self.host_matrix = host_matrix;
         self.host_tags = host_tags;
+        self.host_ranks = host_ranks;
         self.host_lattice = host_lattice;
+
+        if (self.mapped_rune_ranks) |dst| {
+            const len = @min(host_ranks.len, self.matrix_slots);
+            @memcpy(dst[0..len], host_ranks[0..len]);
+        }
 
         if (self.mapped_matrix) |dst| {
             const len = @min(host_matrix.len, self.matrix_slots * 1024);
@@ -2545,7 +2914,7 @@ pub const VulkanEngine = struct {
         try self.transferLatticeToHostWithTimeout(host_lattice, FENCE_TIMEOUT_NS);
     }
 
-    pub fn syncDeviceToHost(self: *VulkanEngine, host_matrix: []u32, host_tags: []u64, host_lattice: []u16) !void {
+    pub fn syncDeviceToHost(self: *VulkanEngine, host_matrix: []u32, host_tags: []u64, host_ranks: []u8, host_lattice: []u16) !void {
         waitForGpuWorkersDrained(self);
         try waitForAllHardwareInterruptsWithTimeout(self, SHUTDOWN_FENCE_TIMEOUT_NS);
         if (self.mapped_matrix) |src| {
@@ -2556,8 +2925,13 @@ pub const VulkanEngine = struct {
             const len = @min(host_tags.len, self.matrix_slots);
             @memcpy(host_tags[0..len], src[0..len]);
         }
+        if (self.mapped_rune_ranks) |src| {
+            const len = @min(host_ranks.len, self.matrix_slots);
+            @memcpy(host_ranks[0..len], src[0..len]);
+        }
         self.host_matrix = host_matrix;
         self.host_tags = host_tags;
+        self.host_ranks = host_ranks;
         self.host_lattice = host_lattice;
         try self.transferLatticeToHostWithTimeout(host_lattice, SHUTDOWN_FENCE_TIMEOUT_NS);
         if (builtin.os.tag == .linux) {
@@ -2623,6 +2997,17 @@ pub const VulkanEngine = struct {
         try self.waitForHardwareInterruptWithTimeout(f_idx, FENCE_TIMEOUT_NS);
     }
 
+    pub fn pollHardwareInterrupt(self: *VulkanEngine, f_idx: usize) !bool {
+        const status = self.vk_ctx.vkGetFenceStatus.?(self.dev, self.fences[f_idx]);
+        if (status == vk.VK_SUCCESS) {
+            return true;
+        } else if (status == vk.VK_NOT_READY) {
+            return false;
+        } else {
+            return error.HardwareSyncFailed;
+        }
+    }
+
     fn recycleHardwareFence(self: *VulkanEngine, f_idx: usize) !void {
         try self.waitForHardwareInterrupt(f_idx);
         const reset_res = self.vk_ctx.vkResetFences.?(self.dev, 1, &self.fences[f_idx]);
@@ -2655,6 +3040,21 @@ pub const VulkanEngine = struct {
         const f: usize = self.frame_idx;
         try self.recycleHardwareFence(f);
         return f;
+    }
+
+    fn acquireFrameSlotNonBlocking(self: *VulkanEngine) !?usize {
+        var attempts: usize = 0;
+        while (attempts < FRAME_COUNT) : (attempts += 1) {
+            const f: usize = (self.frame_idx + attempts) % FRAME_COUNT;
+            const status = self.vk_ctx.vkGetFenceStatus.?(self.dev, self.fences[f]);
+            if (status == vk.VK_NOT_READY) continue;
+            if (status != vk.VK_SUCCESS) return error.HardwareSyncFailed;
+            const reset_res = self.vk_ctx.vkResetFences.?(self.dev, 1, &self.fences[f]);
+            if (reset_res != vk.VK_SUCCESS) return error.FenceResetFailed;
+            self.frame_idx = @intCast(f);
+            return f;
+        }
+        return null;
     }
 
     fn advanceFrameSlot(self: *VulkanEngine) void {
@@ -2775,6 +3175,19 @@ test "ghost index pruning skips far simhash blocks" {
     try std.testing.expect(summary.retained_blocks >= 1);
     try std.testing.expect(!shouldSkipGhostIndexBlock(query_hash, blocks[0]));
     try std.testing.expect(ghostIndexNearnessPerMille(0, std.math.maxInt(u64)) < GHOST_INDEX_SKIP_THRESHOLD_PER_MILLE);
+}
+
+test "Gemma Vulkan forward recorder rejects missing pipelines before command recording" {
+    var engine: VulkanEngine = undefined;
+    engine.gemma_rune_embed_pipeline = null;
+    engine.gemma_matmul_q4k_pipeline = null;
+    engine.gemma_matmul_q8_0_pipeline = null;
+    engine.gemma_rms_norm_pipeline = null;
+    engine.gemma_swiglu_pipeline = null;
+    engine.gemma_attention_pipeline = null;
+    engine.gemma_rune_project_pipeline = null;
+    try std.testing.expect(!engine.gemmaPipelinesReady());
+    try std.testing.expectError(error.GemmaPipelinesUnavailable, engine.recordGemmaForwardSchedule(null, null, .{}));
 }
 
 test "SPO vectorization distinguishes directed inverse relations" {

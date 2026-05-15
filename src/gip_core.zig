@@ -808,6 +808,7 @@ pub const IMPLEMENTED_KINDS = [_]RequestKind{
     .@"curiosity.status",
     .@"hive.status",
     .@"recursive_boot.status",
+    .@"intent.ground",
     .@"artifact.read",
     .@"artifact.list",
     .@"artifact.policy.describe",

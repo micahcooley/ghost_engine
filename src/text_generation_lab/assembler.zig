@@ -61,30 +61,12 @@ pub fn assemblePredicateDraft(allocator: std.mem.Allocator, input: AssemblyInput
 pub fn assembleVoidDraft(allocator: std.mem.Allocator, input: VoidInput) ![]u8 {
     var out = std.ArrayList(u8).init(allocator);
     errdefer out.deinit();
-    const subject = semanticSubject(input.query);
-    const variant = hashChoice(input.query, input.shard_hint orelse "", 3);
-    switch (variant) {
-        0 => {
-            try out.appendSlice("No extractable predicate was found");
-            if (subject.len != 0) {
-                try out.appendSlice(" for ");
-                try appendBoundPhrase(&out, subject);
-            }
-        },
-        1 => {
-            try out.appendSlice("The query resolved to a semantic void");
-            if (subject.len != 0) {
-                try out.appendSlice(" around ");
-                try appendBoundPhrase(&out, subject);
-            }
-        },
-        else => {
-            try out.appendSlice("The current shard did not yield a subject-predicate-object concept");
-            if (subject.len != 0) {
-                try out.appendSlice(" for ");
-                try appendBoundPhrase(&out, subject);
-            }
-        },
+    const keyword = singleConceptKeyword(input.query);
+    if (keyword.len == 0) {
+        try out.appendSlice("The query resolved to a semantic void");
+    } else {
+        try out.appendSlice("The query resolved to a semantic void after single-concept VSA search for ");
+        try appendBoundPhrase(&out, keyword);
     }
     try finishSentence(&out);
     return out.toOwnedSlice();
@@ -150,6 +132,10 @@ fn finishSentence(out: *std.ArrayList(u8)) !void {
 }
 
 fn semanticSubject(query: []const u8) []const u8 {
+    return singleConceptKeyword(query);
+}
+
+pub fn singleConceptKeyword(query: []const u8) []const u8 {
     var start: ?usize = null;
     var best: []const u8 = "";
     var idx: usize = 0;
@@ -162,7 +148,7 @@ fn semanticSubject(query: []const u8) []const u8 {
         }
         if (start) |s| {
             const term = query[s..idx];
-            if (term.len >= 3 and !isQuestionWord(term)) best = term;
+            if (term.len >= 3 and term.len >= best.len and !isQuestionWord(term)) best = term;
             start = null;
         }
     }
@@ -182,4 +168,12 @@ test "assembler renders predicate without canned subject response" {
     const text = try assemblePredicateDraft(allocator, .{ .query = "who is albert einstein", .concept = parsed });
     defer allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "physicist") != null);
+}
+
+test "assembler falls back to single concept instead of predicate failure" {
+    const allocator = std.testing.allocator;
+    const text = try assembleVoidDraft(allocator, .{ .query = "what is a ghost", .shard_hint = null });
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ghost") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "No extractable predicate") == null);
 }

@@ -35,27 +35,12 @@ fn makeGoldenSoul(allocator: std.mem.Allocator, payload: GoldenPayload) !ghost_s
     var soul = try ghost_state.GhostSoul.init(allocator);
     soul.lexical_rotor = payload.lexical;
     soul.semantic_rotor = payload.semantic;
-    soul.spatial_rotor = vsa.HyperRotor.init(payload.lexical ^ payload.semantic);
-    soul.spatial_rotor.evolve(payload.rune);
+    soul.spatial_rotor = vsa.generate(payload.lexical ^ payload.semantic);
     return soul;
 }
 
-fn cpuProjectSpatialSignature(rotor: vsa.HyperRotor) u32 {
-    var result: u32 = 0;
-    const state: [16]u64 = rotor.state;
-    for (0..16) |i| {
-        const word = state[i];
-        const lo = @as(u32, @truncate(word));
-        if (@popCount(lo) > 16) result |= (@as(u32, 1) << @as(u5, @intCast(i * 2)));
-
-        const hi = @as(u32, @truncate(word >> 32));
-        if (@popCount(hi) > 16) result |= (@as(u32, 1) << @as(u5, @intCast(i * 2 + 1)));
-    }
-    return result;
-}
-
-fn cpuFindSlot(rotor: vsa.HyperRotor, uniform_hash: u64, num_slots: u32) ?u32 {
-    const spatial_sig = cpuProjectSpatialSignature(rotor);
+fn cpuFindSlot(spatial_rotor: vsa.HyperVector, uniform_hash: u64, num_slots: u32) ?u32 {
+    const spatial_sig = vsa.projectSpatialSignature(spatial_rotor);
     const wide = @as(u64, spatial_sig) *% @as(u64, num_slots);
     const base_slot = @as(u32, @truncate(wide >> 32)) & ~@as(u32, vsa.SUDH_NEIGHBORHOOD_SIZE - 1);
     const raw_stride = @as(u32, @truncate(uniform_hash >> 32));
@@ -70,13 +55,13 @@ fn cpuFindSlot(rotor: vsa.HyperRotor, uniform_hash: u64, num_slots: u32) ?u32 {
     return null;
 }
 
-fn cpuEtchSlotFull(meaning: *vsa.MeaningMatrix, rotor: vsa.HyperRotor, uniform_hash: u64, target_char: u32) !u32 {
+fn cpuEtchSlotFull(meaning: *vsa.MeaningMatrix, spatial_rotor: vsa.HyperVector, uniform_hash: u64, target_char: u32) !u32 {
     const num_slots: u32 = @intCast(meaning.tags.?.len);
-    const slot_idx = cpuFindSlot(rotor, uniform_hash, num_slots) orelse return error.NoSlot;
+    const slot_idx = cpuFindSlot(spatial_rotor, uniform_hash, num_slots) orelse return error.NoSlot;
 
     var claimed = false;
     var p: u32 = 0;
-    const spatial_sig = cpuProjectSpatialSignature(rotor);
+    const spatial_sig = vsa.projectSpatialSignature(spatial_rotor);
     const wide = @as(u64, spatial_sig) *% @as(u64, num_slots);
     const base_slot = @as(u32, @truncate(wide >> 32)) & ~@as(u32, vsa.SUDH_NEIGHBORHOOD_SIZE - 1);
     const raw_stride = @as(u32, @truncate(uniform_hash >> 32));
@@ -282,7 +267,7 @@ fn makeSnapshot(
 ) WindowsParityGolden {
     const lexical_hv: vsa.HyperVector = @bitCast(lexical_vector);
     const semantic_hv: vsa.HyperVector = @bitCast(semantic_vector);
-    const rotor_state: [16]u64 = @bitCast(soul.spatial_rotor.state);
+    const rotor_state: [16]u64 = @bitCast(soul.spatial_rotor);
     const resonance = vsa.calculateResonance(lexical_hv, semantic_hv);
     const drift = vsa.dualDriftCheck(lexical_hv, semantic_hv, 512, 512);
     return .{
@@ -390,7 +375,7 @@ test "single-rune CPU and GPU etch agree bit-for-bit" {
 
     trace.begin("prepare gpu dispatch");
     var rotors: [18]u64 = undefined;
-    const spatial_state: [16]u64 = soul.spatial_rotor.state;
+    const spatial_state: [16]u64 = @bitCast(soul.spatial_rotor);
     @memcpy(rotors[0..16], spatial_state[0..16]);
     rotors[16] = payload.lexical;
     rotors[17] = payload.semantic;

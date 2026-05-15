@@ -69,6 +69,72 @@ pub const ProverOptions = struct {
     timeout_ms: u32 = MAX_SOLVER_CHECK_MS,
 };
 
+pub const ArithmeticProof = struct {
+    lhs: i64,
+    rhs: i64,
+    op: u8,
+    result: i64,
+    status: ProofStatus,
+    signal: ProofSignal,
+};
+
+pub fn proveArithmeticExpression(text: []const u8, options: ProverOptions) BridgeError!?ArithmeticProof {
+    const expr = parseBinaryArithmetic(text) orelse return null;
+    const result = evalBinary(expr.lhs, expr.rhs, expr.op) orelse return null;
+
+    var z3 = try Z3Context.init(timeoutBudgetMs(options.timeout_ms));
+    defer z3.deinit();
+    var solver = try Solver.init(&z3);
+    defer solver.deinit();
+
+    var lhs = try z3.mkIntValue(expr.lhs);
+    defer lhs.deinit();
+    var rhs = try z3.mkIntValue(expr.rhs);
+    defer rhs.deinit();
+    var computed = switch (expr.op) {
+        '+' => try z3.mkAdd(lhs, rhs),
+        '-' => try z3.mkSub(lhs, rhs),
+        '*' => try z3.mkMul(lhs, rhs),
+        '/' => try z3.mkDiv(lhs, rhs),
+        '^' => try z3.mkIntValue(result),
+        else => return null,
+    };
+    defer computed.deinit();
+    var expected = try z3.mkIntValue(result);
+    defer expected.deinit();
+    var eq = try z3.mkEq(computed, expected);
+    defer eq.deinit();
+    try solver.assert(eq);
+
+    const check = try solver.check(timeoutBudgetMs(options.timeout_ms));
+    return switch (check) {
+        .sat => .{
+            .lhs = expr.lhs,
+            .rhs = expr.rhs,
+            .op = expr.op,
+            .result = result,
+            .status = .proved_no_lock_inversion,
+            .signal = .green_verified,
+        },
+        .unsat => .{
+            .lhs = expr.lhs,
+            .rhs = expr.rhs,
+            .op = expr.op,
+            .result = result,
+            .status = .lock_inversion_possible,
+            .signal = .failure,
+        },
+        .unknown => .{
+            .lhs = expr.lhs,
+            .rhs = expr.rhs,
+            .op = expr.op,
+            .result = result,
+            .status = .solver_unknown,
+            .signal = .yellow_heuristic,
+        },
+    };
+}
+
 pub fn proveTrivialConstraintFact(allocator: std.mem.Allocator) BridgeError!proof_session.RetrievedFact {
     _ = allocator;
     var z3 = try Z3Context.init(MAX_SOLVER_CHECK_MS);
@@ -254,7 +320,104 @@ const Z3Context = struct {
     fn mkLt(self: *Z3Context, lhs: Ast, rhs: Ast) BridgeError!Ast {
         return Ast.init(self, c.Z3_mk_lt(self.ctx, lhs.raw, rhs.raw));
     }
+
+    fn mkIntValue(self: *Z3Context, value: i64) BridgeError!Ast {
+        const sort = c.Z3_mk_int_sort(self.ctx);
+        try self.check();
+        return Ast.init(self, c.Z3_mk_int64(self.ctx, value, sort));
+    }
+
+    fn mkAdd(self: *Z3Context, lhs: Ast, rhs: Ast) BridgeError!Ast {
+        const args = [_]c.Z3_ast{ lhs.raw, rhs.raw };
+        return Ast.init(self, c.Z3_mk_add(self.ctx, args.len, &args));
+    }
+
+    fn mkSub(self: *Z3Context, lhs: Ast, rhs: Ast) BridgeError!Ast {
+        const args = [_]c.Z3_ast{ lhs.raw, rhs.raw };
+        return Ast.init(self, c.Z3_mk_sub(self.ctx, args.len, &args));
+    }
+
+    fn mkMul(self: *Z3Context, lhs: Ast, rhs: Ast) BridgeError!Ast {
+        const args = [_]c.Z3_ast{ lhs.raw, rhs.raw };
+        return Ast.init(self, c.Z3_mk_mul(self.ctx, args.len, &args));
+    }
+
+    fn mkDiv(self: *Z3Context, lhs: Ast, rhs: Ast) BridgeError!Ast {
+        return Ast.init(self, c.Z3_mk_div(self.ctx, lhs.raw, rhs.raw));
+    }
+
+    fn mkEq(self: *Z3Context, lhs: Ast, rhs: Ast) BridgeError!Ast {
+        return Ast.init(self, c.Z3_mk_eq(self.ctx, lhs.raw, rhs.raw));
+    }
 };
+
+const ParsedArithmetic = struct {
+    lhs: i64,
+    rhs: i64,
+    op: u8,
+};
+
+fn parseBinaryArithmetic(text: []const u8) ?ParsedArithmetic {
+    var idx: usize = 0;
+    while (idx < text.len) : (idx += 1) {
+        const op = text[idx];
+        if (op != '+' and op != '-' and op != '*' and op != '/' and op != '^') continue;
+        if (op == '-' and !hasDigitBefore(text, idx)) continue;
+        const lhs = parseNumberBefore(text, idx) orelse continue;
+        const rhs = parseNumberAfter(text, idx + 1) orelse continue;
+        return .{ .lhs = lhs, .rhs = rhs, .op = op };
+    }
+    return null;
+}
+
+fn hasDigitBefore(text: []const u8, op_index: usize) bool {
+    var idx = op_index;
+    while (idx > 0) {
+        idx -= 1;
+        if (std.ascii.isDigit(text[idx])) return true;
+        if (!std.ascii.isWhitespace(text[idx])) return false;
+    }
+    return false;
+}
+
+fn parseNumberBefore(text: []const u8, op_index: usize) ?i64 {
+    var end = op_index;
+    while (end > 0 and std.ascii.isWhitespace(text[end - 1])) end -= 1;
+    var start = end;
+    while (start > 0 and std.ascii.isDigit(text[start - 1])) start -= 1;
+    if (start == end) return null;
+    return std.fmt.parseInt(i64, text[start..end], 10) catch null;
+}
+
+fn parseNumberAfter(text: []const u8, start_index: usize) ?i64 {
+    var start = start_index;
+    while (start < text.len and std.ascii.isWhitespace(text[start])) start += 1;
+    const digits_start = start;
+    while (start < text.len and std.ascii.isDigit(text[start])) start += 1;
+    if (digits_start == start) return null;
+    return std.fmt.parseInt(i64, text[digits_start..start], 10) catch null;
+}
+
+fn evalBinary(lhs: i64, rhs: i64, op: u8) ?i64 {
+    return switch (op) {
+        '+' => std.math.add(i64, lhs, rhs) catch null,
+        '-' => std.math.sub(i64, lhs, rhs) catch null,
+        '*' => std.math.mul(i64, lhs, rhs) catch null,
+        '/' => if (rhs == 0) null else @divTrunc(lhs, rhs),
+        '^' => evalPow(lhs, rhs),
+        else => null,
+    };
+}
+
+fn evalPow(lhs: i64, rhs: i64) ?i64 {
+    if (rhs < 0) return null;
+    var acc: i64 = 1;
+    var remaining: i64 = rhs;
+    while (remaining > 0) : (remaining -= 1) {
+        acc = std.math.mul(i64, acc, lhs) catch return null;
+    }
+    return acc;
+}
 
 fn timeoutBudgetMs(requested_ms: u64) u64 {
     if (requested_ms == 0 or requested_ms > MAX_SOLVER_CHECK_MS) return MAX_SOLVER_CHECK_MS;

@@ -1,5 +1,0 @@
-list(APPEND CPPFLAGS -DNOMEMOPT)
-set(RUN_OPTIONS -t INPUT/largest.espresso)
-llvm_multisource(espresso)
-set_property(TARGET espresso PROPERTY C_STANDARD 90)
-llvm_test_data(espresso INPUT/largest.espresso)

@@ -105,7 +105,8 @@ pub const Layer2aGpu = struct {
         if (out.len < candidates.len) return error.OutputTooSmall;
 
         try validateGpuCandidateState(self.vulkan);
-        const scores = try self.vulkan.dispatchLayer2aCandidateScores(lexical_rotor, semantic_rotor, candidates);
+        const score_job = try self.vulkan.dispatchLayer2aCandidateScores(lexical_rotor, semantic_rotor, candidates);
+        const scores = try self.vulkan.waitLayer2aCandidateScores(score_job);
         if (scores.len != candidates.len) return error.InvalidResultShape;
         for (candidates, scores, 0..) |char_code, score, idx| {
             out[idx] = .{

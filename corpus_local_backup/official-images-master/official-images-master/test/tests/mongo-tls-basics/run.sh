@@ -1,1 +1,0 @@
-../mongo-basics/run.sh

@@ -3,42 +3,51 @@
 // ──────────────────────────────────────────────────────────────────────────
 
 const std = @import("std");
+const deps = @import("gip/deps.zig");
 const core = @import("gip_core.zig");
 const schema = @import("gip_schema.zig");
 const validation = @import("gip_validation.zig");
-const conversation_session = @import("conversation_session.zig");
-const response_engine = @import("response_engine.zig");
-const hypothesis_core = @import("hypothesis_core.zig");
-const verifier_adapter = @import("verifier_adapter.zig");
-const verifier_candidates = @import("verifier_candidates.zig");
-const verifier_candidate_execution = @import("verifier_candidate_execution.zig");
-const knowledge_packs = @import("knowledge_packs.zig");
-const knowledge_pack_store = @import("knowledge_pack_store.zig");
-const autopsy_guidance_validator = @import("autopsy_guidance_validator.zig");
-const feedback = @import("feedback.zig");
-const shards = @import("shards.zig");
-const task_sessions = @import("task_sessions.zig");
-const project_autopsy = @import("project_autopsy.zig");
-const learning_loop = @import("learning_loop.zig");
-const context_autopsy = @import("context_autopsy.zig");
-const context_autopsy_engine = @import("context_autopsy_engine.zig");
-const context_artifacts = @import("context_artifacts.zig");
-const context_inputs = @import("context_inputs.zig");
-const corpus_ask = @import("corpus_ask.zig");
-const rule_reasoning = @import("rule_reasoning.zig");
-const correction_candidates = @import("correction_candidates.zig");
-const correction_review = @import("correction_review.zig");
-const negative_knowledge_review = @import("negative_knowledge_review.zig");
-const learning_store = @import("learning_store.zig");
-const learning_status = @import("learning_status.zig");
-const procedure_pack_candidates = @import("procedure_pack_candidates.zig");
-const sigil_core = @import("sigil_core.zig");
-const artifact_policy = @import("artifact_policy.zig");
-const artifact_autopsy = @import("artifact_autopsy.zig");
-const oracle_auto_fix = @import("oracle/auto_fix.zig");
-const curiosity = @import("ghost/curiosity.zig");
-const hive = @import("net/hive.zig");
-const recursive_boot = @import("ghost/recursive_boot.zig");
+const route_scalar = @import("routes/scalar.zig");
+const route_z3 = @import("routes/z3.zig");
+
+const routes_artifacts = deps.routes_artifacts;
+const routes_learning = deps.routes_learning;
+const routes_verification = deps.routes_verification;
+const conversation_session = deps.conversation_session;
+const response_engine = deps.response_engine;
+const hypothesis_core = deps.hypothesis_core;
+const verifier_adapter = deps.verifier_adapter;
+const verifier_candidates = deps.verifier_candidates;
+const verifier_candidate_execution = deps.verifier_candidate_execution;
+const knowledge_packs = deps.knowledge_packs;
+const knowledge_pack_store = deps.knowledge_pack_store;
+const autopsy_guidance_validator = deps.autopsy_guidance_validator;
+const feedback = deps.feedback;
+const shards = deps.shards;
+const task_sessions = deps.task_sessions;
+const project_autopsy = deps.project_autopsy;
+const learning_loop = deps.learning_loop;
+const context_autopsy = deps.context_autopsy;
+const context_autopsy_engine = deps.context_autopsy_engine;
+const context_artifacts = deps.context_artifacts;
+const context_inputs = deps.context_inputs;
+const corpus_ask = deps.corpus_ask;
+const rule_reasoning = deps.rule_reasoning;
+const correction_candidates = deps.correction_candidates;
+const correction_review = deps.correction_review;
+const negative_knowledge_review = deps.negative_knowledge_review;
+const learning_store = deps.learning_store;
+const learning_status = deps.learning_status;
+const procedure_pack_candidates = deps.procedure_pack_candidates;
+const sigil_core = deps.sigil_core;
+const artifact_policy = deps.artifact_policy;
+const artifact_autopsy = deps.artifact_autopsy;
+const oracle_auto_fix = deps.oracle_auto_fix;
+const curiosity = deps.curiosity;
+const hive = deps.hive;
+const recursive_boot = deps.recursive_boot;
+const vsa_math = deps.vsa_math;
+const frontal_lobe = deps.frontal_lobe;
 
 pub const DispatchResult = struct {
     status: core.ProtocolStatus,
@@ -55,22 +64,7 @@ pub const DispatchResult = struct {
     }
 };
 
-fn getInt(obj: std.json.ObjectMap, snake: []const u8, camel: []const u8) ?i64 {
-    const v = obj.get(snake) orelse obj.get(camel) orelse return null;
-    return if (v == .integer) v.integer else null;
-}
-
-fn getStr(obj: std.json.ObjectMap, snake: []const u8, camel: []const u8) ?[]const u8 {
-    const v = obj.get(snake) orelse obj.get(camel) orelse return null;
-    return if (v == .string) v.string else null;
-}
-
-fn getBool(obj: std.json.ObjectMap, snake: []const u8, camel: []const u8) ?bool {
-    const v = obj.get(snake) orelse obj.get(camel) orelse return null;
-    return if (v == .bool) v.bool else null;
-}
-
-fn boundedMaxItems(obj: std.json.ObjectMap, default_value: usize, max_value: usize) usize {
+pub fn boundedMaxItems(obj: std.json.ObjectMap, default_value: usize, max_value: usize) usize {
     const requested = getInt(obj, "max_items", "maxItems") orelse return default_value;
     if (requested <= 0) return 0;
     return @min(@as(usize, @intCast(requested)), max_value);
@@ -121,9 +115,9 @@ pub fn dispatch(
         .@"curiosity.status" => dispatchCuriosityStatus(allocator, request_body),
         .@"hive.status" => dispatchHiveStatus(allocator),
         .@"recursive_boot.status" => dispatchRecursiveBootStatus(allocator, request_body),
-        .@"learning.status" => dispatchLearningStatus(allocator, request_body),
-        .@"learning.review" => dispatchLearningReview(allocator, request_body),
-        .@"learning.loop.plan" => dispatchLearningLoopPlan(allocator, workspace_root, request_body),
+        .@"learning.status" => routes_learning.dispatchLearningStatus(allocator, request_body),
+        .@"learning.review" => routes_learning.dispatchLearningReview(allocator, request_body),
+        .@"learning.loop.plan" => routes_learning.dispatchLearningLoopPlan(allocator, workspace_root, request_body),
         .@"correction.propose" => dispatchCorrectionPropose(allocator, request_body),
         .@"correction.review" => dispatchCorrectionReview(allocator, request_body),
         .@"correction.reviewed.list" => dispatchCorrectionReviewedList(allocator, request_body),
@@ -133,19 +127,19 @@ pub fn dispatch(
         .@"procedure_pack.candidate.review" => dispatchProcedurePackCandidateReview(allocator, request_body),
         .@"procedure_pack.candidate.reviewed.list" => dispatchProcedurePackCandidateReviewedList(allocator, request_body),
         .@"procedure_pack.candidate.reviewed.get" => dispatchProcedurePackCandidateReviewedGet(allocator, request_body),
-        .@"artifact.read" => dispatchArtifactRead(allocator, workspace_root, request_path),
-        .@"artifact.list" => dispatchArtifactList(allocator, workspace_root, request_path),
-        .@"artifact.policy.describe" => dispatchArtifactPolicyDescribe(allocator),
-        .@"artifact.patch.propose" => dispatchArtifactPatchPropose(allocator, workspace_root, request_body),
+        .@"artifact.read" => routes_artifacts.dispatchArtifactRead(allocator, workspace_root, request_path),
+        .@"artifact.list" => routes_artifacts.dispatchArtifactList(allocator, workspace_root, request_path),
+        .@"artifact.policy.describe" => routes_artifacts.dispatchArtifactPolicyDescribe(allocator),
+        .@"artifact.patch.propose" => routes_artifacts.dispatchArtifactPatchPropose(allocator, workspace_root, request_body),
         .@"hypothesis.list" => dispatchHypothesisList(allocator, request_body),
         .@"hypothesis.triage" => dispatchHypothesisTriage(allocator, request_body),
-        .@"verifier.list" => dispatchVerifierList(allocator),
-        .@"verifier.candidate.execution.list" => dispatchVerifierCandidateExecutionList(allocator, workspace_root, request_body),
-        .@"verifier.candidate.execution.get" => dispatchVerifierCandidateExecutionGet(allocator, workspace_root, request_body),
-        .@"verifier.candidate.propose_from_learning_plan" => dispatchVerifierCandidateProposeFromLearningPlan(allocator, request_body),
-        .@"verifier.candidate.list" => dispatchVerifierCandidateList(allocator, request_body),
-        .@"verifier.candidate.review" => dispatchVerifierCandidateReview(allocator, request_body),
-        .@"verifier.candidate.execute" => dispatchVerifierCandidateExecute(allocator, workspace_root, request_body),
+        .@"verifier.list" => routes_verification.dispatchVerifierList(allocator),
+        .@"verifier.candidate.execution.list" => routes_verification.dispatchVerifierCandidateExecutionList(allocator, workspace_root, request_body),
+        .@"verifier.candidate.execution.get" => routes_verification.dispatchVerifierCandidateExecutionGet(allocator, workspace_root, request_body),
+        .@"verifier.candidate.propose_from_learning_plan" => routes_verification.dispatchVerifierCandidateProposeFromLearningPlan(allocator, request_body),
+        .@"verifier.candidate.list" => routes_verification.dispatchVerifierCandidateList(allocator, request_body),
+        .@"verifier.candidate.review" => routes_verification.dispatchVerifierCandidateReview(allocator, request_body),
+        .@"verifier.candidate.execute" => routes_verification.dispatchVerifierCandidateExecute(allocator, workspace_root, request_body),
         .@"correction.list" => dispatchCorrectionList(allocator, workspace_root, request_body),
         .@"correction.get" => dispatchCorrectionGet(allocator, workspace_root, request_body),
         .@"negative_knowledge.candidate.list" => dispatchNegativeKnowledgeCandidateList(allocator, workspace_root, request_body),
@@ -166,7 +160,8 @@ pub fn dispatch(
         .@"session.get" => dispatchSessionGet(allocator, request_body),
         .@"project.autopsy" => dispatchProjectAutopsy(allocator, workspace_root, request_body),
         .@"context.autopsy" => dispatchContextAutopsy(allocator, workspace_root, request_body),
-        .@"artifact.autopsy.inspect" => dispatchArtifactAutopsyInspect(allocator, workspace_root, request_body),
+        .@"intent.ground" => dispatchIntentGround(allocator, request_body),
+        .@"artifact.autopsy.inspect" => routes_artifacts.dispatchArtifactAutopsyInspect(allocator, workspace_root, request_body),
         else => .{
             .status = .unsupported,
             .err = .{
@@ -318,6 +313,152 @@ fn dispatchRecursiveBootStatus(allocator: std.mem.Allocator, request_body: ?[]co
     };
 }
 
+// ── Neuro-Symbolic Router (Mamba-3 Frontal Lobe) ──────────────────────────
+
+pub const RouteKind = enum {
+    z3_route,
+    vsa_route,
+    scalar_route,
+};
+
+pub const NeuralGipPacket = struct {
+    route: RouteKind,
+    formula: ?[]const u8 = null,
+    vector_intent: ?[]const u8 = null,
+    scalar_response: ?[]const u8 = null,
+    context_hint: []const u8 = "general",
+    encoder_source: EncoderSource = .local_state_space,
+    confidence_per_mille: u16 = 0,
+    state_hash: u64 = 0,
+    scalar_score: u32 = 0,
+    z3_score: u32 = 0,
+    vsa_score: u32 = 0,
+    offload_status: frontal_lobe.OffloadStatus = .skipped,
+    offload_slot: ?u32 = null,
+};
+
+pub const READY_SCALAR_RESPONSE = route_scalar.READY_RESPONSE;
+
+pub const EncoderSource = frontal_lobe.EncoderSource;
+
+fn encodeTextToVectorWithFrontalLobe(allocator: std.mem.Allocator, text: []const u8) !vsa_math.HyperVector {
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    var buf: [1024]u8 = undefined;
+    const uri = std.Uri.parse("http://127.0.0.1:8081/encode") catch return error.NeuralFrontalLobeOffline;
+
+    var req = client.open(.POST, uri, .{ .server_header_buffer = &buf }) catch {
+        return error.NeuralFrontalLobeOffline;
+    };
+    defer req.deinit();
+
+    const payload = std.json.stringifyAlloc(allocator, .{ .text = text }, .{}) catch return error.NeuralFrontalLobeOffline;
+    defer allocator.free(payload);
+
+    req.transfer_encoding = .{ .content_length = payload.len };
+    req.send() catch return error.NeuralFrontalLobeOffline;
+    req.writer().writeAll(payload) catch return error.NeuralFrontalLobeOffline;
+    req.finish() catch return error.NeuralFrontalLobeOffline;
+    req.wait() catch return error.NeuralFrontalLobeOffline;
+
+    if (req.response.status != .ok) {
+        return error.NeuralFrontalLobeOffline;
+    }
+
+    var res_body = std.ArrayList(u8).init(allocator);
+    defer res_body.deinit();
+    req.reader().readAllArrayList(&res_body, 1024 * 1024) catch return error.NeuralFrontalLobeOffline;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, res_body.items, .{}) catch return error.NeuralFrontalLobeOffline;
+    defer parsed.deinit();
+
+    var vec: vsa_math.HyperVector = undefined;
+    if (parsed.value.object.get("vector")) |v| {
+        if (v == .array) {
+            for (v.array.items, 0..) |item, i| {
+                if (i < 16) {
+                    if (item == .integer) {
+                        vec[i] = @intCast(item.integer);
+                    } else {
+                        vec[i] = 0;
+                    }
+                }
+            }
+        } else {
+            return error.NeuralFrontalLobeOffline;
+        }
+    } else {
+        return error.NeuralFrontalLobeOffline;
+    }
+
+    return vec;
+}
+
+pub fn neuralRouter(allocator: std.mem.Allocator, message: []const u8) !NeuralGipPacket {
+    const trimmed = std.mem.trim(u8, message, " \t\r\n");
+
+    var projection: frontal_lobe.Projection = if (encodeTextToVectorWithFrontalLobe(allocator, trimmed)) |intent_vec|
+        frontal_lobe.projectExternalIntent(trimmed, intent_vec)
+    else |err| switch (err) {
+        error.NeuralFrontalLobeOffline => try frontal_lobe.projectLocalIntent(allocator, trimmed),
+        else => return err,
+    };
+    frontal_lobe.offloadDefault(allocator, &projection);
+
+    const route_vec = projection.route_vector;
+    const dist_z3 = vsa_math.hammingDistance(route_vec, vsa_math.ROUTE_VEC_Z3);
+    const dist_vsa = vsa_math.hammingDistance(route_vec, vsa_math.ROUTE_VEC_VSA);
+    const dist_scalar = vsa_math.hammingDistance(route_vec, vsa_math.ROUTE_VEC_SCALAR);
+
+    // Lowest Hamming distance = Highest Semantic Resonance
+    if (dist_z3 < dist_vsa and dist_z3 < dist_scalar) {
+        return .{
+            .route = .z3_route,
+            .formula = trimmed,
+            .context_hint = "arithmetic_resonance",
+            .encoder_source = projection.source,
+            .confidence_per_mille = projection.confidence_per_mille,
+            .state_hash = projection.state_hash,
+            .scalar_score = projection.scalar_score,
+            .z3_score = projection.z3_score,
+            .vsa_score = projection.vsa_score,
+            .offload_status = projection.offload.status,
+            .offload_slot = projection.offload.slot,
+        };
+    } else if (dist_scalar < dist_vsa) {
+        return .{
+            .route = .scalar_route,
+            .scalar_response = READY_SCALAR_RESPONSE,
+            .context_hint = "filler_resonance",
+            .encoder_source = projection.source,
+            .confidence_per_mille = projection.confidence_per_mille,
+            .state_hash = projection.state_hash,
+            .scalar_score = projection.scalar_score,
+            .z3_score = projection.z3_score,
+            .vsa_score = projection.vsa_score,
+            .offload_status = projection.offload.status,
+            .offload_slot = projection.offload.slot,
+        };
+    } else {
+        return .{
+            .route = .vsa_route,
+            .vector_intent = trimmed,
+            .context_hint = "technical_resonance",
+            .encoder_source = projection.source,
+            .confidence_per_mille = projection.confidence_per_mille,
+            .state_hash = projection.state_hash,
+            .scalar_score = projection.scalar_score,
+            .z3_score = projection.z3_score,
+            .vsa_score = projection.vsa_score,
+            .offload_status = projection.offload.status,
+            .offload_slot = projection.offload.slot,
+        };
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+
 fn dispatchConversationTurn(allocator: std.mem.Allocator, workspace_root: ?[]const u8, request_body: ?[]const u8) !DispatchResult {
     const root = workspace_root orelse ".";
     const body = request_body orelse return .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "body missing" } };
@@ -329,6 +470,31 @@ fn dispatchConversationTurn(allocator: std.mem.Allocator, workspace_root: ?[]con
 
     const obj = parsed.value.object;
     const msg = if (obj.get("message")) |m| m.string else return .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "message missing" } };
+
+    const neural_packet = try neuralRouter(allocator, msg);
+    switch (neural_packet.route) {
+        .z3_route => {
+            if (try route_z3.dispatchConversation(allocator, msg, neural_packet.formula.?)) |z3_result| {
+                return .{
+                    .status = .ok,
+                    .result_state = z3_result.result_state,
+                    .result_json = z3_result.result_json,
+                    .allocated_result = true,
+                };
+            }
+        },
+        .scalar_route => {
+            const scalar_result = try route_scalar.dispatchConversation(allocator, neural_packet.scalar_response.?);
+            return .{
+                .status = .ok,
+                .result_state = scalar_result.result_state,
+                .result_json = scalar_result.result_json,
+                .allocated_result = true,
+            };
+        },
+        .vsa_route => {}, // Fall through to standard conversation session
+    }
+
     const session_id = getStr(obj, "session_id", "session_id");
     const reasoning_level_str = getStr(obj, "reasoning_level", "reasoning_level") orelse "balanced";
     const r_level: response_engine.ReasoningLevel = if (std.mem.eql(u8, reasoning_level_str, "quick"))
@@ -355,7 +521,7 @@ fn dispatchConversationTurn(allocator: std.mem.Allocator, workspace_root: ?[]con
     const w = out.writer();
 
     try w.writeAll("{\"conversationTurn\":");
-    try renderConversationTurnResult(w, turn_result);
+    try renderConversationTurnResult(w, turn_result, neural_packet);
     try w.writeAll("}");
 
     const gip_status: core.ProtocolStatus = .ok;
@@ -389,7 +555,7 @@ fn dispatchConversationTurn(allocator: std.mem.Allocator, workspace_root: ?[]con
     };
 }
 
-fn renderConversationTurnResult(w: anytype, res: conversation_session.TurnResult) !void {
+fn renderConversationTurnResult(w: anytype, res: conversation_session.TurnResult, packet: NeuralGipPacket) !void {
     try w.writeAll("{\"session_id\":\"");
     try writeEscaped(w, res.session.session_id);
     try w.writeAll("\",\"response\":");
@@ -411,6 +577,30 @@ fn renderConversationTurnResult(w: anytype, res: conversation_session.TurnResult
     } else {
         try w.writeAll("null");
     }
+    try w.writeAll(",\"neuralRouter\":{\"encoderSource\":\"");
+    try w.writeAll(@tagName(packet.encoder_source));
+    try w.writeAll("\",\"role\":\"fuzzy_human_intent\",\"routeContract\":\"vsa_resonance\",\"confidencePerMille\":");
+    try w.print("{d}", .{packet.confidence_per_mille});
+    try w.writeAll(",\"stateHash\":");
+    try w.print("{d}", .{packet.state_hash});
+    try w.writeAll(",\"scores\":{\"scalar\":");
+    try w.print("{d}", .{packet.scalar_score});
+    try w.writeAll(",\"z3\":");
+    try w.print("{d}", .{packet.z3_score});
+    try w.writeAll(",\"vsa\":");
+    try w.print("{d}", .{packet.vsa_score});
+    try w.writeAll("},\"memoryOffload\":{\"status\":\"");
+    try w.writeAll(@tagName(packet.offload_status));
+    try w.writeAll("\"");
+    if (packet.offload_slot) |slot| {
+        try w.writeAll(",\"slot\":");
+        try w.print("{d}", .{slot});
+    }
+    try w.writeAll("}");
+    if (packet.encoder_source == .local_state_space) {
+        try w.writeAll(",\"localProjection\":\"semantic_encoder_hidden_state_to_vsa_route_vectors\",\"externalEncoder\":\"offline\"");
+    }
+    try w.writeAll("}");
     try w.writeAll("}");
 }
 
@@ -608,6 +798,74 @@ fn dispatchRuleEvaluate(allocator: std.mem.Allocator, request_body: ?[]const u8)
         .allocated_result = true,
     };
 }
+fn dispatchIntentGround(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
+    const body = request_body orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "request body is required for intent.ground" },
+    };
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } };
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) {
+        return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "intent.ground request must be a JSON object" } };
+    }
+
+    const obj = parsed.value.object;
+    const intent_text = getStr(obj, "intent", "intent") orelse getStr(obj, "message", "message") orelse return .{
+        .status = .rejected,
+        .err = .{ .code = .missing_required_field, .message = "intent or message is required for intent.ground" },
+    };
+
+    const options = deps.intent_grounding.GroundingOptions{
+        .context_target = getStr(obj, "context_target", "contextTarget"),
+    };
+
+    var result = try deps.intent_grounding.ground(allocator, intent_text, options);
+    defer result.deinit();
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+
+    try w.writeAll("{\"groundedIntent\":");
+    // TODO: implement renderIntentGroundingJson in intent_grounding.zig if missing
+    // For now, we'll do a basic serialization or assume it exists
+    try w.writeAll("{\"status\":\"");
+    try w.writeAll(@tagName(result.status));
+    try w.writeAll("\",\"intentClass\":\"");
+    try w.writeAll(@tagName(result.intent_class));
+    try w.writeAll("\"}}");
+
+    var gip_state = schema.draftResultState();
+    switch (result.status) {
+        .grounded => {
+            gip_state.state = .verified;
+            gip_state.is_draft = false;
+            gip_state.verification_state = .verified;
+        },
+        .partially_grounded => {
+            gip_state.state = .unresolved;
+            gip_state.is_draft = true;
+            gip_state.verification_state = .unverified;
+        },
+        .unresolved => {
+            gip_state.state = .unresolved;
+            gip_state.is_draft = true;
+            gip_state.verification_state = .unverified;
+        },
+    }
+
+    return .{
+        .status = .ok,
+        .result_state = gip_state,
+        .result_json = try out.toOwnedSlice(),
+        .allocated_result = true,
+    };
+}
+
 
 fn dispatchSigilInspect(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
     const body = request_body orelse return .{
@@ -741,7 +999,7 @@ fn dispatchCorrectionPropose(allocator: std.mem.Allocator, request_body: ?[]cons
         .user_correction = getStr(obj, "userCorrection", "user_correction"),
         .correction_type = correction_type,
         .evidence_refs = evidence_refs.items,
-        .project_shard = getStr(obj, "projectShard", "project_shard"),
+        .project_shard = getStr(obj, "project_shard", "project_shard"),
     };
 
     const proposal = correction_candidates.propose(request, std.hash.Fnv1a_64.hash(body));
@@ -1237,109 +1495,7 @@ fn dispatchProcedurePackCandidatePropose(allocator: std.mem.Allocator, request_b
     };
 }
 
-fn dispatchVerifierCandidateProposeFromLearningPlan(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
-    const body = request_body orelse return .{
-        .status = .rejected,
-        .err = .{ .code = .missing_required_field, .message = "request body is required for verifier.candidate.propose_from_learning_plan" },
-    };
-    var proposed = verifier_candidates.proposeFromLearningPlanBody(allocator, body) catch |err| {
-        return verifierCandidateRequestError(err, "verifier.candidate.propose_from_learning_plan rejected invalid learning loop plan or verifier ref");
-    };
-    defer proposed.deinit();
-
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-    try verifier_candidates.writeProposeResultJson(out.writer(), proposed);
-
-    var gip_state = schema.draftResultState();
-    gip_state.permission = .none;
-    gip_state.verification_state = .unverified;
-    gip_state.support_minimum_met = false;
-    gip_state.non_authorization_notice = "verifier.candidate.propose_from_learning_plan appends candidate metadata only; it does not execute commands or verifiers and does not create proof or evidence";
-
-    return .{ .status = .ok, .result_state = gip_state, .result_json = try out.toOwnedSlice(), .allocated_result = true };
-}
-
-fn dispatchVerifierCandidateList(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
-    const body = request_body orelse return .{
-        .status = .rejected,
-        .err = .{ .code = .missing_required_field, .message = "request body is required for verifier.candidate.list" },
-    };
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
-        return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } };
-    };
-    defer parsed.deinit();
-    if (parsed.value != .object) {
-        return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "verifier.candidate.list request must be a JSON object" } };
-    }
-    const obj = parsed.value.object;
-    const project_shard = getStr(obj, "project_shard", "projectShard") orelse shards.DEFAULT_PROJECT_ID;
-    const limit = boundedCount(obj, "limit", "limit", verifier_candidates.MAX_CANDIDATES_READ, verifier_candidates.MAX_CANDIDATES_READ);
-
-    var listed = try verifier_candidates.listCandidates(allocator, project_shard, limit);
-    defer listed.deinit();
-
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-    try verifier_candidates.writeListResultJson(out.writer(), listed);
-
-    var gip_state = schema.draftResultState();
-    gip_state.permission = .none;
-    gip_state.verification_state = .unverified;
-    gip_state.support_minimum_met = false;
-    gip_state.non_authorization_notice = "verifier.candidate.list is read-only candidate metadata inspection; listing never executes commands or verifiers and never creates evidence";
-
-    return .{ .status = .ok, .result_state = gip_state, .result_json = try out.toOwnedSlice(), .allocated_result = true };
-}
-
-fn dispatchVerifierCandidateReview(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
-    const body = request_body orelse return .{
-        .status = .rejected,
-        .err = .{ .code = .missing_required_field, .message = "request body is required for verifier.candidate.review" },
-    };
-    var reviewed = verifier_candidates.reviewBody(allocator, body) catch |err| {
-        return verifierCandidateRequestError(err, "verifier.candidate.review rejected invalid review request");
-    };
-    defer reviewed.deinit();
-
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-    try verifier_candidates.writeReviewResultJson(out.writer(), reviewed);
-
-    var gip_state = schema.draftResultState();
-    gip_state.permission = .none;
-    gip_state.verification_state = .unverified;
-    gip_state.support_minimum_met = false;
-    gip_state.non_authorization_notice = "verifier.candidate.review appends approval/rejection metadata only; approval permits possible future execution but does not execute or produce evidence";
-
-    return .{ .status = .ok, .result_state = gip_state, .result_json = try out.toOwnedSlice(), .allocated_result = true };
-}
-
-fn dispatchVerifierCandidateExecute(allocator: std.mem.Allocator, workspace_root: ?[]const u8, request_body: ?[]const u8) !DispatchResult {
-    const body = request_body orelse return .{
-        .status = .rejected,
-        .err = .{ .code = .missing_required_field, .message = "request body is required for verifier.candidate.execute" },
-    };
-    var executed = verifier_candidate_execution.executeBody(allocator, body, workspace_root) catch |err| {
-        return verifierCandidateExecutionRequestError(err);
-    };
-    defer executed.deinit();
-
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-    try verifier_candidate_execution.writeExecuteResultJson(out.writer(), executed);
-
-    var gip_state = schema.draftResultState();
-    gip_state.permission = .none;
-    gip_state.verification_state = .partial;
-    gip_state.support_minimum_met = false;
-    gip_state.non_authorization_notice = "verifier.candidate.execute runs only approved candidates through the bounded harness and produces verifier execution evidence candidates only; it never grants proof/support or applies correction, negative knowledge, patches, packs, or corpus changes";
-
-    const status: core.ProtocolStatus = if (!executed.executed) .rejected else if (std.mem.eql(u8, executed.status, "passed")) .ok else .failed;
-    return .{ .status = status, .result_state = gip_state, .result_json = try out.toOwnedSlice(), .allocated_result = true };
-}
-
-fn verifierCandidateExecutionRequestError(err: anyerror) DispatchResult {
+pub fn verifierCandidateExecutionRequestError(err: anyerror) DispatchResult {
     return switch (err) {
         error.InvalidJson => .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } },
         error.MissingProjectShard => .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "projectShard is required" } },
@@ -1351,7 +1507,7 @@ fn verifierCandidateExecutionRequestError(err: anyerror) DispatchResult {
     };
 }
 
-fn verifierCandidateRequestError(err: anyerror, fallback: []const u8) DispatchResult {
+pub fn verifierCandidateRequestError(err: anyerror, fallback: []const u8) DispatchResult {
     return switch (err) {
         error.InvalidJson => .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } },
         error.MissingProjectShard => .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "projectShard is required" } },
@@ -1570,293 +1726,6 @@ fn dispatchProcedurePackCandidateReviewedGet(allocator: std.mem.Allocator, reque
     gip_state.non_authorization_notice = "procedure_pack.candidate.reviewed.get is read-only inspection; records are non-authorizing and not proof or evidence";
     return .{
         .status = if (inspected.record != null) .ok else .unresolved,
-        .result_state = gip_state,
-        .result_json = try out.toOwnedSlice(),
-        .allocated_result = true,
-    };
-}
-
-fn dispatchLearningReview(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
-    const body = request_body orelse return .{
-        .status = .rejected,
-        .err = .{ .code = .missing_required_field, .message = "request body is required for learning.review" },
-    };
-
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
-        return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } };
-    };
-    defer parsed.deinit();
-
-    if (parsed.value != .object) {
-        return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "learning.review request must be a JSON object" } };
-    }
-    const obj = parsed.value.object;
-    const decision_text = getStr(obj, "decision", "decision") orelse return .{
-        .status = .rejected,
-        .err = .{ .code = .missing_required_field, .message = "decision is required" },
-    };
-    const decision = learning_store.Decision.parse(decision_text) orelse return .{
-        .status = .rejected,
-        .err = .{ .code = .invalid_request, .message = "decision must be accepted or rejected", .details = decision_text },
-    };
-    const reviewer_note = getStr(obj, "reviewer_note", "reviewerNote") orelse return .{
-        .status = .rejected,
-        .err = .{ .code = .missing_required_field, .message = "reviewerNote is required" },
-    };
-    const project_shard = getStr(obj, "project_shard", "projectShard") orelse shards.DEFAULT_PROJECT_ID;
-    const candidate_id = getStr(obj, "learning_candidate_id", "learningCandidateId") orelse return .{
-        .status = .rejected,
-        .err = .{ .code = .missing_required_field, .message = "learningCandidateId is required" },
-    };
-    const learning_candidate_json = if (obj.get("learningCandidate")) |candidate_value| try std.json.stringifyAlloc(allocator, candidate_value, .{}) else null;
-    defer if (learning_candidate_json) |json| allocator.free(json);
-
-    var outcome = try learning_store.reviewAndAppend(allocator, .{
-        .project_shard = project_shard,
-        .learning_candidate_id = candidate_id,
-        .decision = decision,
-        .reviewer_note = reviewer_note,
-        .learning_candidate_json = learning_candidate_json,
-    });
-    defer outcome.deinit();
-
-    if (outcome == .conflict) {
-        const conflict = outcome.conflict;
-        var out = std.ArrayList(u8).init(allocator);
-        errdefer out.deinit();
-        const w = out.writer();
-        try w.writeAll("{\"learningReview\":{\"status\":\"ConflictDetected\",\"appendRefused\":true,\"projectShard\":\"");
-        try writeEscaped(w, project_shard);
-        try w.writeAll("\",\"learningCandidateId\":\"");
-        try writeEscaped(w, candidate_id);
-        try w.writeAll("\",\"conflictsWithRecordIds\":[");
-        for (conflict.established_record_ids, 0..) |id, idx| {
-            if (idx != 0) try w.writeByte(',');
-            try w.writeByte('"');
-            try writeEscaped(w, id);
-            try w.writeByte('"');
-        }
-        try w.writeAll("],\"reason\":\"");
-        try writeEscaped(w, conflict.reason);
-        try w.writeAll("\",\"appendOnly\":{\"storage\":\"jsonl\",\"file\":\"learned_records.jsonl\",\"recordAppended\":false,\"inPlaceRewrite\":false,\"deletion\":false,\"compaction\":false},\"authority\":{\"nonAuthorizing\":true,\"treatedAsProof\":false,\"usedAsEvidence\":false,\"supportGranted\":false,\"proofDischarged\":false,\"globalPromotion\":false}}}");
-        return .{
-            .status = .rejected,
-            .result_state = schema.unresolvedResultState("learning conflict detected"),
-            .result_json = try out.toOwnedSlice(),
-            .err = .{
-                .code = .conflict_detected,
-                .message = "ConflictDetected: accepted learning review contradicts established same-shard learning",
-                .details = "see result.learningReview.conflictsWithRecordIds",
-                .fix_hint = "review the established record before accepting contradictory learning into this shard",
-                .severity = .warning,
-            },
-            .allocated_result = true,
-        };
-    }
-
-    const result = outcome.appended;
-
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-    const w = out.writer();
-    try w.writeAll("{\"learningReview\":{\"status\":\"reviewed\",\"reviewedLearningRecord\":");
-    try w.writeAll(result.record_json);
-    try w.writeAll(",\"storage\":{\"path\":\"");
-    try writeEscaped(w, result.storage_path);
-    try w.writeAll("\",\"appendOnly\":true,\"file\":\"learned_records.jsonl\",\"inPlaceRewrite\":false,\"deletion\":false,\"compaction\":false,\"stableOrdering\":\"file_append_order\"}");
-    try w.writeAll(",\"mutationFlags\":{\"corpusMutation\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"correctionMutation\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false}");
-    try w.writeAll(",\"authority\":{\"nonAuthorizing\":true,\"treatedAsProof\":false,\"usedAsEvidence\":false,\"supportGranted\":false,\"proofDischarged\":false,\"globalPromotion\":false}}}");
-
-    var gip_state = schema.draftResultState();
-    gip_state.permission = .none;
-    gip_state.verification_state = .unverified;
-    gip_state.support_minimum_met = false;
-    gip_state.non_authorization_notice = "learning.review persists append-only reviewed learning records only; accepted records may influence draft generation but are non-authorizing and not proof or evidence";
-    return .{
-        .status = .ok,
-        .result_state = gip_state,
-        .result_json = try out.toOwnedSlice(),
-        .allocated_result = true,
-    };
-}
-
-fn dispatchLearningStatus(allocator: std.mem.Allocator, request_body: ?[]const u8) !DispatchResult {
-    var parsed: ?std.json.Parsed(std.json.Value) = null;
-    defer if (parsed) |*p| p.deinit();
-
-    var obj: ?std.json.ObjectMap = null;
-    if (request_body) |body| {
-        parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
-            return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } };
-        };
-        if (parsed.?.value != .object) {
-            return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "learning.status request must be a JSON object" } };
-        }
-        obj = parsed.?.value.object;
-    }
-
-    const project_shard = if (obj) |body_obj| getStr(body_obj, "project_shard", "projectShard") orelse shards.DEFAULT_PROJECT_ID else shards.DEFAULT_PROJECT_ID;
-    const include_records = if (obj) |body_obj| getBool(body_obj, "include_records", "includeRecords") orelse false else false;
-    const include_warnings = if (obj) |body_obj| getBool(body_obj, "include_warnings", "includeWarnings") orelse true else true;
-    const limit = if (include_records and obj != null)
-        boundedCount(obj.?, "limit", "limit", learning_status.MAX_LEARNING_STATUS_RECORDS, learning_status.MAX_LEARNING_STATUS_RECORDS)
-    else if (include_records)
-        learning_status.MAX_LEARNING_STATUS_RECORDS
-    else
-        0;
-
-    var status = try learning_status.readStatus(allocator, .{
-        .project_shard = project_shard,
-        .include_records = include_records,
-        .include_warnings = include_warnings,
-        .limit = limit,
-    });
-    defer status.deinit();
-
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-    const w = out.writer();
-    try w.writeAll("{\"learningStatus\":{\"status\":\"ok\",\"projectShard\":\"");
-    try writeEscaped(w, project_shard);
-    try w.writeAll("\",\"readOnly\":true");
-    try w.writeAll(",\"correctionSummary\":{");
-    try w.print("\"reviewedCorrectionRecords\":{d},\"acceptedReviewedCorrections\":{d},\"rejectedReviewedCorrections\":{d},\"malformedCorrectionLines\":{d}", .{
-        status.correction_status.summary.total_records,
-        status.correction_status.summary.accepted_records,
-        status.correction_status.summary.rejected_records,
-        status.correction_status.summary.malformed_lines,
-    });
-    try w.writeAll(",\"correctionOperationKindCounts\":");
-    try writeCountEntriesJson(w, status.correction_status.summary.operation_kind_counts);
-    try w.writeAll(",\"correctionTypeCounts\":");
-    try writeCountEntriesJson(w, status.correction_status.summary.correction_type_counts);
-    try w.writeAll(",\"correctionInfluenceKindCounts\":");
-    try writeCountEntriesJson(w, status.correction_status.summary.influence_kind_counts);
-    try w.print(",\"correctionSuppressionCandidateCount\":{d},\"correctionFutureBehaviorCandidateCount\":{d}", .{
-        status.correction_status.summary.suppression_candidate_count,
-        status.correction_status.summary.future_behavior_candidate_count,
-    });
-    try w.writeAll("},\"negativeKnowledgeSummary\":{");
-    try w.print("\"reviewedNegativeKnowledgeRecords\":{d},\"acceptedReviewedNegativeKnowledge\":{d},\"rejectedReviewedNegativeKnowledge\":{d},\"malformedNegativeKnowledgeLines\":{d}", .{
-        status.negative_knowledge_summary.reviewed_records,
-        status.negative_knowledge_summary.accepted_records,
-        status.negative_knowledge_summary.rejected_records,
-        status.negative_knowledge_summary.malformed_lines,
-    });
-    try w.writeAll(",\"negativeKnowledgeOperationKindCounts\":");
-    try writeCountEntriesJson(w, status.negative_knowledge_summary.operation_kind_counts);
-    try w.writeAll(",\"negativeKnowledgeInfluenceKindCounts\":");
-    try writeCountEntriesJson(w, status.negative_knowledge_summary.influence_kind_counts);
-    try w.print(",\"negativeKnowledgeSuppressionCandidateCount\":{d},\"negativeKnowledgeFutureBehaviorCandidateCount\":{d}", .{
-        status.negative_knowledge_summary.suppression_candidate_count,
-        status.negative_knowledge_summary.future_behavior_candidate_count,
-    });
-    try w.writeAll("},\"reviewedLearningSummary\":{");
-    try w.print("\"reviewedLearningRecords\":{d},\"acceptedReviewedLearning\":{d},\"rejectedReviewedLearning\":{d},\"malformedLearningLines\":{d}", .{
-        status.learning_status.summary.reviewed_records,
-        status.learning_status.summary.accepted_records,
-        status.learning_status.summary.rejected_records,
-        status.learning_status.summary.malformed_lines,
-    });
-    try w.writeAll("},\"selfVerificationScoreboard\":{");
-    try w.print("\"passed\":{d},\"failed\":{d},\"ambiguous\":{d}", .{
-        status.learning_status.summary.self_verification_passed,
-        status.learning_status.summary.self_verification_failed,
-        status.learning_status.summary.self_verification_ambiguous,
-    });
-    try w.writeAll(",\"learningCandidateKindCounts\":");
-    try writeCountEntriesJson(w, status.learning_status.summary.candidate_kind_counts);
-    try w.writeAll("},\"influenceSummary\":{");
-    const corpus_correction = countNamed(status.correction_status.summary.operation_kind_counts, "corpus.ask") > 0;
-    const rule_correction = countNamed(status.correction_status.summary.operation_kind_counts, "rule.evaluate") > 0;
-    const corpus_nk = countNamed(status.negative_knowledge_summary.operation_kind_counts, "corpus.ask") > 0;
-    const rule_nk = countNamed(status.negative_knowledge_summary.operation_kind_counts, "rule.evaluate") > 0;
-    const reviewed_learning_available = status.learning_status.summary.accepted_records > 0;
-    const suppression = status.correction_status.summary.suppression_candidate_count + status.negative_knowledge_summary.suppression_candidate_count;
-    const stronger = status.correction_status.summary.stronger_evidence_candidate_count + status.negative_knowledge_summary.stronger_evidence_candidate_count;
-    const verifier = status.correction_status.summary.verifier_candidate_count + status.negative_knowledge_summary.verifier_candidate_count;
-    const pack = status.correction_status.summary.pack_guidance_candidate_count + status.negative_knowledge_summary.pack_guidance_candidate_count;
-    const corpus = status.correction_status.summary.corpus_update_candidate_count + status.negative_knowledge_summary.corpus_update_candidate_count;
-    const rule = status.correction_status.summary.rule_update_candidate_count + status.negative_knowledge_summary.rule_update_candidate_count;
-    const future = status.correction_status.summary.future_behavior_candidate_count + status.negative_knowledge_summary.future_behavior_candidate_count;
-    try w.print("\"corpusAskCorrectionInfluenceAvailable\":{},\"ruleEvaluateCorrectionInfluenceAvailable\":{},\"corpusAskNegativeKnowledgeInfluenceAvailable\":{},\"ruleEvaluateNegativeKnowledgeInfluenceAvailable\":{},\"reviewedLearningInfluenceAvailable\":{}", .{
-        corpus_correction,
-        rule_correction,
-        corpus_nk,
-        rule_nk,
-        reviewed_learning_available,
-    });
-    try w.print(",\"suppressionCapableRecords\":{d},\"strongerEvidenceCandidateCount\":{d},\"verifierCandidateCount\":{d},\"packGuidanceCandidateCount\":{d},\"corpusUpdateCandidateCount\":{d},\"ruleUpdateCandidateCount\":{d},\"futureBehaviorCandidateCount\":{d},\"unappliedCandidateCount\":{d}", .{
-        suppression,
-        stronger,
-        verifier,
-        pack,
-        corpus,
-        rule,
-        future,
-        future,
-    });
-    try w.writeAll("},\"warningSummary\":{");
-    try w.print("\"malformedReviewedCorrectionLines\":{d},\"malformedReviewedNegativeKnowledgeLines\":{d},\"malformedReviewedLearningLines\":{d},\"capacityWarnings\":{d},\"unknownOrUnclassifiedRecords\":{d},\"readCapsHit\":{},\"byteCapsHit\":{}", .{
-        status.warning_summary.malformed_reviewed_correction_lines,
-        status.warning_summary.malformed_reviewed_negative_knowledge_lines,
-        status.warning_summary.malformed_reviewed_learning_lines,
-        status.warning_summary.capacity_warnings,
-        status.warning_summary.unknown_or_unclassified_records,
-        status.warning_summary.read_caps_hit,
-        status.warning_summary.byte_caps_hit,
-    });
-    try w.writeAll("},\"capacityTelemetry\":{");
-    try w.print("\"correctionRecordsRead\":{d},\"correctionMaxRecords\":{d},\"correctionReadCapHit\":{},\"correctionMaxBytes\":{d},\"correctionByteCapHit\":{},\"negativeKnowledgeRecordsRead\":{d},\"negativeKnowledgeMaxRecords\":{d},\"negativeKnowledgeReadCapHit\":{},\"negativeKnowledgeMaxBytes\":{d},\"negativeKnowledgeByteCapHit\":{},\"learningRecordsRead\":{d},\"learningMaxRecords\":{d},\"learningReadCapHit\":{},\"learningMaxBytes\":{d},\"learningByteCapHit\":{},\"includeRecords\":{},\"limit\":{d},\"returnedRecords\":{d},\"limitHit\":{}", .{
-        status.capacity_telemetry.correction_records_read,
-        status.capacity_telemetry.correction_max_records,
-        status.capacity_telemetry.correction_read_cap_hit,
-        status.capacity_telemetry.correction_max_bytes,
-        status.capacity_telemetry.correction_byte_cap_hit,
-        status.capacity_telemetry.negative_knowledge_records_read,
-        status.capacity_telemetry.negative_knowledge_max_records,
-        status.capacity_telemetry.negative_knowledge_read_cap_hit,
-        status.capacity_telemetry.negative_knowledge_max_bytes,
-        status.capacity_telemetry.negative_knowledge_byte_cap_hit,
-        status.capacity_telemetry.learning_records_read,
-        status.capacity_telemetry.learning_max_records,
-        status.capacity_telemetry.learning_read_cap_hit,
-        status.capacity_telemetry.learning_max_bytes,
-        status.capacity_telemetry.learning_byte_cap_hit,
-        status.capacity_telemetry.include_records,
-        status.capacity_telemetry.limit,
-        status.capacity_telemetry.returned_records,
-        status.capacity_telemetry.limit_hit,
-    });
-    try w.writeAll("},\"storage\":{\"appendOnly\":true,\"correctionMissingFile\":");
-    try w.print("{}", .{status.storage.correction_missing_file});
-    try w.writeAll(",\"negativeKnowledgeMissingFile\":");
-    try w.print("{}", .{status.storage.negative_knowledge_missing_file});
-    try w.writeAll(",\"learningMissingFile\":");
-    try w.print("{}", .{status.storage.learning_missing_file});
-    try w.writeAll(",\"sameShardOnly\":true,\"readOnly\":true,\"inPlaceRewrite\":false,\"deletion\":false,\"compaction\":false,\"stableOrdering\":\"file_append_order\"}");
-    if (include_warnings) {
-        try w.writeAll(",\"warnings\":{\"corrections\":");
-        try writeReadWarningsJson(w, status.correction_status.warnings);
-        try w.writeAll(",\"negativeKnowledge\":");
-        try writeNegativeKnowledgeReadWarningsJson(w, status.negative_knowledge_warnings);
-        try w.writeAll("}");
-    }
-    if (include_records) {
-        try w.writeAll(",\"records\":");
-        try writeLearningRecordsJson(w, status.records);
-    }
-    try w.writeAll(",\"mutationFlags\":{\"corpusMutation\":false,\"packMutation\":false,\"negativeKnowledgeMutation\":false,\"correctionMutation\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false}");
-    try w.writeAll(",\"authority\":{\"nonAuthorizing\":true,\"treatedAsProof\":false,\"globalPromotion\":false,\"usedAsEvidence\":false,\"supportGranted\":false,\"proofDischarged\":false,\"allLearningNonAuthorizing\":true}}}");
-
-    var gip_state = schema.draftResultState();
-    gip_state.permission = .none;
-    gip_state.verification_state = .unverified;
-    gip_state.support_minimum_met = false;
-    gip_state.non_authorization_notice = "learning.status is a read-only reviewed learning-loop scoreboard; counts are diagnostics only and not proof, evidence, support, mutation, or global promotion";
-
-    return .{
-        .status = .ok,
         .result_state = gip_state,
         .result_json = try out.toOwnedSlice(),
         .allocated_result = true,
@@ -2120,23 +1989,15 @@ fn dispatchNegativeKnowledgeReviewedGet(allocator: std.mem.Allocator, request_bo
     };
 }
 
-fn boundedCount(obj: std.json.ObjectMap, snake: []const u8, camel: []const u8, default_value: usize, max_value: usize) usize {
-    const requested = getInt(obj, snake, camel) orelse return default_value;
-    if (requested <= 0) return 0;
-    return @min(@as(usize, @intCast(requested)), max_value);
-}
-
-fn writeCountEntriesJson(w: anytype, entries: []const correction_review.CountEntry) !void {
-    try w.writeByte('{');
-    for (entries, 0..) |entry, i| {
-        if (i != 0) try w.writeByte(',');
-        try w.writeByte('"');
-        try writeEscaped(w, entry.name);
-        try w.writeAll("\":");
-        try w.print("{d}", .{entry.count});
-    }
-    try w.writeByte('}');
-}
+const gip_utils = @import("gip/utils.zig");
+const writeCountEntriesJson = gip_utils.writeCountEntriesJson;
+const countNamed = gip_utils.countNamed;
+const writeReadWarningsJson = gip_utils.writeReadWarningsJson;
+const writeEscaped = gip_utils.writeEscaped;
+const getStr = gip_utils.getStr;
+const getBool = gip_utils.getBool;
+const getInt = gip_utils.getInt;
+const boundedCount = gip_utils.boundedCount;
 
 fn writeInfluenceStatusRecordsJson(w: anytype, records: []const correction_review.InfluenceStatusRecord) !void {
     try w.writeByte('[');
@@ -2159,7 +2020,7 @@ fn writeInfluenceStatusRecordsJson(w: anytype, records: []const correction_revie
     try w.writeByte(']');
 }
 
-fn writeLearningRecordsJson(w: anytype, records: []const learning_status.RecordSample) !void {
+pub fn writeLearningRecordsJson(w: anytype, records: []const learning_status.RecordSample) !void {
     try w.writeByte('[');
     for (records, 0..) |record, i| {
         if (i != 0) try w.writeByte(',');
@@ -2174,26 +2035,6 @@ fn writeLearningRecordsJson(w: anytype, records: []const learning_status.RecordS
         try w.writeAll(",\"reviewedRecord\":");
         try w.writeAll(record.record_json);
         try w.writeAll("}");
-    }
-    try w.writeByte(']');
-}
-
-fn countNamed(entries: []const correction_review.CountEntry, name: []const u8) usize {
-    for (entries) |entry| {
-        if (std.mem.eql(u8, entry.name, name)) return entry.count;
-    }
-    return 0;
-}
-
-fn writeReadWarningsJson(w: anytype, warnings: []const correction_review.ReadWarning) !void {
-    try w.writeByte('[');
-    for (warnings, 0..) |warning, i| {
-        if (i != 0) try w.writeByte(',');
-        try w.writeAll("{\"lineNumber\":");
-        try w.print("{d}", .{warning.line_number});
-        try w.writeAll(",\"reason\":\"");
-        try writeEscaped(w, warning.reason);
-        try w.writeAll("\"}");
     }
     try w.writeByte(']');
 }
@@ -2223,18 +2064,7 @@ fn writeProcedurePackCandidateSafeguards(w: anytype, read_only: bool) !void {
     try w.writeAll(",\"authority\":{\"nonAuthorizing\":true,\"treatedAsProof\":false,\"usedAsEvidence\":false,\"supportGranted\":false,\"proofDischarged\":false,\"executesByDefault\":false,\"packMutation\":false,\"globalPromotion\":false}");
 }
 
-fn writeNegativeKnowledgeReadWarningsJson(w: anytype, warnings: []const negative_knowledge_review.ReadWarning) !void {
-    try w.writeByte('[');
-    for (warnings, 0..) |warning, i| {
-        if (i != 0) try w.writeByte(',');
-        try w.writeAll("{\"lineNumber\":");
-        try w.print("{d}", .{warning.line_number});
-        try w.writeAll(",\"reason\":\"");
-        try writeEscaped(w, warning.reason);
-        try w.writeAll("\"}");
-    }
-    try w.writeByte(']');
-}
+const writeNegativeKnowledgeReadWarningsJson = gip_utils.writeNegativeKnowledgeReadWarningsJson;
 
 fn writeReviewedNegativeKnowledgeSafeguards(w: anytype) !void {
     try w.writeAll(",\"readOnly\":true");
@@ -2249,262 +2079,7 @@ fn stringifyJsonValue(allocator: std.mem.Allocator, value: std.json.Value) ![]u8
     return out.toOwnedSlice();
 }
 
-fn dispatchArtifactRead(allocator: std.mem.Allocator, workspace_root: ?[]const u8, request_path: ?[]const u8) !DispatchResult {
-    const root = workspace_root orelse return .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "workspace root missing" } };
-    const path = request_path orelse return .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "path missing" } };
-
-    if (validation.validatePathContainment(root, path)) |err| return .{ .status = .rejected, .err = err };
-
-    const full_path = if (std.fs.path.isAbsolute(path)) try allocator.dupe(u8, path) else try std.fs.path.join(allocator, &.{ root, path });
-    defer allocator.free(full_path);
-
-    const file = std.fs.cwd().openFile(full_path, .{}) catch {
-        return .{ .status = .failed, .err = .{ .code = .path_not_found, .message = "file not found" } };
-    };
-    defer file.close();
-
-    const content = try file.readToEndAlloc(allocator, core.MAX_ARTIFACT_READ_BYTES);
-    defer allocator.free(content);
-
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-    const w = out.writer();
-
-    try w.writeAll("{\"artifact\":{\"path\":\"");
-    try writeEscaped(w, path);
-    try w.writeAll("\",\"content\":\"");
-    try writeEscaped(w, content);
-    try w.writeAll("\"}}");
-
-    return .{
-        .status = .ok,
-        .result_json = try out.toOwnedSlice(),
-        .allocated_result = true,
-    };
-}
-
-fn dispatchArtifactList(allocator: std.mem.Allocator, workspace_root: ?[]const u8, request_path: ?[]const u8) !DispatchResult {
-    const root = workspace_root orelse return .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "workspace root missing" } };
-    const path = request_path orelse ".";
-
-    if (validation.validatePathContainment(root, path)) |err| return .{ .status = .rejected, .err = err };
-
-    const full_path = if (std.fs.path.isAbsolute(path)) try allocator.dupe(u8, path) else try std.fs.path.join(allocator, &.{ root, path });
-    defer allocator.free(full_path);
-
-    var dir = std.fs.openDirAbsolute(full_path, .{ .iterate = true }) catch {
-        return .{ .status = .failed, .err = .{ .code = .path_not_found, .message = "dir not found" } };
-    };
-    defer dir.close();
-
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-    const w = out.writer();
-
-    try w.writeAll("{\"entries\":[");
-    var iter = dir.iterate();
-    var first = true;
-    while (try iter.next()) |entry| {
-        if (!first) try w.writeByte(',');
-        first = false;
-        try w.writeAll("{\"name\":\"");
-        try writeEscaped(w, entry.name);
-        try w.writeAll("\",\"type\":\"");
-        try w.writeAll(if (entry.kind == .directory) "directory" else "file");
-        try w.writeAll("\"}");
-    }
-    try w.writeAll("]}");
-
-    return .{
-        .status = .ok,
-        .result_json = try out.toOwnedSlice(),
-        .allocated_result = true,
-    };
-}
-
-fn dispatchArtifactPolicyDescribe(allocator: std.mem.Allocator) !DispatchResult {
-    const summary = artifact_policy.codeProfileSummary();
-    const inner_json = try summary.toJson(allocator);
-    defer allocator.free(inner_json);
-
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-    const w = out.writer();
-
-    try w.writeAll("{\"artifactPolicy\":");
-    try w.writeAll(inner_json);
-    try w.writeAll(",\"readOnly\":true,\"mutatesState\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false,\"non_authorizing\":true}");
-
-    var gip_state = schema.draftResultState();
-    gip_state.permission = .none;
-    gip_state.verification_state = .unverified;
-    gip_state.support_minimum_met = false;
-    gip_state.stop_reason = .none;
-    gip_state.unresolved_reason = null;
-    gip_state.non_authorization_notice = "artifact.policy.describe is a read-only metadata inspection operation; it does not grant proof or support";
-
-    return .{
-        .status = .ok,
-        .result_state = gip_state,
-        .result_json = try out.toOwnedSlice(),
-        .allocated_result = true,
-    };
-}
-
-fn getSpanText(file_content: []const u8, start_line: usize, start_col: usize, end_line: usize, end_col: usize) ?[]const u8 {
-    if (start_line < 1 or end_line < 1 or start_col < 1 or end_col < 1) return null;
-    if (start_line > end_line) return null;
-    if (start_line == end_line and start_col > end_col) return null;
-
-    var line_num: usize = 1;
-    var offset: usize = 0;
-    var span_start: ?usize = null;
-    var span_end: ?usize = null;
-
-    while (offset < file_content.len) {
-        if (line_num == start_line and span_start == null) span_start = offset + start_col - 1;
-        if (line_num == end_line and span_end == null) span_end = offset + end_col - 1;
-        if (file_content[offset] == '\n') line_num += 1;
-        offset += 1;
-    }
-    if (line_num == start_line and span_start == null) span_start = offset + start_col - 1;
-    if (line_num == end_line and span_end == null) span_end = offset + end_col - 1;
-
-    if (span_start) |s| {
-        if (span_end) |e| {
-            if (s <= e and e <= file_content.len and s <= file_content.len) return file_content[s..e];
-        }
-    }
-    return null;
-}
-
-fn dispatchArtifactPatchPropose(allocator: std.mem.Allocator, workspace_root: ?[]const u8, request_body: ?[]const u8) !DispatchResult {
-    const root = workspace_root orelse return .{
-        .status = .rejected,
-        .err = .{ .code = .missing_required_field, .message = "workspace root not configured" },
-    };
-    const body = request_body orelse return .{
-        .status = .rejected,
-        .err = .{ .code = .missing_required_field, .message = "missing request body" },
-    };
-
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
-        return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON payload" } };
-    };
-    defer parsed.deinit();
-
-    const obj = parsed.value.object;
-    const path_val = obj.get("path") orelse return .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "path field is required" } };
-    const path = path_val.string;
-
-    const edits_val = obj.get("edits") orelse return .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "edits field is required" } };
-    if (edits_val != .array) return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "edits must be an array" } };
-
-    if (validation.validatePathContainment(root, path)) |err| return .{ .status = .rejected, .err = err };
-
-    const full_path = if (std.fs.path.isAbsolute(path)) try allocator.dupe(u8, path) else try std.fs.path.join(allocator, &.{ root, path });
-    defer allocator.free(full_path);
-
-    const file = std.fs.cwd().openFile(full_path, .{}) catch {
-        return .{
-            .status = .failed,
-            .err = .{ .code = .path_not_found, .message = "file not found", .details = path },
-            .result_state = schema.unresolvedResultState("file not found"),
-        };
-    };
-    defer file.close();
-
-    const stat = try file.stat();
-    if (stat.size > core.MAX_ARTIFACT_READ_BYTES) return .{ .status = .failed, .err = .{ .code = .artifact_too_large, .message = "file too large for patching" } };
-
-    const content = try allocator.alloc(u8, @intCast(stat.size));
-    defer allocator.free(content);
-    _ = try file.readAll(content);
-
-    var total_bytes: usize = 0;
-    var last_end_line: usize = 0;
-    var last_end_col: usize = 0;
-
-    for (edits_val.array.items) |edit_val| {
-        if (edit_val != .object) return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "edit must be object" } };
-        const edit = edit_val.object;
-
-        const span_val = edit.get("span") orelse return .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "edit span required" } };
-        if (span_val != .object) return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "span must be object" } };
-        const span = span_val.object;
-
-        const start_line = getInt(span, "start_line", "start_line") orelse return .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "start_line missing" } };
-        const start_col = getInt(span, "start_col", "start_col") orelse return .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "start_col missing" } };
-        const end_line = getInt(span, "end_line", "end_line") orelse return .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "end_line missing" } };
-        const end_col = getInt(span, "end_col", "end_col") orelse return .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "end_col missing" } };
-
-        const u_start_line: usize = @intCast(start_line);
-        const u_start_col: usize = @intCast(start_col);
-        const u_end_line: usize = @intCast(end_line);
-        const u_end_col: usize = @intCast(end_col);
-
-        if (u_start_line < last_end_line or (u_start_line == last_end_line and u_start_col < last_end_col)) {
-            return .{ .status = .rejected, .err = .{ .code = .invalid_patch_span, .message = "edits overlap or are not sorted" } };
-        }
-        last_end_line = u_end_line;
-        last_end_col = u_end_col;
-
-        const replacement = getStr(edit, "replacement", "replacement") orelse return .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "replacement missing" } };
-        total_bytes += replacement.len;
-
-        if (total_bytes > 512 * 1024) return .{ .status = .rejected, .err = .{ .code = .budget_exhausted, .message = "patch replacement bytes exceed limit" } };
-
-        const span_text = getSpanText(content, u_start_line, u_start_col, u_end_line, u_end_col) orelse {
-            return .{ .status = .rejected, .err = .{ .code = .invalid_patch_span, .message = "span out of bounds or invalid" } };
-        };
-
-        if (edit.get("precondition")) |prec_val| {
-            if (prec_val == .object) {
-                const prec = prec_val.object;
-                if (getStr(prec, "expected_text", "expected_text")) |exp_text| {
-                    if (!std.mem.eql(u8, span_text, exp_text)) {
-                        return .{ .status = .rejected, .err = .{ .code = .patch_precondition_failed, .message = "expected_text mismatch" } };
-                    }
-                }
-                if (getInt(prec, "expected_hash", "expected_hash")) |exp_hash| {
-                    const file_hash = std.hash.Wyhash.hash(0, content);
-                    if (@as(u64, @intCast(exp_hash)) != file_hash) {
-                        return .{ .status = .rejected, .err = .{ .code = .patch_precondition_failed, .message = "expected_hash mismatch" } };
-                    }
-                }
-            }
-        }
-    }
-
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-    const w = out.writer();
-
-    try w.writeAll("{\"patch_proposal\":{");
-    try w.writeAll("\"patch_id\":\"prop-");
-    try w.print("{d}", .{std.hash.Wyhash.hash(0, body)});
-    try w.writeAll("\",\"artifact_ref\":\"");
-    try writeEscaped(w, path);
-    try w.writeAll("\",\"edits\":");
-    try std.json.stringify(edits_val, .{}, w);
-    try w.writeAll(",\"appliesCleanly\":true,\"previewDiff\":\"");
-    try writeEscaped(w, "--- before\n+++ after\n(preview not generated for dry-run stub)");
-    try w.writeAll("\",\"conflicts\":[],\"requiresApproval\":true,\"requiresVerification\":true,\"missingObligations\":[],\"non_authorizing\":true");
-    try w.writeAll(",\"provenance\":\"ghost_gip\",\"trace\":\"generated proposal\"}}");
-
-    var gip_state = schema.draftResultState();
-    gip_state.state = .draft;
-    gip_state.permission = .none;
-    gip_state.is_draft = true;
-    gip_state.verification_state = .unverified;
-
-    return .{
-        .status = .ok,
-        .result_state = gip_state,
-        .result_json = try out.toOwnedSlice(),
-        .allocated_result = true,
-    };
-}
+const getSpanText = gip_utils.getSpanText;
 
 // ── Hypothesis List ────────────────────────────────────────────────────
 
@@ -2590,80 +2165,7 @@ fn dispatchHypothesisTriage(allocator: std.mem.Allocator, request_body: ?[]const
 
 // ── Verifier List ─────────────────────────────────────────────────────
 
-fn dispatchVerifierList(allocator: std.mem.Allocator) !DispatchResult {
-    // Build a registry with builtin adapters and list them.
-    // This is registry inspection only — no verifier is executed.
-    var registry = verifier_adapter.Registry.init(allocator);
-    defer registry.deinit();
-    try verifier_adapter.registerBuiltinAdapters(&registry);
-
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-    const w = out.writer();
-
-    try w.writeAll("{\"adapters\":[");
-
-    var iter = registry.entries.iterator();
-    var first = true;
-    while (iter.next()) |entry| {
-        const adapter = entry.value_ptr.*;
-        if (!first) try w.writeByte(',');
-        first = false;
-        try w.writeAll("{\"adapter_id\":\"");
-        try writeEscaped(w, adapter.id);
-        try w.writeAll("\",\"domain\":\"");
-        try writeEscaped(w, adapter.schema_name);
-        try w.writeAll("\",\"hook_kind\":\"");
-        try writeEscaped(w, @tagName(adapter.hook_kind));
-        try w.writeAll("\",\"input_artifact_types\":[");
-        for (adapter.input_artifact_types, 0..) |a_type, idx| {
-            if (idx != 0) try w.writeByte(',');
-            try w.writeByte('"');
-            try writeEscaped(w, @tagName(a_type));
-            try w.writeByte('"');
-        }
-        try w.writeAll("],\"required_entity_kinds\":[");
-        for (adapter.required_entity_kinds, 0..) |kind, idx| {
-            if (idx != 0) try w.writeByte(',');
-            try w.writeByte('"');
-            try writeEscaped(w, kind);
-            try w.writeByte('"');
-        }
-        try w.writeAll("],\"required_relation_kinds\":[");
-        for (adapter.required_relation_kinds, 0..) |rel, idx| {
-            if (idx != 0) try w.writeByte(',');
-            try w.writeByte('"');
-            try writeEscaped(w, @tagName(rel));
-            try w.writeByte('"');
-        }
-        try w.writeAll("],\"required_obligations\":[");
-        for (adapter.required_obligations, 0..) |obl, idx| {
-            if (idx != 0) try w.writeByte(',');
-            try w.writeByte('"');
-            try writeEscaped(w, obl);
-            try w.writeByte('"');
-        }
-        try w.writeAll("],\"budget_cost\":");
-        try w.print("{d}", .{adapter.budget_cost});
-        try w.writeAll(",\"evidence_kind\":\"");
-        try writeEscaped(w, @tagName(adapter.output_evidence_kind));
-        try w.writeAll("\",\"safe_local\":");
-        try w.writeAll(if (!isExternalHook(adapter.hook_kind)) "true" else "false");
-        try w.writeAll(",\"external\":");
-        try w.writeAll(if (isExternalHook(adapter.hook_kind)) "true" else "false");
-        try w.writeAll(",\"enabled\":true}");
-    }
-
-    try w.writeAll("]}");
-
-    return .{
-        .status = .ok,
-        .result_json = try out.toOwnedSlice(),
-        .allocated_result = true,
-    };
-}
-
-fn isExternalHook(kind: verifier_adapter.HookKind) bool {
+pub fn isExternalHook(kind: verifier_adapter.HookKind) bool {
     return switch (kind) {
         .build, .@"test", .runtime, .custom_external => true,
         else => false,
@@ -2987,183 +2489,7 @@ fn writeTrustDecayCandidateProjection(w: anytype, root: std.json.Value, node: st
     try w.writeAll("\",\"suggested_delta\":null,\"status\":\"proposed\",\"non_authorizing\":true}");
 }
 
-fn dispatchVerifierCandidateExecutionList(allocator: std.mem.Allocator, workspace_root: ?[]const u8, request_body: ?[]const u8) !DispatchResult {
-    _ = workspace_root;
-    var max_items: usize = core.MAX_VERIFIER_EXECUTION_ITEMS;
-    var candidate_filter: ?[]const u8 = null;
-    var candidate_filter_owned: ?[]u8 = null;
-    defer if (candidate_filter_owned) |value| allocator.free(value);
-    var status_filter: ?[]const u8 = null;
-    var status_filter_owned: ?[]u8 = null;
-    defer if (status_filter_owned) |value| allocator.free(value);
-    var project_shard: ?[]const u8 = null;
-    var project_shard_owned: ?[]u8 = null;
-    defer if (project_shard_owned) |value| allocator.free(value);
-
-    if (request_body) |body| {
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
-            return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON" } };
-        };
-        defer parsed.deinit();
-        if (parsed.value != .object) return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "verifier.candidate.execution.list request must be a JSON object" } };
-        const obj = parsed.value.object;
-        max_items = boundedMaxItems(obj, core.MAX_VERIFIER_EXECUTION_ITEMS, core.MAX_VERIFIER_EXECUTION_ITEMS);
-        if (getStr(obj, "project_shard", "projectShard")) |value| {
-            project_shard_owned = try allocator.dupe(u8, value);
-            project_shard = project_shard_owned.?;
-        }
-        if (getStr(obj, "candidate_id", "candidateId")) |value| {
-            candidate_filter_owned = try allocator.dupe(u8, value);
-            candidate_filter = candidate_filter_owned.?;
-        }
-        if (getStr(obj, "status_filter", "statusFilter")) |value| {
-            status_filter_owned = try allocator.dupe(u8, value);
-            status_filter = status_filter_owned.?;
-        }
-    }
-    const shard_id = project_shard orelse return .{
-        .status = .rejected,
-        .err = .{ .code = .missing_required_field, .message = "projectShard is required" },
-    };
-
-    var listed = verifier_candidate_execution.listExecutionRecords(allocator, shard_id, candidate_filter, status_filter, max_items) catch |err| {
-        return switch (err) {
-            else => .{ .status = .failed, .err = .{ .code = .internal_error, .message = "verifier.candidate.execution.list failed", .details = @errorName(err) } },
-        };
-    };
-    defer listed.deinit();
-
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-    const w = out.writer();
-
-    try w.writeAll("{\"executions\":[");
-    for (listed.records, 0..) |record, i| {
-        if (i != 0) try w.writeByte(',');
-        try w.writeAll(record.raw_json);
-    }
-    try w.writeAll("],\"counts\":{\"total\":");
-    try w.print("{d}", .{listed.total});
-    try w.writeAll(",\"emitted\":");
-    try w.print("{d}", .{listed.emitted});
-    try w.writeAll(",\"passed\":");
-    try w.print("{d}", .{listed.passed});
-    try w.writeAll(",\"failed\":");
-    try w.print("{d}", .{listed.failed});
-    try w.writeAll(",\"timed_out\":");
-    try w.print("{d}", .{listed.timed_out});
-    try w.writeAll(",\"disallowed\":");
-    try w.print("{d}", .{listed.disallowed});
-    try w.writeAll(",\"rejected\":");
-    try w.print("{d}", .{listed.rejected});
-    try w.writeAll(",\"unknown\":");
-    try w.print("{d}", .{listed.unknown});
-    try w.writeAll("},\"projectShard\":\"");
-    try writeEscaped(w, shard_id);
-    try w.writeAll("\",\"max_items\":");
-    try w.print("{d}", .{listed.limit});
-    try w.writeAll(",\"read_only\":true,\"readOnly\":true,\"non_authorizing\":true,\"nonAuthorizing\":true,\"commands_executed\":false,\"commandsExecuted\":false,\"verifiers_executed\":false,\"verifiersExecuted\":false,\"mutates_state\":false,\"mutatesState\":false,\"proof_granted\":false,\"proofGranted\":false,\"support_granted\":false,\"supportGranted\":false,\"correction_applied\":false,\"correctionApplied\":false,\"negative_knowledge_promoted\":false,\"negativeKnowledgePromoted\":false,\"patch_applied\":false,\"patchApplied\":false,\"corpus_mutation\":false,\"corpusMutation\":false,\"pack_mutation\":false,\"packMutation\":false,\"state_source\":\"verifier_execution_records_jsonl\",\"storage_path\":\"");
-    try writeEscaped(w, listed.storage_path);
-    try w.writeAll("\",\"telemetry\":{\"malformed_lines\":");
-    try w.print("{d}", .{listed.malformed_lines});
-    try w.writeAll(",\"bytes_read\":");
-    try w.print("{d}", .{listed.bytes_read});
-    try w.writeAll(",\"truncated\":");
-    try w.writeAll(if (listed.truncated) "true" else "false");
-    try w.writeAll("},\"trace\":{\"summary\":\"inspection only; read existing verifier execution JSONL records without scheduling or running verifiers\"}}");
-
-    return .{
-        .status = .ok,
-        .result_json = try out.toOwnedSlice(),
-        .allocated_result = true,
-    };
-}
-
-fn dispatchVerifierCandidateExecutionGet(allocator: std.mem.Allocator, workspace_root: ?[]const u8, request_body: ?[]const u8) !DispatchResult {
-    _ = workspace_root;
-    const body = request_body orelse return .{
-        .status = .rejected,
-        .err = .{ .code = .missing_required_field, .message = "missing request body" },
-        .result_json = try renderVerifierCandidateExecutionGetError(allocator, "rejected", null, null, "missing_request_body", "request body is required"),
-        .allocated_result = true,
-    };
-
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
-        return .{
-            .status = .rejected,
-            .err = .{ .code = .json_contract_error, .message = "invalid JSON" },
-            .result_json = try renderVerifierCandidateExecutionGetError(allocator, "rejected", null, null, "invalid_json", "request body must be valid JSON"),
-            .allocated_result = true,
-        };
-    };
-    defer parsed.deinit();
-
-    if (parsed.value != .object) return .{
-        .status = .rejected,
-        .err = .{ .code = .invalid_request, .message = "verifier.candidate.execution.get request must be a JSON object" },
-        .result_json = try renderVerifierCandidateExecutionGetError(allocator, "rejected", null, null, "invalid_request_shape", "request must be a JSON object"),
-        .allocated_result = true,
-    };
-    const obj = parsed.value.object;
-    const project_shard_raw = getStr(obj, "project_shard", "projectShard") orelse return .{
-        .status = .rejected,
-        .err = .{ .code = .missing_required_field, .message = "projectShard is required" },
-        .result_json = try renderVerifierCandidateExecutionGetError(allocator, "rejected", null, null, "missing_project_shard", "projectShard is required"),
-        .allocated_result = true,
-    };
-    const execution_id_raw = getStr(obj, "execution_id", "executionId") orelse return .{
-        .status = .rejected,
-        .err = .{ .code = .missing_required_field, .message = "execution_id is required" },
-        .result_json = try renderVerifierCandidateExecutionGetError(allocator, "rejected", project_shard_raw, null, "missing_execution_id", "executionId is required"),
-        .allocated_result = true,
-    };
-    const project_shard = try allocator.dupe(u8, project_shard_raw);
-    defer allocator.free(project_shard);
-    const execution_id = try allocator.dupe(u8, execution_id_raw);
-    defer allocator.free(execution_id);
-
-    var inspected = verifier_candidate_execution.getExecutionRecord(allocator, project_shard, execution_id) catch |err| {
-        return switch (err) {
-            else => .{ .status = .failed, .err = .{ .code = .internal_error, .message = "verifier.candidate.execution.get failed", .details = @errorName(err) } },
-        };
-    };
-    defer inspected.deinit();
-    if (inspected.record) |record| {
-        var out = std.ArrayList(u8).init(allocator);
-        errdefer out.deinit();
-        const w = out.writer();
-        try w.writeAll("{\"execution\":");
-        try w.writeAll(record.raw_json);
-        try w.writeAll(",\"projectShard\":\"");
-        try writeEscaped(w, project_shard);
-        try w.writeAll("\",\"executionId\":\"");
-        try writeEscaped(w, execution_id);
-        try w.writeAll("\",\"read_only\":true,\"readOnly\":true,\"non_authorizing\":true,\"nonAuthorizing\":true,\"commands_executed\":false,\"commandsExecuted\":false,\"verifiers_executed\":false,\"verifiersExecuted\":false,\"mutates_state\":false,\"mutatesState\":false,\"proof_granted\":false,\"proofGranted\":false,\"support_granted\":false,\"supportGranted\":false,\"correction_applied\":false,\"correctionApplied\":false,\"negative_knowledge_promoted\":false,\"negativeKnowledgePromoted\":false,\"patch_applied\":false,\"patchApplied\":false,\"corpus_mutation\":false,\"corpusMutation\":false,\"pack_mutation\":false,\"packMutation\":false,\"state_source\":\"verifier_execution_records_jsonl\",\"storage_path\":\"");
-        try writeEscaped(w, inspected.storage_path);
-        try w.writeAll("\",\"telemetry\":{\"malformed_lines\":");
-        try w.print("{d}", .{inspected.malformed_lines});
-        try w.writeAll(",\"bytes_read\":");
-        try w.print("{d}", .{inspected.bytes_read});
-        try w.writeAll(",\"truncated\":");
-        try w.writeAll(if (inspected.truncated) "true" else "false");
-        try w.writeAll("},\"trace\":{\"summary\":\"inspection only; read existing verifier execution JSONL record without scheduling or running verifiers\"}}");
-        return .{ .status = .ok, .result_json = try out.toOwnedSlice(), .allocated_result = true };
-    }
-
-    return .{
-        .status = .unresolved,
-        .err = .{
-            .code = .path_not_found,
-            .message = "verifier candidate execution not found",
-            .fix_hint = "list verifier.candidate.execution.list with projectShard to inspect persisted verifier execution records",
-        },
-        .result_state = schema.unresolvedResultState("verifier candidate execution not found"),
-        .result_json = try renderVerifierCandidateExecutionGetError(allocator, "not_found", project_shard, execution_id, "verifier_execution_not_found", "no same-shard verifier execution record matched executionId"),
-        .allocated_result = true,
-    };
-}
-
-fn renderVerifierCandidateExecutionGetError(
+pub fn renderVerifierCandidateExecutionGetError(
     allocator: std.mem.Allocator,
     status: []const u8,
     project_shard: ?[]const u8,
@@ -3774,7 +3100,7 @@ fn negativeKnowledgeReviewPersistenceUnsupported(allocator: std.mem.Allocator, c
     try w.writeAll("\",\"decision\":\"");
     try writeEscaped(w, decision);
     try w.writeAll("\",\"record_id\":null,\"review_event_id\":null,\"status\":\"unsupported_without_persistence\",\"non_authorizing\":true,\"requires_no_pack_mutation\":true},\"unsupported\":true,\"reason\":\"negative knowledge review requires a safe explicit append-only persistence target; GIP does not fake review state\",\"pack_mutation\":false,\"global_promotion\":false,\"support_authority\":false}");
-    return .{ .status = .unsupported, .result_json = try out.toOwnedSlice(), .allocated_result = true, .result_state = schema.unsupportedResultState() };
+    return .{ .status = .unsupported, .result_json = try out.toOwnedSlice(), .allocated_result = true, .result_state = schema.unresolvedResultState(null) };
 }
 
 fn negativeKnowledgeRecordMutationUnsupported(allocator: std.mem.Allocator, record_id: []const u8, action: []const u8, reason: []const u8) !DispatchResult {
@@ -5101,115 +4427,6 @@ fn writeStringList(w: anytype, values: []const []const u8) !void {
 // Command candidates remain argv arrays with requires_user_confirmation=true.
 // Verifier plan candidates have executes_by_default=false.
 // Missing evidence is expressed as unknown/gap, not negative evidence.
-fn dispatchArtifactAutopsyInspect(allocator: std.mem.Allocator, workspace_root: ?[]const u8, request_body: ?[]const u8) !DispatchResult {
-    var domain: artifact_autopsy.ArtifactDomain = .documentation_audit;
-    var artifact_paths = std.ArrayList([]const u8).init(allocator);
-    defer {
-        for (artifact_paths.items) |p| allocator.free(p);
-        artifact_paths.deinit();
-    }
-
-    if (request_body) |body| {
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
-            return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } };
-        };
-        defer parsed.deinit();
-
-        if (parsed.value == .object) {
-            const obj = parsed.value.object;
-            if (getStr(obj, "domain", "domain")) |d| {
-                if (std.mem.eql(u8, d, "documentation_audit")) {
-                    domain = .documentation_audit;
-                } else if (std.mem.eql(u8, d, "recipe_consistency")) {
-                    domain = .recipe_consistency;
-                } else {
-                    return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "unknown domain", .details = d } };
-                }
-            }
-
-            if (obj.get("artifactPaths") orelse obj.get("artifact_paths")) |paths_val| {
-                if (paths_val == .array) {
-                    for (paths_val.array.items) |p_val| {
-                        if (p_val == .string) {
-                            try artifact_paths.append(try allocator.dupe(u8, p_val.string));
-                        } else {
-                            return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "artifactPaths must be strings" } };
-                        }
-                    }
-                } else {
-                    return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "artifactPaths must be an array" } };
-                }
-            }
-        } else {
-            return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "artifact.autopsy.inspect request must be a JSON object" } };
-        }
-    }
-
-    if (artifact_paths.items.len > artifact_autopsy.MAX_FILES) {
-        return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "too many files provided in artifactPaths" } };
-    }
-
-    if (artifact_paths.items.len > 0 and workspace_root == null) {
-        return .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "workspace root is required for bounded file autopsy when artifactPaths are provided" } };
-    }
-
-    // Run file-backed analysis in a sub-arena so all analysis allocations
-    // (file content, duped paths, ArrayLists) are freed together after
-    // stringification into the main allocator output buffer.
-    var analysis_arena = std.heap.ArenaAllocator.init(allocator);
-    defer analysis_arena.deinit();
-    const analysis_alloc = analysis_arena.allocator();
-
-    const result = if (domain == .recipe_consistency)
-        artifact_autopsy.recipeConsistency(analysis_alloc, workspace_root orelse ".", artifact_paths.items)
-    else
-        artifact_autopsy.documentationAudit(analysis_alloc, workspace_root orelse ".", artifact_paths.items);
-
-    const autopsy_result = result catch |err| switch (err) {
-        error.TooManyFiles => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "too many files provided in artifactPaths" } },
-        error.EmptyPathRejected => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "empty paths are rejected for artifact autopsy" } },
-        error.AbsolutePathRejected => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "absolute paths are rejected for artifact autopsy" } },
-        error.PathTraversalRejected => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "path traversal is rejected for artifact autopsy" } },
-        error.DirectoryRejected => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "directory paths are rejected for artifact autopsy" } },
-        error.SymlinkRejected => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "symlink paths are rejected for artifact autopsy" } },
-        error.FileTooLarge => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "file too large for artifact autopsy" } },
-        error.TotalBytesExceeded => return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "total bytes exceeded for artifact autopsy" } },
-        error.WorkspaceNotFound => return .{ .status = .rejected, .err = .{ .code = .path_not_found, .message = "workspace root not found" } },
-        else => return err,
-    };
-
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-    const w = out.writer();
-
-    try w.writeAll("{\"artifactAutopsyInspect\":");
-    try std.json.stringify(autopsy_result, .{}, w);
-    try w.writeAll(",\"readOnly\":true,\"mutatesState\":false,\"commandsExecuted\":false,\"verifiersExecuted\":false,\"supportGranted\":false,\"proofGranted\":false,\"non_authorizing\":true");
-    // v1 contract fields in envelope for consumer discoverability
-    try w.print(",\"autopsy_schema_version\":\"{s}\"", .{autopsy_result.autopsy_schema_version});
-    try w.print(",\"artifact_autopsy_contract\":\"{s}\"", .{autopsy_result.artifact_autopsy_contract});
-    try w.print(",\"route_kind\":\"{s}\"", .{autopsy_result.route_kind});
-    try w.print(",\"fixture_backed\":{}", .{autopsy_result.fixture_backed});
-    try w.print(",\"file_backed\":{}", .{autopsy_result.file_backed});
-    try w.print(",\"product_ready\":{}", .{autopsy_result.product_ready});
-    try w.writeAll("}");
-
-    // analysis_arena.deinit() called by defer above; result slices are gone.
-    // out buffer (owned by main allocator) contains the serialized output.
-
-    var gip_state = schema.draftResultState();
-    gip_state.permission = .none;
-    gip_state.verification_state = .unverified;
-    gip_state.support_minimum_met = false;
-    gip_state.non_authorization_notice = "artifact.autopsy.inspect output is candidate-only and non-authorizing; no verifier was executed and no proof/support gate was discharged";
-
-    return .{
-        .status = .ok,
-        .result_state = gip_state,
-        .result_json = try out.toOwnedSlice(),
-        .allocated_result = true,
-    };
-}
 
 fn dispatchProjectAutopsy(allocator: std.mem.Allocator, workspace_root: ?[]const u8, request_body: ?[]const u8) !DispatchResult {
     const root = workspace_root orelse return .{
@@ -5289,84 +4506,6 @@ fn dispatchProjectAutopsy(allocator: std.mem.Allocator, workspace_root: ?[]const
     gip_state.stop_reason = .none;
     gip_state.unresolved_reason = null;
     gip_state.non_authorization_notice = "project autopsy output is a draft profile; it does not constitute supported output or proof of any claim";
-
-    return .{
-        .status = .ok,
-        .result_state = gip_state,
-        .result_json = try out.toOwnedSlice(),
-        .allocated_result = true,
-    };
-}
-
-fn dispatchLearningLoopPlan(allocator: std.mem.Allocator, workspace_root: ?[]const u8, request_body: ?[]const u8) !DispatchResult {
-    const root = workspace_root orelse return .{
-        .status = .rejected,
-        .err = .{ .code = .missing_required_field, .message = "workspace root is required for learning.loop.plan" },
-    };
-
-    var max_entries: usize = project_autopsy.DEFAULT_MAX_ENTRIES;
-    var max_depth: usize = project_autopsy.DEFAULT_MAX_DEPTH;
-    var plan_id: ?[]u8 = null;
-    defer if (plan_id) |owned| allocator.free(owned);
-
-    if (request_body) |body| {
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
-            return .{ .status = .rejected, .err = .{ .code = .json_contract_error, .message = "invalid JSON in request body" } };
-        };
-        defer parsed.deinit();
-        if (parsed.value != .object) {
-            return .{ .status = .rejected, .err = .{ .code = .invalid_request, .message = "learning.loop.plan request must be a JSON object" } };
-        }
-        const obj = parsed.value.object;
-        if (getInt(obj, "max_entries", "maxEntries")) |v| {
-            if (v > 0) max_entries = @min(@as(usize, @intCast(v)), project_autopsy.DEFAULT_MAX_ENTRIES);
-        }
-        if (getInt(obj, "max_depth", "maxDepth")) |v| {
-            if (v > 0) max_depth = @min(@as(usize, @intCast(v)), project_autopsy.DEFAULT_MAX_DEPTH);
-        }
-        if (getStr(obj, "plan_id", "planId")) |value| {
-            plan_id = try allocator.dupe(u8, value);
-        }
-    }
-
-    var analysis_arena = std.heap.ArenaAllocator.init(allocator);
-    defer analysis_arena.deinit();
-    const analysis_alloc = analysis_arena.allocator();
-
-    const autopsy_result = project_autopsy.analyze(analysis_alloc, root, .{
-        .max_entries = max_entries,
-        .max_depth = max_depth,
-    }) catch |err| {
-        if (err == error.FileNotFound) {
-            return .{
-                .status = .rejected,
-                .err = .{ .code = .path_not_found, .message = "workspace root does not exist" },
-            };
-        }
-        return .{
-            .status = .failed,
-            .err = .{
-                .code = .internal_error,
-                .message = "learning loop project autopsy analysis failed",
-                .details = @errorName(err),
-            },
-        };
-    };
-
-    const plan = try learning_loop.planFromAutopsy(analysis_alloc, autopsy_result, .{ .plan_id = plan_id });
-
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-    const w = out.writer();
-
-    try w.writeAll("{\"learningLoopPlan\":");
-    try plan.writeJson(w);
-    try w.writeAll(",\"readOnly\":true,\"candidateOnly\":true,\"commandsExecuted\":false,\"verifiersExecuted\":false,\"patchesApplied\":false,\"packsMutated\":false,\"correctionsApplied\":false,\"negativeKnowledgePromoted\":false,\"mutatesState\":false,\"authorityEffect\":\"candidate\",\"non_authorizing\":true}");
-
-    var gip_state = schema.draftResultState();
-    gip_state.stop_reason = .none;
-    gip_state.unresolved_reason = null;
-    gip_state.non_authorization_notice = "learning.loop.plan is read-only and candidate-only; it does not execute commands, run verifiers, apply patches, mutate packs, apply corrections, promote negative knowledge, or grant support";
 
     return .{
         .status = .ok,
@@ -5534,19 +4673,6 @@ fn writeNullableStringJson(w: anytype, value: ?[]const u8) !void {
     }
 }
 
-fn writeEscaped(w: anytype, s: []const u8) !void {
-    for (s) |c| {
-        switch (c) {
-            '\"' => try w.writeAll("\\\""),
-            '\\' => try w.writeAll("\\\\"),
-            '\n' => try w.writeAll("\\n"),
-            '\r' => try w.writeAll("\\r"),
-            '\t' => try w.writeAll("\\t"),
-            else => try w.writeByte(c),
-        }
-    }
-}
-
 fn readFileAbsoluteAlloc(allocator: std.mem.Allocator, abs_path: []const u8, max_bytes: usize) ![]u8 {
     const file = try std.fs.openFileAbsolute(abs_path, .{});
     defer file.close();
@@ -5593,7 +4719,7 @@ test "artifact.patch.propose handles path traversal" {
         \\  "edits": []
         \\}
     ;
-    var result = try dispatchArtifactPatchPropose(allocator, "/", body);
+    var result = try routes_artifacts.dispatchArtifactPatchPropose(allocator, "/", body);
     defer result.deinit(allocator);
 
     try std.testing.expectEqual(core.ProtocolStatus.rejected, result.status);
@@ -5608,7 +4734,7 @@ test "artifact.patch.propose missing file" {
         \\  "edits": []
         \\}
     ;
-    var result = try dispatchArtifactPatchPropose(allocator, "/tmp", body);
+    var result = try routes_artifacts.dispatchArtifactPatchPropose(allocator, "/tmp", body);
     defer result.deinit(allocator);
 
     try std.testing.expectEqual(core.ProtocolStatus.failed, result.status);
@@ -5632,7 +4758,7 @@ test "artifact.patch.propose invalid span rejected" {
         \\}
     ;
 
-    var result = try dispatchArtifactPatchPropose(allocator, ws.workspace_root, body);
+    var result = try routes_artifacts.dispatchArtifactPatchPropose(allocator, ws.workspace_root, body);
     defer result.deinit(allocator);
 
     try std.testing.expectEqual(core.ProtocolStatus.rejected, result.status);
@@ -5656,7 +4782,7 @@ test "artifact.patch.propose successful dry run with non_authorizing" {
         \\}
     ;
 
-    var result = try dispatchArtifactPatchPropose(allocator, ws.workspace_root, body);
+    var result = try routes_artifacts.dispatchArtifactPatchPropose(allocator, ws.workspace_root, body);
     defer result.deinit(allocator);
 
     try std.testing.expectEqual(core.ProtocolStatus.ok, result.status);
@@ -5682,7 +4808,7 @@ test "artifact.patch.propose does not modify source file" {
         \\}
     ;
 
-    var result = try dispatchArtifactPatchPropose(allocator, ws.workspace_root, body);
+    var result = try routes_artifacts.dispatchArtifactPatchPropose(allocator, ws.workspace_root, body);
     defer result.deinit(allocator);
 
     const file_path = try std.fs.path.join(allocator, &.{ ws.workspace_root, "sample.txt" });
@@ -5718,7 +4844,7 @@ test "artifact.patch.propose overlapping edits rejected" {
         \\}
     ;
 
-    var result = try dispatchArtifactPatchPropose(allocator, ws.workspace_root, body);
+    var result = try routes_artifacts.dispatchArtifactPatchPropose(allocator, ws.workspace_root, body);
     defer result.deinit(allocator);
 
     try std.testing.expectEqual(core.ProtocolStatus.rejected, result.status);
@@ -5743,7 +4869,7 @@ test "artifact.patch.propose expected_text mismatch rejected" {
         \\}
     ;
 
-    var result = try dispatchArtifactPatchPropose(allocator, ws.workspace_root, body);
+    var result = try routes_artifacts.dispatchArtifactPatchPropose(allocator, ws.workspace_root, body);
     defer result.deinit(allocator);
 
     try std.testing.expectEqual(core.ProtocolStatus.rejected, result.status);
@@ -5768,7 +4894,7 @@ test "artifact.patch.propose expected_hash mismatch rejected" {
         \\}
     ;
 
-    var result = try dispatchArtifactPatchPropose(allocator, ws.workspace_root, body);
+    var result = try routes_artifacts.dispatchArtifactPatchPropose(allocator, ws.workspace_root, body);
     defer result.deinit(allocator);
 
     try std.testing.expectEqual(core.ProtocolStatus.rejected, result.status);
@@ -5791,7 +4917,7 @@ test "artifact.patch.propose oversized replacement rejected" {
     }
     try bw.writeAll("\"}]}");
 
-    var result = try dispatchArtifactPatchPropose(allocator, ws.workspace_root, body_buf.items);
+    var result = try routes_artifacts.dispatchArtifactPatchPropose(allocator, ws.workspace_root, body_buf.items);
     defer result.deinit(allocator);
 
     try std.testing.expectEqual(core.ProtocolStatus.rejected, result.status);
@@ -5829,10 +4955,10 @@ test "artifact.patch.propose deterministic patch_id for same input" {
         \\}
     ;
 
-    var result1 = try dispatchArtifactPatchPropose(allocator, ws.workspace_root, body);
+    var result1 = try routes_artifacts.dispatchArtifactPatchPropose(allocator, ws.workspace_root, body);
     defer result1.deinit(allocator);
 
-    var result2 = try dispatchArtifactPatchPropose(allocator, ws.workspace_root, body);
+    var result2 = try routes_artifacts.dispatchArtifactPatchPropose(allocator, ws.workspace_root, body);
     defer result2.deinit(allocator);
 
     try std.testing.expectEqual(result1.status, result2.status);
@@ -8283,6 +7409,20 @@ test "protocol.describe lists context.autopsy as implemented" {
     const json = result.result_json.?;
     try std.testing.expect(std.mem.indexOf(u8, json, "\"context.autopsy\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "read_only_artifact_and_input_refs_runtime_and_persistent_pack_guidance") != null);
+}
+
+test "local neural vsa projection keeps scalar z3 and vsa wired without frontal lobe" {
+    const allocator = std.testing.allocator;
+    const scalar = try frontal_lobe.projectLocalIntent(allocator, "ready");
+    const z3 = try frontal_lobe.projectLocalIntent(allocator, "2+3");
+    const vsa = try frontal_lobe.projectLocalIntent(allocator, "search the VSA lattice for vulkan memory");
+
+    try std.testing.expectEqual(frontal_lobe.IntentRoute.scalar, scalar.route);
+    try std.testing.expectEqual(frontal_lobe.IntentRoute.z3, z3.route);
+    try std.testing.expectEqual(frontal_lobe.IntentRoute.vsa, vsa.route);
+    try std.testing.expectEqual(@as(u16, 0), vsa_math.hammingDistance(scalar.route_vector, vsa_math.ROUTE_VEC_SCALAR));
+    try std.testing.expectEqual(@as(u16, 0), vsa_math.hammingDistance(z3.route_vector, vsa_math.ROUTE_VEC_Z3));
+    try std.testing.expectEqual(@as(u16, 0), vsa_math.hammingDistance(vsa.route_vector, vsa_math.ROUTE_VEC_VSA));
 }
 
 test "capabilities.describe lists context.autopsy as allowed read-only" {

@@ -1,0 +1,46 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 1) readonly buffer InputActivations {
+    float values[];
+} input_activations;
+
+layout(std430, binding = 2) buffer OutputActivations {
+    float values[];
+} output_activations;
+
+layout(push_constant) uniform Constants {
+    uint vector_count;
+    uint vector_len;
+    uint base_offset;
+    uint flags;
+} params;
+
+shared float partial[64];
+
+void main() {
+    uint vector_id = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    if (vector_id >= params.vector_count || params.vector_len == 0u) return;
+
+    uint base = params.base_offset + vector_id * params.vector_len;
+    float sum = 0.0;
+    for (uint i = lane; i < params.vector_len; i += 64u) {
+        float v = input_activations.values[base + i];
+        sum += v * v;
+    }
+    partial[lane] = sum;
+    barrier();
+
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) partial[lane] += partial[lane + stride];
+        barrier();
+    }
+
+    float inv_rms = inversesqrt((partial[0] / float(params.vector_len)) + 0.000001);
+    for (uint i = lane; i < params.vector_len; i += 64u) {
+        output_activations.values[base + i] = input_activations.values[base + i] * inv_rms;
+    }
+}
+

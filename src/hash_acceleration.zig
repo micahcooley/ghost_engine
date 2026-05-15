@@ -69,9 +69,15 @@ pub fn semanticHash64(ctx: ?*Context, allocator: std.mem.Allocator, text: []cons
     if (ctx) |actual_ctx| {
         if (actual_ctx.policy == .vulkan) {
             if (actual_ctx.vulkan) |engine| {
-                const mixed_words = engine.dispatchSemanticHashBatch(seeds) catch |err| {
+                const job = engine.dispatchSemanticHashBatch(seeds) catch |err| {
                     if (vsa_vulkan.runtimeLogsEnabled()) {
                         std.debug.print("[ACCEL] Vulkan semantic hash dispatch failed: {any}. Falling back to CPU semantic hash.\n", .{err});
+                    }
+                    return semanticHash64Cpu(text);
+                };
+                const mixed_words = engine.waitSemanticHashBatch(job) catch |err| {
+                    if (vsa_vulkan.runtimeLogsEnabled()) {
+                        std.debug.print("[ACCEL] Vulkan semantic hash wait failed: {any}. Falling back to CPU semantic hash.\n", .{err});
                     }
                     return semanticHash64Cpu(text);
                 };
@@ -125,9 +131,16 @@ pub fn semanticHash64Batch(ctx: ?*Context, allocator: std.mem.Allocator, texts: 
     var seed_offset: usize = 0;
     while (seed_offset < seeds.len) {
         const batch_len = @min(MAX_GPU_BLOCKS, seeds.len - seed_offset);
-        const words = ctx.?.vulkan.?.dispatchSemanticHashBatch(seeds[seed_offset .. seed_offset + batch_len]) catch |err| {
+        const job = ctx.?.vulkan.?.dispatchSemanticHashBatch(seeds[seed_offset .. seed_offset + batch_len]) catch |err| {
             if (vsa_vulkan.runtimeLogsEnabled()) {
                 std.debug.print("[ACCEL] Vulkan batched semantic hash dispatch failed: {any}. Falling back to CPU semantic hashes.\n", .{err});
+            }
+            for (texts, 0..) |text, idx| out[idx] = semanticHash64Cpu(text);
+            return;
+        };
+        const words = ctx.?.vulkan.?.waitSemanticHashBatch(job) catch |err| {
+            if (vsa_vulkan.runtimeLogsEnabled()) {
+                std.debug.print("[ACCEL] Vulkan batched semantic hash wait failed: {any}. Falling back to CPU semantic hashes.\n", .{err});
             }
             for (texts, 0..) |text, idx| out[idx] = semanticHash64Cpu(text);
             return;

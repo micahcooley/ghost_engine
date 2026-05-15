@@ -84,6 +84,40 @@ pub const CHECKSUM_BLOCK_SIZE: usize = 64 * 1024 * 1024; // 64MB per verificatio
 pub const CHECKSUM_BLOCK_COUNT: usize = UNIFIED_SIZE_BYTES / CHECKSUM_BLOCK_SIZE;
 pub const CHECKSUM_RESERVED_BYTES: usize = 1024; // Reserved tail space for hashes
 
+// --- Ghost Engine v2: Forge & Triad Constants ---
+// Rune Lattice capacity (number of Rune slots in the ranked memory)
+pub const RUNE_LATTICE_CAPACITY: u32 = if (TEST_MODE) 4096 else 4_194_304;
+
+// Rank promotion thresholds
+pub const V2_RANK_EMERGING_MIN_OBS: u32 = 5; // Noise→Emerging after 5 observations
+pub const V2_RANK_PATTERN_MIN_OBS: u32 = 100; // Emerging→Pattern after 100 observations
+pub const V2_RANK_PATTERN_MIN_CTX: u32 = 3; // ...across 3+ distinct contexts
+pub const V2_NOISE_TTL_MS: u64 = 3600_000; // Stale Noise runes pruned after 1 hour
+
+// Scout variance detection
+pub const V2_SCOUT_VARIANCE_MULTIPLIER: u32 = 5; // Spike = EMA + 2.5×MAD (5/2)
+
+// King distance threshold tau — Hamming distance ceiling for Lattice match acceptance.
+// 1024-bit vectors have theoretical max distance of 1024, random pairs cluster near 512.
+// tau=490 keeps Rank-1 matches inside a concrete acceptance window while leaving
+// farther/noise candidates available only to the Medic's exploratory dark-space path.
+pub const V2_KING_DISTANCE_TAU: u16 = 490;
+
+// Medic Loop (0x8B) uses the same hard Rank-1 acceptance tau. When no Rank-1
+// vector resolves inside this window, it may surface nearest Rank-5 noise as an
+// explicitly marked exploratory result rather than hard-failing verification.
+pub const V2_MEDIC_DISTANCE_TAU: u16 = V2_KING_DISTANCE_TAU;
+
+// Training-mode rank floor: during Phase 2 (Forge training), the King accepts
+// Emerging (Rank 4) patterns to avoid being mute while the Lattice fills up.
+// Once training is mature (>50% Rank 3+), switch to .pattern for production.
+pub const V2_TRAINING_MIN_RANK: u8 = 4; // RuneRank.emerging
+pub const V2_PRODUCTION_MIN_RANK: u8 = 3; // RuneRank.pattern
+
+// Forge maintenance intervals
+pub const V2_FORGE_PRUNE_INTERVAL_MS: u64 = 300_000; // 5 minutes
+pub const V2_FORGE_PROMOTION_SWEEP_MS: u64 = 60_000; // 1 minute
+
 // --- Paths (Environment Agnostic) ---
 pub fn getPath(allocator: std.mem.Allocator, sub_path: []const u8) ![]u8 {
     if (std.fs.path.isAbsolute(sub_path)) return allocator.dupe(u8, sub_path);
@@ -135,6 +169,7 @@ fn ensureTestRootInitialized(test_root: []const u8) !void {
 pub const LATTICE_FILE_NAME = "unified_lattice.bin";
 pub const SEMANTIC_FILE_NAME = "semantic_monolith.bin";
 pub const TAG_FILE_NAME = "semantic_tags.bin";
+pub const RUNE_RANK_FILE_NAME = "rune_ranks.bin";
 pub const SIGIL_CONTROL_FILE_NAME = "control.bin";
 pub const ABSTRACTION_CATALOG_FILE_NAME = "catalog.gabs";
 pub const ABSTRACTION_STAGED_FILE_NAME = "staged.gabs";

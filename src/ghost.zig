@@ -46,11 +46,21 @@ pub const knowledge_pack_store = @import("knowledge_pack_store.zig");
 pub const knowledge_packs = @import("knowledge_packs.zig");
 pub const compute_budget = @import("compute_budget.zig");
 pub const support_routing = @import("support_routing.zig");
+pub const effector = @import("effector.zig");
 pub const artifact_schema = @import("artifact_schema.zig");
 pub const hypothesis_core = @import("hypothesis_core.zig");
 pub const intent_grounding = @import("intent_grounding.zig");
 pub const grpe_classifier = @import("grpe_classifier.zig");
 pub const text_generation_lab = @import("text_generation_lab.zig");
+pub const gemma_config = @import("gemma/config.zig");
+pub const gemma_agents = @import("gemma/agents.zig");
+pub const gemma_context_provider = @import("gemma/context_provider.zig");
+pub const gemma_inference = @import("gemma/inference.zig");
+pub const gemma_layers = @import("gemma/layers.zig");
+pub const gemma_model = @import("gemma/model.zig");
+pub const gemma_weights = @import("gemma/weights.zig");
+pub const gemma_q8_matmul = @import("gemma/q8_matmul.zig");
+pub const gemma_rune_encoder = @import("gemma/rune_encoder.zig");
 pub const response_engine = @import("response_engine.zig");
 pub const epistemic_renderer = @import("epistemic_renderer.zig");
 pub const conversation_session = @import("conversation_session.zig");
@@ -76,7 +86,23 @@ pub const context_autopsy = @import("context_autopsy.zig");
 pub const context_autopsy_engine = @import("context_autopsy_engine.zig");
 pub const context_artifacts = @import("context_artifacts.zig");
 pub const context_inputs = @import("context_inputs.zig");
+pub const frontal_lobe = @import("frontal_lobe.zig");
 pub const gip = @import("gip.zig");
+pub const ProtocolStatus = @import("gip_core.zig").ProtocolStatus;
+pub const MAX_ARTIFACT_READ_BYTES = @import("gip_core.zig").MAX_ARTIFACT_READ_BYTES;
+pub const MAX_VERIFIER_EXECUTION_ITEMS = @import("gip_core.zig").MAX_VERIFIER_EXECUTION_ITEMS;
 pub const wasm_loader = @import("extensions/wasm_loader.zig");
+
+// ── Ghost Engine v2: Rune-Native Triple-Core Pipeline ──
+pub const triad = @import("triad.zig");
+pub const rune_lattice = @import("rune_lattice.zig");
+pub const forge = @import("forge.zig");
+
+// ── Ghost Engine v2: Semantic Lattice Test Modules ──
+pub const semantic_encoder = @import("semantic_encoder.zig");
+pub const concept_index = @import("concept_index.zig");
+pub const contradiction_detector = @import("contradiction_detector.zig");
+pub const cross_domain_projector = @import("cross_domain_projector.zig");
+pub const intent_resolver = @import("intent_resolver.zig");
 
 pub const VERSION = @import("build_options").ghost_version;

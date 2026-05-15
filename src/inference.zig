@@ -767,7 +767,8 @@ pub const BeamSearchPool = struct {
             layer3.trace.call(event);
             layer3.dump.call(event, &.{}, &.{});
 
-            const energies = try self.vulkan.dispatchResonanceBatched(active_count, rotor_pairs[0 .. active_count * 2]);
+            const energies_job = try self.vulkan.dispatchResonanceBatched(active_count, rotor_pairs[0 .. active_count * 2]);
+            const energies = try self.vulkan.waitResonanceBatched(energies_job);
 
             var lane_idx: u32 = 0;
             for (0..num_lanes) |i| {

@@ -110,15 +110,29 @@ pub fn freeSearchResults(allocator: std.mem.Allocator, results: []SearchResult) 
 }
 
 pub fn discoverPipRequirement(allocator: std.mem.Allocator, module_name: []const u8, diagnostic: []const u8) !?[]u8 {
+    return discoverPipRequirementForYear(allocator, module_name, diagnostic, null);
+}
+
+pub fn discoverPipRequirementForYear(allocator: std.mem.Allocator, module_name: []const u8, diagnostic: []const u8, commit_year: ?u16) !?[]u8 {
     if (!isSafeModuleName(module_name)) return null;
-    const query = try std.fmt.allocPrint(allocator, "python ImportError No module named {s} pip install {s}", .{ module_name, module_name });
+    const query = if (commit_year) |year|
+        try std.fmt.allocPrint(allocator, "python ImportError No module named {s} pip install {s} release before {d} legacy version", .{ module_name, module_name, year })
+    else
+        try std.fmt.allocPrint(allocator, "python ImportError No module named {s} pip install {s}", .{ module_name, module_name });
     defer allocator.free(query);
     return discoverInstallToken(allocator, query, diagnostic, .pip);
 }
 
 pub fn discoverNpmPackage(allocator: std.mem.Allocator, module_name: []const u8, diagnostic: []const u8) !?[]u8 {
+    return discoverNpmPackageForYear(allocator, module_name, diagnostic, null);
+}
+
+pub fn discoverNpmPackageForYear(allocator: std.mem.Allocator, module_name: []const u8, diagnostic: []const u8, commit_year: ?u16) !?[]u8 {
     if (!isSafeNpmPackage(module_name)) return null;
-    const query = try std.fmt.allocPrint(allocator, "node Cannot find module {s} npm install {s}", .{ module_name, module_name });
+    const query = if (commit_year) |year|
+        try std.fmt.allocPrint(allocator, "node Cannot find module {s} npm install {s} release before {d} legacy version", .{ module_name, module_name, year })
+    else
+        try std.fmt.allocPrint(allocator, "node Cannot find module {s} npm install {s}", .{ module_name, module_name });
     defer allocator.free(query);
     return discoverInstallToken(allocator, query, diagnostic, .npm);
 }
@@ -316,4 +330,11 @@ test "install command extraction stays package-token bounded" {
     try std.testing.expect(extractPipRequirement("pip install bad;rm") == null);
     try std.testing.expectEqualStrings("PyQt5", extractPypiToken("https://pypi.org/project/PyQt5/").?);
     try std.testing.expectEqualStrings("@scope/pkg", extractNpmToken("https://www.npmjs.com/package/@scope/pkg").?);
+}
+
+test "time-aware discovery query remains local and bounded" {
+    const allocator = std.testing.allocator;
+    const url = try renderSearchUrl(allocator, .{}, "python ImportError No module named babel._compat pip install babel._compat release before 2017 legacy version");
+    defer allocator.free(url);
+    try std.testing.expect(std.mem.indexOf(u8, url, "before+2017") != null);
 }

@@ -34,6 +34,7 @@ var global_lattice_path: ?[]const u8 = null;
 var global_host_lattice_words: ?[]u16 = null;
 var global_meaning_data: ?[]u32 = null;
 var global_tags_data: ?[]u64 = null;
+var global_rank_data: ?[]u8 = null;
 
 const INPUT_LINE_CAPACITY = 1024;
 const TYPEAHEAD_CAPACITY = 8;
@@ -218,6 +219,9 @@ fn crystallizeStateAndExit() noreturn {
             if (global_tags_data) |host_tags| {
                 @memcpy(host_tags, vk.getTagsData()[0..host_tags.len]);
             }
+            if (global_rank_data) |host_ranks| {
+                @memcpy(host_ranks, vk.getRanksData()[0..host_ranks.len]);
+            }
             if (global_state_shard) |*state_shard| {
                 if (syncSliceToPagedLattice(vk.getLatticeData(), &state_shard.paged_lattice)) |_| {
                     var provider = lattice_provider.?;
@@ -272,6 +276,9 @@ fn crystallizeStateAndExit() noreturn {
             sys.printOut("[TEARDOWN] Flushing and Unmapping Tags...\n");
             sys.flushMappedMemory(&state_shard.tags_file) catch |err| {
                 sys.print("[WARNING] Tags flush failed: {any}\n", .{err});
+            };
+            sys.flushMappedMemory(&state_shard.rank_file) catch |err| {
+                sys.print("[WARNING] Rank flush failed: {any}\n", .{err});
             };
             state_shard.deinit();
             global_state_shard = null;
@@ -442,6 +449,7 @@ pub fn main_wrapped(allocator: std.mem.Allocator) !void {
     global_lattice_path = try allocator.dupe(u8, global_state_shard.?.paths.lattice_abs_path);
     global_meaning_data = meaning_matrix.data;
     global_tags_data = meaning_matrix.tags;
+    global_rank_data = global_state_shard.?.rank_bytes;
     global_host_lattice_words = null;
 
     if (!sigil_control.force_cpu_only and sigil_control.enable_vulkan) {
@@ -450,7 +458,7 @@ pub fn main_wrapped(allocator: std.mem.Allocator) !void {
             global_vk_engine = vk;
             try syncPagedLatticeToSlice(&global_state_shard.?.paged_lattice, vk.getLatticeData());
             global_host_lattice_words = vk.getLatticeData();
-            vk.bindHostState(meaning_matrix.data, meaning_matrix.tags.?, global_host_lattice_words.?);
+            vk.bindHostState(meaning_matrix.data, meaning_matrix.tags.?, global_rank_data.?, global_host_lattice_words.?);
             sys.printOut("[COMPUTE] Ghost-Vulkan-Native active.\n");
         } else |_| sys.printOut("[COMPUTE] GPU not available. Running in CPU-only mode.\n");
     } else {
@@ -491,10 +499,12 @@ pub fn main_wrapped(allocator: std.mem.Allocator) !void {
             .lattice_file = null,
             .meaning_file = global_state_shard.?.semantic_file,
             .tags_file = global_state_shard.?.tags_file,
+            .rank_file = global_state_shard.?.rank_file,
             .scratchpad = &global_scratchpad.?,
             .lattice_words = global_host_lattice_words,
             .meaning_words = global_meaning_data.?,
             .tags_words = global_tags_data.?,
+            .rank_words = global_rank_data.?,
         }) catch |err| {
             sys.print("\n[FATAL] Embedded shell startup failed: {any}\n", .{err});
             sys.exit(1);

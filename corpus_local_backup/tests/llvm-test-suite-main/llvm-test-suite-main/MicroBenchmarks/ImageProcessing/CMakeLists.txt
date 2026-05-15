@@ -1,6 +1,0 @@
-add_subdirectory(Dither)
-add_subdirectory(AnisotropicDiffusion)
-add_subdirectory(Interpolation)
-add_subdirectory(Blur)
-add_subdirectory(BilateralFiltering)
-add_subdirectory(Dilate)

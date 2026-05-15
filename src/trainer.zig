@@ -9,6 +9,8 @@ const config = core.config;
 const shards = core.shards;
 const sigil_runtime = core.sigil_runtime;
 
+// ── Ghost Engine v2 ──
+const forge_mod = core.forge;
 const STREAM_BUFFER_CAPACITY = 64 * 1024;
 const CPU_SUDH_PROBE_LIMIT: u32 = 32;
 const CPU_LATTICE_LEAKY_MASK: u64 = 0xEFEFEFEFEFEFEFEF;
@@ -98,11 +100,9 @@ pub const StreamState = struct {
     eof: bool,
     mutex: core.sync.Mutex = .{},
 
-    // V32: HyperRotor — 1024-bit HRR context accumulator.
-    // Evolves per-rune via Permute→Bind→Bundle to track the "context smell".
-    // Used exclusively on the CPU side for future SUDH addressing.
+    // V32: Context accumulator — 1024-bit context vector.
     // Memory cost: 128 bytes per active stream (16 × u64).
-    context_rotor: vsa.HyperRotor,
+    context_rotor: vsa.HyperVector,
 
     pub fn init(data: []const u8, name: []const u8, weight: u32) StreamState {
         return .{
@@ -120,10 +120,7 @@ pub const StreamState = struct {
             .buffer_start = 0,
             .buffer_end = 0,
             .eof = true,
-            .context_rotor = vsa.HyperRotor.init(ghost_state.wyhash(
-                ghost_state.GENESIS_SEED,
-                ghost_state.FNV_OFFSET_BASIS,
-            )),
+            .context_rotor = @splat(0),
         };
     }
 
@@ -145,10 +142,7 @@ pub const StreamState = struct {
             .buffer_start = 0,
             .buffer_end = 0,
             .eof = false,
-            .context_rotor = vsa.HyperRotor.init(ghost_state.wyhash(
-                ghost_state.GENESIS_SEED,
-                ghost_state.FNV_OFFSET_BASIS,
-            )),
+            .context_rotor = @splat(0),
         };
     }
 
@@ -308,11 +302,12 @@ pub const GreedyBatcher = struct {
             stream.semantic_rotor = std.math.rotl(u64, stream.semantic_rotor, 13) *% ghost_state.FNV_PRIME;
         }
 
-        stream.context_rotor.evolve(rune);
+        stream.context_rotor = vsa.bundle(vsa.rotate(stream.context_rotor, 1), vsa.generate(rune), vsa.generate(stream.lexical_rotor));
 
         const base = total_packed.* * 18;
+        const rotor_words: [16]u64 = @bitCast(stream.context_rotor);
         inline for (0..16) |j| {
-            out_rotors[base + j] = stream.context_rotor.state[j];
+            out_rotors[base + j] = rotor_words[j];
         }
         out_rotors[base + 16] = stream.lexical_rotor;
         out_rotors[base + 17] = stream.semantic_rotor;
@@ -560,9 +555,16 @@ pub const OhlTrainer = struct {
     mapped_lattice: ?[]u16 = null,
     mapped_meaning: ?[]u32 = null,
     mapped_tags: ?[]u64 = null,
+    mapped_ranks: ?[]u8 = null,
     lattice_file: ?*const sys.MappedFile = null,
     meaning_file: ?*const sys.MappedFile = null,
     tags_file: ?*const sys.MappedFile = null,
+    rank_file: ?*const sys.MappedFile = null,
+
+    // ── v2: Forge Engine (Rank-Based Training) ──
+    // When attached, the trainer observes every etched rune into the Forge’s
+    // Rune Lattice, building rank history alongside the existing MeaningMatrix.
+    forge: ?*forge_mod.ForgeEngine = null,
 
     pub fn init(allocator: std.mem.Allocator, fleet: ?*vsa_vulkan.MultiGPU, batcher: *GreedyBatcher, options: TrainerOptions) !OhlTrainer {
         var selected_count: usize = 0;
@@ -936,13 +938,18 @@ pub const OhlTrainer = struct {
         defer self.checkpoint_in_progress.store(false, .release);
         try self.checkpoint();
         self.last_checkpoint_ms.store(now, .release);
+
+        // v2: Run Forge maintenance (prune stale noise, sweep promotions)
+        if (self.forge) |forge_engine| {
+            forge_engine.tick(now);
+        }
     }
 
     pub fn checkpoint(self: *OhlTrainer) !void {
-        if (self.mapped_lattice == null or self.mapped_meaning == null or self.mapped_tags == null) return;
+        if (self.mapped_lattice == null or self.mapped_meaning == null or self.mapped_tags == null or self.mapped_ranks == null) return;
 
         for (self.engines) |engine| {
-            try engine.syncDeviceToHost(self.mapped_meaning.?, self.mapped_tags.?, self.mapped_lattice.?);
+            try engine.syncDeviceToHost(self.mapped_meaning.?, self.mapped_tags.?, self.mapped_ranks.?, self.mapped_lattice.?);
 
             if (engine.mapped_edges) |edges_ptr| {
                 var graph = vsa.FlatGraph.fromMapped(@as([*]vsa.GraphNode, @ptrCast(@alignCast(edges_ptr))), engine.matrix_slots);
@@ -1186,6 +1193,17 @@ pub const OhlTrainer = struct {
             stats.last_dispatch_ms.store(dispatch_elapsed, .monotonic);
             _ = stats.busy_time_ms.fetchAdd(dispatch_elapsed, .monotonic);
             _ = stats.dispatched_batches.fetchAdd(1, .monotonic);
+
+            // v2: Observe etched runes into the Forge Rune Lattice
+            if (self.forge) |forge_engine| {
+                const now_ms = sys.getMilliTick();
+                for (0..num_packed) |fi| {
+                    const frune = chars[fi];
+                    const fbase = fi * 18;
+                    const ctx_hash = ghost_state.wyhash(rotors[fbase + 16], rotors[fbase + 17]);
+                    _ = forge_engine.observe(vsa.generate(frune), ctx_hash, now_ms);
+                }
+            }
         }
 
         sys.print("[CPU-{d}] Worker Offline.\n", .{worker_id});
@@ -1215,14 +1233,17 @@ fn main_wrapped(allocator: std.mem.Allocator) !void {
     defer m_meaning.unmap();
     var m_tags = try sys.createMappedFile(allocator, shard_paths.tags_abs_path, config.TAG_SIZE_BYTES);
     defer m_tags.unmap();
+    var m_ranks = try sys.createMappedFile(allocator, shard_paths.rank_abs_path, config.SEMANTIC_SLOTS);
+    defer m_ranks.unmap();
 
     const host_lattice = @as([*]u16, @ptrCast(@alignCast(m_lattice.data.ptr)))[0 .. m_lattice.data.len / @sizeOf(u16)];
     const host_meaning = @as([*]u32, @ptrCast(@alignCast(m_meaning.data.ptr)))[0..config.SEMANTIC_ENTRIES];
     const host_tags = @as([*]u64, @ptrCast(@alignCast(m_tags.data.ptr)))[0..config.TAG_ENTRIES];
+    const host_ranks = @as([*]u8, @ptrCast(@alignCast(m_ranks.data.ptr)))[0..config.SEMANTIC_SLOTS];
 
     if (fleet) |*fleet_ref| {
         for (fleet_ref.engines) |*engine| {
-            engine.bindHostState(host_meaning, host_tags, host_lattice);
+            engine.bindHostState(host_meaning, host_tags, host_ranks, host_lattice);
         }
     }
 

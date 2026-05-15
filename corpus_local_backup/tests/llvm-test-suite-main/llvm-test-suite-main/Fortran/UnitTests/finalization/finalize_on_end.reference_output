@@ -1,2 +1,0 @@
-Pass: finalizes a non-pointer non-allocatable object at the END statement
-exit 0

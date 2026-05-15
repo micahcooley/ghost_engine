@@ -1,1 +1,0 @@
-../run-java-in-container.sh

@@ -1,6 +1,0 @@
-list(APPEND LDFLAGS -lm)
-list(APPEND CPPFLAGS -Wno-error=incompatible-pointer-types)
-add_subdirectory(datamining)
-add_subdirectory(linear-algebra)
-add_subdirectory(medley)
-add_subdirectory(stencils)

@@ -4,6 +4,8 @@ const gip_mapping = @import("../gip/mapping.zig");
 
 pub const MAX_RUNE_LATTICE: usize = 100_000;
 pub const GPU_STAGE_GATE_RUNE_COUNT: usize = 1000;
+pub const MIN_RUNE_SIMILARITY_PER_MILLE: u16 = 750;
+pub const MAX_ACCEPTED_HAMMING_DISTANCE: u16 = @intCast((gutf.RUNE_BYTES * 8 * (1000 - MIN_RUNE_SIMILARITY_PER_MILLE)) / 1000);
 
 pub const LatticeLocation = enum {
     cpu_ram,
@@ -63,6 +65,9 @@ pub const LatticeView = struct {
                 };
             }
         }
+        if (best) |match| {
+            if (match.hamming_distance > MAX_ACCEPTED_HAMMING_DISTANCE) return null;
+        }
         return best;
     }
 };
@@ -94,7 +99,8 @@ test "lattice stage gate selects Vulkan residency only for large point clouds" {
 
 test "nearest search ignores shadow tier unless explicitly requested" {
     var query_bytes: gutf.RuneBytes align(gutf.RUNE_ALIGNMENT) = gutf.deterministicRuneBytes(10, 0x04);
-    var verified_bytes: gutf.RuneBytes align(gutf.RUNE_ALIGNMENT) = gutf.deterministicRuneBytes(11, 0x04);
+    var verified_bytes: gutf.RuneBytes align(gutf.RUNE_ALIGNMENT) = query_bytes;
+    verified_bytes[0] ^= 0x01;
     var shadow_bytes: gutf.RuneBytes align(gutf.RUNE_ALIGNMENT) = query_bytes;
 
     const entries = [_]LatticeEntry{

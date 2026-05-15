@@ -40,8 +40,10 @@ pub const LiveState = struct {
     scratchpad: *scratchpad.ScratchpadLayer,
     meaning_file: *const sys.MappedFile,
     tags_file: *const sys.MappedFile,
+    rank_file: *const sys.MappedFile,
     meaning_words: []u32,
     tags_words: []u64,
+    rank_bytes: []u8,
     lattice_words: ?[]u16 = null,
 };
 
@@ -266,7 +268,7 @@ fn syncLiveLatticeWords(dest: []u16, start: usize, src: []const u16) void {
 fn syncGpuToHostIfNeeded(state: LiveState) !void {
     if (state.engine.vulkan) |vk| {
         const host_lattice = state.lattice_words orelse return error.HostLatticeUnavailable;
-        try vk.syncDeviceToHost(state.meaning_words, state.tags_words, host_lattice);
+        try vk.syncDeviceToHost(state.meaning_words, state.tags_words, state.rank_bytes, host_lattice);
     }
 }
 
@@ -319,6 +321,10 @@ fn writeSlot(state: LiveState, slot: Slot) !void {
     const tags_path = try slotFilePath(state.allocator, state.paths, slot, config.TAG_FILE_NAME);
     defer state.allocator.free(tags_path);
     try copyBytesToFile(state.allocator, tags_path, std.mem.sliceAsBytes(state.tags_words));
+
+    const rank_path = try slotFilePath(state.allocator, state.paths, slot, config.RUNE_RANK_FILE_NAME);
+    defer state.allocator.free(rank_path);
+    try copyBytesToFile(state.allocator, rank_path, state.rank_bytes);
 
     var captured = try state.control.captureState(state.allocator);
     defer captured.deinit();
@@ -397,6 +403,11 @@ fn restoreSlot(state: LiveState, slot: Slot) !void {
     try readExactFile(state.allocator, tags_path, std.mem.sliceAsBytes(state.tags_words));
     try sys.flushMappedMemory(state.tags_file);
 
+    const rank_path = try slotFilePath(state.allocator, state.paths, slot, config.RUNE_RANK_FILE_NAME);
+    defer state.allocator.free(rank_path);
+    try readExactFile(state.allocator, rank_path, state.rank_bytes);
+    try sys.flushMappedMemory(state.rank_file);
+
     var captured = try readControlSlot(state.allocator, state.paths, slot);
     defer captured.deinit();
     try state.control.restoreState(&captured);
@@ -406,7 +417,7 @@ fn restoreSlot(state: LiveState, slot: Slot) !void {
 
     if (state.engine.vulkan) |vk| {
         const host_lattice = state.lattice_words orelse return error.HostLatticeUnavailable;
-        vk.bindHostState(state.meaning_words, state.tags_words, host_lattice);
+        vk.bindHostState(state.meaning_words, state.tags_words, state.rank_bytes, host_lattice);
     }
 }
 
@@ -484,6 +495,7 @@ pub fn executeCommand(state: LiveState, command: Command) !SnapshotStatus {
                 try state.scratchpad.applyToPermanent();
                 try sys.flushMappedMemory(state.meaning_file);
                 try sys.flushMappedMemory(state.tags_file);
+                try sys.flushMappedMemory(state.rank_file);
             }
             try abstractions.applyStaged(state.allocator, state.paths);
             try corpus_ingest.applyStaged(state.allocator, state.paths);

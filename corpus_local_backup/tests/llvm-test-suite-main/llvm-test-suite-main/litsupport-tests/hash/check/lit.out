@@ -1,3 +1,0 @@
-CHECK-DAG: NOCHANGE: test-suite :: tests/unchanged.test
-CHECK-DAG: PASS: test-suite :: tests/normal.test
-CHECK: Expected Passes

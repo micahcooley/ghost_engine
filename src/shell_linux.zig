@@ -140,6 +140,8 @@ const TrainingSession = struct {
         if (global_lattice_file) |*m| session.trainer.lattice_file = m;
         if (global_meaning_file) |*m| session.trainer.meaning_file = m;
         if (global_tags_file) |*m| session.trainer.tags_file = m;
+        if (global_rank_file) |*m| session.trainer.rank_file = m;
+        session.trainer.mapped_ranks = global_ranks;
         return session;
     }
 
@@ -160,11 +162,13 @@ var global_engine: ?*engine.SingularityEngine = null;
 var global_lattice_file: ?sys.MappedFile = null;
 var global_meaning_file: ?sys.MappedFile = null;
 var global_tags_file: ?sys.MappedFile = null;
+var global_rank_file: ?sys.MappedFile = null;
 var global_scratchpad: ?*scratchpad.ScratchpadLayer = null;
 var global_state_paths: ?*const shards.Paths = null;
 var global_lattice: ?[]u16 = null;
 var global_meaning: ?[]u32 = null;
 var global_tags: ?[]u64 = null;
+var global_ranks: ?[]u8 = null;
 var global_last_stop_reason = std.atomic.Value(u32).init(@intFromEnum(trainer.StopReason.none));
 var global_last_checkpoint_ms = std.atomic.Value(u64).init(0);
 var global_chat_queue: ChatRequestQueue = .{};
@@ -184,10 +188,12 @@ pub const EmbeddedInit = struct {
     lattice_file: ?sys.MappedFile = null,
     meaning_file: sys.MappedFile,
     tags_file: sys.MappedFile,
+    rank_file: sys.MappedFile,
     scratchpad: *scratchpad.ScratchpadLayer,
     lattice_words: ?[]u16 = null,
     meaning_words: []u32,
     tags_words: []u64,
+    rank_words: []u8,
     port: u16 = 8080,
 };
 
@@ -1070,8 +1076,16 @@ fn handleSigilRequest(sock: usize, allocator: std.mem.Allocator, body: []const u
                 .scratchpad = live_scratchpad,
                 .meaning_file = &meaning_file,
                 .tags_file = &tags_file,
+                .rank_file = if (global_rank_file) |*m| m else {
+                    sendJsonError(sock, .service_unavailable, "Rank state unavailable");
+                    return;
+                },
                 .meaning_words = meaning_words,
                 .tags_words = tags_words,
+                .rank_bytes = global_ranks orelse {
+                    sendJsonError(sock, .service_unavailable, "Rank words unavailable");
+                    return;
+                },
                 .lattice_words = global_lattice,
             }, parsed_command) catch |err| {
                 handleSigilCommandError(sock, err);
@@ -1963,11 +1977,13 @@ pub fn startEmbedded(init: EmbeddedInit) !void {
     global_lattice_file = init.lattice_file;
     global_meaning_file = init.meaning_file;
     global_tags_file = init.tags_file;
+    global_rank_file = init.rank_file;
     global_scratchpad = init.scratchpad;
     global_state_paths = init.state_paths;
     global_lattice = init.lattice_words;
     global_meaning = init.meaning_words;
     global_tags = init.tags_words;
+    global_ranks = init.rank_words;
     global_ema_average.store(init.live_engine.ema.average, .release);
     global_ema_deviation.store(init.live_engine.ema.deviation, .release);
 

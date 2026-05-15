@@ -46,6 +46,14 @@ pub const ROLE_PREDICATE = generate(0x5555_5555_AAAA_AAAA);
 pub const MASK_SCRIBE = generate(0x55AA_55AA_55AA_55AA);
 pub const MASK_CRITIC = generate(0xAA55_AA55_AA55_AA55);
 
+// ── V33: Intent Route Vectors (Semantic Resonance Hooks) ──
+// These vectors define the orthogonal axes of our cognitive routing space.
+// They are used by the NeuralGipPacket to determine if a query is logical,
+// sub-symbolic, or trivial.
+pub const ROUTE_VEC_Z3     = generate(0x5555_AAAA_5555_AAAA); // LOGIC (Z3 Bridge)
+pub const ROUTE_VEC_VSA    = generate(0xAAAA_5555_AAAA_5555); // SUB-SYMBOLIC (VSA/Search)
+pub const ROUTE_VEC_SCALAR = generate(0x1234_4321_1234_4321); // TRIVIAL (Scalar/Social)
+
 /// Hardware-accelerated concept generator.
 pub fn generate(seed: u64) HyperVector {
     var v: HyperVector = undefined;
@@ -111,107 +119,34 @@ pub inline fn collapse(v: HyperVector) u64 {
     return acc;
 }
 
-// ── V32: HyperRotor — XOR-Majority Context Accumulator ──
-// Evolves a 1024-bit context vector per-rune using the HRR triple:
-//   1. Permute  — shift temporal position (makes the sequence order-dependent)
-//   2. Bind     — XOR the new rune identity into the shifted context
-//   3. Bundle   — majority-vote superposition to maintain "inertia" from history
-//
-// The resulting state vector is a smeared, temporal superposition.  Two sequences
-// that share a long common prefix will have near-identical states; sequences with
-// different content will diverge toward orthogonality (~512 resonance).
-//
-// IMPORTANT: This struct is CPU-side only.  It is NOT dispatched to the GPU.
-// The GPU continues to use u64 FNV-1a rotors for O(1) hash addressing.  The
-// HyperRotor is consumed exclusively by `projectSpatialSignature()`, which
-// compresses the 1024-bit state to a u32 Locality-Sensitive Hash for the future
-// SUDH (Semantic-Uniform Double Hashing) addressing mode.
+/// Project the 1024-bit HyperVector to a 32-bit Locality-Sensitive Hash.
+///
+/// Algorithm: Majority-Thresholded Segment Projection
+///   - Partition the 1024-bit vector into 32 segments of 32 bits each.
+///   - For each segment, count the set bits (popcount).
+///   - If more than 16 bits are set (majority = 1), the projection bit is 1.
+pub fn projectSpatialSignature(v: HyperVector) u32 {
+    var result: u32 = 0;
+    inline for (0..16) |word_idx| {
+        const word = v[word_idx];
 
-pub const HyperRotor = struct {
-    state: HyperVector,
-
-    /// Initialize with a deterministic seed vector.
-    /// Different seeds create orthogonal initial states, useful for
-    /// multi-stream training where each stream needs an independent context.
-    pub fn init(seed: u64) HyperRotor {
-        return .{ .state = generate(seed) };
-    }
-
-    /// Evolve the context state by absorbing a single Unicode codepoint.
-    /// Approximates HRR (Holographic Reduced Representation) circular convolution
-    /// via XOR-bind + majority-vote bundle. Empirically tested:
-    ///   - Identical sequences converge to resonance ~1024 (bit-identical).
-    ///   - Sequences differing only in the last rune: resonance ~900+.
-    ///   - Unrelated sequences: resonance ~512 (near statistical baseline).
-    pub fn evolve(self: *HyperRotor, rune: u32) void {
-        const rune_vec = generate(@as(u64, rune));
-
-        // Step 1: Temporal Shift — Circular permutation advances the "clock"
-        // of the context.  Without this, bind(A,B) == bind(B,A) and we lose
-        // sequence ordering.  The permute makes position matter.
-        const shifted = permute(self.state);
-
-        // Step 2: Binding — XOR fuses the rune identity into the shifted
-        // context.  This produces a vector that is near-orthogonal to both
-        // the shifted context and the rune alone, encoding "this rune at
-        // this position in this history."
-        const bound = bind(shifted, rune_vec);
-
-        // Step 3: Bundling — Majority-vote superposition of:
-        //   (a) The previous state (inertia / long-term memory)
-        //   (b) The bound vector   (new information)
-        //   (c) The shifted state  (bridge between old and new)
-        //
-        // This creates ~75% overlap with the previous state and ~25% from
-        // the new symbol, producing a smooth decay curve where recent runes
-        // have the strongest influence but older runes persist as fading
-        // "echoes" in the bit pattern.
-        self.state = bundle(self.state, bound, shifted);
-    }
-
-    /// Project the 1024-bit HyperVector to a 32-bit Locality-Sensitive Hash.
-    ///
-    /// Algorithm: Majority-Thresholded Segment Projection
-    ///   - Partition the 1024-bit vector into 32 segments of 32 bits each.
-    ///   - For each segment, count the set bits (popcount).
-    ///   - If more than 16 bits are set (majority = 1), the projection bit is 1.
-    ///
-    /// Locality Guarantee:
-    ///   Two HyperVectors with high Hamming resonance (few differing bits)
-    ///   will produce identical or near-identical u32 projections, because
-    ///   a small number of bit flips in a 32-bit segment rarely changes the
-    ///   majority.  This is the mathematical foundation of LSH (Locality-
-    ///   Sensitive Hashing) applied to binary hypervectors.
-    ///
-    /// Performance: 16 popcount + 32 comparisons = ~48 ALU ops.  Zero branches.
-    pub fn projectSpatialSignature(self: HyperRotor) u32 {
-        var result: u32 = 0;
-        inline for (0..15) |word_idx| {
-            const word = self.state[word_idx];
-
-            // Lower 32 bits → projection bit at index (word_idx * 2)
-            const lo = @as(u32, @truncate(word));
-            const lo_pop = @popCount(lo);
-            if (lo_pop > 16) {
-                result |= @as(u32, 1) << @as(u5, @intCast(word_idx * 2));
-            }
-
-            // Upper 32 bits → projection bit at index (word_idx * 2 + 1)
-            const hi = @as(u32, @truncate(word >> 32));
-            const hi_pop = @popCount(hi);
-            if (hi_pop > 16) {
-                result |= @as(u32, 1) << @as(u5, @intCast(word_idx * 2 + 1));
-            }
+        // Lower 32 bits → projection bit at index (word_idx * 2)
+        const lo = @as(u32, @truncate(word));
+        const lo_pop = @popCount(lo);
+        if (lo_pop > 16) {
+            result |= @as(u32, 1) << @as(u5, @intCast(word_idx * 2));
         }
-        return result;
-    }
 
-    /// Compute the resonance between this rotor's context and another vector.
-    /// Convenience wrapper that avoids exposing the internal state field.
-    pub fn resonanceWith(self: HyperRotor, other: HyperVector) u16 {
-        return calculateResonance(self.state, other);
+        // Upper 32 bits → projection bit at index (word_idx * 2 + 1)
+        const hi = @as(u32, @truncate(word >> 32));
+        const hi_pop = @popCount(hi);
+        if (hi_pop > 16) {
+            result |= @as(u32, 1) << @as(u5, @intCast(word_idx * 2 + 1));
+        }
     }
-};
+    return result;
+}
+
 
 // ── V32: Semantic-Uniform Double Hashing (SUDH) ──
 // Combines Locality-Sensitive spatial projection with uniform FNV-1a dispersion

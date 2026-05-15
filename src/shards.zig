@@ -55,6 +55,7 @@ pub const Paths = struct {
     lattice_abs_path: []u8,
     semantic_abs_path: []u8,
     tags_abs_path: []u8,
+    rank_abs_path: []u8,
     sigil_root_abs_path: []u8,
     sigil_scratch_abs_path: []u8,
     sigil_committed_abs_path: []u8,
@@ -84,6 +85,7 @@ pub const Paths = struct {
         self.allocator.free(self.lattice_abs_path);
         self.allocator.free(self.semantic_abs_path);
         self.allocator.free(self.tags_abs_path);
+        self.allocator.free(self.rank_abs_path);
         self.allocator.free(self.sigil_root_abs_path);
         self.allocator.free(self.sigil_scratch_abs_path);
         self.allocator.free(self.sigil_committed_abs_path);
@@ -118,6 +120,8 @@ pub const MountedStateShard = struct {
     tags_file: sys.MappedFile,
     meaning_words: []u32,
     tags_words: []u64,
+    rank_file: sys.MappedFile,
+    rank_bytes: []u8,
     meaning_matrix: vsa.MeaningMatrix,
 
     pub fn mount(allocator: std.mem.Allocator, metadata: Metadata, cache_cap_bytes: usize) !MountedStateShard {
@@ -134,15 +138,20 @@ pub const MountedStateShard = struct {
 
         var tags_file = try sys.createMappedFile(allocator, paths.tags_abs_path, config.TAG_SIZE_BYTES);
         errdefer tags_file.unmap();
-
+        
+        var rank_file = try sys.createMappedFile(allocator, paths.rank_abs_path, config.SEMANTIC_SLOTS);
+        errdefer rank_file.unmap();
+        
         return .{
             .allocator = allocator,
             .paths = paths,
             .paged_lattice = paged_lattice,
             .semantic_file = semantic_file,
             .tags_file = tags_file,
+            .rank_file = rank_file,
             .meaning_words = @as([*]u32, @ptrCast(@alignCast(semantic_file.data.ptr)))[0..config.SEMANTIC_ENTRIES],
             .tags_words = @as([*]u64, @ptrCast(@alignCast(tags_file.data.ptr)))[0..config.TAG_ENTRIES],
+            .rank_bytes = @as([*]u8, @ptrCast(@alignCast(rank_file.data.ptr)))[0..config.SEMANTIC_SLOTS],
             .meaning_matrix = .{
                 .data = @as([*]u32, @ptrCast(@alignCast(semantic_file.data.ptr)))[0..config.SEMANTIC_ENTRIES],
                 .tags = @as([*]u64, @ptrCast(@alignCast(tags_file.data.ptr)))[0..config.TAG_ENTRIES],
@@ -169,9 +178,17 @@ pub const MountedStateShard = struct {
     pub fn deinit(self: *MountedStateShard) void {
         self.semantic_file.unmap();
         self.tags_file.unmap();
+        self.rank_file.unmap();
         self.paged_lattice.deinit();
         self.paths.deinit();
         self.* = undefined;
+    }
+
+    pub fn flush(self: *MountedStateShard) !void {
+        try sys.flushMappedMemory(&self.semantic_file);
+        try sys.flushMappedMemory(&self.tags_file);
+        try sys.flushMappedMemory(&self.rank_file);
+        try self.paged_lattice.flush();
     }
 };
 
@@ -266,6 +283,8 @@ pub fn resolvePaths(allocator: std.mem.Allocator, metadata: Metadata) !Paths {
     defer allocator.free(semantic_rel);
     const tags_rel = try std.fs.path.join(allocator, &.{ metadata.rel_root, config.TAG_FILE_NAME });
     defer allocator.free(tags_rel);
+    const rank_rel = try std.fs.path.join(allocator, &.{ metadata.rel_root, config.RUNE_RANK_FILE_NAME });
+    defer allocator.free(rank_rel);
     const sigil_rel = try std.fs.path.join(allocator, &.{ metadata.rel_root, "sigil" });
     defer allocator.free(sigil_rel);
     const scratch_rel = try std.fs.path.join(allocator, &.{ sigil_rel, "scratch" });
@@ -332,6 +351,7 @@ pub fn resolvePaths(allocator: std.mem.Allocator, metadata: Metadata) !Paths {
         .lattice_abs_path = try config.getPath(allocator, lattice_rel),
         .semantic_abs_path = try config.getPath(allocator, semantic_rel),
         .tags_abs_path = try config.getPath(allocator, tags_rel),
+        .rank_abs_path = try config.getPath(allocator, rank_rel),
         .sigil_root_abs_path = try config.getPath(allocator, sigil_rel),
         .sigil_scratch_abs_path = try config.getPath(allocator, scratch_rel),
         .sigil_committed_abs_path = try config.getPath(allocator, committed_rel),

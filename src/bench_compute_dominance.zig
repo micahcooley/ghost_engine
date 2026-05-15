@@ -162,6 +162,9 @@ fn runCorpusExactPhrase(allocator: std.mem.Allocator) !ScenarioResult {
     const started = std.time.nanoTimestamp();
     var result = try corpus_ask.ask(allocator, .{ .question = question, .project_shard = shard_id, .max_snippet_bytes = 96 });
     defer result.deinit();
+    if (result.status != .answered) {
+        std.debug.print("corpus.ask failed with status: {s}\n", .{@tagName(result.status)});
+    }
 
     var out = scenarioFromAsk("corpus.ask/exact_phrase_match", question.len, elapsedNs(started), &result);
     out.success = result.status == .answered and result.answer_draft != null and result.evidence_used.len == 1 and result.evidence_used[0].matched_phrase != null;
@@ -1445,6 +1448,11 @@ test "compute dominance report is generated with required scenarios and safety f
     defer suite.deinit();
 
     try std.testing.expectEqual(@as(usize, 32), suite.scenarios.len);
+    for (suite.scenarios) |scenario| {
+        if (!scenario.success) {
+            std.debug.print("Failed scenario: {s}\n", .{scenario.name});
+        }
+    }
     try std.testing.expect(allScenariosPassed(suite.scenarios));
 
     const json = try renderJsonReport(allocator, suite);
