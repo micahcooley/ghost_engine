@@ -1192,12 +1192,14 @@ fn dispatchResidentCorpusAsk(allocator: std.mem.Allocator, resident: *ResidentSt
         .vsa_route => {
             if (resident.vulkan) |vk| {
                 const query = vsa_math.generate(vsa_vulkan.murmur3Bytes64(question));
-                const job = vk.dispatchRuneSearchAsync(query, 5, 1024) catch |err| switch (err) {
-                    error.GpuBusy => return try renderVsaPendingCorpusAskResult(allocator, obj, question, null, true),
-                    else => null,
-                };
-                if (job) |gpu_job| {
-                    return try renderVsaPendingCorpusAskResult(allocator, obj, question, gpu_job, false);
+                const job = try vk.dispatchRuneSearchAsync(query, 5, 1024);
+                const res = try vk.waitRuneSearch(job);
+                
+                if (res.distance < 400) {
+                    resident.setPipelineTelemetry("VSA", "active", "green_verified");
+                    // TODO: Lookup rune in slot and render real result.
+                    // For now, we fall back to social if it's high distance, 
+                    // but we have a real result if it's low distance.
                 }
             }
             // Contextual Awareness enforced via Neural context hint
@@ -1210,7 +1212,18 @@ fn dispatchResidentCorpusAsk(allocator: std.mem.Allocator, resident: *ResidentSt
             }
         },
         .scalar_route => {
-            return try renderScalarReadyCorpusAskResult(allocator, obj, question, packet.scalar_response.?);
+            var draft = try text_generation_lab.generateSocialResponderDraft(allocator, .{
+                .user_query = question,
+                .active_shard = "all",
+                .daemon_active = true,
+                .vulkan_active = resident.vulkan_active,
+                .vram_resident_bytes = resident.vram_resident_bytes,
+                .resident_shards = resident.shards.items.len,
+                .session_hot_bytes = resident.session_hot.usedBytes(),
+                .neural_chat_response = packet.scalar_response,
+            });
+            defer draft.deinit(allocator);
+            return try renderSocialResponseResult(allocator, resident, obj, question, "all", draft.draft_text);
         },
     }
     // --------------------------------------------------

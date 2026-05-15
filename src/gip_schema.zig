@@ -410,7 +410,7 @@ pub fn renderResponse(
 
 // ── JSON Helpers ──────────────────────────────────────────────────────
 
-fn writeStr(w: anytype, key: []const u8, value: []const u8, first: bool) !void {
+pub fn writeStr(w: anytype, key: []const u8, value: []const u8, first: bool) !void {
     if (!first) try w.writeByte(',');
     try w.writeByte('"');
     try w.writeAll(key);
@@ -419,7 +419,7 @@ fn writeStr(w: anytype, key: []const u8, value: []const u8, first: bool) !void {
     try w.writeByte('"');
 }
 
-fn writeUsize(w: anytype, key: []const u8, value: usize, first: bool) !void {
+pub fn writeUsize(w: anytype, key: []const u8, value: usize, first: bool) !void {
     if (!first) try w.writeByte(',');
     try w.writeByte('"');
     try w.writeAll(key);
@@ -427,7 +427,7 @@ fn writeUsize(w: anytype, key: []const u8, value: usize, first: bool) !void {
     try w.print("{d}", .{value});
 }
 
-fn writeU64(w: anytype, key: []const u8, value: u64, first: bool) !void {
+pub fn writeU64(w: anytype, key: []const u8, value: u64, first: bool) !void {
     if (!first) try w.writeByte(',');
     try w.writeByte('"');
     try w.writeAll(key);
@@ -435,7 +435,7 @@ fn writeU64(w: anytype, key: []const u8, value: u64, first: bool) !void {
     try w.print("{d}", .{value});
 }
 
-fn writeBool(w: anytype, key: []const u8, value: bool, first: bool) !void {
+pub fn writeBool(w: anytype, key: []const u8, value: bool, first: bool) !void {
     if (!first) try w.writeByte(',');
     try w.writeByte('"');
     try w.writeAll(key);
@@ -443,7 +443,7 @@ fn writeBool(w: anytype, key: []const u8, value: bool, first: bool) !void {
     try w.writeAll(if (value) "true" else "false");
 }
 
-fn writeEscapedJson(w: anytype, s: []const u8) !void {
+pub fn writeEscapedJson(w: anytype, s: []const u8) !void {
     for (s) |c| {
         switch (c) {
             '"' => try w.writeAll("\\\""),
@@ -475,6 +475,15 @@ pub fn renderJsonStringArray(allocator: std.mem.Allocator, items: []const []cons
     }
     try w.writeByte(']');
     return out.toOwnedSlice();
+}
+
+pub fn renderHyperVectorJson(writer: anytype, vector: [16]u64) !void {
+    try writer.writeByte('[');
+    inline for (0..16) |i| {
+        if (i > 0) try writer.writeByte(',');
+        try writer.print("\"0x{x:0>16}\"", .{vector[i]});
+    }
+    try writer.writeByte(']');
 }
 
 pub fn renderProtocolDescription(allocator: std.mem.Allocator) ![]u8 {
@@ -740,4 +749,13 @@ test "renderResponse with draft result state" {
     try std.testing.expect(std.mem.indexOf(u8, response, "\"isDraft\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "\"permission\":\"none\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "\"nonAuthorizationNotice\"") != null);
+}
+
+test "renderHyperVectorJson produces hex array" {
+    var out = std.ArrayList(u8).init(std.testing.allocator);
+    defer out.deinit();
+    var v: [16]u64 = undefined;
+    for (0..16) |i| v[i] = i;
+    try renderHyperVectorJson(out.writer(), v);
+    try std.testing.expectEqualStrings("[\"0x0000000000000000\",\"0x0000000000000001\",\"0x0000000000000002\",\"0x0000000000000003\",\"0x0000000000000004\",\"0x0000000000000005\",\"0x0000000000000006\",\"0x0000000000000007\",\"0x0000000000000008\",\"0x0000000000000009\",\"0x000000000000000a\",\"0x000000000000000b\",\"0x000000000000000c\",\"0x000000000000000d\",\"0x000000000000000e\",\"0x000000000000000f\"]", out.items);
 }

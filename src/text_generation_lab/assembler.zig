@@ -20,6 +20,20 @@ const ClauseOrder = enum {
 
 pub fn assemblePredicateDraft(allocator: std.mem.Allocator, input: AssemblyInput) ![]u8 {
     const predicate = input.concept.predicate orelse return assembleVoidDraft(allocator, .{ .query = input.query, .shard_hint = input.source_hint });
+    
+    // For social/conversational intents, we bypass the symbolic "predicate reads" wrapper
+    // to provide a natural, human-like response from the neural layer.
+    if (input.concept.intent == .social) {
+        var out = std.ArrayList(u8).init(allocator);
+        errdefer out.deinit();
+        const trimmed = std.mem.trim(u8, input.concept.source_sentence, " \r\n\t");
+        try out.appendSlice(trimmed);
+        if (out.items.len > 0 and out.items[out.items.len - 1] != '.' and out.items[out.items.len - 1] != '!' and out.items[out.items.len - 1] != '?') {
+            try out.append('.');
+        }
+        return out.toOwnedSlice();
+    }
+
     const order = chooseOrder(input.query, input.concept.source_sentence);
     var out = std.ArrayList(u8).init(allocator);
     errdefer out.deinit();

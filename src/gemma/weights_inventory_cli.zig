@@ -6,6 +6,8 @@ const inference = @import("inference.zig");
 const model = @import("model.zig");
 const q8_matmul = @import("q8_matmul.zig");
 const weights = @import("weights.zig");
+const vsa_math = @import("../vsa_math.zig");
+const rune_encoder = @import("rune_encoder.zig");
 
 const usage =
     \\Usage:
@@ -143,7 +145,7 @@ pub fn main() !void {
     }
 
     if (command == .agent_route) {
-        const result = try runAgentRouteCommand(options, context_hints.items);
+        const result = try runAgentRouteCommand(allocator, options, context_hints.items);
         if (options.json) {
             try printAgentRouteJson(std.io.getStdOut().writer(), result);
         } else {
@@ -196,6 +198,7 @@ pub fn main() !void {
                 try std.io.getStdErr().writer().print("Error: inference smoke failed: {s}\n", .{@errorName(err)});
                 std.process.exit(1);
             };
+            defer summary.deinit(allocator);
             if (options.json) {
                 try printInferenceSmokeJson(std.io.getStdOut().writer(), model_path, text, summary);
             } else {
@@ -543,10 +546,27 @@ fn printAgentRouteJson(writer: anytype, result: agents.ResultPayload) !void {
     try writer.writeAll("}\n");
 }
 
-fn runAgentRouteCommand(options: Options, context_hints: []const []const u8) !agents.ResultPayload {
+fn runAgentRouteCommand(allocator: std.mem.Allocator, options: Options, context_hints: []const []const u8) !agents.ResultPayload {
     const intent = options.intent orelse return fail("--intent is required for agent route", .{});
     const subject = options.subject orelse return fail("--subject is required for agent route", .{});
     const needs_ghost = options.needs_ghost orelse defaultNeedsGhost(intent);
+
+    var resonance = options.resonance;
+    if (resonance == 0.0) {
+        const encoder = rune_encoder.RuneEncoder.init(allocator, 1024);
+        const runes = try encoder.encode(subject, 0);
+        defer rune_encoder.freeRunes(allocator, runes);
+        if (runes.len > 0) {
+            const target_vec = switch (intent) {
+                .query, .prove => vsa_math.ROUTE_VEC_VSA,
+                .converse => vsa_math.ROUTE_VEC_SCALAR,
+                .etch => vsa_math.ROUTE_VEC_VSA,
+            };
+            const res_u16 = vsa_math.resonanceScore(runes[runes.len - 1].vector, target_vec);
+            resonance = @as(f32, @floatFromInt(res_u16)) / 1024.0;
+        }
+    }
+
     return agents.route(.{
         .intent = intent,
         .subject = subject,
@@ -556,7 +576,7 @@ fn runAgentRouteCommand(options: Options, context_hints: []const []const u8) !ag
         .original_message = subject,
         .source = options.source,
         .explicit_store = options.explicit_store,
-        .resonance = options.resonance,
+        .resonance = resonance,
         .decision_trace = options.decision_trace,
         .evidence_trace = options.evidence_trace,
     });

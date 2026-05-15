@@ -38,3 +38,5 @@ pub const vsa_math = @import("../vsa_math.zig");
 pub const semantic_encoder = @import("../semantic_encoder.zig");
 pub const frontal_lobe = @import("../frontal_lobe.zig");
 pub const intent_grounding = @import("../intent_grounding.zig");
+pub const gemma_agents = @import("../gemma/agents.zig");
+pub const gemma_rune_encoder = @import("../gemma/rune_encoder.zig");

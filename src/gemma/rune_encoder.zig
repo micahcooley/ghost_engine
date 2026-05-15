@@ -70,6 +70,10 @@ pub fn freeRunes(allocator: std.mem.Allocator, runes: []ConversationRune) void {
 
 pub fn segmentWords(allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayList([]const u8)) !void {
     _ = allocator;
+    // V34: Pure Tokenless Spatial Rotor Ingest.
+    // We treat the entire input as a single continuous conceptual stream.
+    // Instead of arbitrary slicing, we segment by logical structural hints (BoundaryBytes)
+    // while maintaining a sliding spatial context within the hyper-rotor builder.
     var cursor: usize = 0;
     while (cursor < text.len) {
         while (cursor < text.len and isBoundaryByte(text[cursor])) cursor += 1;
@@ -77,30 +81,24 @@ pub fn segmentWords(allocator: std.mem.Allocator, text: []const u8, out: *std.Ar
         while (cursor < text.len and !isBoundaryByte(text[cursor])) cursor += 1;
         const end = cursor;
         if (end > start) {
-            const len = @min(end - start, max_segment_bytes);
-            try out.append(text[start .. start + len]);
+            // Each segment is a dense conceptual unit, mapped directly to a Rune.
+            try out.append(text[start..end]);
         }
     }
 }
 
 pub fn buildHyperRotor(segment: []const u8) vsa.HyperVector {
+    // Spatial hyper-rotor: binds each character to its position via permutation
+    // then bundles them into a unified conceptual vector.
     var state = vsa.generate(encoder_seed);
-    var utf8 = std.unicode.Utf8View.init(segment) catch {
-        return buildBytesRotor(segment);
-    };
-    var it = utf8.iterator();
-    while (it.nextCodepoint()) |cp| {
-        const rune_vec = vsa.generate(@as(u64, cp));
-        const position_vec = vsa.generate(encoder_seed ^ @as(u64, cp) ^ vsa.collapse(state));
-        state = vsa.bundle(vsa.permute(state), rune_vec, position_vec);
-    }
-    return state;
-}
-
-fn buildBytesRotor(segment: []const u8) vsa.HyperVector {
-    var state = vsa.generate(encoder_seed);
-    for (segment) |byte| {
-        state = vsa.bundle(vsa.permute(state), vsa.generate(byte), vsa.generate(encoder_seed ^ byte));
+    for (segment, 0..) |byte, pos| {
+        const char_vec = vsa.generate(byte);
+        // Position binding via N-fold permutation
+        var pos_vec = char_vec;
+        for (0..pos % 15) |_| {
+            pos_vec = vsa.permute(pos_vec);
+        }
+        state = vsa.bundle(state, pos_vec, vsa.generate(encoder_seed ^ @as(u64, byte)));
     }
     return state;
 }
@@ -123,6 +121,7 @@ pub fn projectDeterministic(vector: vsa.HyperVector, embedding: []f32) void {
 }
 
 fn isBoundaryByte(byte: u8) bool {
+    // Structural hints for the rotor ingest, NOT data-center tokenization.
     return switch (byte) {
         ' ', '\t', '\r', '\n', ',', '.', ';', ':', '!', '?', '(', ')', '[', ']', '{', '}', '"', '\'' => true,
         else => false,

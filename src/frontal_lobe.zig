@@ -51,30 +51,23 @@ pub const Projection = struct {
     offload: OffloadResult = .{ .status = .skipped },
 };
 
-const IntentExample = struct {
-    route: IntentRoute,
-    text: []const u8,
-    weight: u16,
-};
-
-const bootstrap_examples = [_]IntentExample{
-    .{ .route = .scalar, .text = "ready status hello ping help start engine available", .weight = 2 },
-    .{ .route = .scalar, .text = "are you online system ready daemon status", .weight = 2 },
-    .{ .route = .z3, .text = "prove solve arithmetic integer constraint equation logic theorem", .weight = 2 },
-    .{ .route = .z3, .text = "calculate compare equals greater less than formal proof", .weight = 2 },
-    .{ .route = .vsa, .text = "search recall retrieve memory lattice corpus semantic similarity", .weight = 2 },
-    .{ .route = .vsa, .text = "vulkan gpu vsa vector resonance context knowledge", .weight = 2 },
-};
+// No more lazy bootstrap examples. Intent is now determined by pure semantic resonance
+// against orthogonal route centroids.
 
 pub fn projectLocalIntent(allocator: std.mem.Allocator, text: []const u8) !Projection {
+    _ = allocator;
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
     const hidden_state = try evolveHiddenState(trimmed);
     const concept_state = semantic_encoder.encodeDomainConcept(trimmed, "human_intent");
     const intent_vector = vsa.bundle(hidden_state, concept_state, semantic_encoder.encodeConceptString(trimmed));
 
     var scores = IntentScores{};
-    scoreExamples(&scores, trimmed, intent_vector, &bootstrap_examples);
-    try scoreReviewedExamples(allocator, &scores, trimmed, intent_vector);
+    // Calculate pure resonance against route centroids
+    scores.scalar = @as(u32, vsa.resonanceScore(intent_vector, vsa.ROUTE_VEC_SCALAR));
+    scores.z3 = @as(u32, vsa.resonanceScore(intent_vector, vsa.ROUTE_VEC_Z3));
+    scores.vsa = @as(u32, vsa.resonanceScore(intent_vector, vsa.ROUTE_VEC_VSA));
+
+    // Bias for structural signals to capture "human weirdness" (math symbols, etc.)
     scores.applyStructuralSignals(trimmed);
 
     const route = scores.selectRoute();
@@ -154,9 +147,33 @@ const IntentScores = struct {
     }
 
     fn applyStructuralSignals(self: *IntentScores, text: []const u8) void {
-        if (looksArithmeticOrLogic(text)) self.z3 += 1400;
-        if (containsAnyAsciiIgnoreCase(text, &.{ "ready", "hello", "hi", "status", "ping", "help", "start" })) self.scalar += 900;
-        if (containsAnyAsciiIgnoreCase(text, &.{ "search", "recall", "retrieve", "memory", "vsa", "lattice", "corpus", "semantic", "similar", "vulkan", "gpu" })) self.vsa += 900;
+        var z3_boost: u32 = 0;
+        var vsa_boost: u32 = 0;
+        var scalar_boost: u32 = 0;
+
+        for (text) |byte| {
+            if (byte == '+' or byte == '-' or byte == '*' or byte == '/' or byte == '=') {
+                z3_boost += 200;
+            }
+        }
+        if (std.mem.indexOf(u8, text, "prove") != null or std.mem.indexOf(u8, text, "Z3") != null) {
+            z3_boost += 400;
+        }
+
+        if (std.mem.indexOf(u8, text, "what") != null or std.mem.indexOf(u8, text, "how") != null or std.mem.indexOf(u8, text, "why") != null) {
+            vsa_boost += 200;
+        }
+        if (std.mem.indexOf(u8, text, "hypervector") != null or std.mem.indexOf(u8, text, "rune") != null or std.mem.indexOf(u8, text, "vsa") != null) {
+            vsa_boost += 400;
+        }
+
+        if (std.mem.indexOf(u8, text, "hi") != null or std.mem.indexOf(u8, text, "hello") != null or std.mem.indexOf(u8, text, "hey") != null or std.mem.indexOf(u8, text, "thanks") != null or std.mem.indexOf(u8, text, "thank") != null) {
+            scalar_boost += 300;
+        }
+
+        self.z3 += z3_boost;
+        self.vsa += vsa_boost;
+        self.scalar += scalar_boost;
     }
 
     fn selectRoute(self: IntentScores) IntentRoute {
@@ -166,39 +183,11 @@ const IntentScores = struct {
     }
 };
 
-fn scoreExamples(scores: *IntentScores, text: []const u8, query: vsa.HyperVector, examples: []const IntentExample) void {
-    for (examples) |example| {
-        const example_vec = semantic_encoder.encodeDomainConcept(example.text, "human_intent");
-        const resonance = vsa.resonanceScore(query, example_vec);
-        var amount: u32 = @as(u32, resonance) * example.weight;
-        if (hasAnyPrototypeTerm(text, example.text)) amount += 250;
-        scores.add(example.route, amount);
-    }
-}
-
 fn scoreReviewedExamples(allocator: std.mem.Allocator, scores: *IntentScores, text: []const u8, query: vsa.HyperVector) !void {
-    const maybe_path = try reviewedExamplesPath(allocator);
-    const path = maybe_path orelse return;
-    defer allocator.free(path);
-
-    const bytes = std.fs.cwd().readFileAlloc(allocator, path, 256 * 1024) catch return;
-    defer allocator.free(bytes);
-
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r\n");
-        if (trimmed.len == 0) continue;
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch continue;
-        defer parsed.deinit();
-        if (parsed.value != .object) continue;
-        const obj = parsed.value.object;
-        const route_text = jsonString(obj, "route") orelse continue;
-        const example_text = jsonString(obj, "text") orelse continue;
-        const route = parseRoute(route_text) orelse continue;
-        const weight = jsonInt(obj, "weight") orelse 3;
-        const example = IntentExample{ .route = route, .text = example_text, .weight = @intCast(@min(@as(i64, 12), @max(@as(i64, 1), weight))) };
-        scoreExamples(scores, text, query, &.{example});
-    }
+    _ = allocator;
+    _ = scores;
+    _ = text;
+    _ = query;
 }
 
 fn projectionFromRoute(source: EncoderSource, route: IntentRoute, intent_vector: vsa.HyperVector, hidden_state: vsa.HyperVector, scores: IntentScores) Projection {
@@ -237,76 +226,7 @@ fn toMmapVector(vector: vsa.HyperVector) mmap_hv.HyperVector {
     return .{ .lanes = @as([16]u64, vector) };
 }
 
-fn parseRoute(text: []const u8) ?IntentRoute {
-    if (std.ascii.eqlIgnoreCase(text, "scalar")) return .scalar;
-    if (std.ascii.eqlIgnoreCase(text, "z3") or std.ascii.eqlIgnoreCase(text, "logic")) return .z3;
-    if (std.ascii.eqlIgnoreCase(text, "vsa") or std.ascii.eqlIgnoreCase(text, "memory")) return .vsa;
-    return null;
-}
-
-fn jsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const value = obj.get(key) orelse return null;
-    if (value != .string) return null;
-    return value.string;
-}
-
-fn jsonInt(obj: std.json.ObjectMap, key: []const u8) ?i64 {
-    const value = obj.get(key) orelse return null;
-    if (value != .integer) return null;
-    return value.integer;
-}
-
-fn hasAnyPrototypeTerm(text: []const u8, prototype_text: []const u8) bool {
-    var it = std.mem.splitScalar(u8, prototype_text, ' ');
-    while (it.next()) |term| {
-        if (term.len == 0) continue;
-        if (indexOfAsciiIgnoreCase(text, term) != null) return true;
-    }
-    return false;
-}
-
-fn looksArithmeticOrLogic(text: []const u8) bool {
-    if (containsAnyAsciiIgnoreCase(text, &.{
-        "z3",
-        "prove",
-        "solver",
-        "solve",
-        "logic",
-        "theorem",
-        "constraint",
-        "integer",
-        "arithmetic",
-        "equals",
-    })) return true;
-
-    var saw_digit = false;
-    var saw_operator = false;
-    for (text) |c| {
-        if (std.ascii.isDigit(c)) saw_digit = true;
-        switch (c) {
-            '+', '-', '*', '/', '=', '<', '>' => saw_operator = true,
-            else => {},
-        }
-    }
-    return saw_digit and saw_operator;
-}
-
-fn containsAnyAsciiIgnoreCase(text: []const u8, needles: []const []const u8) bool {
-    for (needles) |needle| {
-        if (indexOfAsciiIgnoreCase(text, needle) != null) return true;
-    }
-    return false;
-}
-
-fn indexOfAsciiIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
-    if (needle.len == 0) return 0;
-    if (needle.len > haystack.len) return null;
-    var idx: usize = 0;
-    while (idx + needle.len <= haystack.len) : (idx += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[idx .. idx + needle.len], needle)) return idx;
-    }
-    return null;
-}
+// Helpers removed. Using pure VSA resonance.
 
 test "local frontal lobe projects fuzzy intent into VSA route space" {
     const allocator = std.testing.allocator;

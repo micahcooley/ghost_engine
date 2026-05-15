@@ -48,6 +48,7 @@ const hive = deps.hive;
 const recursive_boot = deps.recursive_boot;
 const vsa_math = deps.vsa_math;
 const frontal_lobe = deps.frontal_lobe;
+const gemma_agents = deps.gemma_agents;
 
 pub const DispatchResult = struct {
     status: core.ProtocolStatus,
@@ -337,8 +338,6 @@ pub const NeuralGipPacket = struct {
     offload_slot: ?u32 = null,
 };
 
-pub const READY_SCALAR_RESPONSE = route_scalar.READY_RESPONSE;
-
 pub const EncoderSource = frontal_lobe.EncoderSource;
 
 fn encodeTextToVectorWithFrontalLobe(allocator: std.mem.Allocator, text: []const u8) !vsa_math.HyperVector {
@@ -406,6 +405,34 @@ pub fn neuralRouter(allocator: std.mem.Allocator, message: []const u8) !NeuralGi
     };
     frontal_lobe.offloadDefault(allocator, &projection);
 
+    // --- Stage 3: Neural Tie-Breaker (No Slacking Off) ---
+    // If the VSA resonance is weak or ambiguous, the Frontal Lobe is likely failing
+    // to understand "human weirdness". We call the Neural Agent to break the tie.
+    if (projection.confidence_per_mille < 400) {
+        const agent_result = gemma_agents.route(.{
+            .intent = .converse, // Start with converse, will be refined by subject
+            .subject = trimmed,
+            .needs_ghost = false,
+            .resonance = @as(f32, @floatFromInt(projection.vsa_score)) / 1024.0,
+        });
+
+        if (agent_result.status == .converse) {
+            return .{
+                .route = .scalar_route,
+                .scalar_response = agent_result.chat_response,
+                .context_hint = "neural_tiebreak_social",
+                .encoder_source = .frontal_lobe,
+                .confidence_per_mille = 999,
+                .state_hash = projection.state_hash,
+                .scalar_score = projection.scalar_score,
+                .z3_score = projection.z3_score,
+                .vsa_score = projection.vsa_score,
+                .offload_status = projection.offload.status,
+                .offload_slot = projection.offload.slot,
+            };
+        }
+    }
+    
     const route_vec = projection.route_vector;
     const dist_z3 = vsa_math.hammingDistance(route_vec, vsa_math.ROUTE_VEC_Z3);
     const dist_vsa = vsa_math.hammingDistance(route_vec, vsa_math.ROUTE_VEC_VSA);
@@ -427,9 +454,16 @@ pub fn neuralRouter(allocator: std.mem.Allocator, message: []const u8) !NeuralGi
             .offload_slot = projection.offload.slot,
         };
     } else if (dist_scalar < dist_vsa) {
+        const agent_result = gemma_agents.route(.{
+            .intent = .converse,
+            .subject = "filler_resonance",
+            .original_message = trimmed,
+            .needs_ghost = false,
+            .resonance = @as(f32, @floatFromInt(projection.scalar_score)) / 1024.0,
+        });
         return .{
             .route = .scalar_route,
-            .scalar_response = READY_SCALAR_RESPONSE,
+            .scalar_response = agent_result.chat_response,
             .context_hint = "filler_resonance",
             .encoder_source = projection.source,
             .confidence_per_mille = projection.confidence_per_mille,
@@ -459,7 +493,7 @@ pub fn neuralRouter(allocator: std.mem.Allocator, message: []const u8) !NeuralGi
 
 // ──────────────────────────────────────────────────────────────────────────
 
-fn dispatchConversationTurn(allocator: std.mem.Allocator, workspace_root: ?[]const u8, request_body: ?[]const u8) !DispatchResult {
+pub fn dispatchConversationTurn(allocator: std.mem.Allocator, workspace_root: ?[]const u8, request_body: ?[]const u8) !DispatchResult {
     const root = workspace_root orelse ".";
     const body = request_body orelse return .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "body missing" } };
 
@@ -472,27 +506,15 @@ fn dispatchConversationTurn(allocator: std.mem.Allocator, workspace_root: ?[]con
     const msg = if (obj.get("message")) |m| m.string else return .{ .status = .rejected, .err = .{ .code = .missing_required_field, .message = "message missing" } };
 
     const neural_packet = try neuralRouter(allocator, msg);
-    switch (neural_packet.route) {
-        .z3_route => {
-            if (try route_z3.dispatchConversation(allocator, msg, neural_packet.formula.?)) |z3_result| {
-                return .{
-                    .status = .ok,
-                    .result_state = z3_result.result_state,
-                    .result_json = z3_result.result_json,
-                    .allocated_result = true,
-                };
-            }
-        },
-        .scalar_route => {
-            const scalar_result = try route_scalar.dispatchConversation(allocator, neural_packet.scalar_response.?);
+    if (neural_packet.route == .z3_route) {
+        if (try route_z3.dispatchConversation(allocator, msg, neural_packet.formula.?)) |z3_result| {
             return .{
                 .status = .ok,
-                .result_state = scalar_result.result_state,
-                .result_json = scalar_result.result_json,
+                .result_state = z3_result.result_state,
+                .result_json = z3_result.result_json,
                 .allocated_result = true,
             };
-        },
-        .vsa_route => {}, // Fall through to standard conversation session
+        }
     }
 
     const session_id = getStr(obj, "session_id", "session_id");
@@ -826,18 +848,8 @@ fn dispatchIntentGround(allocator: std.mem.Allocator, request_body: ?[]const u8)
     var result = try deps.intent_grounding.ground(allocator, intent_text, options);
     defer result.deinit();
 
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-    const w = out.writer();
-
-    try w.writeAll("{\"groundedIntent\":");
-    // TODO: implement renderIntentGroundingJson in intent_grounding.zig if missing
-    // For now, we'll do a basic serialization or assume it exists
-    try w.writeAll("{\"status\":\"");
-    try w.writeAll(@tagName(result.status));
-    try w.writeAll("\",\"intentClass\":\"");
-    try w.writeAll(@tagName(result.intent_class));
-    try w.writeAll("\"}}");
+    const rendered = try result.renderJson(allocator);
+    errdefer allocator.free(rendered);
 
     var gip_state = schema.draftResultState();
     switch (result.status) {
@@ -861,7 +873,7 @@ fn dispatchIntentGround(allocator: std.mem.Allocator, request_body: ?[]const u8)
     return .{
         .status = .ok,
         .result_state = gip_state,
-        .result_json = try out.toOwnedSlice(),
+        .result_json = rendered,
         .allocated_result = true,
     };
 }

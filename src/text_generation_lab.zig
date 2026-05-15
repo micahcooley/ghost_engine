@@ -93,6 +93,7 @@ pub const SocialResponderInput = struct {
     vram_resident_bytes: usize = 0,
     resident_shards: usize = 0,
     session_hot_bytes: usize = 0,
+    neural_chat_response: ?[]const u8 = null,
 };
 
 pub const StateReflectionInput = struct {
@@ -1018,10 +1019,15 @@ fn isAcronymToken(token: []const u8) bool {
 pub fn generateSocialResponderDraft(allocator: std.mem.Allocator, input: SocialResponderInput) !TextGenerationDraft {
     var raw = std.ArrayList(u8).init(allocator);
     defer raw.deinit();
-    try raw.writer().print(
-        "session status is conversational; resident shards are {d}; compute residency is {s}; hot memory contains {d} bytes",
-        .{ input.resident_shards, if (input.vulkan_active) "vram" else "cpu", input.session_hot_bytes },
-    );
+    
+    if (input.neural_chat_response) |resp| {
+        try raw.appendSlice(resp);
+    } else {
+        try raw.writer().print(
+            "session status is conversational; resident shards are {d}; compute residency is {s}; hot memory contains {d} bytes",
+            .{ input.resident_shards, if (input.vulkan_active) "vram" else "cpu", input.session_hot_bytes },
+        );
+    }
     var parsed = (try parser.parseConcept(allocator, input.user_query, raw.items)) orelse {
         return .{
             .draft_text = try assembler.assembleVoidDraft(allocator, .{ .query = input.user_query, .shard_hint = input.active_shard }),

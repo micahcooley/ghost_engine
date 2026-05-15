@@ -3,6 +3,7 @@ const task_intent = @import("task_intent.zig");
 const artifact_schema = @import("artifact_schema.zig");
 const vsa_vulkan = @import("vsa_vulkan.zig");
 const gip_parser = @import("compiler/gip_parser.zig");
+const gip_schema = @import("gip_schema.zig");
 
 // ──────────────────────────────────────────────────────────────────────────
 // Intent Grounding v2
@@ -501,6 +502,186 @@ pub const GroundedIntent = struct {
             .traces = try traces.toOwnedSlice(),
             .fast_path_eligible = self.fast_path_eligible,
         };
+    }
+
+    pub fn renderJson(self: GroundedIntent, allocator: std.mem.Allocator) ![]u8 {
+        var out = std.ArrayList(u8).init(allocator);
+        errdefer out.deinit();
+        const w = out.writer();
+
+        try w.writeAll("{\"status\":\"");
+        try w.writeAll(@tagName(self.status));
+        try w.writeAll("\",\"intentClass\":\"");
+        try w.writeAll(@tagName(self.intent_class));
+        try w.writeAll("\",\"scope\":\"");
+        try w.writeAll(@tagName(self.scope));
+        try w.writeAll("\"");
+
+        try gip_schema.writeBool(w, "fastPathEligible", self.fast_path_eligible, false);
+
+        if (self.artifact_bindings.len > 0) {
+            try w.writeAll(",\"artifactBindings\":[");
+            for (self.artifact_bindings, 0..) |binding, i| {
+                if (i > 0) try w.writeByte(',');
+                try w.writeAll("{\"artifactId\":\"");
+                try gip_schema.writeEscapedJson(w, binding.artifact_id);
+                try w.writeAll("\",\"source\":\"");
+                try w.writeAll(@tagName(binding.source));
+                try w.writeAll("\",\"schemaName\":\"");
+                try gip_schema.writeEscapedJson(w, binding.schema_name);
+                try w.writeAll("\",\"confidence\":");
+                try w.print("{d}", .{binding.confidence});
+                try w.writeAll("}");
+            }
+            try w.writeAll("]");
+        }
+
+        if (self.action_surfaces.len > 0) {
+            try w.writeAll(",\"actionSurfaces\":[");
+            for (self.action_surfaces, 0..) |surface, i| {
+                if (i > 0) try w.writeByte(',');
+                try w.writeByte('\"');
+                try w.writeAll(@tagName(surface));
+                try w.writeByte('\"');
+            }
+            try w.writeAll("]");
+        }
+
+        if (self.constraints.len > 0) {
+            try w.writeAll(",\"constraints\":[");
+            for (self.constraints, 0..) |c, i| {
+                if (i > 0) try w.writeByte(',');
+                try w.writeAll("{\"kind\":\"");
+                try w.writeAll(@tagName(c.kind));
+                try w.writeAll("\",\"source\":\"");
+                try w.writeAll(@tagName(c.source));
+                if (c.value) |v| {
+                    try w.writeAll("\",\"value\":\"");
+                    try gip_schema.writeEscapedJson(w, v);
+                    try w.writeByte('\"');
+                }
+                if (c.detail) |d| {
+                    try w.writeAll(",\"detail\":\"");
+                    try gip_schema.writeEscapedJson(w, d);
+                    try w.writeByte('\"');
+                }
+                try w.writeAll("}");
+            }
+            try w.writeAll("]");
+        }
+
+        if (self.obligations.len > 0) {
+            try w.writeAll(",\"obligations\":[");
+            for (self.obligations, 0..) |o, i| {
+                if (i > 0) try w.writeByte(',');
+                try w.writeAll("{\"id\":\"");
+                try gip_schema.writeEscapedJson(w, o.id);
+                try w.writeAll("\",\"label\":\"");
+                try gip_schema.writeEscapedJson(w, o.label);
+                try w.writeAll("\",\"scope\":\"");
+                try gip_schema.writeEscapedJson(w, o.scope);
+                try w.writeAll("\",\"pending\":");
+                try w.writeAll(if (o.pending) "true" else "false");
+                if (o.resolved_by) |r| {
+                    try w.writeAll(",\"resolvedBy\":\"");
+                    try gip_schema.writeEscapedJson(w, r);
+                    try w.writeByte('\"');
+                }
+                try w.writeAll("}");
+            }
+            try w.writeAll("]");
+        }
+
+        if (self.ambiguity_sets.len > 0) {
+            try w.writeAll(",\"ambiguitySets\":[");
+            for (self.ambiguity_sets, 0..) |as, i| {
+                if (i > 0) try w.writeByte(',');
+                try w.writeAll("{\"reason\":\"");
+                try gip_schema.writeEscapedJson(w, as.reason);
+                try w.writeAll("\",\"obligationToResolve\":\"");
+                try gip_schema.writeEscapedJson(w, as.obligation_to_resolve);
+                try w.writeAll("\",\"candidateIndices\":[");
+                for (as.candidate_indices, 0..) |idx, j| {
+                    if (j > 0) try w.writeByte(',');
+                    try w.print("{d}", .{idx});
+                }
+                try w.writeAll("]}");
+            }
+            try w.writeAll("]");
+        }
+
+        if (self.missing_obligations.len > 0) {
+            try w.writeAll(",\"missingObligations\":[");
+            for (self.missing_obligations, 0..) |mo, i| {
+                if (i > 0) try w.writeByte(',');
+                try w.writeAll("{\"id\":\"");
+                try gip_schema.writeEscapedJson(w, mo.id);
+                try w.writeAll("\",\"label\":\"");
+                try gip_schema.writeEscapedJson(w, mo.label);
+                try w.writeAll("\",\"requiredFor\":\"");
+                try gip_schema.writeEscapedJson(w, mo.required_for);
+                try w.writeAll("\"}");
+            }
+            try w.writeAll("]");
+        }
+
+        if (self.candidate_intents.len > 0) {
+            try w.writeAll(",\"candidateIntents\":[");
+            for (self.candidate_intents, 0..) |ci, i| {
+                if (i > 0) try w.writeByte(',');
+                try w.writeAll("{\"label\":\"");
+                try gip_schema.writeEscapedJson(w, ci.label);
+                try w.writeAll("\",\"actionSurface\":\"");
+                try w.writeAll(@tagName(ci.action_surface));
+                try w.writeAll("\",\"scope\":\"");
+                try w.writeAll(@tagName(ci.scope));
+                try gip_schema.writeBool(w, "viable", ci.viable, false);
+                try w.writeAll(",\"reason\":\"");
+                try gip_schema.writeEscapedJson(w, ci.reason);
+                try w.writeAll("\"}");
+            }
+            try w.writeAll("]");
+        }
+
+        if (self.ontological_primitives.len > 0) {
+            try w.writeAll(",\"ontologicalPrimitives\":[");
+            for (self.ontological_primitives, 0..) |op, i| {
+                if (i > 0) try w.writeByte(',');
+                try w.writeAll("{\"role\":\"");
+                try w.writeAll(@tagName(op.role));
+                try w.writeAll("\",\"concept\":\"");
+                try w.writeAll(@tagName(op.concept));
+                try w.writeAll("\",\"source\":\"");
+                try gip_schema.writeEscapedJson(w, op.source);
+                try w.writeAll("\",\"confidence\":");
+                try w.print("{d}", .{op.confidence});
+                try w.writeAll("}");
+            }
+            try w.writeAll("]");
+        }
+
+        if (self.traces.len > 0) {
+            try w.writeAll(",\"traces\":[");
+            for (self.traces, 0..) |t, i| {
+                if (i > 0) try w.writeByte(',');
+                try w.writeAll("{\"step\":\"");
+                try gip_schema.writeEscapedJson(w, t.step);
+                try w.writeAll("\",\"input\":\"");
+                try gip_schema.writeEscapedJson(w, t.input);
+                try w.writeAll("\",\"output\":\"");
+                try gip_schema.writeEscapedJson(w, t.output);
+                if (t.detail) |d| {
+                    try w.writeAll(",\"detail\":\"");
+                    try gip_schema.writeEscapedJson(w, d);
+                    try w.writeByte('\"');
+                }
+                try w.writeAll("}");
+            }
+            try w.writeAll("]");
+        }
+
+        try w.writeAll("}");
+        return out.toOwnedSlice();
     }
 };
 

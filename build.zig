@@ -677,6 +677,8 @@ pub fn build(b: *std.Build) void {
         .filters = test_filters,
     });
     gemma_weights_tests.want_lto = use_lto;
+    gemma_weights_tests.root_module.addOptions("build_options", core_options);
+    gemma_weights_tests.root_module.linkSystemLibrary("c", .{});
     const run_gemma_weights_tests = b.addRunArtifact(gemma_weights_tests);
     const gemma_weights_step = b.step("test-gemma-weights", "Run GGUF parser and Gemma weight inventory tests");
     gemma_weights_step.dependOn(&run_gemma_weights_tests.step);
@@ -694,12 +696,14 @@ pub fn build(b: *std.Build) void {
         .filters = test_filters,
     });
     gemma_inference_tests.want_lto = use_lto;
+    gemma_inference_tests.root_module.addOptions("build_options", core_options);
+    gemma_inference_tests.root_module.linkSystemLibrary("c", .{});
     const run_gemma_inference_tests = b.addRunArtifact(gemma_inference_tests);
 
     const gemma_agent_tests = b.addTest(.{
         .use_llvm = use_llvm,
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/gemma/agents.zig"),
+            .root_source_file = b.path("src/gemma_native_tests.zig"),
             .target = target,
             .optimize = optimize,
             .code_model = .small,
@@ -709,8 +713,11 @@ pub fn build(b: *std.Build) void {
         .filters = test_filters,
     });
     gemma_agent_tests.want_lto = use_lto;
+    gemma_agent_tests.root_module.addOptions("build_options", core_options);
+    gemma_agent_tests.root_module.linkSystemLibrary("c", .{});
     const run_gemma_agent_tests = b.addRunArtifact(gemma_agent_tests);
-
+    
+    // Add the agents test back to the native step
     const gemma_native_step = b.step("test-gemma-native", "Run Ghost-native Gemma rune, attention, inference, and agent-router tests");
     gemma_native_step.dependOn(&run_gemma_inference_tests.step);
     gemma_native_step.dependOn(&run_gemma_agent_tests.step);
@@ -793,6 +800,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(phase3_step);
     test_step.dependOn(phase456_step);
     test_step.dependOn(swe_harness_step);
+    test_step.dependOn(gemma_native_step);
     run_text_generation_lab_tests.step.dependOn(&run_main_tests.step);
 
     const lifecycle_tests = b.addTest(.{

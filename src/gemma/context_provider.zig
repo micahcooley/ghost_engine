@@ -2,12 +2,16 @@ const std = @import("std");
 const vsa = @import("../vsa_math.zig");
 const rune_encoder = @import("rune_encoder.zig");
 
+const shards = @import("../shards.zig");
+
 pub const ContextEntry = struct {
     slot: u32,
     resonance: f32,
     embedding: []const f32,
     rune_id: u64,
     rotor: [2]u64,
+    text: []const u8 = "",
+    owned_embedding: bool = false,
 };
 
 pub const QueryLogEntry = struct {
@@ -37,29 +41,73 @@ pub const GhostContextProvider = struct {
         top_k: usize,
     ) ![]ContextEntry {
         if (top_k == 0) return error.InvalidTopK;
-        const count = @min(top_k, candidates.len);
-        var entries = try self.allocator.alloc(ContextEntry, candidates.len);
-        errdefer self.allocator.free(entries);
+        var entries = std.ArrayList(ContextEntry).init(self.allocator);
+        defer entries.deinit();
 
         for (candidates, 0..) |candidate, idx| {
-            entries[idx] = .{
+            try entries.append(.{
                 .slot = @intCast(idx),
                 .resonance = resonanceScore(query, candidate.vector),
                 .embedding = candidate.embedding,
                 .rune_id = candidate.rotor[0],
                 .rotor = candidate.rotor,
-            };
+                .text = candidate.text,
+                .owned_embedding = false,
+            });
         }
-        std.mem.sort(ContextEntry, entries, {}, sortByResonanceDesc);
 
+        // Dynamically mount the active Core MountedStateShard to query the true MeaningMatrix on disk/memory
+        if (shards.MountedStateShard.mountCore(self.allocator, 1024 * 1024)) |*shard| {
+            var active_shard = shard.*;
+            defer active_shard.deinit();
+
+            if (active_shard.meaning_matrix.tags) |tags| {
+                const num_slots = @as(u32, @intCast(tags.len));
+                for (0..num_slots) |slot| {
+                    const tag = tags[slot];
+                    if (tag != 0) {
+                        const vec = active_shard.meaning_matrix.collapseToBinaryAtSlot(@intCast(slot));
+                        const res = resonanceScore(query, vec);
+                        if (res > 0.2) { // Only pull meaningful/resonant historical concepts
+                            const embedding = try self.allocator.alloc(f32, candidates[0].embedding.len);
+                            rune_encoder.projectDeterministic(vec, embedding);
+                            
+                            try entries.append(.{
+                                .slot = @intCast(slot + candidates.len),
+                                .resonance = res,
+                                .embedding = embedding,
+                                .rune_id = tag,
+                                .rotor = .{ tag, vsa.collapse(vec) },
+                                .text = "etched_memory_lattice",
+                                .owned_embedding = true,
+                            });
+                        }
+                    }
+                }
+            }
+        } else |_| {}
+
+        std.mem.sort(ContextEntry, entries.items, {}, sortByResonanceDesc);
+
+        const count = @min(top_k, entries.items.len);
         const result = try self.allocator.alloc(ContextEntry, count);
-        @memcpy(result, entries[0..count]);
-        self.allocator.free(entries);
+        @memcpy(result, entries.items[0..count]);
+
+        for (entries.items[count..]) |entry| {
+            if (entry.owned_embedding) {
+                self.allocator.free(entry.embedding);
+            }
+        }
         return result;
     }
 };
 
 pub fn freeContext(allocator: std.mem.Allocator, context: []ContextEntry) void {
+    for (context) |entry| {
+        if (entry.owned_embedding) {
+            allocator.free(entry.embedding);
+        }
+    }
     allocator.free(context);
 }
 

@@ -90,3 +90,4 @@ __pycache__/
 # Explicit config/state exceptions
 !/build.zig.zon
 !/.vscode/settings.json
+/.ghost/

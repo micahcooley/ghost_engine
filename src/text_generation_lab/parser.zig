@@ -77,6 +77,23 @@ pub fn parseConcept(allocator: std.mem.Allocator, query: []const u8, raw_text: [
         best_sentence = trimmed;
     }
 
+    if (intent == .social) {
+        const ontological_primitives = try parseOntologyPrimitives(allocator, query, best_sentence);
+        errdefer intent_grounding.freeOntologicalPrimitives(allocator, ontological_primitives);
+        return .{
+            .intent = intent,
+            .predicate = .{
+                .subject = try allocator.dupe(u8, best_sentence),
+                .predicate = try allocator.dupe(u8, ""),
+                .object = try allocator.dupe(u8, ""),
+                .kind = .action,
+            },
+            .ontological_primitives = ontological_primitives,
+            .source_sentence = try allocator.dupe(u8, best_sentence),
+            .confidence_per_mille = 999,
+        };
+    }
+
     var predicate = (try extractPredicate(allocator, best_sentence, intent)) orelse return null;
     errdefer predicate.deinit(allocator);
     const ontological_primitives = try parseOntologyPrimitives(allocator, query, best_sentence);
@@ -143,7 +160,7 @@ fn inferIntent(query: []const u8) IntentKind {
     if (containsWord(query, "who")) return .factual_identity;
     if (containsWord(query, "what") or containsWord(query, "define") or containsWord(query, "definition")) return .factual_definition;
     if (containsWord(query, "how")) return .procedural;
-    if (containsWord(query, "hi") or containsWord(query, "hello") or containsWord(query, "hey")) return .social;
+    if (containsWord(query, "hi") or containsWord(query, "hello") or containsWord(query, "hey") or containsWord(query, "thanks") or containsWord(query, "thank")) return .social;
     return .unknown;
 }
 
