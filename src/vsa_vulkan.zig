@@ -29,6 +29,8 @@ pub const CORPUS_SCAN_TERM_BYTES: usize = 16;
 pub const LatticeQueryRune = gpu_lattice.GreRune;
 pub const GEMMA_FORWARD_STAGES_PER_BLOCK: u32 = 14;
 const DESCRIPTOR_BINDING_COUNT: u32 = 15;
+const GEMMA_DESCRIPTOR_BINDING_COUNT: u32 = 6; // weights, inA, inB, matrix, scores, rune_ids
+const GEMMA_DESCRIPTOR_SET_COUNT: u32 = 6;
 const FENCE_TIMEOUT_NS: u64 = 2_000_000_000;
 const SHUTDOWN_FENCE_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
 const VALIDATION_LAYER_NAME: [*:0]const u8 = "VK_LAYER_KHRONOS_validation";
@@ -119,6 +121,39 @@ pub const NegativeSignalSnapshot = struct {
     last_query_hash: u64 = 0,
     color_profile: []const u8 = NEGATIVE_SIGNAL_COLOR_PROFILE,
     sigil_opacity_per_mille: u16 = NEGATIVE_SIGNAL_SIGIL_OPACITY_PER_MILLE,
+};
+
+pub const GemmaPushConstants = struct {
+    rows_or_count: u32 = 0,
+    cols_or_len: u32 = 0,
+    row_offset: u32 = 0,
+    flags: u32 = 0,
+    weight_offset: u64 = 0,
+};
+
+pub const GemmaInferenceState = struct {
+    weights: ResidentBuffer = .{},
+    hidden: [2]ResidentBuffer = [_]ResidentBuffer{.{}} ** 2, // Ping-pong activations
+    q: ResidentBuffer = .{},
+    k: ResidentBuffer = .{},
+    v: ResidentBuffer = .{},
+    scores: ResidentBuffer = .{},
+    embeddings: ResidentBuffer = .{},
+    context_rune_ids: ResidentBuffer = .{},
+    tensor_offsets: std.StringHashMap(u64),
+    
+    pub fn deinit(self: *GemmaInferenceState, engine: *const VulkanEngine) void {
+        engine.destroyResidentBuffer(&self.weights);
+        engine.destroyResidentBuffer(&self.hidden[0]);
+        engine.destroyResidentBuffer(&self.hidden[1]);
+        engine.destroyResidentBuffer(&self.q);
+        engine.destroyResidentBuffer(&self.k);
+        engine.destroyResidentBuffer(&self.v);
+        engine.destroyResidentBuffer(&self.scores);
+        engine.destroyResidentBuffer(&self.embeddings);
+        engine.destroyResidentBuffer(&self.context_rune_ids);
+        self.tensor_offsets.deinit();
+    }
 };
 
 pub const GemmaForwardScheduleConfig = struct {
@@ -767,6 +802,12 @@ pub const VulkanEngine = struct {
     gemma_attention_pipeline: vk.VkPipeline = null,
     gemma_rune_project_pipeline: vk.VkPipeline = null,
 
+    // Gemma Sovereign Inference (V2)
+    gemma_descriptor_set_layout: vk.VkDescriptorSetLayout = null,
+    gemma_pipeline_layout: vk.VkPipelineLayout = null,
+    gemma_descriptor_sets: [6]vk.VkDescriptorSet = [_]vk.VkDescriptorSet{null} ** 6,
+    gemma_state: ?*GemmaInferenceState = null,
+
     // Synchronization
     timeline_semaphore: vk.VkSemaphore = null,
     timeline_value: u64 = 0,
@@ -1272,7 +1313,7 @@ pub const VulkanEngine = struct {
         }
     }
 
-    fn createComputePipeline(self: *VulkanEngine, spv: []const u8, spec_info: ?*const vk.VkSpecializationInfo) !vk.VkPipeline {
+    fn createComputePipeline(self: *VulkanEngine, spv: []const u8, spec_info: ?*const vk.VkSpecializationInfo, layout: vk.VkPipelineLayout) !vk.VkPipeline {
         const spv_u32 = try self.allocator.alloc(u32, spv.len / 4);
         defer self.allocator.free(spv_u32);
         @memcpy(std.mem.sliceAsBytes(spv_u32), spv);
@@ -1295,17 +1336,17 @@ pub const VulkanEngine = struct {
         var pipelineInfo = std.mem.zeroes(vk.VkComputePipelineCreateInfo);
         pipelineInfo.sType = vk.VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
         pipelineInfo.stage = stageInfo;
-        pipelineInfo.layout = self.pipeline_layout;
+        pipelineInfo.layout = layout;
 
         var pipeline: vk.VkPipeline = null;
         try check(self.vk_ctx.vkCreateComputePipelines.?(self.dev, null, 1, &pipelineInfo, null, &pipeline));
         return pipeline;
     }
 
-    fn createComputePipelineFromPath(self: *VulkanEngine, path: []const u8) !vk.VkPipeline {
+    fn createComputePipelineFromPath(self: *VulkanEngine, path: []const u8, layout: vk.VkPipelineLayout) !vk.VkPipeline {
         const spv = try std.fs.cwd().readFileAlloc(self.allocator, path, 4 * 1024 * 1024);
         defer self.allocator.free(spv);
-        return self.createComputePipeline(spv, null);
+        return self.createComputePipeline(spv, null, layout);
     }
 
     fn setupPipelines(self: *VulkanEngine) !void {
@@ -1335,43 +1376,61 @@ pub const VulkanEngine = struct {
         plCreateInfo.pPushConstantRanges = &pcRange;
         try check(self.vk_ctx.vkCreatePipelineLayout.?(self.dev, &plCreateInfo, null, &self.pipeline_layout));
 
-        self.compute_pipeline = try self.createComputePipeline(@embedFile("shaders/resonance_query.spv"), null);
-        self.candidate_score_pipeline = try self.createComputePipeline(@embedFile("shaders/candidate_score.spv"), null);
-        self.neighborhood_score_pipeline = try self.createComputePipeline(@embedFile("shaders/neighborhood_score.spv"), null);
-        self.contradiction_filter_pipeline = try self.createComputePipeline(@embedFile("shaders/contradiction_filter.spv"), null);
-        self.semantic_hash_pipeline = try self.createComputePipeline(@embedFile("shaders/semantic_hash.spv"), null);
+        // ── Gemma Layout ──
+        var gemma_bindings = [_]vk.VkDescriptorSetLayoutBinding{std.mem.zeroes(vk.VkDescriptorSetLayoutBinding)} ** GEMMA_DESCRIPTOR_BINDING_COUNT;
+        for (&gemma_bindings, 0..) |*b, i| {
+            b.binding = @intCast(i);
+            b.descriptorType = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            b.descriptorCount = 1;
+            b.stageFlags = vk.VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+        var gdslCreateInfo = std.mem.zeroes(vk.VkDescriptorSetLayoutCreateInfo);
+        gdslCreateInfo.sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        gdslCreateInfo.bindingCount = GEMMA_DESCRIPTOR_BINDING_COUNT;
+        gdslCreateInfo.pBindings = &gemma_bindings[0];
+        try check(self.vk_ctx.vkCreateDescriptorSetLayout.?(self.dev, &gdslCreateInfo, null, &self.gemma_descriptor_set_layout));
+
+        var gplCreateInfo = std.mem.zeroes(vk.VkPipelineLayoutCreateInfo);
+        gplCreateInfo.sType = vk.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        gplCreateInfo.setLayoutCount = 1;
+        gplCreateInfo.pSetLayouts = &self.gemma_descriptor_set_layout;
+        gplCreateInfo.pushConstantRangeCount = 1;
+        gplCreateInfo.pPushConstantRanges = &pcRange;
+        try check(self.vk_ctx.vkCreatePipelineLayout.?(self.dev, &gplCreateInfo, null, &self.gemma_pipeline_layout));
+
+        self.compute_pipeline = try self.createComputePipeline(@embedFile("shaders/resonance_query.spv"), null, self.pipeline_layout);
+        self.candidate_score_pipeline = try self.createComputePipeline(@embedFile("shaders/candidate_score.spv"), null, self.pipeline_layout);
+        self.neighborhood_score_pipeline = try self.createComputePipeline(@embedFile("shaders/neighborhood_score.spv"), null, self.pipeline_layout);
+        self.contradiction_filter_pipeline = try self.createComputePipeline(@embedFile("shaders/contradiction_filter.spv"), null, self.pipeline_layout);
+        self.semantic_hash_pipeline = try self.createComputePipeline(@embedFile("shaders/semantic_hash.spv"), null, self.pipeline_layout);
         const corpus_scan_spv = try std.fs.cwd().readFileAlloc(self.allocator, build_options.corpus_scan_spv_path, 1024 * 1024);
         defer self.allocator.free(corpus_scan_spv);
-        self.corpus_scan_pipeline = try self.createComputePipeline(corpus_scan_spv, null);
+        self.corpus_scan_pipeline = try self.createComputePipeline(corpus_scan_spv, null, self.pipeline_layout);
         const lattice_query_spv = try std.fs.cwd().readFileAlloc(self.allocator, build_options.lattice_query_spv_path, 1024 * 1024);
         defer self.allocator.free(lattice_query_spv);
-        self.lattice_query_pipeline = try self.createComputePipeline(lattice_query_spv, null);
+        self.lattice_query_pipeline = try self.createComputePipeline(lattice_query_spv, null, self.pipeline_layout);
 
         var etch_wg_size: u32 = @min(1024, self.max_workgroup_invocations);
         var spec_map = vk.VkSpecializationMapEntry{ .constantID = 0, .offset = 0, .size = @sizeOf(u32) };
         var etch_spec = vk.VkSpecializationInfo{ .mapEntryCount = 1, .pMapEntries = &spec_map, .dataSize = @sizeOf(u32), .pData = &etch_wg_size };
-        self.etch_pipeline = try self.createComputePipeline(@embedFile("shaders/genesis_etch.spv"), &etch_spec);
+        self.etch_pipeline = try self.createComputePipeline(@embedFile("shaders/genesis_etch.spv"), &etch_spec, self.pipeline_layout);
 
-        self.prune_pipeline = try self.createComputePipeline(@embedFile("shaders/thermal_prune.spv"), null);
-        self.lookahead_pipeline = try self.createComputePipeline(@embedFile("shaders/recursive_lookahead.spv"), null);
+        self.prune_pipeline = try self.createComputePipeline(@embedFile("shaders/thermal_prune.spv"), null, self.pipeline_layout);
+        self.lookahead_pipeline = try self.createComputePipeline(@embedFile("shaders/recursive_lookahead.spv"), null, self.pipeline_layout);
 
         var lattice_wg_size: u32 = @min(1024, self.max_workgroup_invocations);
         var lattice_spec = vk.VkSpecializationInfo{ .mapEntryCount = 1, .pMapEntries = &spec_map, .dataSize = @sizeOf(u32), .pData = &lattice_wg_size };
-        self.lattice_pipeline = try self.createComputePipeline(@embedFile("shaders/lattice_etch.spv"), &lattice_spec);
+        self.lattice_pipeline = try self.createComputePipeline(@embedFile("shaders/lattice_etch.spv"), &lattice_spec, self.pipeline_layout);
 
-        // v2: Rune Search pipeline — GPU-accelerated XOR Hamming distance search.
-        // Uses the same descriptor set layout; the shader accesses matrix_buffer
-        // (binding 0) as the Rune vector store, rotor_buffer (binding 1) as the
-        // query vector, and energy_buffer (binding 6) for results.
-        self.rune_search_pipeline = try self.createComputePipeline(@embedFile("shaders/rune_search.spv"), null);
+        self.rune_search_pipeline = try self.createComputePipeline(@embedFile("shaders/rune_search.spv"), null, self.pipeline_layout);
 
-        self.gemma_rune_embed_pipeline = try self.createComputePipelineFromPath(build_options.gemma_rune_embed_spv_path);
-        self.gemma_matmul_q4k_pipeline = try self.createComputePipelineFromPath(build_options.gemma_matmul_q4k_spv_path);
-        self.gemma_matmul_q8_0_pipeline = try self.createComputePipelineFromPath(build_options.gemma_matmul_q8_0_spv_path);
-        self.gemma_rms_norm_pipeline = try self.createComputePipelineFromPath(build_options.gemma_rms_norm_spv_path);
-        self.gemma_swiglu_pipeline = try self.createComputePipelineFromPath(build_options.gemma_swiglu_spv_path);
-        self.gemma_attention_pipeline = try self.createComputePipelineFromPath(build_options.gemma_attention_spv_path);
-        self.gemma_rune_project_pipeline = try self.createComputePipelineFromPath(build_options.gemma_rune_project_spv_path);
+        self.gemma_rune_embed_pipeline = try self.createComputePipelineFromPath(build_options.gemma_rune_embed_spv_path, self.gemma_pipeline_layout);
+        self.gemma_matmul_q4k_pipeline = try self.createComputePipelineFromPath(build_options.gemma_matmul_q4k_spv_path, self.gemma_pipeline_layout);
+        self.gemma_matmul_q8_0_pipeline = try self.createComputePipelineFromPath(build_options.gemma_matmul_q8_0_spv_path, self.gemma_pipeline_layout);
+        self.gemma_rms_norm_pipeline = try self.createComputePipelineFromPath(build_options.gemma_rms_norm_spv_path, self.gemma_pipeline_layout);
+        self.gemma_swiglu_pipeline = try self.createComputePipelineFromPath(build_options.gemma_swiglu_spv_path, self.gemma_pipeline_layout);
+        self.gemma_attention_pipeline = try self.createComputePipelineFromPath(build_options.gemma_attention_spv_path, self.gemma_pipeline_layout);
+        self.gemma_rune_project_pipeline = try self.createComputePipelineFromPath(build_options.gemma_rune_project_spv_path, self.gemma_pipeline_layout);
     }
 
     fn updateDescriptorSets(self: *VulkanEngine, f: u32) void {
@@ -1430,12 +1489,12 @@ pub const VulkanEngine = struct {
     fn setupDescriptorPool(self: *VulkanEngine) !void {
         var poolSize = std.mem.zeroes(vk.VkDescriptorPoolSize);
         poolSize.type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        poolSize.descriptorCount = DESCRIPTOR_BINDING_COUNT * (FRAME_COUNT + INF_LANE_COUNT);
+        poolSize.descriptorCount = DESCRIPTOR_BINDING_COUNT * (FRAME_COUNT + INF_LANE_COUNT) + (GEMMA_DESCRIPTOR_BINDING_COUNT * GEMMA_DESCRIPTOR_SET_COUNT);
         var dpCreateInfo = std.mem.zeroes(vk.VkDescriptorPoolCreateInfo);
         dpCreateInfo.sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         dpCreateInfo.poolSizeCount = 1;
         dpCreateInfo.pPoolSizes = &poolSize;
-        dpCreateInfo.maxSets = FRAME_COUNT + INF_LANE_COUNT;
+        dpCreateInfo.maxSets = FRAME_COUNT + INF_LANE_COUNT + GEMMA_DESCRIPTOR_SET_COUNT;
         try check(self.vk_ctx.vkCreateDescriptorPool.?(self.dev, &dpCreateInfo, null, &self.descriptor_pool));
 
         const dsls = try self.allocator.alloc(vk.VkDescriptorSetLayout, FRAME_COUNT + INF_LANE_COUNT);
@@ -1542,6 +1601,220 @@ pub const VulkanEngine = struct {
         self.vk_ctx.vkFreeMemory.?(self.dev, memory.*, null);
         buffer.* = null;
         memory.* = null;
+    }
+
+    pub fn uploadGemmaWeights(self: *VulkanEngine, loader: *const @import("gemma/weights.zig").GGUFLoader) !void {
+        if (self.gemma_state == null) {
+            self.gemma_state = try self.allocator.create(GemmaInferenceState);
+            self.gemma_state.?.* = .{
+                .tensor_offsets = std.StringHashMap(u64).init(self.allocator),
+            };
+        }
+        const state = self.gemma_state.?;
+
+        var total_bytes: usize = 0;
+        var it = loader.tensors.iterator();
+        while (it.next()) |entry| {
+            total_bytes += entry.value_ptr.byte_len;
+            total_bytes = (total_bytes + 255) & ~@as(usize, 255); // Align to 256 bytes for Vulkan offsets
+        }
+
+        if (state.weights.buffer != null) self.destroyResidentBuffer(&state.weights);
+        state.weights = try self.createResidentBufferSize(total_bytes);
+
+        it = loader.tensors.iterator();
+        var current_offset: u64 = 0;
+        while (it.next()) |entry| {
+            const tensor = try loader.getTensor(entry.key_ptr.*);
+            var chunk_offset: usize = 0;
+            while (chunk_offset < tensor.bytes.len) {
+                const chunk_len = @min(tensor.bytes.len - chunk_offset, self.upload_staging_slot_bytes);
+                try self.uploadResidentBufferBytes(&state.weights, @intCast(current_offset + chunk_offset), tensor.bytes[chunk_offset .. chunk_offset + chunk_len]);
+                chunk_offset += chunk_len;
+            }
+            try state.tensor_offsets.put(entry.key_ptr.*, current_offset);
+            current_offset += @as(u64, @intCast(((tensor.bytes.len + 255) & ~@as(usize, 255))));
+        }
+        
+        // Initialize activation buffers (2x 64MB should be plenty for Gemma-2B layer pass)
+        if (state.hidden[0].buffer == null) state.hidden[0] = try self.createResidentBufferSize(64 * 1024 * 1024);
+        if (state.hidden[1].buffer == null) state.hidden[1] = try self.createResidentBufferSize(64 * 1024 * 1024);
+        if (state.q.buffer == null) state.q = try self.createResidentBufferSize(4 * 1024 * 1024);
+        if (state.k.buffer == null) state.k = try self.createResidentBufferSize(4 * 1024 * 1024);
+        if (state.v.buffer == null) state.v = try self.createResidentBufferSize(4 * 1024 * 1024);
+        if (state.scores.buffer == null) state.scores = try self.createResidentBufferSize(1 * 1024 * 1024);
+        if (state.embeddings.buffer == null) state.embeddings = try self.createResidentBufferSize(8 * 1024 * 1024);
+        if (state.context_rune_ids.buffer == null) state.context_rune_ids = try self.createResidentBufferSize(1 * 1024 * 1024);
+        
+        try self.updateGemmaDescriptorSet();
+    }
+
+    fn updateGemmaDescriptorSet(self: *VulkanEngine) !void {
+        const state = self.gemma_state orelse return error.GemmaStateNotInitialized;
+        
+        if (self.gemma_descriptor_sets[0] == null) {
+            var dsAllocInfo = std.mem.zeroes(vk.VkDescriptorSetAllocateInfo);
+            dsAllocInfo.sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            dsAllocInfo.descriptorPool = self.descriptor_pool;
+            dsAllocInfo.descriptorSetCount = 6;
+            dsAllocInfo.pSetLayouts = &[_]vk.VkDescriptorSetLayout{ self.gemma_descriptor_set_layout } ** 6;
+            try check(self.vk_ctx.vkAllocateDescriptorSets.?(self.dev, &dsAllocInfo, &self.gemma_descriptor_sets));
+        }
+
+        var info = [_]vk.VkDescriptorBufferInfo{std.mem.zeroes(vk.VkDescriptorBufferInfo)} ** GEMMA_DESCRIPTOR_BINDING_COUNT;
+        info[0] = .{ .buffer = state.weights.buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE };
+        info[3] = .{ .buffer = state.embeddings.buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE };
+        info[4] = .{ .buffer = state.scores.buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE };
+        info[5] = .{ .buffer = state.context_rune_ids.buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE };
+
+        // --- Set 0: hidden[0] -> hidden[1] ---
+        info[1] = .{ .buffer = state.hidden[0].buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE };
+        info[2] = .{ .buffer = state.hidden[1].buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE };
+        var write0 = std.mem.zeroes(vk.VkWriteDescriptorSet);
+        write0.sType = vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write0.dstSet = self.gemma_descriptor_sets[0];
+        write0.descriptorCount = GEMMA_DESCRIPTOR_BINDING_COUNT;
+        write0.descriptorType = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write0.pBufferInfo = &info[0];
+        self.vk_ctx.vkUpdateDescriptorSets.?(self.dev, 1, &write0, 0, null);
+
+        // --- Set 1: hidden[0] -> q ---
+        info[2] = .{ .buffer = state.q.buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE };
+        var write1 = std.mem.zeroes(vk.VkWriteDescriptorSet);
+        write1.sType = vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write1.dstSet = self.gemma_descriptor_sets[1];
+        write1.descriptorCount = GEMMA_DESCRIPTOR_BINDING_COUNT;
+        write1.descriptorType = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write1.pBufferInfo = &info[0];
+        self.vk_ctx.vkUpdateDescriptorSets.?(self.dev, 1, &write1, 0, null);
+
+        // --- Set 2: embeddings -> k ---
+        info[1] = .{ .buffer = state.embeddings.buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE };
+        info[2] = .{ .buffer = state.k.buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE };
+        var write2 = std.mem.zeroes(vk.VkWriteDescriptorSet);
+        write2.sType = vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write2.dstSet = self.gemma_descriptor_sets[2];
+        write2.descriptorCount = GEMMA_DESCRIPTOR_BINDING_COUNT;
+        write2.descriptorType = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write2.pBufferInfo = &info[0];
+        self.vk_ctx.vkUpdateDescriptorSets.?(self.dev, 1, &write2, 0, null);
+
+        // --- Set 3: embeddings -> v ---
+        info[2] = .{ .buffer = state.v.buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE };
+        var write3 = std.mem.zeroes(vk.VkWriteDescriptorSet);
+        write3.sType = vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write3.dstSet = self.gemma_descriptor_sets[3];
+        write3.descriptorCount = GEMMA_DESCRIPTOR_BINDING_COUNT;
+        write3.descriptorType = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write3.pBufferInfo = &info[0];
+        self.vk_ctx.vkUpdateDescriptorSets.?(self.dev, 1, &write3, 0, null);
+
+        // --- Set 4: q -> hidden[1] ---
+        info[1] = .{ .buffer = state.q.buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE };
+        info[2] = .{ .buffer = state.hidden[1].buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE };
+        var write4 = std.mem.zeroes(vk.VkWriteDescriptorSet);
+        write4.sType = vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write4.dstSet = self.gemma_descriptor_sets[4];
+        write4.descriptorCount = GEMMA_DESCRIPTOR_BINDING_COUNT;
+        write4.descriptorType = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write4.pBufferInfo = &info[0];
+        self.vk_ctx.vkUpdateDescriptorSets.?(self.dev, 1, &write4, 0, null);
+
+        // --- Set 5: hidden[1] -> hidden[0] ---
+        info[1] = .{ .buffer = state.hidden[1].buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE };
+        info[2] = .{ .buffer = state.hidden[0].buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE };
+        var write5 = std.mem.zeroes(vk.VkWriteDescriptorSet);
+        write5.sType = vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write5.dstSet = self.gemma_descriptor_sets[5];
+        write5.descriptorCount = GEMMA_DESCRIPTOR_BINDING_COUNT;
+        write5.descriptorType = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write5.pBufferInfo = &info[0];
+        self.vk_ctx.vkUpdateDescriptorSets.?(self.dev, 1, &write5, 0, null);
+    }
+
+    pub fn executeGemmaForward(
+        self: *VulkanEngine,
+        context_embeddings: []const f32,
+        context_resonance: []const f32,
+    ) !vsa_core.HyperVector {
+        beginGpuSubmit(self);
+        defer endGpuSubmit(self);
+
+        const state = self.gemma_state orelse return error.GemmaStateNotInitialized;
+        
+        // 1. Upload context data for attention
+        try self.uploadResidentBufferBytes(&state.embeddings, 0, std.mem.sliceAsBytes(context_embeddings));
+        try self.uploadResidentBufferBytes(&state.scores, 0, std.mem.sliceAsBytes(context_resonance));
+        
+        // 2. Refresh all 6 descriptor sets to ensure context is current
+        try self.updateGemmaDescriptorSet();
+
+        // 3. Record and submit
+        const f = try self.acquireFrameSlot();
+        var beginInfo = std.mem.zeroes(vk.VkCommandBufferBeginInfo);
+        beginInfo.sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        try check(self.vk_ctx.vkBeginCommandBuffer.?(self.command_buffers[f], &beginInfo));
+
+        const schedule_config = GemmaForwardScheduleConfig{
+            .rune_count = 1,
+            .top_k = @intCast(context_resonance.len),
+        };
+        _ = try self.recordGemmaForwardSchedule(self.command_buffers[f], schedule_config);
+
+        try check(self.vk_ctx.vkEndCommandBuffer.?(self.command_buffers[f]));
+
+        var submitInfo = std.mem.zeroes(vk.VkSubmitInfo);
+        submitInfo.sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &self.command_buffers[f];
+        try check(self.vk_ctx.vkQueueSubmit.?(self.queue, 1, &submitInfo, self.fences[f]));
+        self.advanceFrameSlot();
+        try self.waitForHardwareInterrupt(f);
+
+        // 4. Download result from hidden[1] (Binding 2)
+        var result_rune: vsa_core.HyperVector = @splat(@as(u64, 0));
+        try self.downloadResidentBufferBytes(&state.hidden[1], 0, @as([*]u8, @ptrCast(&result_rune))[0..@sizeOf(vsa_core.HyperVector)]);
+        return result_rune;
+    }
+
+    pub fn downloadResidentBufferBytes(self: *VulkanEngine, resident: *const ResidentBuffer, offset: usize, dest: []u8) !void {
+        if (dest.len == 0) return;
+        if (offset + dest.len > resident.size_bytes) return error.BufferOverflow;
+
+        var staging_buffer: vk.VkBuffer = null;
+        var staging_memory: vk.VkDeviceMemory = null;
+        const staging_ptr = try self.createBuffer(
+            dest.len,
+            vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            &staging_buffer,
+            &staging_memory,
+        ) orelse return error.VulkanError;
+        defer self.destroyBuffer(&staging_buffer, &staging_memory, staging_ptr);
+
+        const f = self.frame_idx;
+        try self.recycleHardwareFenceWithTimeout(f, SHUTDOWN_FENCE_TIMEOUT_NS);
+
+        var beginInfo = std.mem.zeroes(vk.VkCommandBufferBeginInfo);
+        beginInfo.sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        try check(self.vk_ctx.vkBeginCommandBuffer.?(self.command_buffers[f], &beginInfo));
+
+        var region = std.mem.zeroes(vk.VkBufferCopy);
+        region.srcOffset = offset;
+        region.size = dest.len;
+        self.vk_ctx.vkCmdCopyBuffer.?(self.command_buffers[f], resident.buffer, staging_buffer, 1, &region);
+        try check(self.vk_ctx.vkEndCommandBuffer.?(self.command_buffers[f]));
+
+        var submitInfo = std.mem.zeroes(vk.VkSubmitInfo);
+        submitInfo.sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &self.command_buffers[f];
+        try check(self.vk_ctx.vkQueueSubmit.?(self.queue, 1, &submitInfo, self.fences[f]));
+        try self.waitForHardwareInterruptWithTimeout(f, SHUTDOWN_FENCE_TIMEOUT_NS);
+        
+        const staging_bytes: [*]const u8 = @ptrCast(staging_ptr);
+        @memcpy(dest, staging_bytes[0..dest.len]);
     }
 
     pub fn createResidentBufferFromBytes(self: *VulkanEngine, bytes: []const u8) !ResidentBuffer {
@@ -1781,6 +2054,14 @@ pub const VulkanEngine = struct {
         };
         for (pipelines) |p| if (p.* != null) self.vk_ctx.vkDestroyPipeline.?(self.dev, p.*, null);
 
+        if (self.gemma_pipeline_layout != null) self.vk_ctx.vkDestroyPipelineLayout.?(self.dev, self.gemma_pipeline_layout, null);
+        if (self.gemma_descriptor_set_layout != null) self.vk_ctx.vkDestroyDescriptorSetLayout.?(self.dev, self.gemma_descriptor_set_layout, null);
+        if (self.gemma_state) |state| {
+            state.deinit(self);
+            self.allocator.destroy(state);
+            self.gemma_state = null;
+        }
+
         if (self.pipeline_layout != null) self.vk_ctx.vkDestroyPipelineLayout.?(self.dev, self.pipeline_layout, null);
         if (self.descriptor_set_layout != null) self.vk_ctx.vkDestroyDescriptorSetLayout.?(self.dev, self.descriptor_set_layout, null);
         if (self.timeline_semaphore != null) self.vk_ctx.vkDestroySemaphore.?(self.dev, self.timeline_semaphore, null);
@@ -1915,56 +2196,96 @@ pub const VulkanEngine = struct {
     pub fn recordGemmaForwardSchedule(
         self: *VulkanEngine,
         command_buffer: vk.VkCommandBuffer,
-        descriptor_set: vk.VkDescriptorSet,
         schedule_config: GemmaForwardScheduleConfig,
     ) !u32 {
         if (!self.gemmaPipelinesReady()) return error.GemmaPipelinesUnavailable;
-        if (schedule_config.block_count != gemma_config.default_block_count) return error.UnsupportedGemmaBlockCount;
-        if (schedule_config.embedding_len != gemma_config.default_embedding_length) return error.UnsupportedGemmaEmbeddingLength;
+        const state = self.gemma_state orelse return error.GemmaStateNotInitialized;
 
         var recorded: u32 = 0;
+        
+        // ── 0. Rune Embedding ──
+        // Binding 0: Weights (contains token_embd.weight)
+        // Binding 1: hidden[0] (Output)
+        // Binding 2: hidden[1] (Not used)
+        // Binding 5: context_rune_ids (Input)
         try self.cmdGemmaDispatchInvocations(
             command_buffer,
-            descriptor_set,
             self.gemma_rune_embed_pipeline,
-            .{ schedule_config.rune_count, schedule_config.embedding_len, self.matrix_slots - 1, schedule_config.embedding_len },
+            .{ .rows_or_count = schedule_config.rune_count, .cols_or_len = schedule_config.embedding_len, .weight_offset = state.tensor_offsets.get("token_embd.weight") orelse 0 },
             schedule_config.rune_count * schedule_config.embedding_len,
             64,
+            0,
         );
         recorded += 1;
 
         var layer: u32 = 0;
         while (layer < schedule_config.block_count) : (layer += 1) {
             const ffn_dim = try schedule_config.ffnDim(layer);
-            const head_width = if (schedule_config.fullAttention(layer)) schedule_config.attention_key_length else schedule_config.attention_key_length_swa;
-            const value_width = if (schedule_config.fullAttention(layer)) schedule_config.attention_value_length else schedule_config.attention_value_length_swa;
-            const q_width = schedule_config.attention_head_count * head_width;
-            const kv_width = schedule_config.attention_head_count_kv * value_width;
+            const q_width: u32 = 2048;
+            const kv_width: u32 = 2048;
 
-            try self.cmdGemmaDispatchGroups(command_buffer, descriptor_set, self.gemma_rms_norm_pipeline, .{ 1, schedule_config.embedding_len, 0, layer }, 1);
-            try self.cmdGemmaDispatchInvocations(command_buffer, descriptor_set, self.gemma_matmul_q8_0_pipeline, .{ q_width, schedule_config.embedding_len, 0, layer }, q_width, 64);
-            try self.cmdGemmaDispatchInvocations(command_buffer, descriptor_set, self.gemma_matmul_q8_0_pipeline, .{ kv_width, schedule_config.embedding_len, 0, layer }, kv_width, 64);
-            try self.cmdGemmaDispatchInvocations(command_buffer, descriptor_set, self.gemma_matmul_q8_0_pipeline, .{ kv_width, schedule_config.embedding_len, 0, layer }, kv_width, 64);
-            try self.cmdGemmaDispatchInvocations(command_buffer, descriptor_set, self.gemma_attention_pipeline, .{ schedule_config.top_k, schedule_config.embedding_len, 0, layer }, schedule_config.embedding_len, 64);
-            try self.cmdGemmaDispatchInvocations(command_buffer, descriptor_set, self.gemma_matmul_q8_0_pipeline, .{ schedule_config.embedding_len, q_width, 0, layer }, schedule_config.embedding_len, 64);
-            try self.cmdGemmaDispatchGroups(command_buffer, descriptor_set, self.gemma_rms_norm_pipeline, .{ 1, schedule_config.embedding_len, 0, layer }, 1);
-            try self.cmdGemmaDispatchGroups(command_buffer, descriptor_set, self.gemma_rms_norm_pipeline, .{ 1, schedule_config.embedding_len, 0, layer }, 1);
-            try self.cmdGemmaDispatchInvocations(command_buffer, descriptor_set, self.gemma_matmul_q8_0_pipeline, .{ ffn_dim, schedule_config.embedding_len, 0, layer }, ffn_dim, 64);
-            try self.cmdGemmaDispatchInvocations(command_buffer, descriptor_set, self.gemma_matmul_q8_0_pipeline, .{ ffn_dim, schedule_config.embedding_len, 0, layer }, ffn_dim, 64);
-            try self.cmdGemmaDispatchInvocations(command_buffer, descriptor_set, self.gemma_swiglu_pipeline, .{ ffn_dim, 0, 0, layer }, ffn_dim, 64);
-            try self.cmdGemmaDispatchInvocations(command_buffer, descriptor_set, self.gemma_matmul_q8_0_pipeline, .{ schedule_config.embedding_len, ffn_dim, 0, layer }, schedule_config.embedding_len, 64);
-            try self.cmdGemmaDispatchGroups(command_buffer, descriptor_set, self.gemma_rms_norm_pipeline, .{ 1, schedule_config.embedding_len, 0, layer }, 1);
-            try self.cmdGemmaDispatchGroups(command_buffer, descriptor_set, self.gemma_rms_norm_pipeline, .{ 1, schedule_config.embedding_len, 0, layer }, 1);
+            // Names for this layer
+            var name_buf: [64]u8 = undefined;
+            const q_name = try std.fmt.bufPrint(&name_buf, "blk.{d}.attn_q.weight", .{layer});
+            const q_off = state.tensor_offsets.get(q_name) orelse 0;
+            const k_name = try std.fmt.bufPrint(&name_buf, "blk.{d}.attn_k.weight", .{layer});
+            const k_off = state.tensor_offsets.get(k_name) orelse 0;
+            const v_name = try std.fmt.bufPrint(&name_buf, "blk.{d}.attn_v.weight", .{layer});
+            const v_off = state.tensor_offsets.get(v_name) orelse 0;
+            const out_name = try std.fmt.bufPrint(&name_buf, "blk.{d}.attn_output.weight", .{layer});
+            const out_off = state.tensor_offsets.get(out_name) orelse 0;
+            const up_name = try std.fmt.bufPrint(&name_buf, "blk.{d}.ffn_up.weight", .{layer});
+            const up_off = state.tensor_offsets.get(up_name) orelse 0;
+            const gate_name = try std.fmt.bufPrint(&name_buf, "blk.{d}.ffn_gate.weight", .{layer});
+            const gate_off = state.tensor_offsets.get(gate_name) orelse 0;
+            const down_name = try std.fmt.bufPrint(&name_buf, "blk.{d}.ffn_down.weight", .{layer});
+            const down_off = state.tensor_offsets.get(down_name) orelse 0;
+            const norm_name = try std.fmt.bufPrint(&name_buf, "blk.{d}.attn_norm.weight", .{layer});
+            const norm_off = state.tensor_offsets.get(norm_name) orelse 0;
+            const ffn_norm_name = try std.fmt.bufPrint(&name_buf, "blk.{d}.ffn_norm.weight", .{layer});
+            const ffn_norm_off = state.tensor_offsets.get(ffn_norm_name) orelse 0;
+
+            // 1. RMSNorm (Pre-attention)
+            try self.cmdGemmaDispatchGroups(command_buffer, self.gemma_rms_norm_pipeline, .{ .rows_or_count = 1, .cols_or_len = schedule_config.embedding_len, .weight_offset = norm_off }, 1, 0);
+            
+            // 2. Projection Q (hidden[0] -> q)
+            try self.cmdGemmaDispatchInvocations(command_buffer, self.gemma_matmul_q8_0_pipeline, .{ .rows_or_count = q_width, .cols_or_len = schedule_config.embedding_len, .row_offset = 0, .weight_offset = q_off }, q_width, 64, 1);
+            
+            // 3. Projection K (context -> k) 
+            try self.cmdGemmaDispatchInvocations(command_buffer, self.gemma_matmul_q8_0_pipeline, .{ .rows_or_count = kv_width, .cols_or_len = schedule_config.embedding_len, .row_offset = 0, .weight_offset = k_off }, kv_width, 64, 2);
+            
+            // 4. Projection V (context -> v)
+            try self.cmdGemmaDispatchInvocations(command_buffer, self.gemma_matmul_q8_0_pipeline, .{ .rows_or_count = kv_width, .cols_or_len = schedule_config.embedding_len, .row_offset = 0, .weight_offset = v_off }, kv_width, 64, 3);
+            
+            // 5. Attention (Sovereign Resonance Weighted) (q -> hidden[1])
+            try self.cmdGemmaDispatchInvocations(command_buffer, self.gemma_attention_pipeline, .{ .rows_or_count = schedule_config.top_k, .cols_or_len = schedule_config.embedding_len }, schedule_config.embedding_len, 64, 4);
+            
+            // 6. Matmul Output + Residual Add (hidden[1] -> hidden[0])
+            try self.cmdGemmaDispatchInvocations(command_buffer, self.gemma_matmul_q8_0_pipeline, .{ .rows_or_count = schedule_config.embedding_len, .cols_or_len = q_width, .row_offset = 0, .weight_offset = out_off, .flags = 1 }, schedule_config.embedding_len, 64, 5);
+
+            // 7. RMSNorm (Pre-FFN)
+            try self.cmdGemmaDispatchGroups(command_buffer, self.gemma_rms_norm_pipeline, .{ .rows_or_count = 1, .cols_or_len = schedule_config.embedding_len, .weight_offset = ffn_norm_off }, 1, 0);
+
+            // 8. FFN Up & Gate (hidden[0] -> hidden[1])
+            try self.cmdGemmaDispatchInvocations(command_buffer, self.gemma_matmul_q8_0_pipeline, .{ .rows_or_count = ffn_dim, .cols_or_len = schedule_config.embedding_len, .row_offset = 0, .weight_offset = up_off }, ffn_dim, 64, 0);
+            try self.cmdGemmaDispatchInvocations(command_buffer, self.gemma_matmul_q8_0_pipeline, .{ .rows_or_count = ffn_dim, .cols_or_len = schedule_config.embedding_len, .row_offset = ffn_dim, .weight_offset = gate_off }, ffn_dim, 64, 0);
+            
+            // 9. SwiGLU (hidden[1] -> hidden[1])
+            try self.cmdGemmaDispatchInvocations(command_buffer, self.gemma_swiglu_pipeline, .{ .rows_or_count = ffn_dim, .row_offset = ffn_dim, .flags = 0, .weight_offset = 0 }, ffn_dim, 64, 0);
+            
+            // 10. FFN Down + Residual Add (hidden[1] -> hidden[0])
+            try self.cmdGemmaDispatchInvocations(command_buffer, self.gemma_matmul_q8_0_pipeline, .{ .rows_or_count = schedule_config.embedding_len, .cols_or_len = ffn_dim, .weight_offset = down_off, .flags = 1 }, schedule_config.embedding_len, 64, 5);
+
             recorded += GEMMA_FORWARD_STAGES_PER_BLOCK;
         }
 
+        // ── Final Rune Projection ──
         const head_seed: u64 = 0x6765_6d6d_615f_6864;
-        try self.cmdGemmaDispatchGroups(command_buffer, descriptor_set, self.gemma_rune_project_pipeline, .{
-            schedule_config.embedding_len,
-            16,
-            @truncate(head_seed),
-            @intCast(head_seed >> 32),
-        }, 1);
+        try self.cmdGemmaDispatchGroups(command_buffer, self.gemma_rune_project_pipeline, .{
+            .rows_or_count = schedule_config.embedding_len,
+            .cols_or_len = 16,
+            .weight_offset = head_seed,
+        }, 1, 0);
         recorded += 1;
         return recorded;
     }
@@ -1972,28 +2293,28 @@ pub const VulkanEngine = struct {
     fn cmdGemmaDispatchInvocations(
         self: *VulkanEngine,
         command_buffer: vk.VkCommandBuffer,
-        descriptor_set: vk.VkDescriptorSet,
         pipeline: vk.VkPipeline,
-        pc: [4]u32,
+        pc: GemmaPushConstants,
         invocations: u32,
         local_size: u32,
+        set_idx: u32,
     ) !void {
         const groups = (invocations + (local_size - 1)) / local_size;
-        try self.cmdGemmaDispatchGroups(command_buffer, descriptor_set, pipeline, pc, groups);
+        try self.cmdGemmaDispatchGroups(command_buffer, pipeline, pc, groups, set_idx);
     }
 
     fn cmdGemmaDispatchGroups(
         self: *VulkanEngine,
         command_buffer: vk.VkCommandBuffer,
-        descriptor_set: vk.VkDescriptorSet,
         pipeline: vk.VkPipeline,
-        pc: [4]u32,
+        pc: GemmaPushConstants,
         groups: u32,
+        set_idx: u32,
     ) !void {
         if (pipeline == null) return error.GemmaPipelinesUnavailable;
         self.vk_ctx.vkCmdBindPipeline.?(command_buffer, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-        self.vk_ctx.vkCmdBindDescriptorSets.?(command_buffer, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &descriptor_set, 0, null);
-        self.vk_ctx.vkCmdPushConstants.?(command_buffer, self.pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &pc);
+        self.vk_ctx.vkCmdBindDescriptorSets.?(command_buffer, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.gemma_pipeline_layout, 0, 1, &self.gemma_descriptor_sets[set_idx], 0, null);
+        self.vk_ctx.vkCmdPushConstants.?(command_buffer, self.gemma_pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(GemmaPushConstants), &pc);
         self.vk_ctx.vkCmdDispatch.?(command_buffer, @max(groups, 1), 1, 1);
         self.cmdGemmaBarrier(command_buffer);
     }

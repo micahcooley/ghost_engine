@@ -1,4 +1,5 @@
 #version 450
+#extension GL_ARB_gpu_shader_int64 : require
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
@@ -23,14 +24,16 @@ layout(push_constant) uniform Constants {
     uint cols;
     uint row_offset;
     uint flags;
+    uint64_t weight_offset; // Absolute byte offset in qweight_words
 } params;
 
-uint byteAt(uint byte_index) {
-    uint word = qweight_words.bytes[byte_index >> 2u];
-    return (word >> ((byte_index & 3u) * 8u)) & 0xffu;
+uint byteAt(uint64_t byte_index) {
+    uint64_t absolute = params.weight_offset + byte_index;
+    uint word = qweight_words.bytes[uint(absolute >> 2u)];
+    return (word >> (uint(absolute & 3u) * 8u)) & 0xffu;
 }
 
-uint u16At(uint byte_index) {
+uint u16At(uint64_t byte_index) {
     return byteAt(byte_index) | (byteAt(byte_index + 1u) << 8u);
 }
 
@@ -70,8 +73,8 @@ void main() {
     uint row_blocks = params.cols / QK8_0;
     float sum = 0.0;
     for (uint block_col = 0u; block_col < row_blocks; block_col++) {
-        uint block_index = row * row_blocks + block_col;
-        uint block_base = block_index * BLOCK_Q8_0_BYTES;
+        uint64_t block_index = uint64_t(row) * uint64_t(row_blocks) + uint64_t(block_col);
+        uint64_t block_base = block_index * uint64_t(BLOCK_Q8_0_BYTES);
         float scale = f16ToF32(u16At(block_base));
         uint input_base = block_col * QK8_0;
         for (uint i = 0u; i < QK8_0; i++) {
@@ -79,6 +82,10 @@ void main() {
             sum += (q * scale) * input_activations.values[input_base + i];
         }
     }
-    output_activations.values[row] = sum;
+    float result = sum;
+    if ((params.flags & 1u) != 0u) {
+        result += output_activations.values[row];
+    }
+    output_activations.values[row] = result;
 }
 

@@ -1,22 +1,30 @@
 #version 450
+#extension GL_ARB_gpu_shader_int64 : require
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-layout(std430, binding = 0) readonly buffer ContextEmbeddings {
+layout(std430, binding = 1) readonly buffer Query {
     float values[];
-} context_embeddings;
-
-layout(std430, binding = 1) readonly buffer ResonanceScores {
-    float values[];
-} resonance_scores;
+} query;
 
 layout(std430, binding = 2) buffer Output {
     float values[];
 } output_embedding;
 
+layout(std430, binding = 3) readonly buffer ContextEmbeddings {
+    float values[];
+} context_embeddings;
+
+layout(std430, binding = 4) readonly buffer ResonanceScores {
+    float values[];
+} resonance_scores;
+
 layout(push_constant) uniform Constants {
     uint top_k;
     uint embedding_len;
+    uint unused0;
+    uint unused1;
+    uint64_t unused2;
 } params;
 
 void main() {

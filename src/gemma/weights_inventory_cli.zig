@@ -13,7 +13,7 @@ const usage =
     \\Usage:
     \\  ghost_gemma weights inspect [--path <model.gguf>] [--json] [--tensor-prefix <prefix>] [--limit <n>]
     \\  ghost_gemma matmul calibrate [--path <model.gguf>] [--tensor <name>] [--rows <n>] [--seed <u64>] [--json]
-    \\  ghost_gemma inference smoke --text <text> [--path <model.gguf>] [--top-k <n>] [--embedding-len <n>] [--session-id <u64>] [--json]
+    \\  ghost_gemma inference smoke --text <text> [--path <model.gguf>] [--top-k <n>] [--embedding-len <n>] [--session-id <u64>] [--json] [--gpu]
     \\  ghost_gemma inference plan [--path <model.gguf>] [--json] [--limit <n>]
     \\  ghost_gemma agent route --intent <query|etch|prove|converse> --subject <text> [--hint <text>...] [--confidence <low|medium|high>] [--needs-ghost <true|false>] [--resonance <f32>] [--decision-trace] [--evidence-trace] [--source <source>] [--explicit-store] [--json]
     \\
@@ -40,6 +40,7 @@ const Options = struct {
     evidence_trace: bool = false,
     source: []const u8 = "",
     explicit_store: bool = false,
+    gpu: bool = false,
 };
 
 pub fn main() !void {
@@ -63,6 +64,8 @@ pub fn main() !void {
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--json")) {
             options.json = true;
+        } else if (std.mem.eql(u8, arg, "--gpu")) {
+            options.gpu = true;
         } else if (std.mem.eql(u8, arg, "--path")) {
             options.path = args.next() orelse return failMissing("--path");
         } else if (std.mem.startsWith(u8, arg, "--path=")) {
@@ -165,6 +168,12 @@ pub fn main() !void {
         std.process.exit(1);
     };
     defer loader.deinit();
+
+    if (options.gpu) {
+        const ve = try @import("../vsa_vulkan.zig").initRuntime(allocator);
+        try ve.uploadGemmaWeights(&loader);
+    }
+    defer if (options.gpu) @import("../vsa_vulkan.zig").deinitRuntime();
 
     switch (command) {
         .weights_inspect => {

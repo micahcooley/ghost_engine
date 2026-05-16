@@ -35,10 +35,12 @@ const ProjectionResult = struct {
     dark_slot: u32,
     hypothesis_source: []u8,
     hypothesis_result: ghost.effector.ZigHypothesisResult,
+    decoded_prose: ?[]const u8,
 
     fn deinit(self: *ProjectionResult, allocator: std.mem.Allocator) void {
         self.explanation.deinit(allocator);
         allocator.free(self.hypothesis_source);
+        if (self.decoded_prose) |prose| allocator.free(prose);
         self.hypothesis_result.deinit();
     }
 };
@@ -93,7 +95,7 @@ pub fn main() !void {
         try defaultSandboxRoot(allocator, options.project_shard);
     defer allocator.free(sandbox_root);
 
-    try projectPairs(allocator, docs.items, &lattice, &index, &scout, &results, sandbox_root, hypothesis_source_override, options.message);
+    try exploreLowDensityVSA(allocator, &lattice, &index, &scout, &results, sandbox_root, hypothesis_source_override, options.message);
 
     const dist = lattice.getRankDistribution();
     if (options.render_json) {
@@ -207,9 +209,8 @@ fn loadLiveDocs(
     return docs;
 }
 
-fn projectPairs(
+fn exploreLowDensityVSA(
     allocator: std.mem.Allocator,
-    docs: []const SourceDoc,
     lattice: *ghost.rune_lattice.RuneLattice,
     index: *ghost.concept_index.ConceptIndex,
     scout: *const ghost.triad.ScoutState,
@@ -219,52 +220,101 @@ fn projectPairs(
     prompt: []const u8,
 ) !void {
     const now_ms: u64 = @intCast(std.time.milliTimestamp());
-    for (docs, 0..) |a, i| {
-        for (docs[i + 1 ..]) |b| {
-            if (std.mem.eql(u8, a.domain, b.domain)) continue;
-            const candidate = ghost.cross_domain_projector.projectCrossDomain(
-                a.vector,
-                b.vector,
-                a.label,
-                b.label,
-                a.domain,
-                b.domain,
-            );
-
-            const dark_slot = lattice.observe(candidate.vector, ghost.vsa.collapse(candidate.vector), now_ms) orelse return error.LatticeFull;
-            try index.addEntry("projected dark-space candidate", dark_slot, "ghost_invent", 0, 0, "dark-space", 5, "Cross-domain candidate produced by ghost invent.");
-
-            var explanation = try ghost.cross_domain_projector.decodeCandidateRune(allocator, candidate, lattice, index);
-            errdefer explanation.deinit(allocator);
-            const medic_query = selectMedicQuery(candidate.vector, lattice, scout);
-            const medic = ghost.forge.medicLoop(lattice, medic_query, scout);
-
-            const hypothesis_source = if (hypothesis_source_override) |source|
-                try allocator.dupe(u8, source)
-            else
-                try generateZigHypothesisSource(allocator, candidate, explanation, prompt);
-            errdefer allocator.free(hypothesis_source);
-
-            var hypothesis_result = try ghost.effector.testZigHypothesis(allocator, .{
-                .workspace_root = sandbox_root,
-                .relative_path = "src/projected_candidate.zig",
-                .source = hypothesis_source,
-                .intent = "cross-domain dark-space code candidate",
-                .timeout_ms = 12_000,
-            });
-            errdefer hypothesis_result.deinit();
-
-            if (hypothesis_result.rank == .truth) lattice.verify(dark_slot, now_ms);
-
-            try results.append(.{
-                .explanation = explanation,
-                .medic = medic,
-                .dark_slot = dark_slot,
-                .hypothesis_source = hypothesis_source,
-                .hypothesis_result = hypothesis_result,
-            });
+    
+    // 1. Ghost explores low-density VSA space purely algebraically
+    var local_scout = scout.*;
+    var best_candidate = local_scout.getState();
+    var best_min_dist: u16 = 0;
+    
+    for (0..100) |i| {
+        var vec = best_candidate;
+        for (0..3) |_| {
+            vec = ghost.vsa.permute(vec);
+            _ = local_scout.evolve(@intCast(i % 256), @intCast(i));
+            vec = ghost.vsa.bind(vec, local_scout.getState());
+        }
+        
+        var min_dist: u16 = 1025;
+        var j: u32 = 0;
+        while (j < lattice.capacity) : (j += 1) {
+            if (lattice.tags[j] == 0) continue;
+            const dist = ghost.vsa.hammingDistance(vec, lattice.vectors[j]);
+            if (dist < min_dist) min_dist = dist;
+        }
+        
+        if (min_dist > best_min_dist) {
+            best_min_dist = min_dist;
+            best_candidate = vec;
         }
     }
+    
+    const candidate_rune = ghost.cross_domain_projector.CandidateRune{
+        .vector = best_candidate,
+        .source_a = best_candidate,
+        .source_b = best_candidate,
+        .domain_a = "vsa-algebra",
+        .domain_b = "dark-space",
+        .label_a = "synthetic",
+        .label_b = "exploration",
+    };
+
+    const dark_slot = lattice.observe(best_candidate, ghost.vsa.collapse(best_candidate), now_ms) orelse return error.LatticeFull;
+    try index.addEntry("pure algebraic candidate", dark_slot, "ghost_invent", 0, 0, "dark-space", 5, "Low-density vector found via algebraic exploration.");
+
+    var explanation = try ghost.cross_domain_projector.decodeCandidateRune(allocator, candidate_rune, lattice, index);
+    errdefer explanation.deinit(allocator);
+    
+    const medic_query = selectMedicQuery(best_candidate, lattice, scout);
+    const medic = ghost.forge.medicLoop(lattice, medic_query, scout);
+
+    const hypothesis_source = if (hypothesis_source_override) |source|
+        try allocator.dupe(u8, source)
+    else
+        try generateZigHypothesisSource(allocator, candidate_rune, explanation, prompt);
+    errdefer allocator.free(hypothesis_source);
+
+    // 2. Proof gate runs (is this coherent?)
+    var hypothesis_result = try ghost.effector.testZigHypothesis(allocator, .{
+        .workspace_root = sandbox_root,
+        .relative_path = "src/projected_candidate.zig",
+        .source = hypothesis_source,
+        .intent = "pure algebraic dark-space code candidate",
+        .timeout_ms = 12_000,
+    });
+    errdefer hypothesis_result.deinit();
+
+    var decoded_prose: ?[]const u8 = null;
+    
+    // 3. Gemma decodes verified output only
+    if (hypothesis_result.rank == .truth) {
+        lattice.verify(dark_slot, now_ms);
+        
+        const provider = ghost.gemma_context_provider.GhostContextProvider.init(allocator);
+        const runes_dummy = try allocator.alloc(ghost.gemma_rune_encoder.ConversationRune, 1);
+        defer allocator.free(runes_dummy);
+        runes_dummy[0] = .{
+            .text = "dark space",
+            .rotor = .{0, 0},
+            .vector = best_candidate,
+            .embedding = undefined,
+            .session_id = 0,
+        };
+        
+        const context = try provider.queryContext(best_candidate, runes_dummy, 16);
+        defer ghost.gemma_context_provider.freeContext(allocator, context);
+        
+        const phead = @import("gemma/layers/prose_head.zig").ProseHead.init(allocator);
+        decoded_prose = try phead.synthesize(best_candidate, context);
+    }
+
+    try results.append(.{
+        .explanation = explanation,
+        .medic = medic,
+        .dark_slot = dark_slot,
+        .hypothesis_source = hypothesis_source,
+        .hypothesis_result = hypothesis_result,
+        .decoded_prose = decoded_prose,
+    });
 }
 
 fn selectMedicQuery(
@@ -360,6 +410,10 @@ fn printHuman(
         try writer.writeByte('\n');
         if (result.hypothesis_result.rank == .truth) {
             try writer.writeAll("[Rank 1: Verified by Compiler]\n");
+            if (result.decoded_prose) |prose| {
+                try writer.writeAll("\n[Gemma Neural Decode]\n");
+                try writer.print("  {s}\n\n", .{prose});
+            }
         } else {
             try writer.writeAll("[Rank 5: Dark Space Failure]\n");
         }
@@ -428,6 +482,10 @@ fn printJson(
         try writeJsonString(writer, if (result.hypothesis_result.rank == .truth) "[Rank 1: Verified by Compiler]" else "[Rank 5: Dark Space Failure]");
         try writer.writeAll(",\"source\":");
         try writeJsonString(writer, result.hypothesis_source);
+        if (result.decoded_prose) |prose| {
+            try writer.writeAll(",\"gemmaNeuralDecode\":");
+            try writeJsonString(writer, prose);
+        }
         try writer.writeAll(",\"compilerAutopsy\":{\"command\":");
         try writeJsonString(writer, result.hypothesis_result.command);
         try writer.writeAll(",\"exitCode\":");
