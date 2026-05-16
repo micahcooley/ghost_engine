@@ -698,6 +698,11 @@ pub fn build(b: *std.Build) void {
     gemma_inference_tests.want_lto = use_lto;
     gemma_inference_tests.root_module.addOptions("build_options", core_options);
     gemma_inference_tests.root_module.linkSystemLibrary("c", .{});
+    if (target.result.os.tag == .linux) {
+        gemma_inference_tests.root_module.linkSystemLibrary("dl", .{});
+        gemma_inference_tests.root_module.linkSystemLibrary("vulkan", .{});
+    }
+    addVulkanIncludes(gemma_inference_tests.root_module, target.result.os, vulkan_sdk, b);
     const run_gemma_inference_tests = b.addRunArtifact(gemma_inference_tests);
 
     const gemma_agent_tests = b.addTest(.{
@@ -715,6 +720,11 @@ pub fn build(b: *std.Build) void {
     gemma_agent_tests.want_lto = use_lto;
     gemma_agent_tests.root_module.addOptions("build_options", core_options);
     gemma_agent_tests.root_module.linkSystemLibrary("c", .{});
+    if (target.result.os.tag == .linux) {
+        gemma_agent_tests.root_module.linkSystemLibrary("dl", .{});
+        gemma_agent_tests.root_module.linkSystemLibrary("vulkan", .{});
+    }
+    addVulkanIncludes(gemma_agent_tests.root_module, target.result.os, vulkan_sdk, b);
     const run_gemma_agent_tests = b.addRunArtifact(gemma_agent_tests);
     
     // Add the agents test back to the native step

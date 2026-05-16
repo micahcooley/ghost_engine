@@ -3508,7 +3508,7 @@ test "Gemma Vulkan forward recorder rejects missing pipelines before command rec
     engine.gemma_attention_pipeline = null;
     engine.gemma_rune_project_pipeline = null;
     try std.testing.expect(!engine.gemmaPipelinesReady());
-    try std.testing.expectError(error.GemmaPipelinesUnavailable, engine.recordGemmaForwardSchedule(null, null, .{}));
+    try std.testing.expectError(error.GemmaPipelinesUnavailable, engine.recordGemmaForwardSchedule(null, .{}));
 }
 
 test "SPO vectorization distinguishes directed inverse relations" {

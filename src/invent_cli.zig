@@ -292,11 +292,15 @@ fn exploreLowDensityVSA(
         const provider = ghost.gemma_context_provider.GhostContextProvider.init(allocator);
         const runes_dummy = try allocator.alloc(ghost.gemma_rune_encoder.ConversationRune, 1);
         defer allocator.free(runes_dummy);
+        const dummy_embedding = try allocator.alloc(f32, ghost.gemma_config.default_embedding_length);
+        defer allocator.free(dummy_embedding);
+        @memset(dummy_embedding, 0.0);
+        
         runes_dummy[0] = .{
             .text = "dark space",
             .rotor = .{0, 0},
             .vector = best_candidate,
-            .embedding = undefined,
+            .embedding = dummy_embedding,
             .session_id = 0,
         };
         
@@ -525,9 +529,7 @@ fn generateZigHypothesisSource(
     explanation: ghost.cross_domain_projector.CrossDomainExplanation,
     prompt: []const u8,
 ) ![]u8 {
-    if (containsAscii(prompt, "black box") or containsAscii(prompt, "crash handler") or containsAscii(prompt, "gpu dump")) {
-        return generateCrashHandlerHypothesisSource(allocator, candidate, explanation);
-    }
+    _ = prompt; // Autonomous generation ignores human prompt hints
 
     var out = std.ArrayList(u8).init(allocator);
     errdefer out.deinit();
@@ -549,98 +551,57 @@ fn generateZigHypothesisSource(
     try w.writeAll(";\n");
     try w.print("    pub const novelty_per_mille: u16 = {d};\n", .{@as(u16, @intFromFloat(@min(explanation.novelty_score * 1000.0, 1000.0)))});
     try w.writeAll("};\n\n");
-    try w.writeAll("pub const GpuResidentSceneGraph = struct {\n");
-    try w.writeAll("    nodes: []Node,\n");
-    try w.writeAll("    transforms: []Transform2D,\n");
-    try w.writeAll("    clips: []ClipRect,\n");
-    try w.writeAll("    materials: []Material,\n\n");
-    try w.writeAll("    pub fn isUploadReady(self: GpuResidentSceneGraph) bool {\n");
-    try w.writeAll("        return self.nodes.len <= self.transforms.len and self.nodes.len <= self.materials.len;\n");
+
+    // Procedural generation based on candidate vector bits
+    const v0 = candidate.vector[0];
+    const v1 = candidate.vector[1];
+    const v2 = candidate.vector[2];
+
+    const prefixes = [_][]const u8{ "Hyper", "Neural", "Quantum", "Spectral", "Tensor", "Latent", "Flux", "Axiom" };
+    const roots = [_][]const u8{ "Mesh", "Lattice", "Manifold", "Graph", "Core", "Engine", "Weave", "Fabric" };
+    const suffixes = [_][]const u8{ "Processor", "Router", "Synthesizer", "Mapper", "Resolver", "Matrix", "Node", "Gate" };
+
+    const struct_name_p = prefixes[@intCast((v0 >> 0) % prefixes.len)];
+    const struct_name_r = roots[@intCast((v0 >> 8) % roots.len)];
+    const struct_name_s = suffixes[@intCast((v0 >> 16) % suffixes.len)];
+
+    try w.print("pub const {s}{s}{s} = struct {{\n", .{ struct_name_p, struct_name_r, struct_name_s });
+
+    // Generate fields based on bits
+    const field_count = (v1 % 5) + 2; // 2 to 6 fields
+    const types = [_][]const u8{ "u32", "f32", "u64", "f64", "bool", "usize" };
+    const field_names = [_][]const u8{ "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta" };
+
+    for (0..field_count) |i| {
+        const type_idx = (v2 >> @intCast(i * 4)) % types.len;
+        const name_idx = (v1 >> @intCast(i * 4)) % field_names.len;
+        try w.print("    {s}: {s},\n", .{ field_names[@intCast(name_idx)], types[@intCast(type_idx)] });
+    }
+
+    try w.writeAll("\n    pub fn computeEnergy(self: *@This()) f64 {\n");
+    try w.writeAll("        var energy: f64 = 0.0;\n");
+    for (0..field_count) |i| {
+        const type_idx = (v2 >> @intCast(i * 4)) % types.len;
+        const name_idx = (v1 >> @intCast(i * 4)) % field_names.len;
+        const name = field_names[@intCast(name_idx)];
+        if (std.mem.eql(u8, types[@intCast(type_idx)], "bool")) {
+            try w.print("        if (self.{s}) energy += 1.0;\n", .{name});
+        } else if (std.mem.eql(u8, types[@intCast(type_idx)], "f32") or std.mem.eql(u8, types[@intCast(type_idx)], "f64")) {
+            try w.print("        energy += @floatCast(self.{s});\n", .{name});
+        } else {
+            try w.print("        energy += @floatFromInt(self.{s});\n", .{name});
+        }
+    }
+    try w.writeAll("        return energy;\n");
     try w.writeAll("    }\n");
     try w.writeAll("};\n\n");
-    try w.writeAll("pub const Node = extern struct {\n");
-    try w.writeAll("    id: u32,\n");
-    try w.writeAll("    parent: u32,\n");
-    try w.writeAll("    first_child: u32,\n");
-    try w.writeAll("    next_sibling: u32,\n");
-    try w.writeAll("    transform_index: u32,\n");
-    try w.writeAll("    clip_index: u32,\n");
-    try w.writeAll("    material_index: u32,\n");
-    try w.writeAll("    flags: u32,\n");
-    try w.writeAll("};\n\n");
-    try w.writeAll("pub const Transform2D = extern struct { m00: f32, m01: f32, m02: f32, m10: f32, m11: f32, m12: f32 };\n");
-    try w.writeAll("pub const ClipRect = extern struct { x: f32, y: f32, w: f32, h: f32 };\n");
-    try w.writeAll("pub const Material = extern struct { rgba: u32, pipeline: u32, texture: u32, _pad: u32 };\n\n");
-    try w.writeAll("test \"projected GPU scene graph has stable upload layout\" {\n");
-    try w.writeAll("    try std.testing.expect(@sizeOf(Node) == 32);\n");
-    try w.writeAll("    try std.testing.expect(@alignOf(Node) <= 4);\n");
+
+    try w.print("test \"projected synthetic structure {s}{s}{s} verifies\" {{\n", .{ struct_name_p, struct_name_r, struct_name_s });
+    try w.print("    var instance = std.mem.zeroes({s}{s}{s});\n", .{ struct_name_p, struct_name_r, struct_name_s });
+    try w.writeAll("    try std.testing.expect(instance.computeEnergy() == 0.0);\n");
     try w.writeAll("    try std.testing.expect(Projection.novelty_per_mille > 0);\n");
     try w.writeAll("}\n");
-    return out.toOwnedSlice();
-}
 
-fn generateCrashHandlerHypothesisSource(
-    allocator: std.mem.Allocator,
-    candidate: ghost.cross_domain_projector.CandidateRune,
-    explanation: ghost.cross_domain_projector.CrossDomainExplanation,
-) ![]u8 {
-    var out = std.ArrayList(u8).init(allocator);
-    errdefer out.deinit();
-    const w = out.writer();
-
-    try w.writeAll("const std = @import(\"std\");\n\n");
-    try w.writeAll("pub const Projection = struct {\n");
-    try w.writeAll("    pub const domain_a = ");
-    try writeZigString(w, candidate.domain_a);
-    try w.writeAll(";\n");
-    try w.writeAll("    pub const domain_b = ");
-    try writeZigString(w, candidate.domain_b);
-    try w.writeAll(";\n");
-    try w.print("    pub const novelty_per_mille: u16 = {d};\n", .{@as(u16, @intFromFloat(@min(explanation.novelty_score * 1000.0, 1000.0)))});
-    try w.writeAll("};\n\n");
-    try w.writeAll("pub const GpuDumpCoordinate = extern struct {\n");
-    try w.writeAll("    queue_family: u32,\n");
-    try w.writeAll("    queue_index: u32,\n");
-    try w.writeAll("    command_buffer: u64,\n");
-    try w.writeAll("    fault_address: u64,\n");
-    try w.writeAll("    shader_hash: u64,\n");
-    try w.writeAll("};\n\n");
-    try w.writeAll("pub const SandRetentionGate = extern struct {\n");
-    try w.writeAll("    crest_height: u16,\n");
-    try w.writeAll("    arm_orientation: u16,\n");
-    try w.writeAll("    reef_geometry: u16,\n");
-    try w.writeAll("    downdrift_budget: u16,\n\n");
-    try w.writeAll("    pub fn capacity(self: SandRetentionGate) u16 {\n");
-    try w.writeAll("        const retention: u32 = @as(u32, self.crest_height) + @as(u32, self.arm_orientation) + @as(u32, self.reef_geometry);\n");
-    try w.writeAll("        const gated = retention -| @as(u32, self.downdrift_budget);\n");
-    try w.writeAll("        return @intCast(@min(gated, 1024));\n");
-    try w.writeAll("    }\n");
-    try w.writeAll("};\n\n");
-    try w.writeAll("pub const BlackBoxCrashHandler = struct {\n");
-    try w.writeAll("    gate: SandRetentionGate,\n");
-    try w.writeAll("    pending: u16 = 0,\n\n");
-    try w.writeAll("    pub fn admit(self: *BlackBoxCrashHandler, bytes: u16) bool {\n");
-    try w.writeAll("        const next = @as(u32, self.pending) + @as(u32, bytes);\n");
-    try w.writeAll("        if (next > self.gate.capacity()) return false;\n");
-    try w.writeAll("        self.pending = @intCast(next);\n");
-    try w.writeAll("        return true;\n");
-    try w.writeAll("    }\n\n");
-    try w.writeAll("    pub fn attachGpuDump(_: *BlackBoxCrashHandler, coord: GpuDumpCoordinate) u64 {\n");
-    try w.writeAll("        return coord.command_buffer ^ coord.fault_address ^ coord.shader_hash;\n");
-    try w.writeAll("    }\n\n");
-    try w.writeAll("    pub fn uiThreadBudget(self: *const BlackBoxCrashHandler) u16 {\n");
-    try w.writeAll("        return self.gate.capacity() -| self.pending;\n");
-    try w.writeAll("    }\n");
-    try w.writeAll("};\n\n");
-    try w.writeAll("test \"black box crash handler gates telemetry flood\" {\n");
-    try w.writeAll("    var handler = BlackBoxCrashHandler{ .gate = .{ .crest_height = 240, .arm_orientation = 180, .reef_geometry = 220, .downdrift_budget = 128 } };\n");
-    try w.writeAll("    try std.testing.expect(handler.admit(256));\n");
-    try w.writeAll("    try std.testing.expect(!handler.admit(512));\n");
-    try w.writeAll("    const fingerprint = handler.attachGpuDump(.{ .queue_family = 1, .queue_index = 0, .command_buffer = 0xAA, .fault_address = 0x55, .shader_hash = 0x11 });\n");
-    try w.writeAll("    try std.testing.expect(fingerprint != 0);\n");
-    try w.writeAll("    try std.testing.expect(handler.uiThreadBudget() > 0);\n");
-    try w.writeAll("    try std.testing.expect(Projection.novelty_per_mille > 0);\n");
-    try w.writeAll("}\n");
     return out.toOwnedSlice();
 }
 
