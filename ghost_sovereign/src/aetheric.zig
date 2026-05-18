@@ -28,7 +28,7 @@ pub const AethericCore = struct {
             const anchor_coord = @as(u64, f.value) * 100; // Spread anchors
             
             for (hv.data, 0..) |word_bits, word_idx| {
-                self.voxels.add(anchor_coord + word_idx, @as(i128, @bitCast(word_bits)));
+                self.voxels.add(anchor_coord + word_idx, @as(i128, @intCast(word_bits)));
             }
         }
         
@@ -53,7 +53,7 @@ pub const AethericCore = struct {
             const hv = g.value_ptr.*;
             for (hv.data, 0..) |word_bits, word_idx| {
                 const coord = (h ^ word_idx) % manifold.VoxelCount;
-                self.voxels.add(coord, ( @as(i128, @bitCast(word_bits)) ^ @as(i128, @intCast(h % 500))));
+                self.voxels.add(coord, (@as(i128, @intCast(word_bits)) ^ @as(i128, @intCast(h % 500))));
             }
         }
     }

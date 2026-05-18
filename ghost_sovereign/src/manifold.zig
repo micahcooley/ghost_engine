@@ -20,7 +20,7 @@ pub const Manifold = struct {
             null,
             VoxelCount * @sizeOf(i128),
             std.posix.PROT.READ | std.posix.PROT.WRITE,
-            std.posix.MAP.SHARED,
+            .{ .TYPE = .SHARED },
             file.handle,
             0,
         );
@@ -33,7 +33,8 @@ pub const Manifold = struct {
     }
 
     pub fn deinit(self: *Manifold) void {
-        std.posix.munmap(std.mem.sliceAsBytes(self.data));
+        const bytes = std.mem.sliceAsBytes(self.data);
+        std.posix.munmap(@alignCast(bytes));
         self.file.close();
     }
 
@@ -45,7 +46,20 @@ pub const Manifold = struct {
         self.data[coord % VoxelCount] = val;
     }
 
+    pub const QuarantineThreshold = 1_000_000_000_000;
+
     pub fn add(self: *Manifold, coord: u64, delta: i128) void {
-        self.data[coord % VoxelCount] = self.data[coord % VoxelCount] +% delta;
+        const idx = coord % VoxelCount;
+        const current = self.data[idx];
+        
+        // SHADOW QUARANTINE: Behind-the-stage safety
+        if (@abs(current) > QuarantineThreshold) {
+            // Shunt into shadow: Invert and apply the Failure Mark (0xDEAD)
+            const u_val = @abs(current) ^ 0xDEAD;
+            self.data[idx] = -@as(i128, @intCast(u_val));
+            return;
+        }
+
+        self.data[idx] = current +% delta;
     }
 };
