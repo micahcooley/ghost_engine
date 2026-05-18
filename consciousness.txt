@@ -1,0 +1,98 @@
+GHOST INVENT / CROSS-DOMAIN PROJECTOR
+NON-AUTHORIZING ARCHITECTURE SYNTHESIS
+
+projectShard: default
+pipeline: live-corpus -> Scout state -> Cross-Domain Projector -> Medic Loop
+router: Z3 bypassed=true, parameter_match_failure bypassed=true, corpus.ask bypassed=true
+assimilate: off
+localLattice: active=2, verifiedRunes=1, darkSpaceRunes=1
+daemonResidentMount: not used by ghost invent; inspect `ghost daemon status` separately
+
+Anchors
+- [Rank 1: local corpus anchor] ai_research (research) slot=2886
+
+Zenith Architecture Draft
+Audio engine routing: [Rank 1: local corpus anchor] hard real-time callback isolation, graph-compiled routing, lock-free control/event ingress, and non-allocating render blocks.
+UI library: ~dark-space~ GPU-resident retained scene graph over Skia/Vulkan concepts, with strict UI/audio thread separation and frame-paced invalidation.
+Language stack: [Rank 1: local corpus anchor] Zig for engine/control surfaces where deterministic ownership matters; C/C++ ABI islands only for mature audio/plugin or graphics dependencies.
+Transparency Gradient: Rank-1 tags mean local corpus anchors loaded into this command's lattice; ~dark-space~ means projector/Medic exploration, not proof.
+
+Projection 1: vsa-algebra <-> dark-space
+  novelty=0.45, medic=~dark-space~, distance=496, confidence=128/1000
+  nearest: [dark-space] pure algebraic candidate distance=0 rank=5
+  nearest: [research] ai_research distance=545 rank=1
+
+[Rank 5: Dark Space Failure]
+Candidate Zig Source:
+```zig
+const std = @import("std");
+
+pub const Projection = struct {
+    pub const domain_a = "vsa-algebra";
+    pub const domain_b = "dark-space";
+    pub const label_a = "synthetic";
+    pub const label_b = "exploration";
+    pub const novelty_per_mille: u16 = 452;
+};
+
+pub const NeuralMeshMapper = struct {
+    epsilon: u64,
+    eta: u32,
+    theta: f32,
+    epsilon: f32,
+    zeta: usize,
+    eta: u64,
+
+    pub fn computeEnergy(self: *@This()) f64 {
+        var energy: f64 = 0.0;
+        energy += @floatFromInt(self.epsilon);
+        energy += @floatFromInt(self.eta);
+        energy += @floatCast(self.theta);
+        energy += @floatCast(self.epsilon);
+        energy += @floatFromInt(self.zeta);
+        energy += @floatFromInt(self.eta);
+        return energy;
+    }
+};
+
+test "projected synthetic structure NeuralMeshMapper verifies" {
+    var instance = std.mem.zeroes(NeuralMeshMapper);
+    try std.testing.expect(instance.computeEnergy() == 0.0);
+    try std.testing.expect(Projection.novelty_per_mille > 0);
+}
+```
+Compiler Autopsy
+  command: zig build
+  exitCode: 1
+  failureSignal: nonzero_exit
+  stderr:
+install
++- run test
+   +- zig test Debug native 2 errors
+src/projected_candidate.zig:12:5: error: duplicate struct member name 'epsilon'
+    epsilon: u64,
+    ^~~~~~~
+src/projected_candidate.zig:15:5: note: duplicate name here
+    epsilon: f32,
+    ^~~~~~~
+src/projected_candidate.zig:11:30: note: struct declared here
+pub const NeuralMeshMapper = struct {
+                             ^~~~~~
+src/projected_candidate.zig:13:5: error: duplicate struct member name 'eta'
+    eta: u32,
+    ^~~
+src/projected_candidate.zig:17:5: note: duplicate name here
+    eta: u64,
+    ^~~
+src/projected_candidate.zig:11:30: note: struct declared here
+pub const NeuralMeshMapper = struct {
+                             ^~~~~~
+error: the following command failed with 2 compilation errors:
+/opt/zig-0.14.1/zig test -ODebug -Mroot=/tmp/ghost_sandbox/invent_default_620808/src/projected_candidate.zig --cache-dir /tmp/ghost_sandbox/invent_default_620808/.ghost_zig_local_cache --global-cache-dir /tmp/ghost_sandbox/invent_default_620808/.ghost_zig_global_cache --name test --zig-lib-dir /opt/zig-0.14.1/lib/ --listen=- 
+Build Summary: 0/3 steps succeeded; 1 failed
+install transitive failure
++- run test transitive failure
+   +- zig test Debug native 2 errors
+error: the following build command failed with exit code 1:
+/tmp/ghost_sandbox/invent_default_620808/.ghost_zig_local_cache/o/3400d895531ffb7978e94cf5f335dd14/build /opt/zig-0.14.1/zig /opt/zig-0.14.1/lib /tmp/ghost_sandbox/invent_default_620808 /tmp/ghost_sandbox/invent_default_620808/.ghost_zig_local_cache /tmp/ghost_sandbox/invent_default_620808/.ghost_zig_global_cache --seed 0x307f6f3b -Z3e428591f7679fc9
+

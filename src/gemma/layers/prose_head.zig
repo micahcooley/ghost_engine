@@ -39,7 +39,16 @@ pub fn synthesize(self: ProseHead, output_rune: vsa.HyperVector, context: []cons
 
         if (best_entry) |entry| {
             if (entry.text.len > 0) {
-                try words.append(entry.text);
+                var already_has = false;
+                for (words.items) |w| {
+                    if (std.mem.eql(u8, w, entry.text)) {
+                        already_has = true;
+                        break;
+                    }
+                }
+                if (!already_has) {
+                    try words.append(entry.text);
+                }
             } else {
                 try words.append("lattice");
             }

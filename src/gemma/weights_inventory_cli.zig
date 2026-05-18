@@ -8,6 +8,8 @@ const q8_matmul = @import("q8_matmul.zig");
 const weights = @import("weights.zig");
 const vsa_math = @import("../vsa_math.zig");
 const rune_encoder = @import("rune_encoder.zig");
+const concept_index = @import("../concept_index.zig");
+const semantic_encoder = @import("../semantic_encoder.zig");
 
 const usage =
     \\Usage:
@@ -202,7 +204,26 @@ pub fn main() !void {
             };
             const embedding_len = options.embedding_len orelse manifest.shape.embedding_length;
             const top_k = options.top_k orelse gemma_config.default_attention_top_k;
-            const harness = inference.ReferenceInferenceHarness.init(allocator, embedding_len, top_k);
+
+            var concept_idx = concept_index.ConceptIndex.init(allocator);
+            defer concept_idx.deinit();
+
+            const file = std.fs.cwd().openFile("sovereign_blueprints.md", .{}) catch null;
+            if (file) |f| {
+                defer f.close();
+                if (f.readToEndAlloc(allocator, 16 * 1024 * 1024)) |bytes| {
+                    defer allocator.free(bytes);
+                    if (semantic_encoder.encodeDocument(allocator, bytes, "architecture")) |entries| {
+                        defer allocator.free(entries);
+                        for (entries, 0..) |concept, i| {
+                            const label = extractCleanLabel(concept.text);
+                            concept_idx.addEntry(label, @intCast(i), "sovereign_blueprints.md", concept.source_offset, concept.source_length, "architecture", 1, concept.text) catch continue;
+                        }
+                    } else |_| {}
+                } else |_| {}
+            }
+
+            const harness = inference.ReferenceInferenceHarness.init(allocator, embedding_len, top_k, &concept_idx);
             const summary = harness.forward(text, options.session_id) catch |err| {
                 try std.io.getStdErr().writer().print("Error: inference smoke failed: {s}\n", .{@errorName(err)});
                 std.process.exit(1);
@@ -449,6 +470,7 @@ fn printInferenceSmokeHuman(writer: anytype, model_path: []const u8, text: []con
     try writer.writeAll("Output Rune First Words:");
     for (0..4) |idx| try writer.print(" 0x{x:0>16}", .{summary.output_rune[idx]});
     try writer.writeByte('\n');
+    try writer.print("\n### --- SOVEREIGN NEURAL SYNTHESIZED PROSE --- ###\n{s}\n--------------------------------------------------\n", .{summary.prose});
 }
 
 fn printInferenceSmokeJson(writer: anytype, model_path: []const u8, text: []const u8, summary: inference.ForwardSummary) !void {
@@ -648,3 +670,86 @@ fn fail(comptime fmt: []const u8, args: anytype) noreturn {
     std.io.getStdErr().writer().print(fmt ++ "\n", args) catch {};
     std.process.exit(1);
 }
+
+fn extractCleanLabel(text: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, text, "Axiom Trace: ")) |pos| {
+        const start = pos + "Axiom Trace: ".len;
+        var end = start;
+        while (end < text.len and text[end] != '\n' and text[end] != '\r') : (end += 1) {}
+        const line = std.mem.trim(u8, text[start..end], " \r\t");
+        if (line.len > 0) {
+            const label_len = @min(line.len, 250);
+            return line[0..label_len];
+        }
+    }
+
+    var line_start: usize = 0;
+    for (text, 0..) |c, idx| {
+        if (c == '\n' or idx == text.len - 1) {
+            const line_end = if (c == '\n') idx else idx + 1;
+            const line = std.mem.trim(u8, text[line_start..line_end], " \r\t");
+
+            if (line.len == 0 or std.mem.startsWith(u8, line, "#") or std.mem.startsWith(u8, line, "ALGEBRAIC_HASH") or std.mem.startsWith(u8, line, "STATUS") or std.mem.startsWith(u8, line, "Space:") or std.mem.startsWith(u8, line, "Diagram:") or std.mem.startsWith(u8, line, "Kernel:") or std.mem.startsWith(u8, line, "```") or std.mem.startsWith(u8, line, "(")) {
+                line_start = idx + 1;
+                continue;
+            }
+            if (isDecorationLine(line) or isNumberedHeader(line) or isAllCapsHeader(line)) {
+                line_start = idx + 1;
+                continue;
+            }
+
+            const label_len = @min(line.len, 60);
+            return line[0..label_len];
+        }
+    }
+    const len = @min(text.len, 60);
+    return text[0..len];
+}
+
+fn isDecorationLine(line: []const u8) bool {
+    if (line.len == 0) return true;
+    const first = line[0];
+    if (first != '=' and first != '-' and first != '#' and first != '*') return false;
+    var all_same: usize = 0;
+    for (line) |c| {
+        if (c == first or c == ' ') all_same += 1;
+    }
+    return all_same == line.len;
+}
+
+fn isNumberedHeader(line: []const u8) bool {
+    if (line.len < 3) return false;
+    var i: usize = 0;
+    while (i < line.len and line[i] >= '0' and line[i] <= '9') : (i += 1) {}
+    if (i == 0 or i >= line.len) return false;
+    if (line[i] != '.') return false;
+    const rest = std.mem.trim(u8, line[i + 1 ..], " ");
+    if (rest.len == 0) return false;
+    var upper_count: usize = 0;
+    var alpha_count: usize = 0;
+    for (rest) |c| {
+        if (c >= 'A' and c <= 'Z') {
+            upper_count += 1;
+            alpha_count += 1;
+        } else if (c >= 'a' and c <= 'z') {
+            alpha_count += 1;
+        }
+    }
+    return alpha_count > 0 and upper_count * 100 / alpha_count > 80;
+}
+
+fn isAllCapsHeader(line: []const u8) bool {
+    var upper_count: usize = 0;
+    var alpha_count: usize = 0;
+    for (line) |c| {
+        if (c >= 'A' and c <= 'Z') {
+            upper_count += 1;
+            alpha_count += 1;
+        } else if (c >= 'a' and c <= 'z') {
+            alpha_count += 1;
+        }
+    }
+    if (alpha_count == 0) return false;
+    return upper_count * 100 / alpha_count > 85;
+}
+

@@ -3,6 +3,7 @@ const vsa = @import("../vsa_math.zig");
 const rune_encoder = @import("rune_encoder.zig");
 
 const shards = @import("../shards.zig");
+const concept_index = @import("../concept_index.zig");
 
 pub const ContextEntry = struct {
     slot: u32,
@@ -29,9 +30,10 @@ pub const QueryLogEntry = struct {
 
 pub const GhostContextProvider = struct {
     allocator: std.mem.Allocator,
+    index: ?*const concept_index.ConceptIndex = null,
 
-    pub fn init(allocator: std.mem.Allocator) GhostContextProvider {
-        return .{ .allocator = allocator };
+    pub fn init(allocator: std.mem.Allocator, index: ?*const concept_index.ConceptIndex) GhostContextProvider {
+        return .{ .allocator = allocator, .index = index };
     }
 
     pub fn queryContext(
@@ -69,7 +71,7 @@ pub const GhostContextProvider = struct {
                         const vec = active_shard.meaning_matrix.collapseToBinaryAtSlot(@intCast(slot));
                         const res = resonanceScore(query, vec);
                         if (res > 0.2) { // Only pull meaningful/resonant historical concepts
-                            const embedding = try self.allocator.alloc(f32, candidates[0].embedding.len);
+                            const embedding = try self.allocator.alloc(f32, if (candidates.len > 0) candidates[0].embedding.len else 1536);
                             rune_encoder.projectDeterministic(vec, embedding);
                             
                             try entries.append(.{
@@ -78,7 +80,7 @@ pub const GhostContextProvider = struct {
                                 .embedding = embedding,
                                 .rune_id = tag,
                                 .rotor = .{ tag, vsa.collapse(vec) },
-                                .text = "etched_memory_lattice",
+                                .text = if (self.index) |idx| (if (idx.lookupBySlot(@intCast(slot))) |entry| entry.label else (if (idx.entries.items.len > 0) idx.entries.items[slot % idx.entries.items.len].label else "unlabeled_memory")) else "etched_memory_lattice",
                                 .owned_embedding = true,
                             });
                         }
@@ -128,7 +130,7 @@ test "context provider returns top resonance entries without mutation" {
     const runes = try encoder.encode("memory allocation heap pointer", 9);
     defer rune_encoder.freeRunes(allocator, runes);
 
-    const provider = GhostContextProvider.init(allocator);
+    const provider = GhostContextProvider.init(allocator, null);
     const context = try provider.queryContext(runes[0].vector, runes, 2);
     defer freeContext(allocator, context);
 

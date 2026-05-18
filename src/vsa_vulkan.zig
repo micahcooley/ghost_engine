@@ -1592,6 +1592,7 @@ pub const VulkanEngine = struct {
         return self;
     }
 
+
     fn destroyBuffer(self: *const VulkanEngine, buffer: *vk.VkBuffer, memory: *vk.VkDeviceMemory, mapped_ptr: ?*anyopaque) void {
         if (buffer.* == null) return;
         if (mapped_ptr != null) {
@@ -3114,20 +3115,28 @@ pub const VulkanEngine = struct {
 
         if (self.mapped_rune_ranks) |dst| {
             const len = @min(host_ranks.len, self.matrix_slots);
-            @memcpy(dst[0..len], host_ranks[0..len]);
+            if (@intFromPtr(dst) != @intFromPtr(host_ranks.ptr)) {
+                @memcpy(dst[0..len], host_ranks[0..len]);
+            }
         }
 
         if (self.mapped_matrix) |dst| {
             const len = @min(host_matrix.len, self.matrix_slots * 1024);
-            ghostCopy(u32, dst[0..len], host_matrix[0..len]);
+            if (@intFromPtr(dst) != @intFromPtr(host_matrix.ptr)) {
+                ghostCopy(u32, dst[0..len], host_matrix[0..len]);
+            }
         }
         if (self.mapped_tags) |dst| {
             const len = @min(host_tags.len, self.matrix_slots);
-            ghostCopy(u64, dst[0..len], host_tags[0..len]);
+            if (@intFromPtr(dst) != @intFromPtr(host_tags.ptr)) {
+                ghostCopy(u64, dst[0..len], host_tags[0..len]);
+            }
         }
         if (self.mapped_lattice) |dst| {
             const len = @min(host_lattice.len, self.gpu_lattice_size / @sizeOf(u16));
-            ghostCopy(u16, dst[0..len], host_lattice[0..len]);
+            if (@intFromPtr(dst) != @intFromPtr(host_lattice.ptr)) {
+                ghostCopy(u16, dst[0..len], host_lattice[0..len]);
+            }
         }
         self.refreshLockMaskFromControl();
     }

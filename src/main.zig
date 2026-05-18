@@ -460,7 +460,9 @@ pub fn main_wrapped(allocator: std.mem.Allocator) !void {
             global_host_lattice_words = vk.getLatticeData();
             vk.bindHostState(meaning_matrix.data, meaning_matrix.tags.?, global_rank_data.?, global_host_lattice_words.?);
             sys.printOut("[COMPUTE] Ghost-Vulkan-Native active.\n");
-        } else |_| sys.printOut("[COMPUTE] GPU not available. Running in CPU-only mode.\n");
+        } else |err| {
+            sys.print("[COMPUTE] GPU not available ({any}). Running in CPU-only mode.\n", .{err});
+        }
     } else {
         sys.printOut("[COMPUTE] Sigil boot selected CPU-only mode.\n");
     }

@@ -128,20 +128,20 @@ pub fn runConversationAgent(input: AgentInput) ResultPayload {
         if (weights.GGUFLoader.init(allocator, path)) |var_loader| {
             var loader = var_loader;
             defer loader.deinit();
-            const harness = inference.ReferenceInferenceHarness.initWithLoader(allocator, &loader, 1536, 32);
+            const harness = inference.ReferenceInferenceHarness.initWithLoader(allocator, &loader, 1536, 32, null);
             if (harness.forward(msg, 0)) |summary| {
                 const csum = summary.checksum();
                 // Use the authentic De-Rotor synthesized prose directly from the neural forward pass
                 chat_resp = std.fmt.allocPrint(allocator, "{s} (Gemma 4 GGUF active, hypervector checksum 0x{x})", .{summary.prose, csum}) catch summary.prose;
             } else |_| {}
         } else |_| {
-            const harness = inference.ReferenceInferenceHarness.init(allocator, 1536, 32);
+            const harness = inference.ReferenceInferenceHarness.init(allocator, 1536, 32, null);
             if (harness.forward(msg, 0)) |summary| {
                 chat_resp = summary.prose;
             } else |_| {}
         }
     } else {
-        const harness = inference.ReferenceInferenceHarness.init(allocator, 1536, 32);
+        const harness = inference.ReferenceInferenceHarness.init(allocator, 1536, 32, null);
         if (harness.forward(msg, 0)) |summary| {
             chat_resp = summary.prose;
         } else |_| {}

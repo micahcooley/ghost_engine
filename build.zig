@@ -562,7 +562,7 @@ pub fn build(b: *std.Build) void {
             addVulkanIncludes,
             compile_corpus_scan_shader,
         );
-        if (std.mem.eql(u8, cfg.name, "ghostd") or std.mem.eql(u8, cfg.name, "ghost_gip")) {
+        if (std.mem.eql(u8, cfg.name, "ghostd") or std.mem.eql(u8, cfg.name, "ghost_gip") or std.mem.eql(u8, cfg.name, "ghost_invent") or std.mem.eql(u8, cfg.name, "ghost_gemma")) {
             exe.root_module.addImport("domain_inference", domain_inference_module);
             exe.root_module.addImport("anchor_discovery", anchor_discovery_module);
             exe.root_module.addImport("semantic_tensor", semantic_tensor_module);

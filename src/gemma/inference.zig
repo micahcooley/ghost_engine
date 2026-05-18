@@ -10,6 +10,7 @@ const prose_head = @import("layers/prose_head.zig");
 const vsa = @import("../vsa_math.zig");
 const weights = @import("weights.zig");
 const q8_matmul = @import("q8_matmul.zig");
+const concept_index = @import("../concept_index.zig");
 
 pub const HarnessState = "read_only_non_authorizing_phase_harness_not_full_model";
 
@@ -38,13 +39,14 @@ pub const ReferenceInferenceHarness = struct {
     loader: ?*weights.GGUFLoader = null,
     embedding_len: usize = gemma_config.default_embedding_length,
     top_k: usize = gemma_config.default_attention_top_k,
+    concept_idx: ?*const concept_index.ConceptIndex = null,
 
-    pub fn init(allocator: std.mem.Allocator, embedding_len: usize, top_k: usize) ReferenceInferenceHarness {
-        return .{ .allocator = allocator, .loader = null, .embedding_len = embedding_len, .top_k = top_k };
+    pub fn init(allocator: std.mem.Allocator, embedding_len: usize, top_k: usize, concept_idx: ?*const concept_index.ConceptIndex) ReferenceInferenceHarness {
+        return .{ .allocator = allocator, .loader = null, .embedding_len = embedding_len, .top_k = top_k, .concept_idx = concept_idx };
     }
 
-    pub fn initWithLoader(allocator: std.mem.Allocator, loader: *weights.GGUFLoader, embedding_len: usize, top_k: usize) ReferenceInferenceHarness {
-        return .{ .allocator = allocator, .loader = loader, .embedding_len = embedding_len, .top_k = top_k };
+    pub fn initWithLoader(allocator: std.mem.Allocator, loader: *weights.GGUFLoader, embedding_len: usize, top_k: usize, concept_idx: ?*const concept_index.ConceptIndex) ReferenceInferenceHarness {
+        return .{ .allocator = allocator, .loader = loader, .embedding_len = embedding_len, .top_k = top_k, .concept_idx = concept_idx };
     }
 
     pub fn forward(self: ReferenceInferenceHarness, input_text: []const u8, session_id: u64) !ForwardSummary {
@@ -53,7 +55,7 @@ pub const ReferenceInferenceHarness = struct {
         defer rune_encoder.freeRunes(self.allocator, runes);
         if (runes.len == 0) return error.EmptyInput;
 
-        const provider = context_provider.GhostContextProvider.init(self.allocator);
+        const provider = context_provider.GhostContextProvider.init(self.allocator, self.concept_idx);
         // We query the meaning matrix for context based on the unified conceptual state of the input
         const context = try provider.queryContext(runes[runes.len - 1].vector, runes, self.top_k);
         defer context_provider.freeContext(self.allocator, context);
@@ -224,7 +226,7 @@ pub const ReferenceInferenceHarness = struct {
 
 test "reference inference harness returns deterministic healthy rune" {
     const allocator = std.testing.allocator;
-    const harness = ReferenceInferenceHarness.init(allocator, 32, 4);
+    const harness = ReferenceInferenceHarness.init(allocator, 32, 4, null);
     const first = try harness.forward("memory allocation heap pointer", 11);
     defer first.deinit(allocator);
     const second = try harness.forward("memory allocation heap pointer", 11);
