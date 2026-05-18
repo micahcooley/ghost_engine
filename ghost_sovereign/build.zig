@@ -36,7 +36,7 @@ pub fn build(b: *std.Build) void {
         "hardware_mirror_synthesis", "infinity_stress_test", "ingestion_strategy_synthesis",
         "native_mirror_synthesis", "null_manifesto_synthesis", "primitive_resonance_synthesis",
         "probe_map", "reiteration_synthesis", "simd_resonance_synthesis", "vsa_leap_synthesis",
-        "wiki_ingestion_synthesis", "zero_scalar_proof", "zero_unit_synthesis",
+        "wiki_ingestion_synthesis", "zero_scalar_proof", "zero_unit_synthesis", "entangled_singularity_synthesis",
     };
 
     for (synthesis_files) |name| {
@@ -144,6 +144,14 @@ pub fn build(b: *std.Build) void {
     });
     addGhostImports(final_probe.root_module, modules);
     b.installArtifact(final_probe);
+
+    const reproduce_baseline = b.addExecutable(.{
+        .name = "reproduce_baseline",
+        .root_source_file = b.path("src/reproduce_baseline.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    b.installArtifact(reproduce_baseline);
 
     const absolute_exe = b.addExecutable(.{
         .name = "ghost_absolute",
