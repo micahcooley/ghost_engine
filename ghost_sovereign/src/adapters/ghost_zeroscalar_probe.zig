@@ -1,5 +1,5 @@
 const std = @import("std");
-const absolute = @import("absolute_production.zig");
+const absolute = @import("absolute_production");
 
 // --- GHOST ZERO-SCALAR PROBE ---
 // Purpose: Benchmarking the 100% Non-Scalar Core.

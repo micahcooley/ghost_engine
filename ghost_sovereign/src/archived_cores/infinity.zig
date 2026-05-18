@@ -1,7 +1,7 @@
 const std = @import("std");
-const void_eng = @import("void.zig");
-const vsa = @import("vsa.zig");
-const manifold = @import("manifold.zig");
+const void_eng = @import("void");
+const vsa = @import("vsa");
+const manifold = @import("manifold");
 
 // --- GHOST INFINITY: THE HARDWARE ORGANISM (Mark: 0xE44F9E332F206A51) ---
 // Principle: Spectral Phase-Density with Self-Healing Scars.

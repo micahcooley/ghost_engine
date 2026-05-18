@@ -1,27 +1,43 @@
 const std = @import("std");
 
-// --- GHOST ABSOLUTE: THE PRIMITIVE RESONANCE (Mark: 0xBE496F1695F15480) ---
-// Principle: Bit-Spill Logic with Unrolled 8-Walker Parallelism.
-// Objective: Achieve 500+ MB/s without SIMD or @bitReverse.
+// --- GHOST ABSOLUTE: SHARDED DICTIONARY WALKER ---
+// Principle: mmap-backed bit-mixed lookups with 8 independent 4KB shards.
+// Objective: make the core measurable without SIMD or bit reversal.
 
 pub const AbsoluteCore = struct {
     // Manifold of 64-bit voxels (2^21 * 8 bytes = 16MB)
-    pub const ManifoldSize = 2097152; 
+    pub const ManifoldSize = 2097152;
     pub const AddressMask = ManifoldSize - 1;
-    // 32KB Window (4096 voxels)
-    pub const WindowSize = 4096;
+    pub const ShardCount = 8;
+    pub const ShardBytes = 4 * 1024;
+    pub const ShardSize = ShardBytes / @sizeOf(u64);
+    pub const ShardMask = ShardSize - 1;
+    // 32KB L1 window: 8 shards x 4KB. Each walker owns exactly one shard.
+    pub const WindowSize = ShardCount * ShardSize;
     pub const WindowMask = WindowSize - 1;
     pub const BatchSize = 1024;
 
+    pub const IngestReport = struct {
+        bytes: usize = 0,
+        writes: usize = 0,
+        dominant_edge: usize = 0,
+        dominant_delta: u64 = 0,
+        edge_fingerprint: u64 = 0xBE496F1695F15480,
+    };
+
     field: []u64,
     file: std.fs.File,
+    field_count: usize,
+    address_mask: usize,
     kernel: u64 = 0xBE496F1695F15480,
 
     pub fn init(size_bytes: usize) !AbsoluteCore {
-        const count = std.math.ceilPowerOfTwo(usize, size_bytes / 8) catch ManifoldSize;
+        try std.fs.cwd().makePath("state");
+        const requested_count = @max(WindowSize, size_bytes / @sizeOf(u64));
+        const count = std.math.ceilPowerOfTwo(usize, requested_count) catch ManifoldSize;
         var file = try std.fs.cwd().createFile("state/ghost_absolute.bin", .{ .read = true, .truncate = false });
         try file.setEndPos(count * 8);
-        
+
         const data = try std.posix.mmap(
             null,
             count * 8,
@@ -32,15 +48,13 @@ pub const AbsoluteCore = struct {
         );
 
         const field = std.mem.bytesAsSlice(u64, data);
-        var s: u64 = 0xBE496F1695F15480;
-        for (field) |*v| {
-            s = (s ^ (s >> 31)) ^ 0x9E3779B97F4A7C15;
-            v.* = s;
-        }
+        seedField(field);
 
         return .{
             .field = field,
             .file = file,
+            .field_count = count,
+            .address_mask = count - 1,
         };
     }
 
@@ -49,10 +63,19 @@ pub const AbsoluteCore = struct {
         self.file.close();
     }
 
-    /// PRIMITIVE INGESTION: 8-Walker Bit-Spill (No SIMD, No BitReverse).
-    /// This uses the CPU's out-of-order execution units by unrolling 8 independent streams.
+    pub fn reset(self: *AbsoluteCore) void {
+        seedField(self.field);
+    }
+
+    /// 8-walker bit-spill ingestion. The 32KB active window is split into
+    /// 8 independent 4KB shards, so m1..m8 never write each other's slots.
     pub fn ingest(self: *AbsoluteCore, data: []const u8) void {
-        var m1: usize = self.kernel;
+        _ = self.ingestMeasured(data);
+    }
+
+    pub fn ingestMeasured(self: *AbsoluteCore, data: []const u8) IngestReport {
+        var report = IngestReport{ .bytes = data.len };
+        var m1: usize = @truncate(self.kernel);
         var m2: usize = m1 ^ 0xAAAAAAAAAAAAAAAA;
         var m3: usize = m1 ^ 0x5555555555555555;
         var m4: usize = m1 ^ 0x3333333333333333;
@@ -61,7 +84,7 @@ pub const AbsoluteCore = struct {
         var m7: usize = m1 ^ 0x9999999999999999;
         var m8: usize = m1 ^ 0x7777777777777777;
 
-        const field_mask = AddressMask & ~@as(usize, WindowMask);
+        const field_mask = self.address_mask & ~@as(usize, WindowMask);
         var i: usize = 0;
         const total_len = data.len;
 
@@ -73,42 +96,50 @@ pub const AbsoluteCore = struct {
             const batch = data[i .. i + batch_limit];
 
             var j: usize = 0;
-            // Hot Loop: 8-Walker Bit-Spill Unrolled
-            // This physically saturates the CPU pipeline without using SIMD 'vectors'.
             while (j + 8 <= batch.len) : (j += 8) {
-                // 1. COLLISION (XOR)
-                const b1 = @as(u64, batch[j]);
-                const b2 = @as(u64, batch[j+1]);
-                const b3 = @as(u64, batch[j+2]);
-                const b4 = @as(u64, batch[j+3]);
-                const b5 = @as(u64, batch[j+4]);
-                const b6 = @as(u64, batch[j+5]);
-                const b7 = @as(u64, batch[j+6]);
-                const b8 = @as(u64, batch[j+7]);
-
-                // 2. MIXING: Prime-Weighted Bit-Rotates (1-cycle instruction)
-                // This replaces the expensive software bit-reverse.
-                window[(m1 ^ b1) & WindowMask] ^= std.math.rotl(u64, b1, 7);
-                window[(m2 ^ b2) & WindowMask] ^= std.math.rotl(u64, b2, 11);
-                window[(m3 ^ b3) & WindowMask] ^= std.math.rotl(u64, b3, 13);
-                window[(m4 ^ b4) & WindowMask] ^= std.math.rotl(u64, b4, 17);
-                window[(m5 ^ b5) & WindowMask] ^= std.math.rotl(u64, b5, 19);
-                window[(m6 ^ b6) & WindowMask] ^= std.math.rotl(u64, b6, 23);
-                window[(m7 ^ b7) & WindowMask] ^= std.math.rotl(u64, b7, 29);
-                window[(m8 ^ b8) & WindowMask] ^= std.math.rotl(u64, b8, 31);
-
-                // 3. STOCHASTIC HOP: Update walkers
-                m1 = std.math.rotl(usize, m1 ^ @as(usize, @truncate(window[(m1 ^ b1) & WindowMask])), 1);
-                m2 = std.math.rotl(usize, m2 ^ @as(usize, @truncate(window[(m2 ^ b2) & WindowMask])), 2);
-                m3 = std.math.rotl(usize, m3 ^ @as(usize, @truncate(window[(m3 ^ b3) & WindowMask])), 3);
-                m4 = std.math.rotl(usize, m4 ^ @as(usize, @truncate(window[(m4 ^ b4) & WindowMask])), 4);
-                m5 = std.math.rotl(usize, m5 ^ @as(usize, @truncate(window[(m5 ^ b5) & WindowMask])), 5);
-                m6 = std.math.rotl(usize, m6 ^ @as(usize, @truncate(window[(m6 ^ b6) & WindowMask])), 6);
-                m7 = std.math.rotl(usize, m7 ^ @as(usize, @truncate(window[(m7 ^ b7) & WindowMask])), 7);
-                m8 = std.math.rotl(usize, m8 ^ @as(usize, @truncate(window[(m8 ^ b8) & WindowMask])), 8);
+                mixWalker(window, window_start, 0, &m1, batch[j], 7, 0xBE496F1695F15480, &report);
+                mixWalker(window, window_start, 1, &m2, batch[j + 1], 11, 0xC2B2AE3D27D4EB4F, &report);
+                mixWalker(window, window_start, 2, &m3, batch[j + 2], 13, 0x165667B19E3779F9, &report);
+                mixWalker(window, window_start, 3, &m4, batch[j + 3], 17, 0x85EBCA77C2B2AE63, &report);
+                mixWalker(window, window_start, 4, &m5, batch[j + 4], 19, 0x27D4EB2F165667C5, &report);
+                mixWalker(window, window_start, 5, &m6, batch[j + 5], 23, 0x94D049BB133111EB, &report);
+                mixWalker(window, window_start, 6, &m7, batch[j + 6], 29, 0xD6E8FEB86659FD93, &report);
+                mixWalker(window, window_start, 7, &m8, batch[j + 7], 31, 0x9E3779B97F4A7C15, &report);
+            }
+            if (j < batch.len) {
+                mixWalker(window, window_start, 0, &m1, batch[j], 7, 0xBE496F1695F15480, &report);
+                j += 1;
+            }
+            if (j < batch.len) {
+                mixWalker(window, window_start, 1, &m2, batch[j], 11, 0xC2B2AE3D27D4EB4F, &report);
+                j += 1;
+            }
+            if (j < batch.len) {
+                mixWalker(window, window_start, 2, &m3, batch[j], 13, 0x165667B19E3779F9, &report);
+                j += 1;
+            }
+            if (j < batch.len) {
+                mixWalker(window, window_start, 3, &m4, batch[j], 17, 0x85EBCA77C2B2AE63, &report);
+                j += 1;
+            }
+            if (j < batch.len) {
+                mixWalker(window, window_start, 4, &m5, batch[j], 19, 0x27D4EB2F165667C5, &report);
+                j += 1;
+            }
+            if (j < batch.len) {
+                mixWalker(window, window_start, 5, &m6, batch[j], 23, 0x94D049BB133111EB, &report);
+                j += 1;
+            }
+            if (j < batch.len) {
+                mixWalker(window, window_start, 6, &m7, batch[j], 29, 0xD6E8FEB86659FD93, &report);
+                j += 1;
+            }
+            if (j < batch.len) {
+                mixWalker(window, window_start, 7, &m8, batch[j], 31, 0x9E3779B97F4A7C15, &report);
             }
             i += batch_limit;
         }
+        return report;
     }
 
     pub fn resolve(self: *AbsoluteCore, intent: []const u8, dictionary: []const []const u8, writer: anytype) !void {
@@ -122,8 +153,8 @@ pub const AbsoluteCore = struct {
 
         var words: usize = 0;
         while (words < 20) : (words += 1) {
-            const raw_voxel = self.field[mark & AddressMask];
-            // High 32 bits for the dictionary index — uncorrelated with the
+            const raw_voxel = self.field[mark & self.address_mask];
+            // High 32 bits for the dictionary index: uncorrelated with the
             // rotation/walk math, so word selection isn't locked to the orbit.
             const word_idx = @as(usize, @truncate(raw_voxel >> 32)) % dictionary.len;
             try writer.writeAll(dictionary[word_idx]);
@@ -133,5 +164,51 @@ pub const AbsoluteCore = struct {
             mark = std.math.rotl(usize, mark ^ raw_voxel ^ @as(usize, words), 31);
         }
         try writer.writeAll(".\n");
+    }
+
+    fn seedField(field: []u64) void {
+        var s: u64 = 0xBE496F1695F15480;
+        for (field) |*v| {
+            s = (s ^ (s >> 31)) ^ 0x9E3779B97F4A7C15;
+            v.* = s;
+        }
+    }
+
+    fn mixWalker(
+        window: []u64,
+        window_start: usize,
+        comptime shard: usize,
+        m: *usize,
+        b: u8,
+        rot: u6,
+        lane_salt: u64,
+        report: *IngestReport,
+    ) void {
+        const idx = (shard * ShardSize) + ((m.* ^ @as(usize, b)) & ShardMask);
+        const prior = window[idx];
+        const b64 = @as(u64, b);
+        const spread = b64 ^ (b64 << 8) ^ (b64 << 16) ^ (b64 << 24) ^ (b64 << 32) ^ (b64 << 40) ^ (b64 << 48) ^ (b64 << 56);
+        const mixed = std.math.rotl(u64, spread ^ lane_salt, rot);
+        const next = prior ^ mixed;
+        window[idx] = next;
+
+        const absolute_idx = window_start + idx;
+        const delta = prior ^ next;
+        report.writes += 1;
+        if (delta > report.dominant_delta) {
+            report.dominant_delta = delta;
+            report.dominant_edge = absolute_idx;
+        }
+        report.edge_fingerprint = std.math.rotl(
+            u64,
+            report.edge_fingerprint ^ @as(u64, @intCast(absolute_idx)) ^ next ^ mixed,
+            rot,
+        );
+
+        m.* = std.math.rotl(
+            usize,
+            m.* ^ @as(usize, @truncate(prior)) ^ @as(usize, @truncate(mixed)) ^ absolute_idx,
+            rot,
+        );
     }
 };

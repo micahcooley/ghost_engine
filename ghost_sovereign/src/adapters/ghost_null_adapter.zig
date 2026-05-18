@@ -1,5 +1,5 @@
 const std = @import("std");
-const null_core = @import("null_core.zig");
+const null_core = @import("null_core");
 
 // --- GHOST NULL ADAPTER ---
 // The Zero-Type non-human mind.

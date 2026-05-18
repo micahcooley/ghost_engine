@@ -1,5 +1,5 @@
 const std = @import("std");
-const flame = @import("flame.zig");
+const flame = @import("flame");
 
 // --- GHOST FLARE (Suite 2: Mark 0xA17CABB1) ---
 // Proposed intent: "One law with largest variance, single-flare collapse."

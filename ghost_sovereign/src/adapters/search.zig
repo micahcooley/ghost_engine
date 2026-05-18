@@ -1,8 +1,8 @@
 const std = @import("std");
-const void_eng = @import("void.zig");
-const vsa = @import("vsa.zig");
-const manifold = @import("manifold.zig");
-const aetheric = @import("aetheric.zig");
+const void_eng = @import("void");
+const vsa = @import("vsa");
+const manifold = @import("manifold");
+const aetheric = @import("aetheric");
 
 // --- GHOST SPECTRAL INGESTOR: WIKIPEDIA CORE ---
 // Principle: Spectral Pulse Ingestion.

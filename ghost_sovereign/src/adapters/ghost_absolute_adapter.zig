@@ -1,7 +1,7 @@
 const std = @import("std");
-const flame = @import("flame.zig");
-const absolute = @import("absolute.zig");
-const lore_eng = @import("lore.zig");
+const flame = @import("flame");
+const absolute = @import("absolute_archived");
+const lore_eng = @import("lore");
 
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);

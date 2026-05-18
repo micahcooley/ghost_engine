@@ -1,6 +1,6 @@
 const std = @import("std");
-const void_eng = @import("void.zig");
-const flame = @import("flame.zig");
+const void_eng = @import("void");
+const flame = @import("flame");
 
 // --- GHOST VOID CLI ADAPTER ---
 

@@ -1,5 +1,5 @@
 const std = @import("std");
-const flame = @import("flame.zig");
+const flame = @import("flame");
 
 // --- GHOST FROST (Suite 3: Mark 0x8DB8D3B0) ---
 // Proposed intent: "Three laws with largest variance from median, three entangled flares simultaneously."

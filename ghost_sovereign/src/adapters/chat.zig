@@ -1,6 +1,6 @@
 const std = @import("std");
-const sovereign = @import("sovereign.zig");
-const void_eng = @import("void.zig");
+const sovereign = @import("sovereign");
+const void_eng = @import("void");
 
 // --- GHOST CHAT: THE STEERING WHEEL ---
 

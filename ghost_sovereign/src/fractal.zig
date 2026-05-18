@@ -1,5 +1,5 @@
 const std = @import("std");
-const flame = @import("flame.zig");
+const flame = @import("flame");
 
 // --- GHOST FRACTAL (Suite 4: Mark 0xAD0C53A0) ---
 // Proposed intent: "Recursive law spawning, fractal dimensions."

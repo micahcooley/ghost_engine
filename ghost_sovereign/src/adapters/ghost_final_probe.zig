@@ -1,5 +1,5 @@
 const std = @import("std");
-const absolute = @import("absolute_final.zig");
+const absolute = @import("absolute_final");
 
 // --- GHOST FINAL BENCHMARK ---
 // Purpose: Falsifiable measurement of the Cache-Local Zero-Scalar Core.

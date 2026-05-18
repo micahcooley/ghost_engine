@@ -1,6 +1,6 @@
 const std = @import("std");
-const flame = @import("flame.zig");
-const void_eng = @import("void.zig");
+const flame = @import("flame");
+const void_eng = @import("void");
 
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);

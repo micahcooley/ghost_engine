@@ -1,5 +1,5 @@
 const std = @import("std");
-const absolute_proof = @import("absolute_proof_core.zig");
+const absolute_proof = @import("absolute_proof_core");
 
 // --- GHOST ABSOLUTE PROOF ADAPTER ---
 // Demonstrating the deletion of human units.

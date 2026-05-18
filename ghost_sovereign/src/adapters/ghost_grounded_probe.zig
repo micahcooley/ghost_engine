@@ -1,5 +1,5 @@
 const std = @import("std");
-const grounded = @import("grounded_core.zig");
+const grounded = @import("grounded_core");
 
 // --- GHOST GROUNDED PROBE ---
 // Purpose: Benchmarking the 100% Cache-Local Core.

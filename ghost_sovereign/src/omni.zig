@@ -1,6 +1,6 @@
 const std = @import("std");
-const flame = @import("flame.zig");
-const void_eng = @import("void.zig");
+const flame = @import("flame");
+const void_eng = @import("void");
 const aether = @import("aether.zig");
 
 pub const OmniModalField = struct {

@@ -1,5 +1,5 @@
 const std = @import("std");
-const flame = @import("flame.zig");
+const flame = @import("flame");
 
 pub const VoidEngine = struct {
     state: flame.FlameState,

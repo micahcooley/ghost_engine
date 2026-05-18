@@ -961,15 +961,52 @@ pub fn serializeProgram(allocator: std.mem.Allocator, program: *const Program) !
         @intCast(program.strings.len),
     };
     try output.appendSlice(std.mem.asBytes(&counts));
-    try output.appendSlice(std.mem.sliceAsBytes(program.instructions));
+    for (program.instructions) |inst| {
+        try appendInt(u8, &output, @intFromEnum(inst.opcode));
+        try appendInt(u8, &output, @intFromEnum(inst.mode));
+        try appendInt(i64, &output, inst.a);
+        try appendInt(i64, &output, inst.b);
+        try appendInt(u32, &output, inst.string_index);
+    }
 
     for (program.strings) |item| {
         const len: u32 = @intCast(item.len);
-        try output.appendSlice(std.mem.asBytes(&len));
+        try appendInt(u32, &output, len);
         try output.appendSlice(item);
     }
 
     return output.toOwnedSlice();
+}
+
+fn appendInt(comptime T: type, output: *std.ArrayList(u8), value: T) !void {
+    var bytes: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &bytes, value, .little);
+    try output.appendSlice(&bytes);
+}
+
+test "sigil serialization writes explicit fields without struct padding" {
+    const allocator = std.testing.allocator;
+
+    var program = try compileScript(allocator,
+        \\MOOD "focused"
+        \\LOOM VULKAN_INIT
+        \\LOCK 74
+    );
+    defer program.deinit();
+
+    const serialized = try serializeProgram(allocator, &program);
+    defer allocator.free(serialized);
+
+    const record_size = @sizeOf(u8) + @sizeOf(u8) + @sizeOf(i64) + @sizeOf(i64) + @sizeOf(u32);
+    var expected_len: usize = 4 + (2 * @sizeOf(u32)) + (program.instructions.len * record_size);
+    for (program.strings) |item| expected_len += @sizeOf(u32) + item.len;
+
+    try std.testing.expectEqual(expected_len, serialized.len);
+    try std.testing.expectEqual(@as(usize, 22), record_size);
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(Instruction));
+    try std.testing.expectEqualSlices(u8, "SVM1", serialized[0..4]);
+    try std.testing.expectEqual(@intFromEnum(Opcode.mood), serialized[12]);
+    try std.testing.expectEqual(@intFromEnum(OperandMode.string), serialized[13]);
 }
 
 fn parseLoomCommand(text: []const u8) LoomCommand {

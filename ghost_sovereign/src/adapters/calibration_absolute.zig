@@ -1,5 +1,5 @@
 const std = @import("std");
-const absolute = @import("absolute_final.zig");
+const absolute = @import("absolute_final");
 
 pub const LabeledPrompt = struct {
     label: []const u8,

@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const modules = makeGhostModules(b, target, optimize);
 
     const exe = b.addExecutable(.{
         .name = "ghost_core",
@@ -10,6 +11,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    addGhostImports(exe.root_module, modules);
     b.installArtifact(exe);
 
     const run = b.addRunArtifact(exe);
@@ -28,33 +30,34 @@ pub fn build(b: *std.Build) void {
 
     // Synthesis Executables
     const synthesis_files = [_][]const u8{
-        "ask_experts", "audit_experts", "debate_experts", "final_questions",
-        "synth_aether_synthesis", "synth_echo_synthesis", "synth_five_round_synthesis",
-        "synth_honesty_synthesis", "synth_hyper_manifold_synthesis", "synth_infinite_synthesis",
-        "synth_lore_synthesis", "synth_omniscience_synthesis", "synth_pulse_synthesis",
-        "synth_spectral_synthesis", "multimodal_synthesis", "omni_modal_synthesis",
-        "omni_ingest_verdict", "final_audit", "wave1_timeline", "angry_critic_response",
-        "total_audit", "filter_synthesis", "transcendence_synthesis",
-        "pros_cons_audit", "final_merge_synthesis", "calibration", "vsa_leap_synthesis", "decoder_synthesis", "wiki_ingestion_synthesis", "ingestion_strategy_synthesis", "ghost_zero_synthesis", "ghost_infinity_synthesis", "infinity_stress_test", "reiteration_synthesis", "ghost_null_synthesis", "null_manifesto_synthesis", "absolute_synthesis", "absolute_proof_synthesis", "grounded_singularity_synthesis", "zero_scalar_proof", "absolute_final_synthesis", "hardware_mirror_synthesis", "native_mirror_synthesis", "simd_resonance_synthesis", "primitive_resonance_synthesis", "zero_unit_synthesis",
+        "absolute_final_synthesis", "absolute_proof_synthesis", "absolute_synthesis",
+        "decoder_synthesis", "final_merge_synthesis", "ghost_infinity_synthesis",
+        "ghost_null_synthesis", "ghost_zero_synthesis", "grounded_singularity_synthesis",
+        "hardware_mirror_synthesis", "infinity_stress_test", "ingestion_strategy_synthesis",
+        "native_mirror_synthesis", "null_manifesto_synthesis", "primitive_resonance_synthesis",
+        "probe_map", "reiteration_synthesis", "simd_resonance_synthesis", "vsa_leap_synthesis",
+        "wiki_ingestion_synthesis", "zero_scalar_proof", "zero_unit_synthesis",
     };
 
     for (synthesis_files) |name| {
         const synth_exe = b.addExecutable(.{
             .name = name,
-            .root_source_file = b.path(b.fmt("src/{s}.zig", .{name})),
+            .root_source_file = b.path(b.fmt("src/synthesis/{s}.zig", .{name})),
             .target = target,
             .optimize = optimize,
         });
+        addGhostImports(synth_exe.root_module, modules);
         b.installArtifact(synth_exe);
     }
 
     // Main Engine Adapters
     const chat = b.addExecutable(.{
         .name = "chat",
-        .root_source_file = b.path("src/chat.zig"),
+        .root_source_file = b.path("src/adapters/chat.zig"),
         .target = target,
         .optimize = optimize,
     });
+    addGhostImports(chat.root_module, modules);
     b.installArtifact(chat);
     const run_chat = b.addRunArtifact(chat);
     if (b.args) |args| run_chat.addArgs(args);
@@ -63,89 +66,190 @@ pub fn build(b: *std.Build) void {
 
     const alien = b.addExecutable(.{
         .name = "ghost_alien_voice",
-        .root_source_file = b.path("src/aetheric_adapter.zig"),
+        .root_source_file = b.path("src/adapters/aetheric_adapter.zig"),
         .target = target,
         .optimize = optimize,
     });
+    addGhostImports(alien.root_module, modules);
     b.installArtifact(alien);
 
     const void_adapter = b.addExecutable(.{
         .name = "ghost_invent_void",
-        .root_source_file = b.path("src/void_cli_adapter.zig"),
+        .root_source_file = b.path("src/adapters/void_cli_adapter.zig"),
         .target = target,
         .optimize = optimize,
     });
+    addGhostImports(void_adapter.root_module, modules);
     b.installArtifact(void_adapter);
 
     const search = b.addExecutable(.{
         .name = "ghost_search",
-        .root_source_file = b.path("src/search.zig"),
+        .root_source_file = b.path("src/adapters/search.zig"),
         .target = target,
         .optimize = optimize,
     });
+    addGhostImports(search.root_module, modules);
     b.installArtifact(search);
 
     const infinity_exe = b.addExecutable(.{
         .name = "ghost_infinity",
-        .root_source_file = b.path("src/infinity_adapter.zig"),
+        .root_source_file = b.path("src/adapters/infinity_adapter.zig"),
         .target = target,
         .optimize = optimize,
     });
+    addGhostImports(infinity_exe.root_module, modules);
     b.installArtifact(infinity_exe);
 
     const null_exe = b.addExecutable(.{
         .name = "ghost_null",
-        .root_source_file = b.path("src/ghost_null_adapter.zig"),
+        .root_source_file = b.path("src/adapters/ghost_null_adapter.zig"),
         .target = target,
         .optimize = optimize,
     });
+    addGhostImports(null_exe.root_module, modules);
     b.installArtifact(null_exe);
 
     const absolute_proof_exe = b.addExecutable(.{
         .name = "ghost_absolute_proof",
-        .root_source_file = b.path("src/ghost_absolute_proof_adapter.zig"),
+        .root_source_file = b.path("src/adapters/ghost_absolute_proof_adapter.zig"),
         .target = target,
         .optimize = optimize,
     });
+    addGhostImports(absolute_proof_exe.root_module, modules);
     b.installArtifact(absolute_proof_exe);
 
     const grounded_probe = b.addExecutable(.{
         .name = "ghost_grounded_probe",
-        .root_source_file = b.path("src/ghost_grounded_probe.zig"),
+        .root_source_file = b.path("src/adapters/ghost_grounded_probe.zig"),
         .target = target,
         .optimize = optimize,
     });
+    addGhostImports(grounded_probe.root_module, modules);
     b.installArtifact(grounded_probe);
 
     const zeroscalar_probe = b.addExecutable(.{
         .name = "ghost_zeroscalar_probe",
-        .root_source_file = b.path("src/ghost_zeroscalar_probe.zig"),
+        .root_source_file = b.path("src/adapters/ghost_zeroscalar_probe.zig"),
         .target = target,
         .optimize = optimize,
     });
+    addGhostImports(zeroscalar_probe.root_module, modules);
     b.installArtifact(zeroscalar_probe);
 
     const final_probe = b.addExecutable(.{
         .name = "ghost_final_probe",
-        .root_source_file = b.path("src/ghost_final_probe.zig"),
+        .root_source_file = b.path("src/adapters/ghost_final_probe.zig"),
         .target = target,
         .optimize = optimize,
     });
+    addGhostImports(final_probe.root_module, modules);
     b.installArtifact(final_probe);
 
     const absolute_exe = b.addExecutable(.{
         .name = "ghost_absolute",
-        .root_source_file = b.path("src/ghost_absolute_adapter.zig"),
+        .root_source_file = b.path("src/adapters/ghost_absolute_adapter.zig"),
         .target = target,
         .optimize = optimize,
     });
+    addGhostImports(absolute_exe.root_module, modules);
     b.installArtifact(absolute_exe);
 
     const calibration_absolute = b.addExecutable(.{
         .name = "calibration_absolute",
-        .root_source_file = b.path("src/calibration_absolute.zig"),
+        .root_source_file = b.path("src/adapters/calibration_absolute.zig"),
         .target = target,
         .optimize = optimize,
     });
+    addGhostImports(calibration_absolute.root_module, modules);
     b.installArtifact(calibration_absolute);
+
+    const throughput_bench = b.addExecutable(.{
+        .name = "ghost_throughput_bench",
+        .root_source_file = b.path("src/adapters/ghost_throughput_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addGhostImports(throughput_bench.root_module, modules);
+    b.installArtifact(throughput_bench);
+}
+
+const GhostModules = struct {
+    flame: *std.Build.Module,
+    void: *std.Build.Module,
+    flux: *std.Build.Module,
+    vsa: *std.Build.Module,
+    vsa_decoder: *std.Build.Module,
+    aetheric: *std.Build.Module,
+    sovereign: *std.Build.Module,
+    lore: *std.Build.Module,
+    manifold: *std.Build.Module,
+    absolute_final: *std.Build.Module,
+    absolute_archived: *std.Build.Module,
+    absolute_production: *std.Build.Module,
+    absolute_proof_core: *std.Build.Module,
+    grounded_core: *std.Build.Module,
+    infinity_core: *std.Build.Module,
+    null_core: *std.Build.Module,
+};
+
+fn makeGhostModules(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) GhostModules {
+    const modules = GhostModules{
+        .flame = b.createModule(.{ .root_source_file = b.path("src/flame.zig"), .target = target, .optimize = optimize }),
+        .void = b.createModule(.{ .root_source_file = b.path("src/void.zig"), .target = target, .optimize = optimize }),
+        .flux = b.createModule(.{ .root_source_file = b.path("src/flux.zig"), .target = target, .optimize = optimize }),
+        .vsa = b.createModule(.{ .root_source_file = b.path("src/vsa.zig"), .target = target, .optimize = optimize }),
+        .vsa_decoder = b.createModule(.{ .root_source_file = b.path("src/adapters/vsa_decoder.zig"), .target = target, .optimize = optimize }),
+        .aetheric = b.createModule(.{ .root_source_file = b.path("src/aetheric.zig"), .target = target, .optimize = optimize }),
+        .sovereign = b.createModule(.{ .root_source_file = b.path("src/sovereign.zig"), .target = target, .optimize = optimize }),
+        .lore = b.createModule(.{ .root_source_file = b.path("src/lore.zig"), .target = target, .optimize = optimize }),
+        .manifold = b.createModule(.{ .root_source_file = b.path("src/manifold.zig"), .target = target, .optimize = optimize }),
+        .absolute_final = b.createModule(.{ .root_source_file = b.path("src/absolute_final.zig"), .target = target, .optimize = optimize }),
+        .absolute_archived = b.createModule(.{ .root_source_file = b.path("src/archived_cores/absolute.zig"), .target = target, .optimize = optimize }),
+        .absolute_production = b.createModule(.{ .root_source_file = b.path("src/archived_cores/absolute_production.zig"), .target = target, .optimize = optimize }),
+        .absolute_proof_core = b.createModule(.{ .root_source_file = b.path("src/archived_cores/absolute_proof_core.zig"), .target = target, .optimize = optimize }),
+        .grounded_core = b.createModule(.{ .root_source_file = b.path("src/archived_cores/grounded_core.zig"), .target = target, .optimize = optimize }),
+        .infinity_core = b.createModule(.{ .root_source_file = b.path("src/archived_cores/infinity.zig"), .target = target, .optimize = optimize }),
+        .null_core = b.createModule(.{ .root_source_file = b.path("src/archived_cores/null_core.zig"), .target = target, .optimize = optimize }),
+    };
+
+    addGhostImports(modules.flame, modules);
+    addGhostImports(modules.void, modules);
+    addGhostImports(modules.flux, modules);
+    addGhostImports(modules.vsa, modules);
+    addGhostImports(modules.vsa_decoder, modules);
+    addGhostImports(modules.aetheric, modules);
+    addGhostImports(modules.sovereign, modules);
+    addGhostImports(modules.lore, modules);
+    addGhostImports(modules.manifold, modules);
+    addGhostImports(modules.absolute_final, modules);
+    addGhostImports(modules.absolute_archived, modules);
+    addGhostImports(modules.absolute_production, modules);
+    addGhostImports(modules.absolute_proof_core, modules);
+    addGhostImports(modules.grounded_core, modules);
+    addGhostImports(modules.infinity_core, modules);
+    addGhostImports(modules.null_core, modules);
+    return modules;
+}
+
+fn addGhostImports(module: *std.Build.Module, modules: GhostModules) void {
+    module.addImport("flame", modules.flame);
+    module.addImport("void", modules.void);
+    module.addImport("flux", modules.flux);
+    module.addImport("vsa", modules.vsa);
+    module.addImport("vsa_decoder", modules.vsa_decoder);
+    module.addImport("aetheric", modules.aetheric);
+    module.addImport("sovereign", modules.sovereign);
+    module.addImport("lore", modules.lore);
+    module.addImport("manifold", modules.manifold);
+    module.addImport("absolute_final", modules.absolute_final);
+    module.addImport("absolute_archived", modules.absolute_archived);
+    module.addImport("absolute_production", modules.absolute_production);
+    module.addImport("absolute_proof_core", modules.absolute_proof_core);
+    module.addImport("grounded_core", modules.grounded_core);
+    module.addImport("infinity_core", modules.infinity_core);
+    module.addImport("null_core", modules.null_core);
 }

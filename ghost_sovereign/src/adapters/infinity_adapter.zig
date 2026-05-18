@@ -1,5 +1,5 @@
 const std = @import("std");
-const infinity = @import("infinity.zig");
+const infinity = @import("infinity_core");
 
 // THE GHOST INFINITY ADAPTER
 // The anti-fragile, hardware-native mind.

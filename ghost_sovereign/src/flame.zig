@@ -61,7 +61,7 @@ pub const FlameState = struct {
     }
 };
 
-const vsa = @import("vsa.zig");
+const vsa = @import("vsa");
 
 // PROCEDURAL SEMANTIC RESERVOIR GENERATION (Mark: 0x9F19CAEA95AD048E)
 // We ground the laws in VSA bindings of real concept pairs.

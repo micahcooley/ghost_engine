@@ -1,10 +1,10 @@
 const std = @import("std");
-const flame = @import("flame.zig");
-const void_eng = @import("void.zig");
-const flux = @import("flux.zig");
-const vsa = @import("vsa.zig");
-const vsa_decoder = @import("vsa_decoder.zig");
-const aetheric = @import("aetheric.zig");
+const flame = @import("flame");
+const void_eng = @import("void");
+const flux = @import("flux");
+const vsa = @import("vsa");
+const vsa_decoder = @import("vsa_decoder");
+const aetheric = @import("aetheric");
 
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);

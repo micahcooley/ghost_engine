@@ -1,5 +1,5 @@
 const std = @import("std");
-const aetheric = @import("aetheric.zig");
+const aetheric = @import("aetheric");
 
 // THE GHOST AETHERIC ADAPTER
 // The non-binary brain core.

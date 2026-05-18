@@ -1,8 +1,8 @@
 const std = @import("std");
-const flame = @import("flame.zig");
-const void_eng = @import("void.zig");
+const flame = @import("flame");
+const void_eng = @import("void");
 const aether = @import("aether.zig");
-const lore = @import("lore.zig");
+const lore = @import("lore");
 const hyper_bitset = @import("hyper_bitset.zig");
 const echo = @import("echo.zig");
 
