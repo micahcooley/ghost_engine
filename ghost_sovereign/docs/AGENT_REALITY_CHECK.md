@@ -16,6 +16,7 @@ It is not a finished LLM replacement. It does not currently produce reliable nat
 - `src/aetheric.zig` uses `src/manifold.zig` to place VSA anchors and word hypervectors into a memory-mapped voxel grid.
 - `src/search.zig` ingests a small hardcoded article and runs a dictionary-limited query demo.
 - `src/vsa_decoder.zig` contains a prototype dictionary-based hypervector unbinder and a simple brace/paren verifier.
+- `src/adapters/sovereign_interface.zig` wraps `src/absolute_final.zig` and emits live measured mirror snapshots: peak voxel, normalized popcount density, dominant delta, edge fingerprint, spectral path, and a deterministic syllabic neologism.
 - `src/wiki_ingestion_synthesis.zig`, `src/decoder_synthesis.zig`, and `src/ingestion_strategy_synthesis.zig` run proposal probes that output marks and scars.
 
 ## What Is Not Real Yet
@@ -26,6 +27,8 @@ It is not a finished LLM replacement. It does not currently produce reliable nat
 - `ghost_core` and `ghost_search` output dictionary-selected words, not fluent answer generation.
 - `ghost_invent_void` currently prints placeholder success text after pressure-shaping a message.
 - Synthesis probes do not write architecture papers by themselves. Agents translate the numeric output.
+- The default `AbsoluteCore` field used by the sovereign interface is 16 MiB in this checkout. Do not call it a live 10 GB allocation unless the state file and `fieldBytes` output prove that exact size.
+- The neologism anchors are deterministic bit-slice back-mapping labels. They are not proof of learned semantic understanding.
 
 ## Verified Commands
 
@@ -38,6 +41,7 @@ zig build
 ./zig-out/bin/ghost_search
 ./zig-out/bin/wiki_ingestion_synthesis
 ./zig-out/bin/ghost_invent_void invent --message="invent a local tokenless architecture for typo intent on consumer hardware"
+./zig-out/bin/sovereign_interface --message Hello --json
 ```
 
 Observed behavior on 2026-05-17:
@@ -48,6 +52,7 @@ Observed behavior on 2026-05-17:
 - `ghost_search` ingested a hardcoded `Artificial Intelligence` article and emitted small-dictionary tokens.
 - `wiki_ingestion_synthesis` emitted mark `0x8DB70E1FA4402FC9` and scar `0xACE`.
 - `ghost_invent_void` emitted placeholder text: `Resolution achieved`.
+- `sovereign_interface --message Hello --json` emitted real `AbsoluteCore` measurements including `fieldBytes: 16777216`, `fieldCount: 2097152`, `writes: 5`, `resonanceDensity: 0.328125`, and an active neologism derived from the measured peak.
 
 ## How To Report This Honestly
 

@@ -5,6 +5,7 @@ const std = @import("std");
 // Objective: make the core measurable without SIMD or bit reversal.
 
 pub const AbsoluteCore = struct {
+    pub const DefaultStatePath = "state/ghost_absolute.bin";
     // Manifold of 64-bit voxels (2^21 * 8 bytes = 16MB)
     pub const ManifoldSize = 2097152;
     pub const AddressMask = ManifoldSize - 1;
@@ -32,10 +33,28 @@ pub const AbsoluteCore = struct {
     kernel: u64 = 0xBE496F1695F15480,
 
     pub fn init(size_bytes: usize) !AbsoluteCore {
-        try std.fs.cwd().makePath("state");
+        return initAt(DefaultStatePath, size_bytes);
+    }
+
+    pub fn initAt(state_path: []const u8, size_bytes: usize) !AbsoluteCore {
+        if (std.fs.path.dirname(state_path)) |dir| {
+            if (dir.len != 0) {
+                if (std.fs.path.isAbsolute(dir)) {
+                    std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
+                        error.PathAlreadyExists => {},
+                        else => return err,
+                    };
+                } else {
+                    try std.fs.cwd().makePath(dir);
+                }
+            }
+        }
         const requested_count = @max(WindowSize, size_bytes / @sizeOf(u64));
         const count = std.math.ceilPowerOfTwo(usize, requested_count) catch ManifoldSize;
-        var file = try std.fs.cwd().createFile("state/ghost_absolute.bin", .{ .read = true, .truncate = false });
+        var file = if (std.fs.path.isAbsolute(state_path))
+            try std.fs.createFileAbsolute(state_path, .{ .read = true, .truncate = false })
+        else
+            try std.fs.cwd().createFile(state_path, .{ .read = true, .truncate = false });
         try file.setEndPos(count * 8);
 
         const data = try std.posix.mmap(

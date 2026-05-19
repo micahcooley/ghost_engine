@@ -26,11 +26,21 @@ The active ingest loop is intentionally narrow. Each input byte selects a voxel 
 - N=1000 unique prompt calibration using deterministic PRNG-generated prompts
 - Unique Edge Rate, defined as unique edge fingerprints divided by prompt count
 
+`src/adapters/sovereign_interface.zig` exposes the same active core as a UI-facing mirror. It reports only values derived from the local mapped field and the `IngestReport` returned by `AbsoluteCore.ingestMeasured(...)`:
+
+- `fieldBytes` and `fieldCount` from the actual mapped field
+- `peakVoxel` from the dominant edge index
+- `resonanceDensity` as normalized `@popCount(peakVoxel) / 64`
+- `dominantDelta` and `edgeFingerprint` from the ingest report
+- `spectralPath` from the dominant edge, fingerprint, peak voxel, and delta
+- `activeNeologism` from a deterministic 64-bit syllabic mapping
+
 The benchmark is reproducible from the repo root with:
 
 ```sh
 zig build -Doptimize=ReleaseFast
 ./zig-out/bin/ghost_throughput_bench
+./zig-out/bin/sovereign_interface --message Hello --json
 ```
 
 ## Grounding Note
@@ -40,3 +50,5 @@ VSA grounding is currently non-load-bearing for Ghost Absolute. It is present el
 ## Non-Claims
 
 Ghost Absolute is not a language model, proof engine, or verified intelligence system. It does not prove semantic support, execute reasoning over evidence, or produce authoritative answers. Its current role is a deterministic routing and fingerprinting front-end whose behavior must be evaluated with throughput and collision statistics rather than theatrical claims.
+
+The sovereign interface is a local visualization and pronunciation layer over those measurements. Its English anchors are deterministic labels selected from peak bits; they are not a learned semantic decoder.

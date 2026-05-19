@@ -28,6 +28,15 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run Ghost Core tests");
     test_step.dependOn(&run_tests.step);
 
+    const sovereign_interface_tests = b.addTest(.{
+        .root_source_file = b.path("src/adapters/sovereign_interface.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addGhostImports(sovereign_interface_tests.root_module, modules);
+    const run_sovereign_interface_tests = b.addRunArtifact(sovereign_interface_tests);
+    test_step.dependOn(&run_sovereign_interface_tests.step);
+
     // Synthesis Executables
     const synthesis_files = [_][]const u8{
         "absolute_final_synthesis", "absolute_proof_synthesis", "absolute_synthesis",
@@ -36,7 +45,7 @@ pub fn build(b: *std.Build) void {
         "hardware_mirror_synthesis", "infinity_stress_test", "ingestion_strategy_synthesis",
         "native_mirror_synthesis", "null_manifesto_synthesis", "primitive_resonance_synthesis",
         "probe_map", "reiteration_synthesis", "simd_resonance_synthesis", "vsa_leap_synthesis",
-        "wiki_ingestion_synthesis", "zero_scalar_proof", "zero_unit_synthesis", "entangled_singularity_synthesis",
+        "wiki_ingestion_synthesis", "zero_scalar_proof", "zero_unit_synthesis", "entangled_singularity_synthesis", "bridge_synthesis", "neologism_bridge_synthesis", "cli_overhaul_synthesis",
     };
 
     for (synthesis_files) |name| {
@@ -179,6 +188,23 @@ pub fn build(b: *std.Build) void {
     });
     addGhostImports(throughput_bench.root_module, modules);
     b.installArtifact(throughput_bench);
+
+    const sovereign_interface = b.addExecutable(.{
+        .name = "sovereign_interface",
+        .root_source_file = b.path("src/adapters/sovereign_interface.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addGhostImports(sovereign_interface.root_module, modules);
+    b.installArtifact(sovereign_interface);
+
+    const bridge_transceiver = b.addExecutable(.{
+        .name = "bridge_transceiver",
+        .root_source_file = b.path("src/adapters/bridge_transceiver.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    b.installArtifact(bridge_transceiver);
 }
 
 const GhostModules = struct {
