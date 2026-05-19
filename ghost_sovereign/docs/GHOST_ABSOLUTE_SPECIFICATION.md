@@ -12,7 +12,7 @@ Ghost Absolute is an mmap-backed dictionary walker with 8 sharded workers perfor
 - Active window: 32 KiB
 - Walker layout: 8 walkers, each assigned one 4 KiB shard inside the active window
 - Mixing: XOR plus `rotl`; `@bitReverse` is not used in the active core
-- Mapping mode: `MAP_PRIVATE`, so benchmark mutations do not persist back through the mmap
+- Mapping mode: `MAP_SHARED`; existing non-empty mapped state is preserved, and empty files are seeded once
 
 The active ingest loop is intentionally narrow. Each input byte selects a voxel inside its walker's assigned shard, XORs a rotated byte-derived lane value into that voxel, and advances the walker from the prior voxel state plus the mixed value. The walkers do not write each other's shards, which removes the cross-walker read-after-write hazard present in the earlier shared-window loop.
 
@@ -29,17 +29,21 @@ The active ingest loop is intentionally narrow. Each input byte selects a voxel 
 `src/adapters/sovereign_interface.zig` exposes the same active core as a UI-facing mirror. It reports only values derived from the local mapped field and the `IngestReport` returned by `AbsoluteCore.ingestMeasured(...)`:
 
 - `fieldBytes` and `fieldCount` from the actual mapped field
-- `peakVoxel` from the dominant edge index
-- `resonanceDensity` as normalized `@popCount(peakVoxel) / 64`
+- `peakVoxel` from the highest current input-resonance scan over the mapped field
+- `resonanceDensity` as normalized `@popCount(peakVoxel ^ edgeFingerprint ^ dominantDelta) / 64`
 - `dominantDelta` and `edgeFingerprint` from the ingest report
 - `spectralPath` from the dominant edge, fingerprint, peak voxel, and delta
 - `activeNeologism` from a deterministic 64-bit syllabic mapping
+- `pathfinderChain`, a dynamic chain of alien names and English anchors produced by a 31-bit prime neighbor walk. Chain length varies with input pressure; it is not a fixed response sentence.
+
+`src/adapters/grammar_pulse.zig` is an offline corpus-folding tool for local Common Crawl WET/plain text files. It accepts a real corpus path, folds up to 1,000,000 plausible sentences into the shared `ghost_absolute.bin` field, compares a grammar-density measurement against a deterministic noise baseline, and errors instead of synthesizing a corpus when input is missing or insufficient.
 
 The benchmark is reproducible from the repo root with:
 
 ```sh
 zig build -Doptimize=ReleaseFast
 ./zig-out/bin/ghost_throughput_bench
+./zig-out/bin/grammar_pulse --corpus /path/to/common-crawl-wet-or-text --max-sentences=1000000 --json
 ./zig-out/bin/sovereign_interface --message Hello --json
 ```
 

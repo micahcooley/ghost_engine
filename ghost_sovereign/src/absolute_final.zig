@@ -61,13 +61,13 @@ pub const AbsoluteCore = struct {
             null,
             count * 8,
             std.posix.PROT.READ | std.posix.PROT.WRITE,
-            .{ .TYPE = .PRIVATE },
+            .{ .TYPE = .SHARED },
             file.handle,
             0,
         );
 
         const field = std.mem.bytesAsSlice(u64, data);
-        seedField(field);
+        if (needsSeed(field)) seedField(field);
 
         return .{
             .field = field,
@@ -80,6 +80,10 @@ pub const AbsoluteCore = struct {
     pub fn deinit(self: *AbsoluteCore) void {
         std.posix.munmap(@alignCast(std.mem.sliceAsBytes(self.field)));
         self.file.close();
+    }
+
+    pub fn flush(self: *AbsoluteCore) !void {
+        try std.posix.msync(@alignCast(std.mem.sliceAsBytes(self.field)), std.posix.MSF.SYNC);
     }
 
     pub fn reset(self: *AbsoluteCore) void {
@@ -191,6 +195,21 @@ pub const AbsoluteCore = struct {
             s = (s ^ (s >> 31)) ^ 0x9E3779B97F4A7C15;
             v.* = s;
         }
+    }
+
+    fn needsSeed(field: []const u64) bool {
+        if (field.len == 0) return false;
+        const probes = [_]usize{
+            0,
+            field.len / 7,
+            field.len / 3,
+            field.len / 2,
+            field.len - 1,
+        };
+        for (probes) |idx| {
+            if (field[idx] != 0) return false;
+        }
+        return true;
     }
 
     fn mixWalker(

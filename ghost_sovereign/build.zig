@@ -37,6 +37,15 @@ pub fn build(b: *std.Build) void {
     const run_sovereign_interface_tests = b.addRunArtifact(sovereign_interface_tests);
     test_step.dependOn(&run_sovereign_interface_tests.step);
 
+    const grammar_pulse_tests = b.addTest(.{
+        .root_source_file = b.path("src/adapters/grammar_pulse.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addGhostImports(grammar_pulse_tests.root_module, modules);
+    const run_grammar_pulse_tests = b.addRunArtifact(grammar_pulse_tests);
+    test_step.dependOn(&run_grammar_pulse_tests.step);
+
     // Synthesis Executables
     const synthesis_files = [_][]const u8{
         "absolute_final_synthesis", "absolute_proof_synthesis", "absolute_synthesis",
@@ -45,7 +54,7 @@ pub fn build(b: *std.Build) void {
         "hardware_mirror_synthesis", "infinity_stress_test", "ingestion_strategy_synthesis",
         "native_mirror_synthesis", "null_manifesto_synthesis", "primitive_resonance_synthesis",
         "probe_map", "reiteration_synthesis", "simd_resonance_synthesis", "vsa_leap_synthesis",
-        "wiki_ingestion_synthesis", "zero_scalar_proof", "zero_unit_synthesis", "entangled_singularity_synthesis", "bridge_synthesis", "neologism_bridge_synthesis", "cli_overhaul_synthesis",
+        "wiki_ingestion_synthesis", "zero_scalar_proof", "zero_unit_synthesis", "entangled_singularity_synthesis", "bridge_synthesis", "neologism_bridge_synthesis", "cli_overhaul_synthesis", "wave2_synthesis",
     };
 
     for (synthesis_files) |name| {
@@ -197,6 +206,15 @@ pub fn build(b: *std.Build) void {
     });
     addGhostImports(sovereign_interface.root_module, modules);
     b.installArtifact(sovereign_interface);
+
+    const grammar_pulse = b.addExecutable(.{
+        .name = "grammar_pulse",
+        .root_source_file = b.path("src/adapters/grammar_pulse.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addGhostImports(grammar_pulse.root_module, modules);
+    b.installArtifact(grammar_pulse);
 
     const bridge_transceiver = b.addExecutable(.{
         .name = "bridge_transceiver",

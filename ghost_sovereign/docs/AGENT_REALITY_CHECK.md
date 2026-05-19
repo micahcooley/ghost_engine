@@ -16,19 +16,20 @@ It is not a finished LLM replacement. It does not currently produce reliable nat
 - `src/aetheric.zig` uses `src/manifold.zig` to place VSA anchors and word hypervectors into a memory-mapped voxel grid.
 - `src/search.zig` ingests a small hardcoded article and runs a dictionary-limited query demo.
 - `src/vsa_decoder.zig` contains a prototype dictionary-based hypervector unbinder and a simple brace/paren verifier.
-- `src/adapters/sovereign_interface.zig` wraps `src/absolute_final.zig` and emits live measured mirror snapshots: peak voxel, normalized popcount density, dominant delta, edge fingerprint, spectral path, and a deterministic syllabic neologism.
+- `src/adapters/sovereign_interface.zig` wraps `src/absolute_final.zig` and emits live measured mirror snapshots: peak voxel, normalized resonance density, dominant delta, edge fingerprint, spectral path, deterministic syllabic neologism, and a Pathfinder chain.
+- `src/adapters/grammar_pulse.zig` is a real offline corpus ingester. It reads local Common Crawl WET/plain text files or directories, folds plausible sentences into `ghost_absolute.bin`, compares grammar density against deterministic noise, and errors instead of inventing corpus data.
 - `src/wiki_ingestion_synthesis.zig`, `src/decoder_synthesis.zig`, and `src/ingestion_strategy_synthesis.zig` run proposal probes that output marks and scars.
 
 ## What Is Not Real Yet
 
-- No web-scale fetch/parse/store/query pipeline exists.
+- No web-scale fetch/parse/store/query pipeline exists. `grammar_pulse` can fold local corpus files; it does not download Common Crawl for you and does not provide source-backed retrieval.
 - No source-backed retrieval returns cited passages from the manifold.
 - No trained decoder maps arbitrary reservoir states back into reliable prose.
 - `ghost_core` and `ghost_search` output dictionary-selected words, not fluent answer generation.
 - `ghost_invent_void` currently prints placeholder success text after pressure-shaping a message.
 - Synthesis probes do not write architecture papers by themselves. Agents translate the numeric output.
 - The default `AbsoluteCore` field used by the sovereign interface is 16 MiB in this checkout. Do not call it a live 10 GB allocation unless the state file and `fieldBytes` output prove that exact size.
-- The neologism anchors are deterministic bit-slice back-mapping labels. They are not proof of learned semantic understanding.
+- The neologism/pathfinder anchors are deterministic bit-slice back-mapping labels. They are not proof of learned semantic understanding.
 
 ## Verified Commands
 
@@ -41,6 +42,7 @@ zig build
 ./zig-out/bin/ghost_search
 ./zig-out/bin/wiki_ingestion_synthesis
 ./zig-out/bin/ghost_invent_void invent --message="invent a local tokenless architecture for typo intent on consumer hardware"
+./zig-out/bin/grammar_pulse --corpus /path/to/common-crawl-wet-or-text --max-sentences=1000000 --json
 ./zig-out/bin/sovereign_interface --message Hello --json
 ```
 
