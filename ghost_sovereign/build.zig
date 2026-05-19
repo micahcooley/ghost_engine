@@ -223,6 +223,51 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     b.installArtifact(bridge_transceiver);
+
+    const anchor_readout = b.addExecutable(.{
+        .name = "anchor_readout",
+        .root_source_file = b.path("src/adapters/anchor_readout.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addGhostImports(anchor_readout.root_module, modules);
+    b.installArtifact(anchor_readout);
+
+    const anchor_distribution = b.addExecutable(.{
+        .name = "anchor_distribution",
+        .root_source_file = b.path("src/adapters/anchor_distribution.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addGhostImports(anchor_distribution.root_module, modules);
+    b.installArtifact(anchor_distribution);
+
+    const persistence_check = b.addExecutable(.{
+        .name = "persistence_check",
+        .root_source_file = b.path("src/adapters/persistence_check.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addGhostImports(persistence_check.root_module, modules);
+    b.installArtifact(persistence_check);
+
+    const anchor_readout_tests = b.addTest(.{
+        .root_source_file = b.path("src/adapters/anchor_readout.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addGhostImports(anchor_readout_tests.root_module, modules);
+    const run_anchor_readout_tests = b.addRunArtifact(anchor_readout_tests);
+    test_step.dependOn(&run_anchor_readout_tests.step);
+
+    const anchor_distribution_tests = b.addTest(.{
+        .root_source_file = b.path("src/adapters/anchor_distribution.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addGhostImports(anchor_distribution_tests.root_module, modules);
+    const run_anchor_distribution_tests = b.addRunArtifact(anchor_distribution_tests);
+    test_step.dependOn(&run_anchor_distribution_tests.step);
 }
 
 const GhostModules = struct {
