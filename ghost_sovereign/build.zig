@@ -54,7 +54,7 @@ pub fn build(b: *std.Build) void {
         "hardware_mirror_synthesis", "infinity_stress_test", "ingestion_strategy_synthesis",
         "native_mirror_synthesis", "null_manifesto_synthesis", "primitive_resonance_synthesis",
         "probe_map", "reiteration_synthesis", "simd_resonance_synthesis", "vsa_leap_synthesis",
-        "wiki_ingestion_synthesis", "zero_scalar_proof", "zero_unit_synthesis", "entangled_singularity_synthesis", "bridge_synthesis", "neologism_bridge_synthesis", "cli_overhaul_synthesis", "wave2_synthesis",
+        "wiki_ingestion_synthesis", "zero_scalar_proof", "zero_unit_synthesis", "entangled_singularity_synthesis", "bridge_synthesis", "neologism_bridge_synthesis", "cli_overhaul_synthesis", "wave2_synthesis", "truth_verdict_synthesis", "wave3_synthesis", "semantic_overlap_synthesis",
     };
 
     for (synthesis_files) |name| {
@@ -268,6 +268,24 @@ pub fn build(b: *std.Build) void {
     addGhostImports(anchor_distribution_tests.root_module, modules);
     const run_anchor_distribution_tests = b.addRunArtifact(anchor_distribution_tests);
     test_step.dependOn(&run_anchor_distribution_tests.step);
+
+    const understanding_bench = b.addExecutable(.{
+        .name = "understanding_bench",
+        .root_source_file = b.path("src/adapters/understanding_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addGhostImports(understanding_bench.root_module, modules);
+    b.installArtifact(understanding_bench);
+
+    const understanding_bench_tests = b.addTest(.{
+        .root_source_file = b.path("src/adapters/understanding_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addGhostImports(understanding_bench_tests.root_module, modules);
+    const run_understanding_bench_tests = b.addRunArtifact(understanding_bench_tests);
+    test_step.dependOn(&run_understanding_bench_tests.step);
 }
 
 const GhostModules = struct {

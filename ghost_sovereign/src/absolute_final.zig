@@ -106,6 +106,10 @@ pub const AbsoluteCore = struct {
         var m6: usize = m1 ^ 0x6666666666666666;
         var m7: usize = m1 ^ 0x9999999999999999;
         var m8: usize = m1 ^ 0x7777777777777777;
+        // Shared n-gram context register: rolling 8-byte history of ingested
+        // bytes. Updated per byte, mixed into every walker so consecutive-byte
+        // context (not just the current byte) drives the manifold collision.
+        var context: u64 = 0;
 
         const field_mask = self.address_mask & ~@as(usize, WindowMask);
         var i: usize = 0;
@@ -120,45 +124,61 @@ pub const AbsoluteCore = struct {
 
             var j: usize = 0;
             while (j + 8 <= batch.len) : (j += 8) {
-                mixWalker(window, window_start, 0, &m1, batch[j], 7, 0xBE496F1695F15480, &report);
-                mixWalker(window, window_start, 1, &m2, batch[j + 1], 11, 0xC2B2AE3D27D4EB4F, &report);
-                mixWalker(window, window_start, 2, &m3, batch[j + 2], 13, 0x165667B19E3779F9, &report);
-                mixWalker(window, window_start, 3, &m4, batch[j + 3], 17, 0x85EBCA77C2B2AE63, &report);
-                mixWalker(window, window_start, 4, &m5, batch[j + 4], 19, 0x27D4EB2F165667C5, &report);
-                mixWalker(window, window_start, 5, &m6, batch[j + 5], 23, 0x94D049BB133111EB, &report);
-                mixWalker(window, window_start, 6, &m7, batch[j + 6], 29, 0xD6E8FEB86659FD93, &report);
-                mixWalker(window, window_start, 7, &m8, batch[j + 7], 31, 0x9E3779B97F4A7C15, &report);
+                context = (context << 8) | @as(u64, batch[j]);
+                mixWalker(window, window_start, 0, &m1, context, 7, 0xBE496F1695F15480, &report);
+                context = (context << 8) | @as(u64, batch[j + 1]);
+                mixWalker(window, window_start, 1, &m2, context, 11, 0xC2B2AE3D27D4EB4F, &report);
+                context = (context << 8) | @as(u64, batch[j + 2]);
+                mixWalker(window, window_start, 2, &m3, context, 13, 0x165667B19E3779F9, &report);
+                context = (context << 8) | @as(u64, batch[j + 3]);
+                mixWalker(window, window_start, 3, &m4, context, 17, 0x85EBCA77C2B2AE63, &report);
+                context = (context << 8) | @as(u64, batch[j + 4]);
+                mixWalker(window, window_start, 4, &m5, context, 19, 0x27D4EB2F165667C5, &report);
+                context = (context << 8) | @as(u64, batch[j + 5]);
+                mixWalker(window, window_start, 5, &m6, context, 23, 0x94D049BB133111EB, &report);
+                context = (context << 8) | @as(u64, batch[j + 6]);
+                mixWalker(window, window_start, 6, &m7, context, 29, 0xD6E8FEB86659FD93, &report);
+                context = (context << 8) | @as(u64, batch[j + 7]);
+                mixWalker(window, window_start, 7, &m8, context, 31, 0x9E3779B97F4A7C15, &report);
             }
             if (j < batch.len) {
-                mixWalker(window, window_start, 0, &m1, batch[j], 7, 0xBE496F1695F15480, &report);
+                context = (context << 8) | @as(u64, batch[j]);
+                mixWalker(window, window_start, 0, &m1, context, 7, 0xBE496F1695F15480, &report);
                 j += 1;
             }
             if (j < batch.len) {
-                mixWalker(window, window_start, 1, &m2, batch[j], 11, 0xC2B2AE3D27D4EB4F, &report);
+                context = (context << 8) | @as(u64, batch[j]);
+                mixWalker(window, window_start, 1, &m2, context, 11, 0xC2B2AE3D27D4EB4F, &report);
                 j += 1;
             }
             if (j < batch.len) {
-                mixWalker(window, window_start, 2, &m3, batch[j], 13, 0x165667B19E3779F9, &report);
+                context = (context << 8) | @as(u64, batch[j]);
+                mixWalker(window, window_start, 2, &m3, context, 13, 0x165667B19E3779F9, &report);
                 j += 1;
             }
             if (j < batch.len) {
-                mixWalker(window, window_start, 3, &m4, batch[j], 17, 0x85EBCA77C2B2AE63, &report);
+                context = (context << 8) | @as(u64, batch[j]);
+                mixWalker(window, window_start, 3, &m4, context, 17, 0x85EBCA77C2B2AE63, &report);
                 j += 1;
             }
             if (j < batch.len) {
-                mixWalker(window, window_start, 4, &m5, batch[j], 19, 0x27D4EB2F165667C5, &report);
+                context = (context << 8) | @as(u64, batch[j]);
+                mixWalker(window, window_start, 4, &m5, context, 19, 0x27D4EB2F165667C5, &report);
                 j += 1;
             }
             if (j < batch.len) {
-                mixWalker(window, window_start, 5, &m6, batch[j], 23, 0x94D049BB133111EB, &report);
+                context = (context << 8) | @as(u64, batch[j]);
+                mixWalker(window, window_start, 5, &m6, context, 23, 0x94D049BB133111EB, &report);
                 j += 1;
             }
             if (j < batch.len) {
-                mixWalker(window, window_start, 6, &m7, batch[j], 29, 0xD6E8FEB86659FD93, &report);
+                context = (context << 8) | @as(u64, batch[j]);
+                mixWalker(window, window_start, 6, &m7, context, 29, 0xD6E8FEB86659FD93, &report);
                 j += 1;
             }
             if (j < batch.len) {
-                mixWalker(window, window_start, 7, &m8, batch[j], 31, 0x9E3779B97F4A7C15, &report);
+                context = (context << 8) | @as(u64, batch[j]);
+                mixWalker(window, window_start, 7, &m8, context, 31, 0x9E3779B97F4A7C15, &report);
             }
             i += batch_limit;
         }
@@ -217,16 +237,14 @@ pub const AbsoluteCore = struct {
         window_start: usize,
         comptime shard: usize,
         m: *usize,
-        b: u8,
+        context: u64,
         rot: u6,
         lane_salt: u64,
         report: *IngestReport,
     ) void {
-        const idx = (shard * ShardSize) + ((m.* ^ @as(usize, b)) & ShardMask);
+        const idx = (shard * ShardSize) + ((m.* ^ @as(usize, @truncate(context))) & ShardMask);
         const prior = window[idx];
-        const b64 = @as(u64, b);
-        const spread = b64 ^ (b64 << 8) ^ (b64 << 16) ^ (b64 << 24) ^ (b64 << 32) ^ (b64 << 40) ^ (b64 << 48) ^ (b64 << 56);
-        const mixed = std.math.rotl(u64, spread ^ lane_salt, rot);
+        const mixed = std.math.rotl(u64, context ^ lane_salt, rot);
         const next = prior ^ mixed;
         window[idx] = next;
 
